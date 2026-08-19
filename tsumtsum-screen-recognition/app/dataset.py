@@ -23,7 +23,7 @@ class Sample:
     width: int
     height: int
     game_region: dict[str, int] | None
-    status: str  # unlabeled | predicted | labeled
+    status: str  # unlabeled | predicted | labeled | skipped
 
     @property
     def image_path(self) -> Path:
@@ -95,12 +95,32 @@ class Dataset:
     def unlabeled(self) -> list[Sample]:
         return [s for s in self._samples if s.status == "unlabeled"]
 
+    def pending(self) -> list[Sample]:
+        return [s for s in self._samples if s.status in {"unlabeled", "predicted"}]
+
+    def next_pending(self, after_id: str | None) -> str | None:
+        pending_ids = {s.id for s in self.pending()}
+        if not pending_ids:
+            return None
+        if after_id is None:
+            return self.pending()[0].id
+        ids = [s.id for s in self._samples]
+        try:
+            start = ids.index(after_id)
+        except ValueError:
+            return self.pending()[0].id
+        for sample in self._samples[start + 1 :] + self._samples[: start + 1]:
+            if sample.id in pending_ids and sample.id != after_id:
+                return sample.id
+        return None
+
     def counts(self) -> dict[str, int]:
         return {
             "total": len(self._samples),
             "labeled": len(self.labeled()),
             "predicted": sum(1 for s in self._samples if s.status == "predicted"),
             "unlabeled": len(self.unlabeled()),
+            "skipped": sum(1 for s in self._samples if s.status == "skipped"),
         }
 
     def import_file(self, path: Path) -> Sample:
@@ -179,6 +199,15 @@ class Dataset:
             raise KeyError(sample_id)
         sample.game_region = None
         sample.status = "unlabeled"
+        self._save()
+        return sample
+
+    def skip(self, sample_id: str) -> Sample:
+        sample = self.get(sample_id)
+        if sample is None:
+            raise KeyError(sample_id)
+        sample.game_region = None
+        sample.status = "skipped"
         self._save()
         return sample
 

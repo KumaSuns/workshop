@@ -11,3 +11,7 @@ tsumtsum-screen-recognition/data/images/
 tsumtsum-screen-recognition/data/labels/
 tsumtsum-screen-recognition/data/models/
 tsumtsum-screen-recognition/data/index.json
+
+# 動画から抜き出した画像はリポジトリに入れない
+video-frame-extractor/output/
+

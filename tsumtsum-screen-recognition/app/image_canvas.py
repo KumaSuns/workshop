@@ -1,28 +1,38 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QWheelEvent,
 )
-from PySide6.QtWidgets import (
-    QFrame,
-    QGraphicsRectItem,
-    QGraphicsScene,
-    QGraphicsSimpleTextItem,
-    QGraphicsView,
-)
+from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView, QLabel
 
 MIN_BOX = 16
+CORNER = 14
+EDGE_LEN = 36
+EDGE_THICK = 12
+
+HANDLE_CURSORS = {
+    "nw": Qt.CursorShape.SizeFDiagCursor,
+    "n": Qt.CursorShape.SizeVerCursor,
+    "ne": Qt.CursorShape.SizeBDiagCursor,
+    "e": Qt.CursorShape.SizeHorCursor,
+    "se": Qt.CursorShape.SizeFDiagCursor,
+    "s": Qt.CursorShape.SizeVerCursor,
+    "sw": Qt.CursorShape.SizeBDiagCursor,
+    "w": Qt.CursorShape.SizeHorCursor,
+}
 
 
 class ImageCanvas(QGraphicsView):
     regionCommitted = Signal(int, int, int, int)
+    regionChanged = Signal(int, int, int, int)
     filesDropped = Signal(list)
     imageDropped = Signal(object)
 
@@ -36,6 +46,7 @@ class ImageCanvas(QGraphicsView):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -43,14 +54,23 @@ class ImageCanvas(QGraphicsView):
         self.viewport().setCursor(Qt.CursorShape.CrossCursor)
 
         self._pixmap_item = None
-        self._rect_item: QGraphicsRectItem | None = None
-        self._caption: QGraphicsSimpleTextItem | None = None
-        self._drawing = False
-        self._panning = False
+        self._region: QRectF | None = None
+        self._status = "unlabeled"
+        self._mode: str | None = None
+        self._handle: str | None = None
         self._origin = QPointF()
+        self._orig_rect = QRectF()
         self._pan_pos = QPointF()
         self._should_fit = True
-        self._status = "unlabeled"
+
+        self._guide = QLabel(self)
+        self._guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._guide.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._guide.setStyleSheet(
+            "QLabel { background: rgba(12, 14, 18, 210); color: #f2f5f8; "
+            "padding: 8px 14px; border-radius: 8px; font-size: 13px; }"
+        )
+        self._update_guide()
 
     def has_image(self) -> bool:
         return self._pixmap_item is not None
@@ -59,82 +79,161 @@ class ImageCanvas(QGraphicsView):
         self._scene.clear()
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
-        self._rect_item = QGraphicsRectItem()
-        self._rect_item.setZValue(1)
-        self._scene.addItem(self._rect_item)
-        self._caption = QGraphicsSimpleTextItem()
-        self._caption.setFlag(
-            QGraphicsSimpleTextItem.GraphicsItemFlag.ItemIgnoresTransformations
-        )
-        self._caption.setZValue(2)
-        self._caption.setFont(QFont("Yu Gothic UI", 10, QFont.Weight.DemiBold))
-        self._scene.addItem(self._caption)
         self._should_fit = True
-        self.set_region(region, status)
+        self._mode = None
+        self.set_region(region, status, emit=False)
         self.fit_to_view()
+        self._update_guide()
 
     def clear_image(self) -> None:
         self._scene.clear()
         self._pixmap_item = None
-        self._rect_item = None
-        self._caption = None
+        self._region = None
         self._status = "unlabeled"
+        self._mode = None
         self.resetTransform()
+        self._update_guide()
+        self.viewport().update()
 
-    def set_region(self, region: QRectF | None, status: str = "labeled") -> None:
+    def set_region(self, region: QRectF | None, status: str = "labeled", emit: bool = False) -> None:
         self._status = status
-        if self._rect_item is None:
-            return
         if region is None or region.isEmpty():
-            self._rect_item.setVisible(False)
-            if self._caption:
-                self._caption.setVisible(False)
-            return
-        self._apply_style(status)
-        self._rect_item.setRect(region)
-        self._rect_item.setVisible(True)
-        self._update_caption()
+            self._region = None
+        else:
+            self._region = QRectF(self._clamp_rect(region))
+        self._update_guide()
+        self.viewport().update()
+        if emit:
+            self._emit_region(self.regionChanged)
 
     def current_region(self) -> QRectF | None:
-        if self._rect_item is None or not self._rect_item.isVisible():
-            return None
-        return self._rect_item.rect()
+        return QRectF(self._region) if self._region else None
 
     def fit_to_view(self) -> None:
         if self._pixmap_item is None or self.viewport().width() < 10:
             return
         self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         self._should_fit = True
+        self.viewport().update()
 
-    def _apply_style(self, status: str) -> None:
-        if self._rect_item is None or self._caption is None:
-            return
-        if status == "predicted":
-            color = QColor("#FFB020")
-            pen = QPen(color, 2, Qt.PenStyle.DashLine)
-            self._caption.setText("予測  違っていたら囲み直してください")
+    def _update_guide(self) -> None:
+        if self._pixmap_item is None:
+            self._guide.setText("画像をドロップ  /  Ctrl+V で貼り付け  /  「画像を開く」")
+        elif self._region is None:
+            self._guide.setText("画像の上をドラッグして、ゲーム範囲を四角で囲んでください")
         else:
-            color = QColor("#3DDC97")
-            pen = QPen(color, 2, Qt.PenStyle.SolidLine)
-            self._caption.setText("ゲーム範囲")
-        pen.setCosmetic(True)
-        self._rect_item.setPen(pen)
-        fill = QColor(color)
-        fill.setAlpha(40)
-        self._rect_item.setBrush(fill)
-        self._caption.setBrush(color)
+            self._guide.setText("四隅をつかむと拡大縮小  ・  辺の中央は縦だけ / 横だけ  ・  よければ「この範囲を保存」")
+        self._guide.adjustSize()
+        self._place_guide()
 
-    def _update_caption(self) -> None:
-        if self._caption is None or self._rect_item is None:
-            return
-        rect = self._rect_item.rect()
-        if rect.isEmpty():
-            self._caption.setVisible(False)
-            return
-        self._caption.setVisible(True)
-        self._caption.setPos(rect.left() + 6, rect.top() + 6)
+    def _place_guide(self) -> None:
+        margin = 12
+        self._guide.move(max(margin, (self.width() - self._guide.width()) // 2), margin)
 
-    def _clamp(self, point: QPointF) -> QPointF:
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_guide()
+        if self._should_fit:
+            self.fit_to_view()
+
+    def drawForeground(self, painter: QPainter, _rect: QRectF) -> None:
+        if self._pixmap_item is None:
+            return
+        painter.save()
+        painter.resetTransform()
+        image_view = QRectF(self._view_rect_from_scene(self._pixmap_item.boundingRect()))
+        if self._region is None or self._region.width() < 1 or self._region.height() < 1:
+            painter.setPen(QPen(QColor("#7CFFB2"), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(image_view.adjusted(2, 2, -2, -2))
+            painter.restore()
+            return
+
+        region_view = QRectF(self._view_rect_from_scene(self._region))
+        dim = QPainterPath()
+        dim.addRect(QRectF(image_view))
+        hole = QPainterPath()
+        hole.addRoundedRect(QRectF(region_view), 2, 2)
+        painter.fillPath(dim.subtracted(hole), QColor(0, 0, 0, 150))
+
+        accent = QColor("#FFB020") if self._status == "predicted" else QColor("#5CFF9E")
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 5))
+        painter.drawRect(region_view)
+        painter.setPen(QPen(accent, 2))
+        painter.drawRect(region_view)
+
+        label = (
+            f"{'予測 ' if self._status == 'predicted' else ''}"
+            f"{int(round(self._region.width()))} × {int(round(self._region.height()))} px"
+        )
+        font = QFont("Yu Gothic UI", 10, QFont.Weight.DemiBold)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        text_w = metrics.horizontalAdvance(label) + 14
+        text_h = metrics.height() + 8
+        badge = QRect(
+            int(region_view.left()),
+            max(4, int(region_view.top()) - text_h - 4),
+            text_w,
+            text_h,
+        )
+        if badge.top() < 4:
+            badge.moveTop(int(region_view.top()) + 6)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(12, 16, 20, 220))
+        painter.drawRoundedRect(badge, 6, 6)
+        painter.setPen(accent)
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
+
+        painter.setPen(QPen(QColor("white"), 2))
+        painter.setBrush(accent)
+        for name, handle in self._handle_rects_view().items():
+            if name in {"n", "s", "e", "w"}:
+                painter.drawRoundedRect(handle, 4, 4)
+            else:
+                painter.drawRect(handle)
+        painter.restore()
+
+    def _view_rect_from_scene(self, rect: QRectF) -> QRect:
+        bounds = self.mapFromScene(rect).boundingRect()
+        if isinstance(bounds, QRectF):
+            return bounds.toRect()
+        return QRect(bounds)
+
+    def _viewport_pos(self, event: QMouseEvent) -> QPoint:
+        return event.position().toPoint()
+
+    def _handle_rects_view(self) -> dict[str, QRect]:
+        if self._region is None:
+            return {}
+        r = self._view_rect_from_scene(self._region)
+        cx, cy = r.center().x(), r.center().y()
+        c = CORNER
+        return {
+            "nw": QRect(r.left() - c // 2, r.top() - c // 2, c, c),
+            "ne": QRect(r.right() - c // 2, r.top() - c // 2, c, c),
+            "se": QRect(r.right() - c // 2, r.bottom() - c // 2, c, c),
+            "sw": QRect(r.left() - c // 2, r.bottom() - c // 2, c, c),
+            "n": QRect(cx - EDGE_LEN // 2, r.top() - EDGE_THICK // 2, EDGE_LEN, EDGE_THICK),
+            "s": QRect(cx - EDGE_LEN // 2, r.bottom() - EDGE_THICK // 2, EDGE_LEN, EDGE_THICK),
+            "e": QRect(r.right() - EDGE_THICK // 2, cy - EDGE_LEN // 2, EDGE_THICK, EDGE_LEN),
+            "w": QRect(r.left() - EDGE_THICK // 2, cy - EDGE_LEN // 2, EDGE_THICK, EDGE_LEN),
+        }
+
+    def _hit_handle(self, pos: QPoint) -> str | None:
+        handles = self._handle_rects_view()
+        for name in ("nw", "ne", "se", "sw", "n", "s", "e", "w"):
+            rect = handles.get(name)
+            if rect is not None and rect.adjusted(-6, -6, 6, 6).contains(pos):
+                return name
+        return None
+
+    def _region_contains_view(self, pos: QPoint) -> bool:
+        if self._region is None:
+            return False
+        return self._view_rect_from_scene(self._region).contains(pos)
+
+    def _clamp_point(self, point: QPointF) -> QPointF:
         if self._pixmap_item is None:
             return point
         bounds = self._pixmap_item.boundingRect()
@@ -143,10 +242,26 @@ class ImageCanvas(QGraphicsView):
             min(max(point.y(), bounds.top()), bounds.bottom()),
         )
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        if self._should_fit:
-            self.fit_to_view()
+    def _clamp_rect(self, rect: QRectF) -> QRectF:
+        if self._pixmap_item is None:
+            return rect
+        bounds = self._pixmap_item.boundingRect()
+        r = rect.normalized()
+        x = min(max(r.x(), bounds.left()), bounds.right() - MIN_BOX)
+        y = min(max(r.y(), bounds.top()), bounds.bottom() - MIN_BOX)
+        w = min(max(r.width(), MIN_BOX), bounds.right() - x)
+        h = min(max(r.height(), MIN_BOX), bounds.bottom() - y)
+        return QRectF(x, y, w, h)
+
+    def _emit_region(self, signal) -> None:
+        if self._region is None:
+            return
+        signal.emit(
+            int(round(self._region.x())),
+            int(round(self._region.y())),
+            int(round(self._region.width())),
+            int(round(self._region.height())),
+        )
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if self._pixmap_item is None:
@@ -154,64 +269,125 @@ class ImageCanvas(QGraphicsView):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
         self._should_fit = False
+        self.viewport().update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if self._pixmap_item is None:
             return
+        self.setFocus()
         if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
-            self._panning = True
+            self._mode = "pan"
             self._pan_pos = event.position()
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drawing = True
-            self._origin = self._clamp(self.mapToScene(event.position().toPoint()))
-            self.set_region(QRectF(self._origin, self._origin), "labeled")
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+
+        view_pos = self._viewport_pos(event)
+        scene_pos = self._clamp_point(self.mapToScene(view_pos))
+        handle = self._hit_handle(view_pos)
+        if handle and self._region is not None:
+            self._mode = "resize"
+            self._handle = handle
+            self._orig_rect = QRectF(self._region)
+            self.viewport().setCursor(HANDLE_CURSORS[handle])
             event.accept()
             return
-        super().mousePressEvent(event)
+        if self._region_contains_view(view_pos) and self._region is not None:
+            self._mode = "move"
+            self._origin = scene_pos
+            self._orig_rect = QRectF(self._region)
+            self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
+            event.accept()
+            return
+        self._mode = "draw"
+        self._origin = scene_pos
+        self._status = "labeled"
+        self._region = QRectF(self._origin, self._origin)
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        self._update_guide()
+        self.viewport().update()
+        event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._panning:
+        if self._mode == "pan":
             delta = event.position() - self._pan_pos
             self._pan_pos = event.position()
-            self.horizontalScrollBar().setValue(
-                self.horizontalScrollBar().value() - int(delta.x())
-            )
-            self.verticalScrollBar().setValue(
-                self.verticalScrollBar().value() - int(delta.y())
-            )
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(delta.x()))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(delta.y()))
             self._should_fit = False
+            self.viewport().update()
             event.accept()
             return
-        if self._drawing and self._rect_item is not None:
-            pos = self._clamp(self.mapToScene(event.position().toPoint()))
-            self._rect_item.setRect(QRectF(self._origin, pos).normalized())
-            self._update_caption()
+
+        scene_pos = self._clamp_point(self.mapToScene(self._viewport_pos(event)))
+        if self._mode == "draw":
+            self._region = QRectF(self._origin, scene_pos).normalized()
+            self.viewport().update()
+            self._emit_region(self.regionChanged)
             event.accept()
             return
+        if self._mode == "move" and self._region is not None:
+            delta = scene_pos - self._origin
+            self._region = self._clamp_rect(self._orig_rect.translated(delta))
+            self.viewport().update()
+            self._emit_region(self.regionChanged)
+            event.accept()
+            return
+        if self._mode == "resize" and self._handle:
+            self._region = self._resized_rect(scene_pos)
+            self.viewport().update()
+            self._emit_region(self.regionChanged)
+            event.accept()
+            return
+
+        self._update_hover_cursor(self._viewport_pos(event))
         super().mouseMoveEvent(event)
 
+    def _resized_rect(self, pos: QPointF) -> QRectF:
+        r = QRectF(self._orig_rect)
+        handle = self._handle or ""
+        if handle in {"nw", "w", "sw"}:
+            r.setLeft(pos.x())
+        if handle in {"ne", "e", "se"}:
+            r.setRight(pos.x())
+        if handle in {"nw", "n", "ne"}:
+            r.setTop(pos.y())
+        if handle in {"sw", "s", "se"}:
+            r.setBottom(pos.y())
+        return self._clamp_rect(r)
+
+    def _update_hover_cursor(self, view_pos: QPoint) -> None:
+        handle = self._hit_handle(view_pos)
+        if handle:
+            self.viewport().setCursor(HANDLE_CURSORS[handle])
+        elif self._region_contains_view(view_pos):
+            self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self._panning and event.button() in (
+        if self._mode == "pan" and event.button() in (
             Qt.MouseButton.MiddleButton,
             Qt.MouseButton.RightButton,
         ):
-            self._panning = False
+            self._mode = None
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
             event.accept()
             return
-        if self._drawing and event.button() == Qt.MouseButton.LeftButton:
-            self._drawing = False
-            rect = self._rect_item.rect() if self._rect_item else QRectF()
-            if rect.width() >= MIN_BOX and rect.height() >= MIN_BOX:
-                self.regionCommitted.emit(
-                    int(round(rect.x())),
-                    int(round(rect.y())),
-                    int(round(rect.width())),
-                    int(round(rect.height())),
-                )
+        if self._mode in {"draw", "move", "resize"} and event.button() == Qt.MouseButton.LeftButton:
+            if self._region is not None and self._region.width() >= MIN_BOX and self._region.height() >= MIN_BOX:
+                self._region = self._clamp_rect(self._region)
+                self._status = "labeled"
+                self._emit_region(self.regionCommitted)
+            elif self._mode == "draw":
+                self._region = None
+            self._mode = None
+            self._handle = None
+            self._update_guide()
+            self.viewport().update()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -223,6 +399,43 @@ class ImageCanvas(QGraphicsView):
             return
         super().mouseDoubleClickEvent(event)
 
+    def keyPressEvent(self, event) -> None:
+        if self._region is None:
+            super().keyPressEvent(event)
+            return
+        step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+        r = QRectF(self._region)
+        key = event.key()
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if key == Qt.Key.Key_Left:
+                r.setWidth(r.width() - step)
+            elif key == Qt.Key.Key_Right:
+                r.setWidth(r.width() + step)
+            elif key == Qt.Key.Key_Up:
+                r.setHeight(r.height() - step)
+            elif key == Qt.Key.Key_Down:
+                r.setHeight(r.height() + step)
+            else:
+                super().keyPressEvent(event)
+                return
+        else:
+            if key == Qt.Key.Key_Left:
+                r.translate(-step, 0)
+            elif key == Qt.Key.Key_Right:
+                r.translate(step, 0)
+            elif key == Qt.Key.Key_Up:
+                r.translate(0, -step)
+            elif key == Qt.Key.Key_Down:
+                r.translate(0, step)
+            else:
+                super().keyPressEvent(event)
+                return
+        self._region = self._clamp_rect(r)
+        self._status = "labeled"
+        self.viewport().update()
+        self._emit_region(self.regionChanged)
+        self._emit_region(self.regionCommitted)
+
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls() or event.mimeData().hasImage():
             event.acceptProposedAction()
@@ -230,11 +443,7 @@ class ImageCanvas(QGraphicsView):
             event.ignore()
 
     def dropEvent(self, event) -> None:
-        paths = [
-            url.toLocalFile()
-            for url in event.mimeData().urls()
-            if url.isLocalFile()
-        ]
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
         if paths:
             self.filesDropped.emit(paths)
             event.acceptProposedAction()
