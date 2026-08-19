@@ -12,14 +12,17 @@ from torchvision.transforms import functional as TF
 
 from app.dataset import Sample
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
+from app.regions import REGION_LABELS
 
 MIN_TRAIN_SAMPLES = 5
 
 
 class RegionBoxDataset(Dataset):
-    def __init__(self, samples: list[Sample], augment: bool = True) -> None:
+    def __init__(self, samples: list[Sample], key: str, augment: bool = True) -> None:
         self.samples = samples
+        self.key = key
         self.augment = augment
+        self.allow_flip = key == "game"
         self.jitter = transforms.ColorJitter(0.25, 0.25, 0.25, 0.05)
         self.normalize = transforms.Compose(
             [
@@ -34,7 +37,7 @@ class RegionBoxDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         sample = self.samples[index]
-        region = sample.game_region or {"x": 0, "y": 0, "w": sample.width, "h": sample.height}
+        region = sample.regions[self.key]
         image = Image.open(sample.image_path).convert("RGB")
         x = region["x"] / sample.width
         y = region["y"] / sample.height
@@ -42,7 +45,7 @@ class RegionBoxDataset(Dataset):
         h = region["h"] / sample.height
         if self.augment:
             image = self.jitter(image)
-            if random.random() < 0.5:
+            if self.allow_flip and random.random() < 0.5:
                 image = TF.hflip(image)
                 x = 1.0 - x - w
         box = torch.tensor([x, y, w, h], dtype=torch.float32)
@@ -70,10 +73,13 @@ class TrainWorker(QThread):
     finished_ok = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, samples: list[Sample], model_path: Path, epochs: int = 40) -> None:
+    def __init__(
+        self,
+        jobs: list[tuple[str, list[Sample], Path]],
+        epochs: int = 40,
+    ) -> None:
         super().__init__()
-        self.samples = samples
-        self.model_path = model_path
+        self.jobs = jobs
         self.epochs = epochs
 
     def run(self) -> None:
@@ -84,11 +90,30 @@ class TrainWorker(QThread):
             self.failed.emit(str(exc))
 
     def _train(self) -> dict:
-        if len(self.samples) < MIN_TRAIN_SAMPLES:
+        if not self.jobs:
             raise ValueError(f"学習にはラベル済み画像が {MIN_TRAIN_SAMPLES} 枚以上必要です")
+        results = []
+        total_steps = self.epochs * len(self.jobs)
+        for job_index, (key, samples, model_path) in enumerate(self.jobs):
+            label = REGION_LABELS.get(key, key)
+            result = self._train_one(key, samples, model_path, job_index, total_steps, label)
+            results.append(result)
+        return {"results": results, "epochs": self.epochs}
+
+    def _train_one(
+        self,
+        key: str,
+        samples: list[Sample],
+        model_path: Path,
+        job_index: int,
+        total_steps: int,
+        label: str,
+    ) -> dict:
+        if len(samples) < MIN_TRAIN_SAMPLES:
+            raise ValueError(f"「{label}」の学習には {MIN_TRAIN_SAMPLES} 枚以上必要です")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dataset = RegionBoxDataset(self.samples, augment=True)
+        dataset = RegionBoxDataset(samples, key, augment=True)
         loader = DataLoader(
             dataset,
             batch_size=min(4, len(dataset)),
@@ -106,7 +131,7 @@ class TrainWorker(QThread):
 
         best_iou = -1.0
         best_state = None
-        self.model_path.parent.mkdir(parents=True, exist_ok=True)
+        model_path.parent.mkdir(parents=True, exist_ok=True)
 
         for epoch in range(1, self.epochs + 1):
             model.train()
@@ -132,12 +157,20 @@ class TrainWorker(QThread):
                 best_iou = mean_iou
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             self.progress.emit(
-                epoch,
-                self.epochs,
-                f"epoch {epoch}/{self.epochs}  loss {mean_loss:.4f}  IoU {mean_iou:.3f}",
+                job_index * self.epochs + epoch,
+                total_steps,
+                f"{label}  epoch {epoch}/{self.epochs}  loss {mean_loss:.4f}  IoU {mean_iou:.3f}",
             )
 
         if best_state is None:
-            raise RuntimeError("学習結果を保存できませんでした")
-        torch.save({"state_dict": best_state, "iou": best_iou}, self.model_path)
-        return {"iou": float(best_iou), "epochs": self.epochs, "samples": len(self.samples)}
+            raise RuntimeError(f"「{label}」の学習結果を保存できませんでした")
+        torch.save(
+            {"state_dict": best_state, "iou": best_iou, "key": key, "samples": len(samples)},
+            model_path,
+        )
+        return {
+            "key": key,
+            "label": label,
+            "iou": float(best_iou),
+            "samples": len(samples),
+        }

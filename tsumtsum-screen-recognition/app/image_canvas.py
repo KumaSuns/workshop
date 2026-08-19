@@ -6,14 +6,15 @@ from PySide6.QtGui import (
     QFont,
     QMouseEvent,
     QPainter,
-    QPainterPath,
     QPen,
     QPixmap,
     QWheelEvent,
 )
 from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView, QLabel
 
-MIN_BOX = 16
+from app.regions import REGION_COLORS, REGION_LABELS
+
+MIN_BOX = 8
 CORNER = 14
 EDGE_LEN = 36
 EDGE_THICK = 12
@@ -55,6 +56,8 @@ class ImageCanvas(QGraphicsView):
 
         self._pixmap_item = None
         self._region: QRectF | None = None
+        self._regions: dict[str, QRectF] = {}
+        self._active_key = "game"
         self._status = "unlabeled"
         self._mode: str | None = None
         self._handle: str | None = None
@@ -75,20 +78,61 @@ class ImageCanvas(QGraphicsView):
     def has_image(self) -> bool:
         return self._pixmap_item is not None
 
-    def set_image(self, pixmap: QPixmap, region: QRectF | None = None, status: str = "unlabeled") -> None:
+    def set_image(
+        self,
+        pixmap: QPixmap,
+        region: QRectF | None = None,
+        status: str = "unlabeled",
+        regions: dict[str, QRectF] | None = None,
+        active_key: str = "game",
+    ) -> None:
         self._scene.clear()
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(pixmap.rect()))
         self._should_fit = True
         self._mode = None
-        self.set_region(region, status, emit=False)
+        self._active_key = active_key
+        self._regions = {key: QRectF(rect) for key, rect in (regions or {}).items()}
+        if region is not None and "game" not in self._regions:
+            self._regions["game"] = QRectF(region)
+        self._status = status
+        self._region = self._regions.get(self._active_key)
         self.fit_to_view()
         self._update_guide()
+        self.viewport().update()
+
+    def set_active_key(self, key: str) -> None:
+        self._sync_active()
+        self._active_key = key
+        self._region = self._regions.get(key)
+        self._update_guide()
+        self.viewport().update()
+
+    def all_region_boxes(self) -> dict[str, dict[str, int]]:
+        self._sync_active()
+        boxes: dict[str, dict[str, int]] = {}
+        for key, rect in self._regions.items():
+            if rect is None or rect.width() < MIN_BOX or rect.height() < MIN_BOX:
+                continue
+            boxes[key] = {
+                "x": int(round(rect.x())),
+                "y": int(round(rect.y())),
+                "w": int(round(rect.width())),
+                "h": int(round(rect.height())),
+            }
+        return boxes
+
+    def _sync_active(self) -> None:
+        if self._region is None or self._region.width() < 1 or self._region.height() < 1:
+            self._regions.pop(self._active_key, None)
+        else:
+            self._regions[self._active_key] = QRectF(self._region)
 
     def clear_image(self) -> None:
         self._scene.clear()
         self._pixmap_item = None
         self._region = None
+        self._regions = {}
         self._status = "unlabeled"
         self._mode = None
         self.resetTransform()
@@ -99,8 +143,10 @@ class ImageCanvas(QGraphicsView):
         self._status = status
         if region is None or region.isEmpty():
             self._region = None
+            self._regions.pop(self._active_key, None)
         else:
             self._region = QRectF(self._clamp_rect(region))
+            self._regions[self._active_key] = QRectF(self._region)
         self._update_guide()
         self.viewport().update()
         if emit:
@@ -120,9 +166,11 @@ class ImageCanvas(QGraphicsView):
         if self._pixmap_item is None:
             self._guide.setText("画像をドロップ  /  Ctrl+V で貼り付け  /  「画像を開く」")
         elif self._region is None:
-            self._guide.setText("画像の上をドラッグして、ゲーム範囲を四角で囲んでください")
+            name = REGION_LABELS.get(self._active_key, "範囲")
+            self._guide.setText(f"「{name}」をドラッグして囲んでください")
         else:
-            self._guide.setText("四隅をつかむと拡大縮小  ・  辺の中央は縦だけ / 横だけ  ・  よければ「この範囲を保存」")
+            name = REGION_LABELS.get(self._active_key, "範囲")
+            self._guide.setText(f"「{name}」  四隅で拡大縮小  ・  辺の中央は縦だけ / 横だけ  ・  「この範囲を保存」")
         self._guide.adjustSize()
         self._place_guide()
 
@@ -141,57 +189,43 @@ class ImageCanvas(QGraphicsView):
             return
         painter.save()
         painter.resetTransform()
-        image_view = QRectF(self._view_rect_from_scene(self._pixmap_item.boundingRect()))
-        if self._region is None or self._region.width() < 1 or self._region.height() < 1:
-            painter.setPen(QPen(QColor("#7CFFB2"), 2, Qt.PenStyle.DashLine))
-            painter.drawRect(image_view.adjusted(2, 2, -2, -2))
-            painter.restore()
-            return
-
-        region_view = QRectF(self._view_rect_from_scene(self._region))
-        dim = QPainterPath()
-        dim.addRect(QRectF(image_view))
-        hole = QPainterPath()
-        hole.addRoundedRect(QRectF(region_view), 2, 2)
-        painter.fillPath(dim.subtracted(hole), QColor(0, 0, 0, 150))
-
-        accent = QColor("#FFB020") if self._status == "predicted" else QColor("#5CFF9E")
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor(255, 255, 255, 230), 5))
-        painter.drawRect(region_view)
-        painter.setPen(QPen(accent, 2))
-        painter.drawRect(region_view)
-
-        label = (
-            f"{'予測 ' if self._status == 'predicted' else ''}"
-            f"{int(round(self._region.width()))} × {int(round(self._region.height()))} px"
-        )
-        font = QFont("Yu Gothic UI", 10, QFont.Weight.DemiBold)
+        self._sync_active()
+        font = QFont("Yu Gothic UI", 9, QFont.Weight.DemiBold)
         painter.setFont(font)
-        metrics = painter.fontMetrics()
-        text_w = metrics.horizontalAdvance(label) + 14
-        text_h = metrics.height() + 8
-        badge = QRect(
-            int(region_view.left()),
-            max(4, int(region_view.top()) - text_h - 4),
-            text_w,
-            text_h,
-        )
-        if badge.top() < 4:
-            badge.moveTop(int(region_view.top()) + 6)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(12, 16, 20, 220))
-        painter.drawRoundedRect(badge, 6, 6)
-        painter.setPen(accent)
-        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
-
-        painter.setPen(QPen(QColor("white"), 2))
-        painter.setBrush(accent)
-        for name, handle in self._handle_rects_view().items():
-            if name in {"n", "s", "e", "w"}:
-                painter.drawRoundedRect(handle, 4, 4)
-            else:
-                painter.drawRect(handle)
+        for key, rect in self._regions.items():
+            if rect is None or rect.width() < 1 or rect.height() < 1:
+                continue
+            view = QRectF(self._view_rect_from_scene(rect))
+            accent = QColor(REGION_COLORS.get(key, "#5CFF9E"))
+            if key == "game" and self._status == "predicted" and key == self._active_key:
+                accent = QColor("#FFB020")
+            active = key == self._active_key
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if active:
+                painter.setPen(QPen(QColor(255, 255, 255, 230), 4))
+                painter.drawRect(view)
+            painter.setPen(QPen(accent, 2 if active else 1, Qt.PenStyle.SolidLine))
+            painter.drawRect(view)
+            label = REGION_LABELS.get(key, key)
+            if active:
+                label = f"{label}  {int(round(rect.width()))}×{int(round(rect.height()))}"
+            metrics = painter.fontMetrics()
+            text_w = metrics.horizontalAdvance(label) + 12
+            text_h = metrics.height() + 6
+            badge = QRect(int(view.left()), max(4, int(view.top()) - text_h - 2), text_w, text_h)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(12, 16, 20, 220))
+            painter.drawRoundedRect(badge, 5, 5)
+            painter.setPen(accent)
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
+        if self._region is not None and self._region.width() >= 1:
+            painter.setPen(QPen(QColor("white"), 2))
+            painter.setBrush(QColor(REGION_COLORS.get(self._active_key, "#5CFF9E")))
+            for name, handle in self._handle_rects_view().items():
+                if name in {"n", "s", "e", "w"}:
+                    painter.drawRoundedRect(handle, 4, 4)
+                else:
+                    painter.drawRect(handle)
         painter.restore()
 
     def _view_rect_from_scene(self, rect: QRectF) -> QRect:
@@ -381,9 +415,11 @@ class ImageCanvas(QGraphicsView):
             if self._region is not None and self._region.width() >= MIN_BOX and self._region.height() >= MIN_BOX:
                 self._region = self._clamp_rect(self._region)
                 self._status = "labeled"
+                self._sync_active()
                 self._emit_region(self.regionCommitted)
             elif self._mode == "draw":
                 self._region = None
+                self._sync_active()
             self._mode = None
             self._handle = None
             self._update_guide()
@@ -400,6 +436,12 @@ class ImageCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:
+        mods = event.modifiers()
+        if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down) and not (
+            mods & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
+        ):
+            event.ignore()
+            return
         if self._region is None:
             super().keyPressEvent(event)
             return
