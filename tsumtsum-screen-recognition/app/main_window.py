@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -212,6 +213,8 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.list_widget, 1)
         self.delete_btn = QPushButton("選択を削除")
         side_layout.addWidget(self.delete_btn)
+        self.copy_data_btn = QPushButton("dataをコピー")
+        side_layout.addWidget(self.copy_data_btn)
         self.video_app_btn = QPushButton("動画から画像を抜き出す")
         side_layout.addWidget(self.video_app_btn)
         self.model_label = QLabel()
@@ -265,6 +268,7 @@ class MainWindow(QMainWindow):
         self.predict_btn.clicked.connect(self.predict_current)
         self.train_btn.clicked.connect(self.start_training)
         self.delete_btn.clicked.connect(self.delete_current)
+        self.copy_data_btn.clicked.connect(self.copy_data_folder)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
         self.list_widget.currentItemChanged.connect(self.on_item_changed)
         self.region_list.currentItemChanged.connect(self.on_region_type_changed)
@@ -763,6 +767,39 @@ class MainWindow(QMainWindow):
         self.current_id = None
         self.canvas.clear_image()
         self.refresh_list()
+
+    def copy_data_folder(self) -> None:
+        if not DATA_DIR.exists():
+            QMessageBox.warning(self, "dataがありません", f"コピーするフォルダがありません。\n{DATA_DIR}")
+            return
+        dest_parent = QFileDialog.getExistingDirectory(self, "貼り付ける場所を選ぶ", str(Path.home()))
+        if not dest_parent:
+            return
+        dest = Path(dest_parent) / DATA_DIR.name
+        try:
+            if dest.resolve() == DATA_DIR.resolve():
+                QMessageBox.information(self, "同じ場所です", "コピー元と同じ場所です。")
+                return
+        except OSError:
+            pass
+        if dest.exists():
+            answer = QMessageBox.question(
+                self,
+                "すでにあります",
+                f"{dest}\nすでに data フォルダがあります。中身を置き換えますか？",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            shutil.rmtree(dest)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            shutil.copytree(DATA_DIR, dest)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "コピーに失敗", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.statusBar().showMessage(f"dataをコピーしました: {dest}", 5000)
 
     def predict_current(self) -> None:
         if not self.current_id or not self.predictor.is_ready():
