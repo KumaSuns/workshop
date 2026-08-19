@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from PIL import Image
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice
+from PySide6.QtGui import QImage, QPixmap
+
+from app.paths import DATA_DIR, IMAGE_EXTENSIONS
+
+
+@dataclass
+class Sample:
+    id: str
+    image: str
+    source_name: str
+    added_at: str
+    width: int
+    height: int
+    game_region: dict[str, int] | None
+    status: str  # unlabeled | predicted | labeled
+
+    @property
+    def image_path(self) -> Path:
+        return DATA_DIR / "images" / self.image
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "image": self.image,
+            "source_name": self.source_name,
+            "added_at": self.added_at,
+            "width": self.width,
+            "height": self.height,
+            "game_region": self.game_region,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Sample:
+        return cls(
+            id=data["id"],
+            image=data["image"],
+            source_name=data.get("source_name", data["image"]),
+            added_at=data.get("added_at", ""),
+            width=int(data.get("width") or 0),
+            height=int(data.get("height") or 0),
+            game_region=data.get("game_region"),
+            status=data.get("status", "unlabeled"),
+        )
+
+
+class Dataset:
+    def __init__(self, root: Path = DATA_DIR) -> None:
+        self.root = root
+        self.images_dir = root / "images"
+        self.labels_dir = root / "labels"
+        self.models_dir = root / "models"
+        self.index_path = root / "index.json"
+        self.model_path = self.models_dir / "game_region.pt"
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.labels_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self._samples: list[Sample] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.index_path.exists():
+            self._samples = []
+            return
+        raw = json.loads(self.index_path.read_text(encoding="utf-8"))
+        self._samples = [Sample.from_dict(item) for item in raw.get("samples", [])]
+
+    def _save(self) -> None:
+        payload = {"samples": [sample.to_dict() for sample in self._samples]}
+        self.index_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def all(self) -> list[Sample]:
+        return list(self._samples)
+
+    def get(self, sample_id: str) -> Sample | None:
+        return next((s for s in self._samples if s.id == sample_id), None)
+
+    def labeled(self) -> list[Sample]:
+        return [s for s in self._samples if s.status == "labeled" and s.game_region]
+
+    def unlabeled(self) -> list[Sample]:
+        return [s for s in self._samples if s.status == "unlabeled"]
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "total": len(self._samples),
+            "labeled": len(self.labeled()),
+            "predicted": sum(1 for s in self._samples if s.status == "predicted"),
+            "unlabeled": len(self.unlabeled()),
+        }
+
+    def import_file(self, path: Path) -> Sample:
+        data = path.read_bytes()
+        ext = path.suffix.lower()
+        if ext not in IMAGE_EXTENSIONS:
+            ext = ".png"
+        return self._import_bytes(data, ext, path.name)
+
+    def import_qimage(self, image: QImage | QPixmap, source_name: str = "clipboard.png") -> Sample:
+        if isinstance(image, QPixmap):
+            image = image.toImage()
+        if image is None or image.isNull():
+            raise ValueError("空の画像です")
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buffer, "PNG")
+        data = bytes(QByteArray(buffer.data()))
+        return self._import_bytes(data, ".png", source_name)
+
+    def _import_bytes(self, data: bytes, ext: str, source_name: str) -> Sample:
+        digest = hashlib.sha256(data).hexdigest()[:12]
+        existing = self.get(digest)
+        if existing:
+            return existing
+
+        filename = f"{digest}{ext}"
+        dest = self.images_dir / filename
+        dest.write_bytes(data)
+
+        with Image.open(dest) as img:
+            width, height = img.size
+
+        sample = Sample(
+            id=digest,
+            image=filename,
+            source_name=source_name,
+            added_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            width=width,
+            height=height,
+            game_region=None,
+            status="unlabeled",
+        )
+        self._samples.append(sample)
+        self._save()
+        return sample
+
+    def set_region(
+        self,
+        sample_id: str,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        status: str = "labeled",
+    ) -> Sample:
+        sample = self.get(sample_id)
+        if sample is None:
+            raise KeyError(sample_id)
+        sample.game_region = {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
+        sample.status = status
+        self._save()
+        return sample
+
+    def confirm_region(self, sample_id: str) -> Sample:
+        sample = self.get(sample_id)
+        if sample is None or sample.game_region is None:
+            raise KeyError(sample_id)
+        sample.status = "labeled"
+        self._save()
+        return sample
+
+    def clear_region(self, sample_id: str) -> Sample:
+        sample = self.get(sample_id)
+        if sample is None:
+            raise KeyError(sample_id)
+        sample.game_region = None
+        sample.status = "unlabeled"
+        self._save()
+        return sample
+
+    def remove(self, sample_id: str) -> None:
+        sample = self.get(sample_id)
+        if sample is None:
+            return
+        image_path = sample.image_path
+        if image_path.exists():
+            image_path.unlink()
+        self._samples = [s for s in self._samples if s.id != sample_id]
+        self._save()

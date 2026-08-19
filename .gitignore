@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+
+# 学習用の個人スクリーンショットとモデルはリポジトリに入れない
+tsumtsum-screen-recognition/data/images/
+tsumtsum-screen-recognition/data/labels/
+tsumtsum-screen-recognition/data/models/
+tsumtsum-screen-recognition/data/index.json

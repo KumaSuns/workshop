@@ -1,0 +1,491 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.dataset import Dataset, Sample
+from app.image_canvas import ImageCanvas
+from app.paths import DATA_DIR, IMAGE_EXTENSIONS
+from app.predictor import Predictor
+from app.train_worker import MIN_TRAIN_SAMPLES, TrainWorker
+
+STYLESHEET = """
+QMainWindow, QWidget {
+    background: #16181d;
+    color: #e8eaed;
+    font-family: "Yu Gothic UI", "Segoe UI", sans-serif;
+    font-size: 13px;
+}
+QLabel#title {
+    font-size: 18px;
+    font-weight: 700;
+}
+QLabel#hint {
+    color: #9aa3b2;
+}
+QPushButton {
+    background: #2a303b;
+    color: #e8eaed;
+    border: none;
+    padding: 8px 14px;
+    border-radius: 8px;
+}
+QPushButton:hover { background: #3a4250; }
+QPushButton:disabled { color: #6b7380; background: #22262e; }
+QPushButton#primary {
+    background: #5b6cff;
+    font-weight: 600;
+}
+QPushButton#primary:hover { background: #6e7dff; }
+QPushButton#accent {
+    background: #1f8a5b;
+    font-weight: 600;
+}
+QPushButton#accent:hover { background: #27a36c; }
+QListWidget {
+    background: #101216;
+    border: 1px solid #2a303b;
+    border-radius: 10px;
+    padding: 6px;
+    outline: none;
+}
+QListWidget::item {
+    padding: 8px 10px;
+    border-radius: 6px;
+}
+QListWidget::item:selected {
+    background: #2c3344;
+}
+QFrame#sidebar, QFrame#topbar {
+    background: #1c2028;
+    border: 1px solid #2a303b;
+    border-radius: 12px;
+}
+QProgressBar {
+    background: #101216;
+    border: 1px solid #2a303b;
+    border-radius: 6px;
+    text-align: center;
+    color: #e8eaed;
+    height: 18px;
+}
+QProgressBar::chunk {
+    background: #5b6cff;
+    border-radius: 6px;
+}
+QStatusBar { color: #9aa3b2; }
+"""
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("ツムツム ゲーム範囲トレーナー")
+        self.resize(1280, 840)
+        self.setMinimumSize(980, 640)
+        self.setAcceptDrops(True)
+        self.setStyleSheet(STYLESHEET)
+
+        self.dataset = Dataset(DATA_DIR)
+        self.predictor = Predictor(self.dataset.model_path)
+        self.current_id: str | None = None
+        self.train_worker: TrainWorker | None = None
+
+        self._build_ui()
+        self._bind_shortcuts()
+        self.refresh_list()
+        self.update_stats()
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        top = QFrame()
+        top.setObjectName("topbar")
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(16, 12, 16, 12)
+        title_box = QVBoxLayout()
+        title = QLabel("ツムツム ゲーム範囲トレーナー")
+        title.setObjectName("title")
+        self.hint_label = QLabel("画像をドロップ / Ctrl+V で貼り付け / 「画像を開く」。表示されたらドラッグでゲーム範囲を囲みます。")
+        self.hint_label.setObjectName("hint")
+        self.hint_label.setWordWrap(True)
+        title_box.addWidget(title)
+        title_box.addWidget(self.hint_label)
+        top_layout.addLayout(title_box, 1)
+
+        self.open_btn = QPushButton("画像を開く")
+        self.paste_btn = QPushButton("貼り付け")
+        self.confirm_btn = QPushButton("この範囲を正解にする")
+        self.clear_btn = QPushButton("範囲を消す")
+        self.predict_btn = QPushButton("この画像を予測")
+        self.train_btn = QPushButton("学習する")
+        self.train_btn.setObjectName("primary")
+        for button in (
+            self.open_btn,
+            self.paste_btn,
+            self.confirm_btn,
+            self.clear_btn,
+            self.predict_btn,
+            self.train_btn,
+        ):
+            top_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(top)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(12, 12, 12, 12)
+        side_layout.addWidget(QLabel("データセット"))
+        self.stats_label = QLabel()
+        self.stats_label.setObjectName("hint")
+        self.stats_label.setWordWrap(True)
+        side_layout.addWidget(self.stats_label)
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        side_layout.addWidget(self.list_widget, 1)
+        self.delete_btn = QPushButton("選択を削除")
+        side_layout.addWidget(self.delete_btn)
+        self.model_label = QLabel()
+        self.model_label.setObjectName("hint")
+        self.model_label.setWordWrap(True)
+        side_layout.addWidget(self.model_label)
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        side_layout.addWidget(self.progress)
+        sidebar.setMinimumWidth(260)
+        sidebar.setMaximumWidth(360)
+
+        self.canvas = ImageCanvas()
+        self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        splitter.addWidget(sidebar)
+        splitter.addWidget(self.canvas)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([300, 980])
+        layout.addWidget(splitter, 1)
+        self.setCentralWidget(root)
+        self.statusBar().showMessage("準備完了")
+
+        self.open_btn.clicked.connect(self.open_files)
+        self.paste_btn.clicked.connect(self.paste_clipboard)
+        self.confirm_btn.clicked.connect(self.confirm_current)
+        self.clear_btn.clicked.connect(self.clear_current_region)
+        self.predict_btn.clicked.connect(self.predict_current)
+        self.train_btn.clicked.connect(self.start_training)
+        self.delete_btn.clicked.connect(self.delete_current)
+        self.list_widget.currentItemChanged.connect(self.on_item_changed)
+        self.canvas.regionCommitted.connect(self.on_region_committed)
+        self.canvas.filesDropped.connect(self.import_paths)
+        self.canvas.imageDropped.connect(self.import_qimage)
+
+    def _bind_shortcuts(self) -> None:
+        QShortcut(QKeySequence.StandardKey.Open, self, self.open_files)
+        QShortcut(QKeySequence.StandardKey.Paste, self, self.paste_clipboard)
+        QShortcut(QKeySequence.StandardKey.Delete, self, self.delete_current)
+        fit = QAction(self)
+        fit.setShortcut(QKeySequence("F"))
+        fit.triggered.connect(self.canvas.fit_to_view)
+        self.addAction(fit)
+
+    def refresh_list(self, select_id: str | None = None) -> None:
+        selected = select_id or self.current_id
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for sample in self.dataset.all():
+            item = QListWidgetItem(self._item_text(sample))
+            item.setData(Qt.ItemDataRole.UserRole, sample.id)
+            if sample.status == "labeled":
+                item.setForeground(QColor("#3DDC97"))
+            elif sample.status == "predicted":
+                item.setForeground(QColor("#FFB020"))
+            self.list_widget.addItem(item)
+            if selected and sample.id == selected:
+                self.list_widget.setCurrentItem(item)
+        self.list_widget.blockSignals(False)
+        if selected is None and self.list_widget.count():
+            self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        self.update_stats()
+
+    def _item_text(self, sample: Sample) -> str:
+        mark = {"labeled": "[済]", "predicted": "[予]", "unlabeled": "[  ]"}.get(sample.status, "[  ]")
+        return f"{mark}  {sample.source_name}"
+
+    def update_stats(self) -> None:
+        counts = self.dataset.counts()
+        self.stats_label.setText(
+            f"全 {counts['total']} 枚\n"
+            f"正解 {counts['labeled']} / 予測 {counts['predicted']} / 未設定 {counts['unlabeled']}\n"
+            f"学習の目安: {MIN_TRAIN_SAMPLES} 枚以上"
+        )
+        if self.predictor.is_ready():
+            self.model_label.setText("モデル: 学習済み。新しい画像には自動で範囲を予測します。")
+        else:
+            self.model_label.setText("モデル: まだありません。範囲を教えてから学習してください。")
+        self.train_btn.setEnabled(
+            len(self.dataset.labeled()) >= MIN_TRAIN_SAMPLES and self.train_worker is None
+        )
+        has_sample = self.current_id is not None
+        self.confirm_btn.setEnabled(has_sample)
+        self.clear_btn.setEnabled(has_sample)
+        self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
+        self.delete_btn.setEnabled(has_sample)
+
+    def on_item_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            self.current_id = None
+            self.canvas.clear_image()
+            self.update_stats()
+            return
+        self.show_sample(current.data(Qt.ItemDataRole.UserRole))
+
+    def show_sample(self, sample_id: str) -> None:
+        sample = self.dataset.get(sample_id)
+        if sample is None:
+            return
+        self.current_id = sample.id
+        pixmap = QPixmap(str(sample.image_path))
+        region = None
+        if sample.game_region:
+            r = sample.game_region
+            region = QRectF(r["x"], r["y"], r["w"], r["h"])
+        self.canvas.set_image(pixmap, region, sample.status)
+        if sample.status == "unlabeled":
+            self.hint_label.setText("ドラッグしてゲームの範囲を囲んでください。離した時点で保存されます。")
+        elif sample.status == "predicted":
+            self.hint_label.setText("オレンジは予測です。合っていれば「この範囲を正解にする」、違えば囲み直してください。")
+        else:
+            self.hint_label.setText("緑の枠が正解のゲーム範囲です。違っていたら囲み直してください。")
+        self.update_stats()
+
+    def open_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "画像を開く",
+            str(Path.home()),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        if files:
+            self.import_paths(files)
+
+    def paste_clipboard(self) -> None:
+        mime = QApplication.clipboard().mimeData()
+        if mime.hasImage():
+            self.import_qimage(mime.imageData())
+            return
+        if mime.hasUrls():
+            paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+            if paths:
+                self.import_paths(paths)
+                return
+        self.statusBar().showMessage("クリップボードに画像がありません", 3000)
+
+    def import_paths(self, paths: list[str]) -> None:
+        imported: list[Sample] = []
+        for raw in paths:
+            path = Path(raw)
+            if path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            try:
+                imported.append(self.dataset.import_file(path))
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, "読み込みに失敗", f"{path.name}\n{exc}")
+        if not imported:
+            return
+        self._after_import(imported)
+
+    def import_qimage(self, image) -> None:
+        try:
+            sample = self.dataset.import_qimage(image, "clipboard.png")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "貼り付けに失敗", str(exc))
+            return
+        self._after_import([sample])
+
+    def _after_import(self, samples: list[Sample]) -> None:
+        predicted = 0
+        if self.predictor.is_ready():
+            for sample in samples:
+                if sample.status != "unlabeled":
+                    continue
+                try:
+                    box = self.predictor.predict_path(sample.image_path)
+                    self.dataset.set_region(sample.id, box["x"], box["y"], box["w"], box["h"], status="predicted")
+                    predicted += 1
+                except Exception:
+                    continue
+        last = samples[-1]
+        self.refresh_list(select_id=last.id)
+        self.show_sample(last.id)
+        if predicted:
+            self.statusBar().showMessage(f"{len(samples)} 枚を取り込み、{predicted} 枚を予測しました", 4000)
+        else:
+            self.statusBar().showMessage(f"{len(samples)} 枚を取り込みました。ゲーム範囲を囲んでください", 4000)
+
+    def on_region_committed(self, x: int, y: int, w: int, h: int) -> None:
+        if not self.current_id:
+            return
+        self.dataset.set_region(self.current_id, x, y, w, h, status="labeled")
+        self.refresh_list(select_id=self.current_id)
+        self.statusBar().showMessage(f"ゲーム範囲を保存しました ({w}×{h})", 3000)
+
+    def confirm_current(self) -> None:
+        if not self.current_id:
+            return
+        sample = self.dataset.get(self.current_id)
+        if sample is None or sample.game_region is None:
+            QMessageBox.information(self, "範囲がありません", "先にドラッグでゲーム範囲を囲んでください。")
+            return
+        self.dataset.confirm_region(self.current_id)
+        self.refresh_list(select_id=self.current_id)
+        self.show_sample(self.current_id)
+        self.statusBar().showMessage("この範囲を正解として保存しました", 3000)
+
+    def clear_current_region(self) -> None:
+        if not self.current_id:
+            return
+        self.dataset.clear_region(self.current_id)
+        self.refresh_list(select_id=self.current_id)
+        self.show_sample(self.current_id)
+
+    def delete_current(self) -> None:
+        if not self.current_id:
+            return
+        sample = self.dataset.get(self.current_id)
+        name = sample.source_name if sample else self.current_id
+        answer = QMessageBox.question(self, "削除", f"{name} をデータセットから削除しますか？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.dataset.remove(self.current_id)
+        self.current_id = None
+        self.canvas.clear_image()
+        self.refresh_list()
+
+    def predict_current(self) -> None:
+        if not self.current_id or not self.predictor.is_ready():
+            return
+        sample = self.dataset.get(self.current_id)
+        if sample is None:
+            return
+        try:
+            box = self.predictor.predict_path(sample.image_path)
+            self.dataset.set_region(sample.id, box["x"], box["y"], box["w"], box["h"], status="predicted")
+            self.refresh_list(select_id=sample.id)
+            self.show_sample(sample.id)
+            self.statusBar().showMessage("予測を適用しました。合っていれば正解にしてください", 4000)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "予測に失敗", str(exc))
+
+    def start_training(self) -> None:
+        labeled = self.dataset.labeled()
+        if len(labeled) < MIN_TRAIN_SAMPLES:
+            QMessageBox.information(
+                self,
+                "まだ足りません",
+                f"学習には正解の範囲が {MIN_TRAIN_SAMPLES} 枚以上必要です。いま {len(labeled)} 枚です。",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "学習を開始",
+            f"正解 {len(labeled)} 枚でゲーム範囲を学習します。枚数が少ないと精度は出にくいです。続けますか？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 40)
+        self.progress.setValue(0)
+        self.train_btn.setEnabled(False)
+        self.train_worker = TrainWorker(labeled, self.dataset.model_path)
+        self.train_worker.progress.connect(self.on_train_progress)
+        self.train_worker.finished_ok.connect(self.on_train_finished)
+        self.train_worker.failed.connect(self.on_train_failed)
+        self.train_worker.start()
+        self.statusBar().showMessage("学習中です…")
+
+    def on_train_progress(self, epoch: int, total: int, message: str) -> None:
+        self.progress.setRange(0, total)
+        self.progress.setValue(epoch)
+        self.statusBar().showMessage(message)
+
+    def on_train_finished(self, metrics: dict) -> None:
+        self.train_worker = None
+        self.progress.setVisible(False)
+        self.predictor.reload()
+        applied = self._apply_predictions_to_unlabeled()
+        self.update_stats()
+        self.refresh_list(select_id=self.current_id)
+        if self.current_id:
+            self.show_sample(self.current_id)
+        QMessageBox.information(
+            self,
+            "学習完了",
+            f"平均 IoU {metrics['iou']:.3f} で保存しました。\n"
+            f"未設定の画像 {applied} 枚に予測を入れました。新しい画像でも試せます。",
+        )
+        self.statusBar().showMessage("学習が完了しました", 4000)
+
+    def on_train_failed(self, message: str) -> None:
+        self.train_worker = None
+        self.progress.setVisible(False)
+        self.update_stats()
+        QMessageBox.critical(self, "学習に失敗", message)
+
+    def _apply_predictions_to_unlabeled(self) -> int:
+        if not self.predictor.is_ready():
+            return 0
+        applied = 0
+        for sample in self.dataset.unlabeled():
+            try:
+                box = self.predictor.predict_path(sample.image_path)
+                self.dataset.set_region(sample.id, box["x"], box["y"], box["w"], box["h"], status="predicted")
+                applied += 1
+            except Exception:
+                continue
+        return applied
+
+    def closeEvent(self, event) -> None:
+        if self.train_worker is not None and self.train_worker.isRunning():
+            self.train_worker.wait(1000)
+        event.accept()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls() or event.mimeData().hasImage():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        mime = event.mimeData()
+        if mime.hasUrls():
+            paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+            self.import_paths(paths)
+            event.acceptProposedAction()
+            return
+        if mime.hasImage():
+            self.import_qimage(mime.imageData())
+            event.acceptProposedAction()
+            return
+        event.ignore()
