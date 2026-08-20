@@ -82,6 +82,35 @@ QListWidget::item {
 QListWidget::item:selected {
     background: #2c3344;
 }
+QScrollBar:vertical {
+    background: #101216;
+    width: 14px;
+    margin: 2px;
+    border-radius: 7px;
+}
+QScrollBar::handle:vertical {
+    background: #5a6270;
+    min-height: 32px;
+    border-radius: 6px;
+}
+QScrollBar::handle:vertical:hover { background: #7a8494; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar:horizontal {
+    height: 14px;
+    background: #101216;
+    margin: 2px;
+    border-radius: 7px;
+}
+QScrollBar::handle:horizontal {
+    background: #5a6270;
+    min-width: 32px;
+    border-radius: 6px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+}
 QFrame#sidebar, QFrame#topbar {
     background: #1c2028;
     border: 1px solid #2a303b;
@@ -195,7 +224,7 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 12, 12, 12)
         side_layout.addWidget(QLabel("教える場所"))
         self.region_list = QListWidget()
-        self.region_list.setMaximumHeight(216)
+        self.region_list.setMaximumHeight(168)
         for key, label, color in REGION_SPECS:
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, key)
@@ -210,11 +239,16 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.stats_label)
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_widget.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.list_widget.setUniformItemSizes(True)
         side_layout.addWidget(self.list_widget, 1)
         self.delete_btn = QPushButton("選択を削除")
         side_layout.addWidget(self.delete_btn)
         self.copy_data_btn = QPushButton("dataをコピー")
         side_layout.addWidget(self.copy_data_btn)
+        self.import_data_btn = QPushButton("dataを取り込む")
+        side_layout.addWidget(self.import_data_btn)
         self.video_app_btn = QPushButton("動画から画像を抜き出す")
         side_layout.addWidget(self.video_app_btn)
         self.model_label = QLabel()
@@ -224,8 +258,8 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         side_layout.addWidget(self.progress)
-        sidebar.setMinimumWidth(260)
-        sidebar.setMaximumWidth(360)
+        sidebar.setMinimumWidth(300)
+        sidebar.setMaximumWidth(560)
 
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -233,7 +267,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.canvas)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([300, 980])
+        splitter.setSizes([420, 860])
         layout.addWidget(splitter, 1)
 
         coords = QFrame()
@@ -269,6 +303,7 @@ class MainWindow(QMainWindow):
         self.train_btn.clicked.connect(self.start_training)
         self.delete_btn.clicked.connect(self.delete_current)
         self.copy_data_btn.clicked.connect(self.copy_data_folder)
+        self.import_data_btn.clicked.connect(self.import_data_folder)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
         self.list_widget.currentItemChanged.connect(self.on_item_changed)
         self.region_list.currentItemChanged.connect(self.on_region_type_changed)
@@ -800,6 +835,66 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
         self.statusBar().showMessage(f"dataをコピーしました: {dest}", 5000)
+
+    def _resolve_data_dir(self, path: Path) -> Path | None:
+        if (path / "index.json").exists() or (path / "images").is_dir() or (path / "models").is_dir():
+            return path
+        inner = path / "data"
+        if (inner / "index.json").exists() or (inner / "images").is_dir() or (inner / "models").is_dir():
+            return inner
+        return None
+
+    def import_data_folder(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "取り込む data を選ぶ", str(Path.home()))
+        if not chosen:
+            return
+        source = self._resolve_data_dir(Path(chosen))
+        if source is None:
+            QMessageBox.warning(
+                self,
+                "dataではありません",
+                "index.json か images か models があるフォルダを選んでください。",
+            )
+            return
+        try:
+            if source.resolve() == DATA_DIR.resolve():
+                QMessageBox.information(self, "同じ場所です", "今使っている data と同じ場所です。")
+                return
+        except OSError:
+            pass
+        answer = QMessageBox.question(
+            self,
+            "dataを取り込む",
+            "今の画像・枠・モデルを、選んだ data で置き換えます。続けますか？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self._confirm_discard():
+            return
+        self.current_id = None
+        self.canvas.clear_image()
+        QApplication.processEvents()
+        tmp = DATA_DIR.parent / "_data_importing"
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            shutil.copytree(source, tmp)
+            if DATA_DIR.exists():
+                shutil.rmtree(DATA_DIR)
+            tmp.rename(DATA_DIR)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "取り込みに失敗", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            if tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
+        self.dataset.reload()
+        self.predictor.reload()
+        self._remember_last_boxes()
+        self.refresh_list()
+        self.statusBar().showMessage("dataを取り込みました", 5000)
 
     def predict_current(self) -> None:
         if not self.current_id or not self.predictor.is_ready():

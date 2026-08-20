@@ -89,6 +89,9 @@ class Dataset:
         self._samples: list[Sample] = []
         self._load()
 
+    def reload(self) -> None:
+        self._load()
+
     def _load(self) -> None:
         if not self.index_path.exists():
             self._samples = []
