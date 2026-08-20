@@ -40,6 +40,7 @@ from app.regions import (
     REGION_LABELS,
     is_piece_key,
 )
+from app.train_effect import TrainEffect
 from app.train_worker import MIN_TRAIN_SAMPLES, TrainWorker
 
 STYLESHEET = """
@@ -216,6 +217,7 @@ class MainWindow(QMainWindow):
         self.next_btn = QPushButton("次へ")
         self.prev_btn = QPushButton("前へ")
         self.clear_btn = QPushButton("この場所を消す")
+        self.undo_piece_btn = QPushButton("1つ戻す")
         self.predict_btn = QPushButton("この画像を予測")
         self.train_btn = QPushButton("学習する")
         self.train_btn.setObjectName("primary")
@@ -227,6 +229,7 @@ class MainWindow(QMainWindow):
             self.prev_btn,
             self.next_btn,
             self.clear_btn,
+            self.undo_piece_btn,
             self.predict_btn,
             self.train_btn,
         ):
@@ -287,6 +290,7 @@ class MainWindow(QMainWindow):
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self._hide_save_toast)
+        self._train_fx = TrainEffect(root)
         splitter.addWidget(sidebar)
         splitter.addWidget(self.canvas)
         splitter.setStretchFactor(0, 0)
@@ -331,6 +335,7 @@ class MainWindow(QMainWindow):
         self.next_btn.clicked.connect(self.go_next_image)
         self.prev_btn.clicked.connect(self.go_prev_image)
         self.clear_btn.clicked.connect(self.clear_current_region)
+        self.undo_piece_btn.clicked.connect(self.undo_last_piece)
         self.reuse_btn.clicked.connect(self.reuse_last_box)
         self.predict_btn.clicked.connect(self.predict_current)
         self.train_btn.clicked.connect(self.start_training)
@@ -359,6 +364,7 @@ class MainWindow(QMainWindow):
         return spin
 
     def _bind_shortcuts(self) -> None:
+        QShortcut(QKeySequence.StandardKey.Undo, self, self.undo_last_piece)
         QShortcut(QKeySequence.StandardKey.Save, self, self.confirm_current)
         skip = QShortcut(QKeySequence("P"), self)
         skip.activated.connect(self.skip_current)
@@ -473,6 +479,9 @@ class MainWindow(QMainWindow):
         else:
             self.model_label.setText("モデル: まだありません。範囲を教えてから学習してください。")
         self.train_btn.setEnabled(bool(self._trainable_jobs()) and self.train_worker is None)
+        if self._is_training():
+            self._lock_for_training()
+            return
         has_sample = self.current_id is not None
         has_active = (
             bool(self.canvas.all_pieces())
@@ -490,6 +499,9 @@ class MainWindow(QMainWindow):
         self.clear_btn.setEnabled(has_sample and has_active)
         self.clear_btn.setText(f"{PLACE_LABELS.get(self._active_key, '範囲')}を消す")
         piece_mode = is_piece_key(self._active_key)
+        self.undo_piece_btn.setEnabled(
+            has_sample and piece_mode and self.canvas.has_piece_of_kind(self._active_key)
+        )
         self.spin_group.setEnabled(self._active_key == "tsum")
         has_last = (
             self._active_key in self._last_piece_radius
@@ -675,6 +687,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("動画フレーム抜き出しを起動しました", 4000)
 
     def open_files(self) -> None:
+        if self._block_if_training():
+            return
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "画像を開く",
@@ -685,6 +699,8 @@ class MainWindow(QMainWindow):
             self.import_paths(files)
 
     def paste_clipboard(self) -> None:
+        if self._block_if_training():
+            return
         mime = QApplication.clipboard().mimeData()
         if mime.hasImage():
             self.import_qimage(mime.imageData())
@@ -697,6 +713,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("クリップボードに画像がありません", 3000)
 
     def import_paths(self, paths: list[str]) -> None:
+        if self._block_if_training():
+            return
         imported: list[Sample] = []
         for raw in paths:
             path = Path(raw)
@@ -711,6 +729,8 @@ class MainWindow(QMainWindow):
         self._after_import(imported)
 
     def import_qimage(self, image) -> None:
+        if self._block_if_training():
+            return
         try:
             sample = self.dataset.import_qimage(image, "clipboard.png")
         except Exception as exc:  # noqa: BLE001
@@ -823,6 +843,8 @@ class MainWindow(QMainWindow):
         self._set_dirty(True)
 
     def confirm_current(self) -> None:
+        if self._block_if_training():
+            return
         self.save_current_region()
 
     def save_current_region(self) -> bool:
@@ -888,7 +910,7 @@ class MainWindow(QMainWindow):
         self.confirm_btn.setText("この範囲を保存" if self._needs_save() else "保存済み")
 
     def skip_current(self) -> None:
-        if not self.current_id:
+        if self._block_if_training() or not self.current_id:
             return
         self._set_dirty(False)
         self.dataset.skip(self.current_id)
@@ -903,6 +925,15 @@ class MainWindow(QMainWindow):
         elif self.current_id:
             self.show_sample(self.current_id)
             self.statusBar().showMessage(message, 4000)
+
+    def undo_last_piece(self) -> None:
+        if self._block_if_training() or not self.current_id or not is_piece_key(self._active_key):
+            return
+        if not self.canvas.undo_last_piece(self._active_key):
+            return
+        name = PLACE_LABELS.get(self._active_key, "〇")
+        self.statusBar().showMessage(f"「{name}」を1つ戻しました", 3000)
+        self.update_stats()
 
     def clear_current_region(self) -> None:
         if not self.current_id:
@@ -926,7 +957,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"「{name}」を消しました", 3000)
 
     def delete_current(self) -> None:
-        if not self.current_id:
+        if self._block_if_training() or not self.current_id:
             return
         sample = self.dataset.get(self.current_id)
         name = sample.source_name if sample else self.current_id
@@ -1070,7 +1101,53 @@ class MainWindow(QMainWindow):
         pieces = self.canvas.all_pieces()
         return sample.regions != boxes or sample.pieces != pieces
 
+    def _is_training(self) -> bool:
+        return self.train_worker is not None and self.train_worker.isRunning()
+
+    def _lock_for_training(self) -> None:
+        for widget in (
+            self.open_btn,
+            self.paste_btn,
+            self.confirm_btn,
+            self.skip_btn,
+            self.next_btn,
+            self.prev_btn,
+            self.clear_btn,
+            self.undo_piece_btn,
+            self.predict_btn,
+            self.train_btn,
+            self.delete_btn,
+            self.copy_data_btn,
+            self.import_data_btn,
+            self.video_app_btn,
+            self.reuse_btn,
+            self.region_list,
+            self.list_widget,
+            self.canvas,
+            self.spin_x,
+            self.spin_y,
+            self.spin_w,
+            self.spin_h,
+            self.spin_group,
+        ):
+            widget.setEnabled(False)
+        self.hint_label.setText("学習中です。終わるまで他の操作はできません。")
+
+    def _block_if_training(self) -> bool:
+        if not self._is_training():
+            return False
+        self.statusBar().showMessage("学習中です。終わるまで操作できません", 3000)
+        return True
+
+    def _place_train_fx(self) -> None:
+        host = self._train_fx.parentWidget() or self
+        top_left = self.canvas.mapTo(host, self.canvas.rect().topLeft())
+        self._train_fx.setGeometry(top_left.x(), top_left.y(), self.canvas.width(), self.canvas.height())
+        self._train_fx.raise_()
+
     def start_training(self) -> None:
+        if self._is_training():
+            return
         jobs = self._trainable_jobs()
         counts = self.dataset.labeled_counts()
         if not jobs:
@@ -1102,16 +1179,21 @@ class MainWindow(QMainWindow):
         self.train_worker.finished_ok.connect(self.on_train_finished)
         self.train_worker.failed.connect(self.on_train_failed)
         self.train_worker.start()
-        self.statusBar().showMessage("学習中です…")
+        self._lock_for_training()
+        self._place_train_fx()
+        self._train_fx.start()
+        self.statusBar().showMessage("学習中です。終わるまで他の操作はできません")
 
     def on_train_progress(self, epoch: int, total: int, message: str) -> None:
         self.progress.setRange(0, total)
         self.progress.setValue(epoch)
+        self._train_fx.set_progress(epoch, total, message)
         self.statusBar().showMessage(message)
 
     def on_train_finished(self, metrics: dict) -> None:
         self.train_worker = None
         self.progress.setVisible(False)
+        self._train_fx.stop()
         self.predictor.reload()
         applied = self._apply_predictions_to_unlabeled()
         self.update_stats()
@@ -1132,7 +1214,9 @@ class MainWindow(QMainWindow):
     def on_train_failed(self, message: str) -> None:
         self.train_worker = None
         self.progress.setVisible(False)
+        self._train_fx.stop()
         self.update_stats()
+        self.hint_label.setText("学習に失敗しました。他の操作が使えます。")
         QMessageBox.critical(self, "学習に失敗", message)
 
     def _apply_predictions_to_unlabeled(self) -> int:
@@ -1151,6 +1235,10 @@ class MainWindow(QMainWindow):
         return applied
 
     def eventFilter(self, watched, event) -> bool:
+        if watched is self.canvas and event.type() == QEvent.Type.Resize:
+            self._place_train_fx()
+        if self._is_training() and watched is self.canvas and event.type() == QEvent.Type.KeyPress:
+            return True
         if (
             watched is self.canvas
             and event.type() == QEvent.Type.KeyPress
@@ -1227,10 +1315,14 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.train_worker is not None and self.train_worker.isRunning():
+            self._train_fx.stop()
             self.train_worker.wait(1000)
         event.accept()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self._is_training():
+            event.ignore()
+            return
         if event.mimeData().hasUrls() or event.mimeData().hasImage():
             event.acceptProposedAction()
         else:

@@ -201,6 +201,27 @@ class ImageCanvas(QGraphicsView):
         self.viewport().update()
         return True
 
+    def undo_last_piece(self, kind: str | None = None) -> bool:
+        target = kind if kind in PIECE_KEYS else (self._active_key if is_piece_key(self._active_key) else None)
+        if target is None:
+            return False
+        for index in range(len(self._pieces) - 1, -1, -1):
+            if self._pieces[index].get("kind") == target:
+                self._pieces.pop(index)
+                if self._selected_piece is not None:
+                    if self._selected_piece == index:
+                        self._selected_piece = None
+                    elif self._selected_piece > index:
+                        self._selected_piece -= 1
+                self.piecesChanged.emit()
+                self._update_guide()
+                self.viewport().update()
+                return True
+        return False
+
+    def has_piece_of_kind(self, kind: str) -> bool:
+        return any(piece.get("kind") == kind for piece in self._pieces)
+
     def set_default_radius(self, kind: str, radius: int) -> None:
         self._piece_radius[kind] = max(MIN_RADIUS, int(radius))
         if self._selected_piece is not None:
@@ -278,7 +299,7 @@ class ImageCanvas(QGraphicsView):
                 self._guide.setText(f"「{name}」の前に、ゲーム範囲を保存してください")
             else:
                 self._guide.setText(
-                    f"「{name}」{extra}  大きい〇がガイドです。ツムに合わせてクリック  ・  ホイールで大きさ  ・  Backspaceで削除"
+                    f"「{name}」{extra}  大きい〇がガイドです。ツムに合わせてクリック  ・  ホイールで大きさ  ・  1つ戻す / Ctrl+Z  ・  Backspaceで削除"
                 )
         elif self._region is None:
             name = REGION_LABELS.get(self._active_key, "範囲")
@@ -753,6 +774,13 @@ class ImageCanvas(QGraphicsView):
         if is_piece_key(self._active_key):
             key = event.key()
             if key in (Qt.Key.Key_Backspace, Qt.Key.Key_X) and self.remove_selected_piece():
+                event.accept()
+                return
+            if (
+                key == Qt.Key.Key_Z
+                and not (mods & Qt.KeyboardModifier.ControlModifier)
+                and self.undo_last_piece()
+            ):
                 event.accept()
                 return
             if self._active_key == "tsum" and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
