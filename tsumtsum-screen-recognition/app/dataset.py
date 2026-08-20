@@ -12,7 +12,7 @@ from PySide6.QtCore import QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QImage, QPixmap
 
 from app.paths import DATA_DIR, IMAGE_EXTENSIONS
-from app.regions import REGION_KEYS, model_filename
+from app.regions import PIECE_KEYS, REGION_KEYS, model_filename
 
 
 @dataclass
@@ -26,6 +26,7 @@ class Sample:
     game_region: dict[str, int] | None
     regions: dict[str, dict[str, int]]
     confirmed: list[str]
+    pieces: list[dict[str, int]]
     status: str  # unlabeled | predicted | labeled | skipped
 
     @property
@@ -43,6 +44,7 @@ class Sample:
             "game_region": self.game_region,
             "regions": self.regions,
             "confirmed": self.confirmed,
+            "pieces": self.pieces,
             "status": self.status,
         }
 
@@ -71,6 +73,7 @@ class Sample:
             game_region=game_region,
             regions=regions,
             confirmed=confirmed,
+            pieces=[dict(item) for item in data.get("pieces") or []],
             status=status,
         )
 
@@ -116,6 +119,13 @@ class Dataset:
         return [s for s in self._samples if s.status == "labeled" and s.game_region]
 
     def labeled_for(self, key: str) -> list[Sample]:
+        if key in PIECE_KEYS:
+            return [
+                sample
+                for sample in self._samples
+                if sample.status != "skipped"
+                and any(piece.get("kind") == key for piece in sample.pieces)
+            ]
         return [
             sample
             for sample in self._samples
@@ -123,7 +133,7 @@ class Dataset:
         ]
 
     def labeled_counts(self) -> dict[str, int]:
-        return {key: len(self.labeled_for(key)) for key in REGION_KEYS}
+        return {key: len(self.labeled_for(key)) for key in [*REGION_KEYS, *PIECE_KEYS]}
 
     def model_path_for(self, key: str) -> Path:
         return self.models_dir / model_filename(key)
@@ -200,6 +210,7 @@ class Dataset:
             game_region=None,
             regions={},
             confirmed=[],
+            pieces=[],
             status="unlabeled",
         )
         self._samples.append(sample)
@@ -211,6 +222,7 @@ class Dataset:
         sample_id: str,
         regions: dict[str, dict[str, int]],
         status: str | None = None,
+        pieces: list[dict[str, int]] | None = None,
     ) -> Sample:
         sample = self.get(sample_id)
         if sample is None:
@@ -224,8 +236,21 @@ class Dataset:
                 "h": int(box["h"]),
             }
         sample.regions = cleaned
-        sample.confirmed = list(cleaned.keys())
         sample.game_region = cleaned.get("game")
+        if pieces is not None:
+            sample.pieces = [
+                {
+                    "x": int(piece["x"]),
+                    "y": int(piece["y"]),
+                    "r": int(piece["r"]),
+                    "kind": str(piece["kind"]),
+                    "group": int(piece.get("group") or 1),
+                }
+                for piece in pieces
+                if int(piece.get("r") or 0) >= 4
+            ]
+        kinds = {piece["kind"] for piece in sample.pieces}
+        sample.confirmed = list(cleaned.keys()) + [key for key in PIECE_KEYS if key in kinds]
         if status is not None:
             sample.status = status
         elif sample.game_region:
@@ -288,6 +313,8 @@ class Dataset:
             raise KeyError(sample_id)
         sample.regions.pop(key, None)
         sample.confirmed = [item for item in sample.confirmed if item != key]
+        if key in PIECE_KEYS:
+            sample.pieces = [piece for piece in sample.pieces if piece.get("kind") != key]
         if key == "game":
             sample.game_region = None
             if sample.status != "skipped":

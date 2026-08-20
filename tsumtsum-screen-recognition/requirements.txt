@@ -1,4 +1,6 @@
 PySide6>=6.6
+# GPU を使う場合は CPU 版を入れず、次で入れる:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 torch
 torchvision
 Pillow

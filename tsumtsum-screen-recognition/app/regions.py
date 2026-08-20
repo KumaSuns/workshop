@@ -15,6 +15,21 @@ REGION_LABELS = {key: label for key, label, _color in REGION_SPECS}
 REGION_COLORS = {key: color for key, _label, color in REGION_SPECS}
 REGION_KEYS = [key for key, _label, _color in REGION_SPECS]
 
+PIECE_SPECS: list[tuple[str, str, str]] = [
+    ("tsum", "ツム", "#FFE066"),
+    ("bomb", "ボム", "#FF5C5C"),
+]
+PIECE_LABELS = {key: label for key, label, _color in PIECE_SPECS}
+PIECE_COLORS = {key: color for key, _label, color in PIECE_SPECS}
+PIECE_KEYS = [key for key, _label, _color in PIECE_SPECS]
+PLACE_SPECS = REGION_SPECS + PIECE_SPECS
+PLACE_LABELS = {**REGION_LABELS, **PIECE_LABELS}
+PLACE_COLORS = {**REGION_COLORS, **PIECE_COLORS}
+
+
+def is_piece_key(key: str) -> bool:
+    return key in PIECE_KEYS
+
 
 def model_filename(key: str) -> str:
     return "game_region.pt" if key == "game" else f"{key}.pt"

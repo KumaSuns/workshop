@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRectF, Qt
+from PySide6.QtCore import QEvent, QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -32,7 +32,14 @@ from app.dataset import Dataset, Sample
 from app.image_canvas import ImageCanvas
 from app.paths import DATA_DIR, IMAGE_EXTENSIONS, IPC_NAME, VIDEO_EXTRACTOR_MAIN
 from app.predictor import Predictor
-from app.regions import REGION_KEYS, REGION_LABELS, REGION_SPECS
+from app.regions import (
+    PIECE_KEYS,
+    PLACE_LABELS,
+    PLACE_SPECS,
+    REGION_KEYS,
+    REGION_LABELS,
+    is_piece_key,
+)
 from app.train_worker import MIN_TRAIN_SAMPLES, TrainWorker
 
 STYLESHEET = """
@@ -48,6 +55,14 @@ QLabel#title {
 }
 QLabel#hint {
     color: #9aa3b2;
+}
+QLabel#toast {
+    background: rgba(31, 138, 91, 230);
+    color: #f2f5f8;
+    font-size: 22px;
+    font-weight: 700;
+    padding: 18px 32px;
+    border-radius: 12px;
 }
 QPushButton {
     background: #2a303b;
@@ -164,6 +179,7 @@ class MainWindow(QMainWindow):
         self._extractor_process = None
         self._ipc_buffers: dict[int, bytes] = {}
         self._last_boxes: dict[str, dict[str, int]] = {}
+        self._last_piece_radius: dict[str, int] = {}
         self._remember_last_boxes()
 
         self._build_ui()
@@ -224,8 +240,8 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 12, 12, 12)
         side_layout.addWidget(QLabel("教える場所"))
         self.region_list = QListWidget()
-        self.region_list.setMaximumHeight(168)
-        for key, label, color in REGION_SPECS:
+        self.region_list.setMaximumHeight(210)
+        for key, label, color in PLACE_SPECS:
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, key)
             item.setForeground(QColor(color))
@@ -263,6 +279,14 @@ class MainWindow(QMainWindow):
 
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._toast = QLabel(self.canvas)
+        self._toast.setObjectName("toast")
+        self._toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._toast.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._toast.hide()
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._hide_save_toast)
         splitter.addWidget(sidebar)
         splitter.addWidget(self.canvas)
         splitter.setStretchFactor(0, 0)
@@ -283,6 +307,15 @@ class MainWindow(QMainWindow):
             coords_layout.addWidget(spin)
         self.reuse_btn = QPushButton("同じ枠を使う")
         coords_layout.addWidget(self.reuse_btn)
+        coords_layout.addWidget(QLabel("ツム種類"))
+        self.spin_group = QSpinBox()
+        self.spin_group.setPrefix("No.  ")
+        self.spin_group.setRange(1, 12)
+        self.spin_group.setValue(1)
+        coords_layout.addWidget(self.spin_group)
+        self.piece_count_label = QLabel()
+        self.piece_count_label.setObjectName("hint")
+        coords_layout.addWidget(self.piece_count_label, 1)
         self.coords_hint = QLabel("上下キーで画像を切替  /  左右キーで枠を1px  /  Shift+矢印で10px  /  Ctrl+矢印でサイズ")
         self.coords_hint.setObjectName("hint")
         coords_layout.addWidget(self.coords_hint, 1)
@@ -309,9 +342,12 @@ class MainWindow(QMainWindow):
         self.region_list.currentItemChanged.connect(self.on_region_type_changed)
         self.canvas.regionCommitted.connect(self.on_region_committed)
         self.canvas.regionChanged.connect(self.on_region_changed)
+        self.canvas.piecesChanged.connect(self.on_pieces_changed)
+        self.canvas.pieceGroupChanged.connect(self.on_piece_group_changed)
         self.canvas.filesDropped.connect(self.import_paths)
         self.canvas.imageDropped.connect(self.import_qimage)
         self.canvas.installEventFilter(self)
+        self.spin_group.valueChanged.connect(self.on_group_changed)
         for spin in (self.spin_x, self.spin_y, self.spin_w, self.spin_h):
             spin.valueChanged.connect(self.on_spin_changed)
 
@@ -387,9 +423,9 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, sample.id)
             if sample.status == "skipped":
                 item.setForeground(QColor("#7a8190"))
-            elif self._active_key in sample.confirmed:
+            elif self._sample_has_active(sample):
                 item.setForeground(QColor("#3DDC97"))
-            elif self._active_key in sample.regions:
+            elif not is_piece_key(self._active_key) and self._active_key in sample.regions:
                 item.setForeground(QColor("#FFB020"))
             else:
                 item.setForeground(QColor("#c5cad3"))
@@ -401,13 +437,18 @@ class MainWindow(QMainWindow):
             self.list_widget.setCurrentRow(self.list_widget.count() - 1)
         self.update_stats()
 
+    def _sample_has_active(self, sample: Sample) -> bool:
+        if is_piece_key(self._active_key):
+            return any(piece.get("kind") == self._active_key for piece in sample.pieces)
+        return self._active_key in sample.confirmed
+
     def _item_text(self, sample: Sample) -> str:
-        name = REGION_LABELS.get(self._active_key, "範囲")
+        name = PLACE_LABELS.get(self._active_key, "範囲")
         if sample.status == "skipped":
             mark = "パス"
-        elif self._active_key in sample.confirmed:
+        elif self._sample_has_active(sample):
             mark = f"{name}済"
-        elif self._active_key in sample.regions:
+        elif not is_piece_key(self._active_key) and self._active_key in sample.regions:
             mark = f"{name}予測"
         else:
             mark = f"{name}未"
@@ -417,7 +458,7 @@ class MainWindow(QMainWindow):
         counts = self.dataset.counts()
         labeled_counts = self.dataset.labeled_counts()
         per_type = "  ".join(
-            f"{REGION_LABELS[key]} {labeled_counts[key]}" for key in REGION_KEYS
+            f"{PLACE_LABELS[key]} {labeled_counts[key]}" for key in [*REGION_KEYS, *PIECE_KEYS]
         )
         self.stats_label.setText(
             f"全 {counts['total']} 枚\n"
@@ -433,19 +474,36 @@ class MainWindow(QMainWindow):
             self.model_label.setText("モデル: まだありません。範囲を教えてから学習してください。")
         self.train_btn.setEnabled(bool(self._trainable_jobs()) and self.train_worker is None)
         has_sample = self.current_id is not None
-        has_active = self.canvas.current_region() is not None
-        has_boxes = bool(self.canvas.all_region_boxes()) or has_active
+        has_active = (
+            bool(self.canvas.all_pieces())
+            if is_piece_key(self._active_key)
+            else self.canvas.current_region() is not None
+        )
+        has_boxes = bool(self.canvas.all_region_boxes()) or bool(self.canvas.all_pieces()) or (
+            not is_piece_key(self._active_key) and self.canvas.current_region() is not None
+        )
         self.confirm_btn.setEnabled(has_sample and has_boxes)
         self.confirm_btn.setText("この範囲を保存" if self._needs_save() else "保存済み")
         self.skip_btn.setEnabled(has_sample)
         self.next_btn.setEnabled(has_sample and self._unlabeled_id(self.current_id) is not None)
         self.prev_btn.setEnabled(has_sample and self._unlabeled_id(self.current_id, backward=True) is not None)
         self.clear_btn.setEnabled(has_sample and has_active)
-        self.clear_btn.setText(f"{REGION_LABELS.get(self._active_key, '範囲')}を消す")
-        has_last = self._active_key in self._last_boxes
+        self.clear_btn.setText(f"{PLACE_LABELS.get(self._active_key, '範囲')}を消す")
+        piece_mode = is_piece_key(self._active_key)
+        self.spin_group.setEnabled(self._active_key == "tsum")
+        has_last = (
+            self._active_key in self._last_piece_radius
+            if piece_mode
+            else self._active_key in self._last_boxes
+        )
         self.reuse_btn.setEnabled(has_sample and has_last)
-        name = REGION_LABELS.get(self._active_key, "範囲")
-        self.reuse_btn.setText(f"{name}の枠を使う")
+        name = PLACE_LABELS.get(self._active_key, "範囲")
+        self.reuse_btn.setText(f"{name}の大きさを使う" if piece_mode else f"{name}の枠を使う")
+        counts_map = self.canvas.piece_counts()
+        if counts_map:
+            self.piece_count_label.setText("  ".join(f"{k} {v}" for k, v in counts_map.items()))
+        else:
+            self.piece_count_label.setText("")
         self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
         self.delete_btn.setEnabled(has_sample)
 
@@ -495,13 +553,18 @@ class MainWindow(QMainWindow):
 
     def _refresh_region_list(self) -> None:
         boxes = self.canvas.all_region_boxes() if self.canvas.has_image() else {}
+        pieces = self.canvas.all_pieces() if self.canvas.has_image() else []
         self.region_list.blockSignals(True)
         selected = None
         for row in range(self.region_list.count()):
             item = self.region_list.item(row)
             key = item.data(Qt.ItemDataRole.UserRole)
-            label = REGION_LABELS.get(key, key)
-            item.setText(f"{label}  ✓" if key == self._active_key and key in boxes else label)
+            label = PLACE_LABELS.get(key, key)
+            if is_piece_key(key):
+                has = any(piece.get("kind") == key for piece in pieces)
+            else:
+                has = key in boxes
+            item.setText(f"{label}  ✓" if key == self._active_key and has else label)
             if key == self._active_key:
                 selected = item
         if selected is not None:
@@ -518,7 +581,14 @@ class MainWindow(QMainWindow):
             key: QRectF(box["x"], box["y"], box["w"], box["h"])
             for key, box in sample.regions.items()
         }
-        self.canvas.set_image(pixmap, None, sample.status, regions=regions, active_key=self._active_key)
+        self.canvas.set_image(
+            pixmap,
+            None,
+            sample.status,
+            regions=regions,
+            active_key=self._active_key,
+            pieces=sample.pieces,
+        )
         self.canvas.setFocus()
         self._sync_spins_from_canvas()
         self._set_dirty(False)
@@ -535,17 +605,34 @@ class MainWindow(QMainWindow):
 
     def _remember_last_boxes(self) -> None:
         self._last_boxes = {}
+        self._last_piece_radius = {}
         for sample in self.dataset.all():
             for key in sample.confirmed:
                 box = sample.regions.get(key)
                 if box:
                     self._last_boxes[key] = dict(box)
+            for piece in sample.pieces:
+                kind = str(piece.get("kind") or "")
+                if kind in PIECE_KEYS:
+                    self._last_piece_radius[kind] = int(piece["r"])
 
     def reuse_last_box(self) -> None:
         if not self.current_id:
             return
+        name = PLACE_LABELS.get(self._active_key, "範囲")
+        if is_piece_key(self._active_key):
+            radius = self._last_piece_radius.get(self._active_key)
+            if not radius:
+                self.statusBar().showMessage(
+                    f"「{name}」の大きさがまだありません。先に1つ付けて保存してください",
+                    4000,
+                )
+                return
+            self.canvas.set_default_radius(self._active_key, radius)
+            self._set_dirty(True)
+            self.statusBar().showMessage(f"「{name}」の大きさを {radius}px にしました", 4000)
+            return
         box = self._last_boxes.get(self._active_key)
-        name = REGION_LABELS.get(self._active_key, "範囲")
         if not box:
             self.statusBar().showMessage(
                 f"「{name}」の枠がまだありません。先に1枚囲んで保存してください",
@@ -661,8 +748,21 @@ class MainWindow(QMainWindow):
         self._set_spins({"x": x, "y": y, "w": w, "h": h})
         self._set_dirty(True)
         self._refresh_region_list()
-        name = REGION_LABELS.get(self._active_key, "範囲")
+        name = PLACE_LABELS.get(self._active_key, "範囲")
         self.statusBar().showMessage(f"「{name}」はまだ保存していません。「この範囲を保存」を押すと確定します", 4000)
+
+    def on_pieces_changed(self) -> None:
+        self._set_dirty(True)
+        self._refresh_region_list()
+        self.update_stats()
+
+    def on_group_changed(self, value: int) -> None:
+        self.canvas.set_piece_group(value)
+
+    def on_piece_group_changed(self, value: int) -> None:
+        self.spin_group.blockSignals(True)
+        self.spin_group.setValue(value)
+        self.spin_group.blockSignals(False)
 
     def _set_dirty(self, dirty: bool) -> None:
         changed = self._dirty != dirty
@@ -716,7 +816,7 @@ class MainWindow(QMainWindow):
             spin.blockSignals(False)
 
     def on_spin_changed(self) -> None:
-        if not self.current_id:
+        if not self.current_id or is_piece_key(self._active_key):
             return
         x, y, w, h = self.spin_x.value(), self.spin_y.value(), self.spin_w.value(), self.spin_h.value()
         self.canvas.set_region(QRectF(x, y, w, h), status="labeled", emit=False)
@@ -729,34 +829,63 @@ class MainWindow(QMainWindow):
         if not self.current_id:
             return False
         boxes = self.canvas.all_region_boxes()
-        if not boxes:
-            QMessageBox.information(self, "範囲がありません", "先に左の種類を選んでドラッグで囲んでください。")
+        pieces = self.canvas.all_pieces()
+        if not boxes and not pieces:
+            QMessageBox.information(self, "範囲がありません", "先に左の種類を選んで囲むか、ツムに〇を付けてください。")
             return False
         sample = self.dataset.get(self.current_id)
         already = (
             not self._dirty
             and sample is not None
             and sample.regions == boxes
-            and set(sample.confirmed) == set(boxes.keys())
+            and sample.pieces == pieces
         )
         if already:
             QMessageBox.information(
                 self,
                 "すでに保存済みです",
-                "いま画面にある四角はすべて保存できています。\n"
+                "いま画面にある四角と〇は保存できています。\n"
                 "直したあとにもう一度押せば上書きされます。",
             )
             return True
-        self.dataset.set_regions(self.current_id, boxes)
+        self.dataset.set_regions(self.current_id, boxes, pieces=pieces)
         for key, box in boxes.items():
             self._last_boxes[key] = dict(box)
+        for piece in pieces:
+            self._last_piece_radius[str(piece["kind"])] = int(piece["r"])
         self._set_dirty(False)
         self.refresh_list(select_id=self.current_id)
         self._refresh_region_list()
         self.update_stats()
-        names = "、".join(REGION_LABELS.get(key, key) for key in boxes)
+        names = "、".join(PLACE_LABELS.get(key, key) for key in boxes)
+        if pieces:
+            tsum_n = sum(1 for piece in pieces if piece["kind"] == "tsum")
+            bomb_n = sum(1 for piece in pieces if piece["kind"] == "bomb")
+            extra = []
+            if tsum_n:
+                extra.append(f"ツム{tsum_n}")
+            if bomb_n:
+                extra.append(f"ボム{bomb_n}")
+            names = "、".join([n for n in [names, *extra] if n])
         self.statusBar().showMessage(f"保存しました: {names}", 4000)
+        self._show_save_toast(names)
         return True
+
+    def _show_save_toast(self, names: str) -> None:
+        text = "保存しました" if not names else f"保存しました\n{names}"
+        self._toast.setText(text)
+        self._toast.adjustSize()
+        x = max(12, (self.canvas.width() - self._toast.width()) // 2)
+        y = max(12, (self.canvas.height() - self._toast.height()) // 2)
+        self._toast.move(x, y)
+        self._toast.show()
+        self._toast.raise_()
+        self.confirm_btn.setText("保存しました")
+        self._toast_timer.start(1600)
+
+    def _hide_save_toast(self) -> None:
+        self._toast.hide()
+        self.confirm_btn.setText("この範囲を保存" if self._needs_save() else "保存済み")
 
     def skip_current(self) -> None:
         if not self.current_id:
@@ -778,16 +907,22 @@ class MainWindow(QMainWindow):
     def clear_current_region(self) -> None:
         if not self.current_id:
             return
-        self.canvas.set_region(None)
+        if is_piece_key(self._active_key):
+            self.canvas.clear_pieces_of_kind(self._active_key)
+        else:
+            self.canvas.set_region(None)
         self.dataset.clear_named_region(self.current_id, self._active_key)
         sample = self.dataset.get(self.current_id)
-        saved = sample.regions if sample else {}
-        self._set_dirty(self.canvas.all_region_boxes() != saved)
+        saved_boxes = sample.regions if sample else {}
+        saved_pieces = sample.pieces if sample else []
+        self._set_dirty(
+            self.canvas.all_region_boxes() != saved_boxes or self.canvas.all_pieces() != saved_pieces
+        )
         self.refresh_list(select_id=self.current_id)
         self._sync_spins_from_canvas()
         self._refresh_region_list()
         self.update_stats()
-        name = REGION_LABELS.get(self._active_key, "範囲")
+        name = PLACE_LABELS.get(self._active_key, "範囲")
         self.statusBar().showMessage(f"「{name}」を消しました", 3000)
 
     def delete_current(self) -> None:
@@ -932,7 +1067,8 @@ class MainWindow(QMainWindow):
         if sample is None:
             return False
         boxes = self.canvas.all_region_boxes()
-        return set(sample.confirmed) != set(boxes.keys())
+        pieces = self.canvas.all_pieces()
+        return sample.regions != boxes or sample.pieces != pieces
 
     def start_training(self) -> None:
         jobs = self._trainable_jobs()
@@ -1047,7 +1183,11 @@ class MainWindow(QMainWindow):
             return None
 
         def pending(sample: Sample) -> bool:
-            return sample.status != "skipped" and self._active_key not in sample.confirmed
+            if sample.status == "skipped":
+                return False
+            if is_piece_key(self._active_key):
+                return not any(piece.get("kind") == self._active_key for piece in sample.pieces)
+            return self._active_key not in sample.confirmed
 
         ids = [sample.id for sample in samples]
         if after_id is None or after_id not in ids:
