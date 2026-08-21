@@ -6,14 +6,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRectF, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QRectF, QStandardPaths, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -24,13 +26,16 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from app.dataset import Dataset, Sample
 from app.image_canvas import ImageCanvas
-from app.paths import DATA_DIR, IMAGE_EXTENSIONS, IPC_NAME, VIDEO_EXTRACTOR_MAIN
+from app.paths import APP_ROOT, DATA_DIR, IMAGE_EXTENSIONS, IPC_NAME, VIDEO_EXTRACTOR_MAIN
 from app.predictor import Predictor
 from app.regions import (
     PIECE_KEYS,
@@ -42,6 +47,10 @@ from app.regions import (
 )
 from app.train_effect import TrainEffect
 from app.train_worker import MIN_TRAIN_SAMPLES, TrainWorker
+
+LIST_STATUS_KEYS = ("game", "tsum", "bomb")
+LIST_STATUS_HEADERS = {"game": "ゲーム範囲", "tsum": "ツム", "bomb": "ボム"}
+LIST_STATUS_WIDTHS = {"game": 110, "tsum": 88, "bomb": 88}
 
 STYLESHEET = """
 QMainWindow, QWidget {
@@ -88,15 +97,40 @@ QListWidget {
     background: #101216;
     border: 1px solid #2a303b;
     border-radius: 10px;
-    padding: 6px;
+    padding: 4px;
     outline: none;
+    font-size: 11px;
 }
 QListWidget::item {
-    padding: 8px 10px;
-    border-radius: 6px;
+    padding: 4px 8px;
+    border-radius: 5px;
 }
 QListWidget::item:selected {
     background: #2c3344;
+}
+QTableWidget {
+    background: #101216;
+    border: 1px solid #2a303b;
+    border-radius: 10px;
+    outline: none;
+    font-size: 12px;
+    gridline-color: transparent;
+}
+QTableWidget::item {
+    padding: 5px 4px;
+}
+QTableWidget::item:selected {
+    background: #2c3344;
+}
+QHeaderView::section {
+    background: #1c2028;
+    color: #9aa3b2;
+    border: none;
+    border-bottom: 1px solid #2a303b;
+    border-right: 1px solid #2a303b;
+    padding: 6px 4px;
+    font-size: 11px;
+    font-weight: 600;
 }
 QScrollBar:vertical {
     background: #101216;
@@ -161,10 +195,22 @@ QFrame#coords {
 """
 
 
+class FileListDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        if index.column() < len(LIST_STATUS_KEYS):
+            option.textElideMode = Qt.TextElideMode.ElideNone
+        else:
+            option.textElideMode = Qt.TextElideMode.ElideMiddle
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ツムツム ゲーム範囲トレーナー")
+        icon = self._ensure_app_icon()
+        if icon is not None:
+            self.setWindowIcon(QIcon(str(icon)))
         self.resize(1280, 840)
         self.setMinimumSize(980, 640)
         self.setAcceptDrops(True)
@@ -202,7 +248,7 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("ツムツム ゲーム範囲トレーナー")
         title.setObjectName("title")
-        self.hint_label = QLabel("画像をドロップ / Ctrl+V / 「画像を開く」。左で場所の種類を選び、ドラッグで囲みます。")
+        self.hint_label = QLabel("画像をドロップ / Ctrl+V / 「画像を開く」。左で種類にチェックを付けて保存します。")
         self.hint_label.setObjectName("hint")
         self.hint_label.setWordWrap(True)
         title_box.addWidget(title)
@@ -237,48 +283,47 @@ class MainWindow(QMainWindow):
         layout.addWidget(top)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(12, 12, 12, 12)
-        side_layout.addWidget(QLabel("教える場所"))
+
+        left = QFrame()
+        left.setObjectName("sidebar")
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.addWidget(QLabel("教える場所"))
+        place_hint = QLabel("チェックした種類を保存・学習します")
+        place_hint.setObjectName("hint")
+        left_layout.addWidget(place_hint)
         self.region_list = QListWidget()
-        self.region_list.setMaximumHeight(210)
+        self.region_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.region_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.region_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         for key, label, color in PLACE_SPECS:
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, key)
             item.setForeground(QColor(color))
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            item.setCheckState(Qt.CheckState.Unchecked)
             self.region_list.addItem(item)
         self.region_list.setCurrentRow(0)
-        side_layout.addWidget(self.region_list)
-        side_layout.addWidget(QLabel("データセット"))
-        self.stats_label = QLabel()
-        self.stats_label.setObjectName("hint")
-        self.stats_label.setWordWrap(True)
-        side_layout.addWidget(self.stats_label)
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list_widget.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.list_widget.setUniformItemSizes(True)
-        side_layout.addWidget(self.list_widget, 1)
-        self.delete_btn = QPushButton("選択を削除")
-        side_layout.addWidget(self.delete_btn)
-        self.copy_data_btn = QPushButton("dataをコピー")
-        side_layout.addWidget(self.copy_data_btn)
-        self.import_data_btn = QPushButton("dataを取り込む")
-        side_layout.addWidget(self.import_data_btn)
-        self.video_app_btn = QPushButton("動画から画像を抜き出す")
-        side_layout.addWidget(self.video_app_btn)
+        first = self.region_list.item(0)
+        if first is not None:
+            first.setCheckState(Qt.CheckState.Checked)
+        self._fit_region_list()
+        left_layout.addWidget(self.region_list)
         self.model_label = QLabel()
         self.model_label.setObjectName("hint")
         self.model_label.setWordWrap(True)
-        side_layout.addWidget(self.model_label)
+        left_layout.addWidget(self.model_label)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
-        side_layout.addWidget(self.progress)
-        sidebar.setMinimumWidth(300)
-        sidebar.setMaximumWidth(560)
+        left_layout.addWidget(self.progress)
+        left_layout.addStretch(1)
+        left.setMinimumWidth(220)
+        left.setMaximumWidth(320)
 
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -291,11 +336,59 @@ class MainWindow(QMainWindow):
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self._hide_save_toast)
         self._train_fx = TrainEffect(root)
-        splitter.addWidget(sidebar)
+
+        right = QFrame()
+        right.setObjectName("sidebar")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.addWidget(QLabel("画像ファイル"))
+        self.stats_label = QLabel()
+        self.stats_label.setObjectName("hint")
+        self.stats_label.setWordWrap(True)
+        right_layout.addWidget(self.stats_label)
+        self.list_widget = QTableWidget()
+        self.list_widget.setColumnCount(len(LIST_STATUS_KEYS) + 1)
+        self.list_widget.setHorizontalHeaderLabels(
+            [LIST_STATUS_HEADERS[key] for key in LIST_STATUS_KEYS] + ["ファイル"]
+        )
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.list_widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_widget.setWordWrap(False)
+        self.list_widget.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.list_widget.setItemDelegate(FileListDelegate(self.list_widget))
+        self.list_widget.setAutoScroll(False)
+        self.list_widget.setShowGrid(False)
+        self.list_widget.verticalHeader().setVisible(False)
+        self.list_widget.verticalHeader().setDefaultSectionSize(28)
+        header = self.list_widget.horizontalHeader()
+        header.setHighlightSections(False)
+        header.setStretchLastSection(True)
+        for col, key in enumerate(LIST_STATUS_KEYS):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.list_widget.setColumnWidth(col, LIST_STATUS_WIDTHS[key])
+        header.setSectionResizeMode(len(LIST_STATUS_KEYS), QHeaderView.ResizeMode.Stretch)
+        right_layout.addWidget(self.list_widget, 1)
+        self.delete_btn = QPushButton("選択を削除")
+        right_layout.addWidget(self.delete_btn)
+        self.copy_data_btn = QPushButton("dataをコピー")
+        right_layout.addWidget(self.copy_data_btn)
+        self.import_data_btn = QPushButton("dataを取り込む")
+        right_layout.addWidget(self.import_data_btn)
+        self.shortcut_btn = QPushButton("起動アイコンを作る")
+        right_layout.addWidget(self.shortcut_btn)
+        self.video_app_btn = QPushButton("動画から画像を抜き出す")
+        right_layout.addWidget(self.video_app_btn)
+        right.setMinimumWidth(480)
+
+        splitter.addWidget(left)
         splitter.addWidget(self.canvas)
+        splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 860])
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([240, 860, 720])
         layout.addWidget(splitter, 1)
 
         coords = QFrame()
@@ -338,13 +431,16 @@ class MainWindow(QMainWindow):
         self.undo_piece_btn.clicked.connect(self.undo_last_piece)
         self.reuse_btn.clicked.connect(self.reuse_last_box)
         self.predict_btn.clicked.connect(self.predict_current)
-        self.train_btn.clicked.connect(self.start_training)
+        self.train_btn.clicked.connect(self.on_train_button)
+        self._train_fx.cancelRequested.connect(self.cancel_training)
         self.delete_btn.clicked.connect(self.delete_current)
         self.copy_data_btn.clicked.connect(self.copy_data_folder)
         self.import_data_btn.clicked.connect(self.import_data_folder)
+        self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
-        self.list_widget.currentItemChanged.connect(self.on_item_changed)
+        self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
         self.region_list.currentItemChanged.connect(self.on_region_type_changed)
+        self.region_list.itemChanged.connect(self.on_place_item_changed)
         self.canvas.regionCommitted.connect(self.on_region_committed)
         self.canvas.regionChanged.connect(self.on_region_changed)
         self.canvas.piecesChanged.connect(self.on_pieces_changed)
@@ -378,9 +474,11 @@ class MainWindow(QMainWindow):
         self.addAction(fit)
 
     def _start_ipc(self) -> None:
-        QLocalServer.removeServer(IPC_NAME)
         self._ipc_server = QLocalServer(self)
         self._ipc_server.newConnection.connect(self._on_ipc_connection)
+        if self._ipc_server.listen(IPC_NAME):
+            return
+        QLocalServer.removeServer(IPC_NAME)
         if not self._ipc_server.listen(IPC_NAME):
             self.statusBar().showMessage("他のウィンドウからの受け取り口を開けませんでした", 4000)
 
@@ -408,7 +506,10 @@ class MainWindow(QMainWindow):
             return
         sock.write(b'{"ok":true}\n')
         sock.flush()
-        self.import_incoming_paths(paths)
+        if paths:
+            self.import_incoming_paths(paths)
+        else:
+            self._bring_to_front()
 
     def import_incoming_paths(self, paths: list[str]) -> None:
         self._bring_to_front()
@@ -422,43 +523,104 @@ class MainWindow(QMainWindow):
 
     def refresh_list(self, select_id: str | None = None) -> None:
         selected = select_id or self.current_id
+        samples = list(self.dataset.all())
+        scroll = self.list_widget.verticalScrollBar().value()
+        prev_current = self._list_id_at(self.list_widget.currentRow())
+        existing = [self._list_id_at(row) for row in range(self.list_widget.rowCount())]
+        new_ids = [sample.id for sample in samples]
         self.list_widget.blockSignals(True)
-        self.list_widget.clear()
-        for sample in self.dataset.all():
-            item = QListWidgetItem(self._item_text(sample))
-            item.setData(Qt.ItemDataRole.UserRole, sample.id)
-            if sample.status == "skipped":
-                item.setForeground(QColor("#7a8190"))
-            elif self._sample_has_active(sample):
-                item.setForeground(QColor("#3DDC97"))
-            elif not is_piece_key(self._active_key) and self._active_key in sample.regions:
-                item.setForeground(QColor("#FFB020"))
-            else:
-                item.setForeground(QColor("#c5cad3"))
-            self.list_widget.addItem(item)
-            if selected and sample.id == selected:
-                self.list_widget.setCurrentItem(item)
+        if existing != new_ids:
+            self.list_widget.setRowCount(len(samples))
+        for row, sample in enumerate(samples):
+            self._style_list_row(row, sample)
+        moved_row = None
+        if selected and selected != prev_current:
+            for row in range(self.list_widget.rowCount()):
+                if self._list_id_at(row) == selected:
+                    self.list_widget.setCurrentCell(row, 0)
+                    moved_row = row
+                    break
+        elif selected is None and self.list_widget.rowCount() and prev_current is None:
+            last = self.list_widget.rowCount() - 1
+            self.list_widget.setCurrentCell(last, 0)
+            moved_row = last
+        elif selected and selected == prev_current:
+            for row in range(self.list_widget.rowCount()):
+                if self._list_id_at(row) == selected:
+                    self.list_widget.setCurrentCell(row, 0)
+                    break
         self.list_widget.blockSignals(False)
-        if selected is None and self.list_widget.count():
-            self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        if moved_row is None:
+            self.list_widget.verticalScrollBar().setValue(scroll)
+        else:
+            item = self.list_widget.item(moved_row, 0)
+            if item is not None:
+                self.list_widget.scrollToItem(item)
         self.update_stats()
+
+    def _list_id_at(self, row: int) -> str | None:
+        if row < 0:
+            return None
+        item = self.list_widget.item(row, 0)
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _style_list_row(self, row: int, sample: Sample) -> None:
+        skipped = sample.status == "skipped"
+        for col, key in enumerate(LIST_STATUS_KEYS):
+            state = self._key_list_state(sample, key)
+            if state == "confirmed":
+                text, color = "済", QColor("#3DDC97")
+            elif state == "predicted":
+                text, color = "予測", QColor("#FFB020")
+            else:
+                text, color = "未", QColor("#8b93a0")
+            if skipped:
+                color = QColor("#7a8190")
+            item = self.list_widget.item(row, col)
+            if item is None:
+                item = QTableWidgetItem()
+                self.list_widget.setItem(row, col, item)
+            item.setText(text)
+            item.setForeground(color)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setData(Qt.ItemDataRole.UserRole, sample.id)
+            item.setFlags((item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled) & ~Qt.ItemFlag.ItemIsEditable)
+        name_col = len(LIST_STATUS_KEYS)
+        name_item = self.list_widget.item(row, name_col)
+        if name_item is None:
+            name_item = QTableWidgetItem()
+            self.list_widget.setItem(row, name_col, name_item)
+        name = sample.source_name
+        if skipped:
+            name = f"パス  {name}"
+        name_item.setText(name)
+        name_item.setForeground(QColor("#7a8190") if skipped else QColor("#c5cad3"))
+        name_item.setData(Qt.ItemDataRole.UserRole, sample.id)
+        name_item.setFlags(
+            (name_item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            & ~Qt.ItemFlag.ItemIsEditable
+        )
+        name_item.setToolTip(sample.source_name)
 
     def _sample_has_active(self, sample: Sample) -> bool:
         if is_piece_key(self._active_key):
-            return any(piece.get("kind") == self._active_key for piece in sample.pieces)
+            return self._active_key in sample.confirmed and any(
+                piece.get("kind") == self._active_key for piece in sample.pieces
+            )
         return self._active_key in sample.confirmed
 
-    def _item_text(self, sample: Sample) -> str:
-        name = PLACE_LABELS.get(self._active_key, "範囲")
-        if sample.status == "skipped":
-            mark = "パス"
-        elif self._sample_has_active(sample):
-            mark = f"{name}済"
-        elif not is_piece_key(self._active_key) and self._active_key in sample.regions:
-            mark = f"{name}予測"
+    def _key_list_state(self, sample: Sample, key: str) -> str:
+        if is_piece_key(key):
+            has = any(piece.get("kind") == key for piece in sample.pieces)
         else:
-            mark = f"{name}未"
-        return f"{mark}  {sample.source_name}"
+            has = key in sample.regions
+        if has and key in sample.confirmed:
+            return "confirmed"
+        if has:
+            return "predicted"
+        return "empty"
 
     def update_stats(self) -> None:
         counts = self.dataset.counts()
@@ -474,7 +636,7 @@ class MainWindow(QMainWindow):
         )
         ready = self.predictor.ready_keys()
         if ready:
-            names = "、".join(REGION_LABELS[key] for key in ready)
+            names = "、".join(PLACE_LABELS.get(key, key) for key in ready)
             self.model_label.setText(f"モデル: {names}。新しい画像には自動で予測します。")
         else:
             self.model_label.setText("モデル: まだありません。範囲を教えてから学習してください。")
@@ -482,17 +644,11 @@ class MainWindow(QMainWindow):
         if self._is_training():
             self._lock_for_training()
             return
+        self.train_btn.setText("学習する")
         has_sample = self.current_id is not None
-        has_active = (
-            bool(self.canvas.all_pieces())
-            if is_piece_key(self._active_key)
-            else self.canvas.current_region() is not None
-        )
-        has_boxes = bool(self.canvas.all_region_boxes()) or bool(self.canvas.all_pieces()) or (
-            not is_piece_key(self._active_key) and self.canvas.current_region() is not None
-        )
-        self.confirm_btn.setEnabled(has_sample and has_boxes)
-        self.confirm_btn.setText("この範囲を保存" if self._needs_save() else "保存済み")
+        has_active = any(self._key_has_content(key) for key in self._selected_place_keys())
+        self.confirm_btn.setEnabled(has_sample and has_active)
+        self.confirm_btn.setText(self._confirm_btn_label())
         self.skip_btn.setEnabled(has_sample)
         self.next_btn.setEnabled(has_sample and self._unlabeled_id(self.current_id) is not None)
         self.prev_btn.setEnabled(has_sample and self._unlabeled_id(self.current_id, backward=True) is not None)
@@ -519,15 +675,18 @@ class MainWindow(QMainWindow):
         self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
         self.delete_btn.setEnabled(has_sample)
 
-    def on_item_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
-        if self._switching:
+    def on_list_cell_changed(
+        self, current_row: int, _current_col: int, previous_row: int, _previous_col: int
+    ) -> None:
+        if self._switching or current_row == previous_row:
             return
         if not self._confirm_discard():
             self._switching = True
-            self.list_widget.setCurrentItem(previous)
+            self.list_widget.setCurrentCell(max(previous_row, 0), 0)
             self._switching = False
             return
-        if current is None:
+        sample_id = self._list_id_at(current_row)
+        if sample_id is None:
             self.current_id = None
             self.canvas.clear_image()
             self._set_spins(None)
@@ -535,7 +694,13 @@ class MainWindow(QMainWindow):
             self._refresh_region_list()
             self.update_stats()
             return
-        self.show_sample(current.data(Qt.ItemDataRole.UserRole))
+        self.show_sample(sample_id)
+
+    def on_place_item_changed(self, _item: QListWidgetItem) -> None:
+        if self.region_list.signalsBlocked():
+            return
+        self._apply_visible_keys()
+        self.update_stats()
 
     def on_region_type_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None:
@@ -546,6 +711,11 @@ class MainWindow(QMainWindow):
         self._active_key = key
         self.canvas.set_active_key(key)
         self._sync_spins_from_canvas()
+        if current.checkState() != Qt.CheckState.Checked:
+            self.region_list.blockSignals(True)
+            current.setCheckState(Qt.CheckState.Checked)
+            self.region_list.blockSignals(False)
+        self._apply_visible_keys()
         self._refresh_region_list()
         self.refresh_list(select_id=self.current_id)
 
@@ -564,29 +734,46 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_region_list(self) -> None:
-        boxes = self.canvas.all_region_boxes() if self.canvas.has_image() else {}
-        pieces = self.canvas.all_pieces() if self.canvas.has_image() else []
         self.region_list.blockSignals(True)
-        selected = None
+        current_item = None
         for row in range(self.region_list.count()):
             item = self.region_list.item(row)
             key = item.data(Qt.ItemDataRole.UserRole)
-            label = PLACE_LABELS.get(key, key)
-            if is_piece_key(key):
-                has = any(piece.get("kind") == key for piece in pieces)
-            else:
-                has = key in boxes
-            item.setText(f"{label}  ✓" if key == self._active_key and has else label)
+            item.setText(PLACE_LABELS.get(key, key))
             if key == self._active_key:
-                selected = item
-        if selected is not None:
-            self.region_list.setCurrentItem(selected)
+                current_item = item
+        if current_item is not None:
+            self.region_list.setCurrentItem(current_item)
         self.region_list.blockSignals(False)
+        self._fit_region_list()
+
+    def _fit_region_list(self) -> None:
+        rows = self.region_list.count()
+        if rows <= 0:
+            return
+        row_h = self.region_list.sizeHintForRow(0)
+        if row_h <= 0:
+            row_h = 28
+        frame = self.region_list.frameWidth() * 2
+        self.region_list.setFixedHeight(rows * row_h + frame + 12)
 
     def show_sample(self, sample_id: str) -> None:
         sample = self.dataset.get(sample_id)
         if sample is None:
             return
+        if self.predictor.piece_model is not None:
+            missing = [
+                key
+                for key in PIECE_KEYS
+                if key not in sample.confirmed
+                and not any(piece.get("kind") == key for piece in sample.pieces)
+            ]
+            if missing:
+                try:
+                    self._predict_into_sample(sample, overwrite=False)
+                except Exception:
+                    pass
+                sample = self.dataset.get(sample_id) or sample
         self.current_id = sample.id
         pixmap = QPixmap(str(sample.image_path))
         regions = {
@@ -602,17 +789,18 @@ class MainWindow(QMainWindow):
             pieces=sample.pieces,
         )
         self.canvas.setFocus()
+        self._apply_visible_keys()
         self._sync_spins_from_canvas()
         self._set_dirty(False)
         self._refresh_region_list()
         if sample.status == "unlabeled":
-            self.hint_label.setText("左の「教える場所」で種類を選び、ドラッグで囲みます。全部できたら「この範囲を保存」。使わないなら「この画像をパス」。")
+            self.hint_label.setText("左のチェックを付けた種類だけ保存します。名前をクリックすると、その枠を直せます。")
         elif sample.status == "predicted":
             self.hint_label.setText("オレンジはゲーム範囲の予測です。他の場所も左から選んで囲めます。保存するか、使わないなら「この画像をパス」。")
         elif sample.status == "skipped":
             self.hint_label.setText("この画像はパス済みです。囲んで保存すれば学習に使えます。")
         else:
-            self.hint_label.setText("色つきの四角が保存済みです。直したあとはもう一度「この範囲を保存」を押してください。")
+            self.hint_label.setText("色つきの四角が付いています。保存したい種類にチェックを付けて保存してください。")
         self.update_stats()
 
     def _remember_last_boxes(self) -> None:
@@ -641,7 +829,7 @@ class MainWindow(QMainWindow):
                 )
                 return
             self.canvas.set_default_radius(self._active_key, radius)
-            self._set_dirty(True)
+            self._set_dirty(self._active_needs_save())
             self.statusBar().showMessage(f"「{name}」の大きさを {radius}px にしました", 4000)
             return
         box = self._last_boxes.get(self._active_key)
@@ -657,7 +845,7 @@ class MainWindow(QMainWindow):
             emit=False,
         )
         self._sync_spins_from_canvas()
-        self._set_dirty(True)
+        self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
         self.statusBar().showMessage(
             f"「{name}」の前の枠を載せました。位置を直して保存してください",
@@ -745,8 +933,7 @@ class MainWindow(QMainWindow):
                 if sample.status != "unlabeled":
                     continue
                 try:
-                    boxes = self.predictor.predict_all(sample.image_path)
-                    if self.dataset.apply_predictions(sample.id, boxes):
+                    if self._predict_into_sample(sample):
                         predicted += 1
                 except Exception:
                     continue
@@ -757,22 +944,22 @@ class MainWindow(QMainWindow):
         if predicted:
             self.statusBar().showMessage(f"{len(samples)} 枚を取り込み、{predicted} 枚を予測しました", 4000)
         else:
-            self.statusBar().showMessage(f"{len(samples)} 枚を取り込みました。範囲を囲んで「この範囲を保存」を押してください", 4000)
+            self.statusBar().showMessage(f"{len(samples)} 枚を取り込みました。種類を選んで囲み、その種類を保存してください", 4000)
 
     def on_region_changed(self, x: int, y: int, w: int, h: int) -> None:
         self._set_spins({"x": x, "y": y, "w": w, "h": h})
-        self._set_dirty(True)
+        self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
 
     def on_region_committed(self, x: int, y: int, w: int, h: int) -> None:
         self._set_spins({"x": x, "y": y, "w": w, "h": h})
-        self._set_dirty(True)
+        self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
         name = PLACE_LABELS.get(self._active_key, "範囲")
-        self.statusBar().showMessage(f"「{name}」はまだ保存していません。「この範囲を保存」を押すと確定します", 4000)
+        self.statusBar().showMessage(f"「{name}」はまだ保存していません。「{name}」を保存すると確定します", 4000)
 
     def on_pieces_changed(self) -> None:
-        self._set_dirty(True)
+        self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
         self.update_stats()
 
@@ -787,16 +974,18 @@ class MainWindow(QMainWindow):
     def _set_dirty(self, dirty: bool) -> None:
         changed = self._dirty != dirty
         self._dirty = dirty
-        self.confirm_btn.setText("この範囲を保存" if dirty or self._needs_save() else "保存済み")
+        self.confirm_btn.setText(self._confirm_btn_label())
         if changed:
             self.update_stats()
         else:
-            has_region = self.canvas.current_region() is not None
-            has_boxes = bool(self.canvas.all_region_boxes()) or has_region
-            self.confirm_btn.setEnabled(self.current_id is not None and has_boxes)
+            has_active = any(self._key_has_content(key) for key in self._selected_place_keys())
+            self.confirm_btn.setEnabled(self.current_id is not None and has_active)
 
     def _confirm_discard(self) -> bool:
         if not self._dirty:
+            return True
+        if not self._active_needs_save():
+            self._set_dirty(False)
             return True
         answer = QMessageBox.question(
             self,
@@ -840,7 +1029,7 @@ class MainWindow(QMainWindow):
             return
         x, y, w, h = self.spin_x.value(), self.spin_y.value(), self.spin_w.value(), self.spin_h.value()
         self.canvas.set_region(QRectF(x, y, w, h), status="labeled", emit=False)
-        self._set_dirty(True)
+        self._set_dirty(self._active_needs_save())
 
     def confirm_current(self) -> None:
         if self._block_if_training():
@@ -850,48 +1039,55 @@ class MainWindow(QMainWindow):
     def save_current_region(self) -> bool:
         if not self.current_id:
             return False
-        boxes = self.canvas.all_region_boxes()
-        pieces = self.canvas.all_pieces()
-        if not boxes and not pieces:
-            QMessageBox.information(self, "範囲がありません", "先に左の種類を選んで囲むか、ツムに〇を付けてください。")
+        keys = self._selected_place_keys()
+        ready = [key for key in keys if self._key_has_content(key)]
+        missing = [key for key in keys if key not in ready]
+        if not ready:
+            names = "、".join(PLACE_LABELS.get(key, key) for key in keys)
+            QMessageBox.information(self, "範囲がありません", f"選んだ「{names}」に、まだ枠や〇がありません。")
             return False
-        sample = self.dataset.get(self.current_id)
-        already = (
-            not self._dirty
-            and sample is not None
-            and sample.regions == boxes
-            and sample.pieces == pieces
-        )
-        if already:
+        if not any(self._key_needs_save(key) for key in ready):
+            names = "、".join(PLACE_LABELS.get(key, key) for key in ready)
             QMessageBox.information(
                 self,
                 "すでに保存済みです",
-                "いま画面にある四角と〇は保存できています。\n"
-                "直したあとにもう一度押せば上書きされます。",
+                f"「{names}」は保存できています。\n直したあとにもう一度押せば上書きされます。",
             )
             return True
-        self.dataset.set_regions(self.current_id, boxes, pieces=pieces)
-        for key, box in boxes.items():
-            self._last_boxes[key] = dict(box)
-        for piece in pieces:
-            self._last_piece_radius[str(piece["kind"])] = int(piece["r"])
+        saved_names: list[str] = []
+        for key in ready:
+            saved_names.append(self._save_one_key(key))
         self._set_dirty(False)
         self.refresh_list(select_id=self.current_id)
         self._refresh_region_list()
         self.update_stats()
-        names = "、".join(PLACE_LABELS.get(key, key) for key in boxes)
-        if pieces:
-            tsum_n = sum(1 for piece in pieces if piece["kind"] == "tsum")
-            bomb_n = sum(1 for piece in pieces if piece["kind"] == "bomb")
-            extra = []
-            if tsum_n:
-                extra.append(f"ツム{tsum_n}")
-            if bomb_n:
-                extra.append(f"ボム{bomb_n}")
-            names = "、".join([n for n in [names, *extra] if n])
-        self.statusBar().showMessage(f"保存しました: {names}", 4000)
-        self._show_save_toast(names)
+        toast = "、".join(saved_names)
+        extra = ""
+        if missing:
+            extra = "。枠のない " + "、".join(PLACE_LABELS.get(key, key) for key in missing) + " は飛ばしました"
+        self.statusBar().showMessage(f"保存しました: {toast}{extra}", 4000)
+        self._show_save_toast(toast)
         return True
+
+    def _save_one_key(self, key: str) -> str:
+        name = PLACE_LABELS.get(key, "範囲")
+        if is_piece_key(key):
+            pieces = [piece for piece in self.canvas.all_pieces() if piece["kind"] == key]
+            expected = self.canvas.radius_for_kind(key)
+            cleaned = []
+            for piece in pieces:
+                item = dict(piece)
+                if int(item.get("r") or 0) < expected * 0.5:
+                    item["r"] = expected
+                cleaned.append(item)
+            self.dataset.confirm_key(self.current_id, key, pieces=cleaned)
+            for piece in cleaned:
+                self._last_piece_radius[key] = int(piece["r"])
+            return f"{name} {len(cleaned)}"
+        box = self.canvas.all_region_boxes()[key]
+        self.dataset.confirm_key(self.current_id, key, box=box)
+        self._last_boxes[key] = dict(box)
+        return name
 
     def _show_save_toast(self, names: str) -> None:
         text = "保存しました" if not names else f"保存しました\n{names}"
@@ -907,7 +1103,7 @@ class MainWindow(QMainWindow):
 
     def _hide_save_toast(self) -> None:
         self._toast.hide()
-        self.confirm_btn.setText("この範囲を保存" if self._needs_save() else "保存済み")
+        self.confirm_btn.setText(self._confirm_btn_label())
 
     def skip_current(self) -> None:
         if self._block_if_training() or not self.current_id:
@@ -1002,6 +1198,69 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self.statusBar().showMessage(f"dataをコピーしました: {dest}", 5000)
 
+    def _ensure_app_icon(self) -> Path | None:
+        path = APP_ROOT / "app.ico"
+        if path.exists():
+            return path
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            return None
+        image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((28, 8, 118, 98), fill=(255, 224, 102, 255), outline=(32, 28, 40, 255), width=8)
+        draw.ellipse((138, 8, 228, 98), fill=(255, 224, 102, 255), outline=(32, 28, 40, 255), width=8)
+        draw.ellipse((18, 48, 238, 248), fill=(255, 224, 102, 255), outline=(32, 28, 40, 255), width=10)
+        draw.ellipse((78, 118, 108, 148), fill=(32, 28, 40, 255))
+        draw.ellipse((148, 118, 178, 148), fill=(32, 28, 40, 255))
+        image.save(path, format="ICO", sizes=[(256, 256), (64, 64), (48, 48), (32, 32), (16, 16)])
+        return path
+
+    def create_launch_shortcut(self) -> None:
+        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+        if not desktop:
+            QMessageBox.warning(self, "デスクトップがありません", "デスクトップの場所が分かりませんでした。")
+            return
+        lnk = Path(desktop) / "ツムツム ゲーム範囲トレーナー.lnk"
+        python = Path(sys.executable)
+        pythonw = python.with_name("pythonw.exe")
+        target = pythonw if pythonw.exists() else python
+        script = APP_ROOT / "main.py"
+        icon = self._ensure_app_icon()
+
+        def ps_quote(value: str) -> str:
+            return "'" + value.replace("'", "''") + "'"
+
+        icon_line = f"$s.IconLocation = {ps_quote(str(icon) + ',0')}" if icon else ""
+        command = (
+            "$ws = New-Object -ComObject WScript.Shell\n"
+            f"$s = $ws.CreateShortcut({ps_quote(str(lnk))})\n"
+            f"$s.TargetPath = {ps_quote(str(target))}\n"
+            f"$s.Arguments = {ps_quote(chr(34) + str(script) + chr(34))}\n"
+            f"$s.WorkingDirectory = {ps_quote(str(APP_ROOT))}\n"
+            "$s.WindowStyle = 1\n"
+            "$s.Description = 'ツムツム ゲーム範囲トレーナー'\n"
+            f"{icon_line}\n"
+            "$s.Save()\n"
+        )
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-Command", command],
+                check=False,
+                capture_output=True,
+                text=True,
+                creationflags=flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "アイコンを作れませんでした", str(exc))
+            return
+        if result.returncode != 0 or not lnk.exists():
+            err = (result.stderr or result.stdout or "ショートカットを作れませんでした").strip()
+            QMessageBox.critical(self, "アイコンを作れませんでした", err)
+            return
+        QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
+
     def _resolve_data_dir(self, path: Path) -> Path | None:
         if (path / "index.json").exists() or (path / "images").is_dir() or (path / "models").is_dir():
             return path
@@ -1069,43 +1328,120 @@ class MainWindow(QMainWindow):
         if sample is None:
             return
         try:
-            boxes = self.predictor.predict_all(sample.image_path)
-            added = self.dataset.apply_predictions(sample.id, boxes)
+            added = self._predict_into_sample(sample)
             self.refresh_list(select_id=sample.id)
             self.show_sample(sample.id)
             if added:
-                names = "、".join(REGION_LABELS.get(key, key) for key in added)
+                names = "、".join(PLACE_LABELS.get(key, key) for key in added)
                 self.statusBar().showMessage(f"予測を入れました: {names}。合っていれば保存してください", 4000)
             else:
                 self.statusBar().showMessage("保存済みの場所はそのままです。足りない場所はありませんでした", 4000)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "予測に失敗", str(exc))
 
-    def _trainable_jobs(self) -> list[tuple[str, list, object]]:
-        jobs = []
+    def _trainable_jobs(self) -> list[tuple]:
+        selected = set(self._selected_place_keys())
+        jobs: list[tuple] = []
         for key in REGION_KEYS:
+            if key not in selected:
+                continue
             samples = self.dataset.labeled_for(key)
             if len(samples) >= MIN_TRAIN_SAMPLES:
-                jobs.append((key, samples, self.dataset.model_path_for(key)))
+                jobs.append((key, samples, self.dataset.model_path_for(key), self._job_label(key)))
+        piece_keys = [key for key in PIECE_KEYS if key in selected]
+        if piece_keys:
+            piece_map = {
+                sample.id: sample
+                for key in piece_keys
+                for sample in self.dataset.labeled_for(key)
+            }
+            piece_samples = list(piece_map.values())
+            if len(piece_samples) >= MIN_TRAIN_SAMPLES:
+                jobs.append(
+                    (
+                        "pieces",
+                        piece_samples,
+                        self.dataset.model_path_for("pieces"),
+                        self._piece_job_label(piece_keys),
+                    )
+                )
         return jobs
 
+    def _piece_job_label(self, keys: list[str] | None = None) -> str:
+        selected = keys or [key for key in PIECE_KEYS if key in self._selected_place_keys()]
+        if not selected:
+            selected = list(PIECE_KEYS)
+        return "・".join(PLACE_LABELS[key] for key in selected)
+
+    def _job_label(self, key: str) -> str:
+        if key == "pieces":
+            return self._piece_job_label()
+        return PLACE_LABELS.get(key, key)
+
     def _needs_save(self) -> bool:
-        if self._dirty:
-            return True
+        return self._active_needs_save()
+
+    def _confirm_btn_label(self) -> str:
+        if not self._active_needs_save():
+            return "保存済み"
+        keys = self._selected_place_keys()
+        if len(keys) == 1:
+            return f"「{PLACE_LABELS.get(keys[0], '範囲')}」を保存"
+        return f"選んだ{len(keys)}件を保存"
+
+    def _apply_visible_keys(self) -> None:
+        self.canvas.set_visible_keys(self._selected_place_keys())
+
+    def _selected_place_keys(self) -> list[str]:
+        keys: list[str] = []
+        for row in range(self.region_list.count()):
+            item = self.region_list.item(row)
+            if item is None or item.checkState() != Qt.CheckState.Checked:
+                continue
+            key = item.data(Qt.ItemDataRole.UserRole)
+            if key:
+                keys.append(key)
+        if not keys and self._active_key:
+            return [self._active_key]
+        return keys
+
+    def _key_has_content(self, key: str) -> bool:
+        if is_piece_key(key):
+            return self.canvas.has_piece_of_kind(key)
+        return key in self.canvas.all_region_boxes()
+
+    def _active_needs_save(self) -> bool:
+        return any(self._key_needs_save(key) for key in self._selected_place_keys())
+
+    def _key_needs_save(self, key: str) -> bool:
         if not self.current_id or not self.canvas.has_image():
             return False
         sample = self.dataset.get(self.current_id)
-        if sample is None:
+        if is_piece_key(key):
+            canvas = [piece for piece in self.canvas.all_pieces() if piece["kind"] == key]
+            saved = [piece for piece in (sample.pieces if sample else []) if piece.get("kind") == key]
+            if not canvas:
+                return False
+            return canvas != saved or sample is None or key not in sample.confirmed
+        box = self.canvas.all_region_boxes().get(key)
+        if box is None:
             return False
-        boxes = self.canvas.all_region_boxes()
-        pieces = self.canvas.all_pieces()
-        return sample.regions != boxes or sample.pieces != pieces
+        saved = sample.regions.get(key) if sample else None
+        return box != saved or sample is None or key not in sample.confirmed
+
+    def _canvas_differs_from_saved(self) -> bool:
+        if not self.current_id:
+            return False
+        sample = self.dataset.get(self.current_id)
+        if sample is None:
+            return True
+        return self.canvas.all_region_boxes() != sample.regions or self.canvas.all_pieces() != sample.pieces
 
     def _is_training(self) -> bool:
         return self.train_worker is not None and self.train_worker.isRunning()
 
-    def _lock_for_training(self) -> None:
-        for widget in (
+    def _training_lock_widgets(self) -> tuple:
+        return (
             self.open_btn,
             self.paste_btn,
             self.confirm_btn,
@@ -1115,10 +1451,10 @@ class MainWindow(QMainWindow):
             self.clear_btn,
             self.undo_piece_btn,
             self.predict_btn,
-            self.train_btn,
             self.delete_btn,
             self.copy_data_btn,
             self.import_data_btn,
+            self.shortcut_btn,
             self.video_app_btn,
             self.reuse_btn,
             self.region_list,
@@ -1129,9 +1465,20 @@ class MainWindow(QMainWindow):
             self.spin_w,
             self.spin_h,
             self.spin_group,
-        ):
+        )
+
+    def _lock_for_training(self) -> None:
+        for widget in self._training_lock_widgets():
             widget.setEnabled(False)
-        self.hint_label.setText("学習中です。終わるまで他の操作はできません。")
+        self.train_btn.setEnabled(True)
+        self.train_btn.setText("中止")
+        self.hint_label.setText("学習中です。中止できます。")
+
+    def _unlock_after_training(self) -> None:
+        for widget in self._training_lock_widgets():
+            widget.setEnabled(True)
+        self.train_btn.setText("学習する")
+        self.hint_label.setText("色つきの四角が付いています。保存したい種類にチェックを付けて保存してください。")
 
     def _block_if_training(self) -> bool:
         if not self._is_training():
@@ -1148,32 +1495,40 @@ class MainWindow(QMainWindow):
     def start_training(self) -> None:
         if self._is_training():
             return
+        selected = self._selected_place_keys()
         jobs = self._trainable_jobs()
         counts = self.dataset.labeled_counts()
         if not jobs:
             lines = [
-                f"学習には種類ごとに正解が {MIN_TRAIN_SAMPLES} 枚以上必要です。",
+                f"チェックした種類の学習には、正解が {MIN_TRAIN_SAMPLES} 枚以上必要です。",
                 "",
             ]
-            lines.extend(f"{REGION_LABELS[key]}: {counts[key]} 枚" for key in REGION_KEYS)
+            lines.extend(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚" for key in selected)
             QMessageBox.information(self, "まだ足りません", "\n".join(lines))
             return
-        ready_lines = [
-            f"{REGION_LABELS[key]}: {len(samples)} 枚" for key, samples, _path in jobs
-        ]
-        skipped = [
-            f"{REGION_LABELS[key]}: {counts[key]} 枚" for key in REGION_KEYS if counts[key] < MIN_TRAIN_SAMPLES
-        ]
-        message = "次の場所を学習します。\n" + "\n".join(ready_lines)
+        ready_lines = [f"{job[3]}: {len(job[1])} 枚" for job in jobs]
+        trained_keys = {job[0] for job in jobs}
+        skipped = []
+        for key in selected:
+            if key in PIECE_KEYS:
+                if "pieces" in trained_keys:
+                    continue
+                skipped.append(f"{PLACE_LABELS[key]}: {counts[key]} 枚")
+            elif key not in trained_keys:
+                skipped.append(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚")
+        message = "チェックした種類だけ学習します。\n" + "\n".join(ready_lines)
+        piece_selected = [key for key in PIECE_KEYS if key in selected]
+        if len(piece_selected) == 1 and "pieces" in trained_keys:
+            other = "ボム" if piece_selected[0] == "tsum" else "ツム"
+            message += f"\n（ツムとボムは同じモデルです。{PLACE_LABELS[piece_selected[0]]}だけ学ぶと、{other}の予測も更新されます。）"
         if skipped:
-            message += "\n\n枚数が足りない場所は今回スキップします。\n" + "\n".join(skipped)
+            message += "\n\n枚数が足りないので、今回は学びません。\n" + "\n".join(skipped)
         answer = QMessageBox.question(self, "学習を開始", message)
         if answer != QMessageBox.StandardButton.Yes:
             return
         self.progress.setVisible(True)
         self.progress.setRange(0, 40 * len(jobs))
         self.progress.setValue(0)
-        self.train_btn.setEnabled(False)
         self.train_worker = TrainWorker(jobs)
         self.train_worker.progress.connect(self.on_train_progress)
         self.train_worker.finished_ok.connect(self.on_train_finished)
@@ -1182,7 +1537,22 @@ class MainWindow(QMainWindow):
         self._lock_for_training()
         self._place_train_fx()
         self._train_fx.start()
-        self.statusBar().showMessage("学習中です。終わるまで他の操作はできません")
+        self.statusBar().showMessage("学習中です。中止できます")
+
+    def on_train_button(self) -> None:
+        if self._is_training():
+            self.cancel_training()
+            return
+        self.start_training()
+
+    def cancel_training(self) -> None:
+        if self.train_worker is None or not self.train_worker.isRunning():
+            return
+        self.train_btn.setEnabled(False)
+        self.train_btn.setText("中止しています…")
+        self._train_fx.set_cancelling()
+        self.train_worker.requestInterruption()
+        self.statusBar().showMessage("学習を中止しています")
 
     def on_train_progress(self, epoch: int, total: int, message: str) -> None:
         self.progress.setRange(0, total)
@@ -1191,30 +1561,52 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def on_train_finished(self, metrics: dict) -> None:
-        self.train_worker = None
+        worker = self.train_worker
         self.progress.setVisible(False)
         self._train_fx.stop()
-        self.predictor.reload()
-        applied = self._apply_predictions_to_unlabeled()
+        if worker is not None:
+            worker.wait(8000)
+        self.train_worker = None
+        self._unlock_after_training()
+        try:
+            self.predictor.reload()
+        except Exception:
+            pass
         self.update_stats()
         self.refresh_list(select_id=self.current_id)
         if self.current_id:
             self.show_sample(self.current_id)
+        if metrics.get("cancelled"):
+            done = metrics.get("results") or []
+            extra = ""
+            if done:
+                names = "、".join(item.get("label", "") for item in done)
+                extra = f"\n終わる前に保存できたもの: {names}"
+            QMessageBox.information(self, "学習を中止", "学習を中止しました。" + extra)
+            self.statusBar().showMessage("学習を中止しました", 4000)
+            return
         results = metrics.get("results") or []
-        lines = [
-            f"{item['label']}  IoU {item['iou']:.3f}（{item['samples']} 枚）" for item in results
-        ]
+        lines = []
+        for item in results:
+            if item.get("key") == "pieces":
+                lines.append(f"{item['label']}  loss {item.get('loss', 0):.4f}（{item['samples']} 枚）")
+            else:
+                lines.append(f"{item['label']}  IoU {item['iou']:.3f}（{item['samples']} 枚）")
         QMessageBox.information(
             self,
             "学習完了",
-            "\n".join(lines) + f"\n\n未設定の箇所 {applied} 件に予測を入れました。",
+            "\n".join(lines) + "\n\n今の画像に予測を入れました。他の画像は開いたときに予測します。",
         )
         self.statusBar().showMessage("学習が完了しました", 4000)
 
     def on_train_failed(self, message: str) -> None:
-        self.train_worker = None
+        worker = self.train_worker
         self.progress.setVisible(False)
         self._train_fx.stop()
+        if worker is not None:
+            worker.wait(8000)
+        self.train_worker = None
+        self._unlock_after_training()
         self.update_stats()
         self.hint_label.setText("学習に失敗しました。他の操作が使えます。")
         QMessageBox.critical(self, "学習に失敗", message)
@@ -1227,12 +1619,32 @@ class MainWindow(QMainWindow):
             if sample.status == "skipped":
                 continue
             try:
-                boxes = self.predictor.predict_all(sample.image_path)
-                added = self.dataset.apply_predictions(sample.id, boxes)
+                added = self._predict_into_sample(sample)
             except Exception:
                 continue
             applied += len(added)
         return applied
+
+    def _predict_into_sample(self, sample: Sample, *, overwrite: bool = True) -> list[str]:
+        added: list[str] = []
+        boxes = self.predictor.predict_all(sample.image_path)
+        if boxes:
+            added.extend(self.dataset.apply_predictions(sample.id, boxes))
+        sample = self.dataset.get(sample.id) or sample
+        game = sample.regions.get("game") or sample.game_region
+        pieces = self.predictor.predict_pieces(sample.image_path, game)
+        if pieces:
+            if not overwrite:
+                existing = {str(piece.get("kind")) for piece in sample.pieces}
+                confirmed = set(sample.confirmed)
+                pieces = [
+                    piece
+                    for piece in pieces
+                    if piece.get("kind") not in existing and piece.get("kind") not in confirmed
+                ]
+            if pieces:
+                added.extend(self.dataset.apply_piece_predictions(sample.id, pieces))
+        return added
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self.canvas and event.type() == QEvent.Type.Resize:
@@ -1251,7 +1663,7 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _select_image_by_delta(self, delta: int) -> None:
-        count = self.list_widget.count()
+        count = self.list_widget.rowCount()
         if count <= 0:
             return
         row = self.list_widget.currentRow()
@@ -1274,7 +1686,7 @@ class MainWindow(QMainWindow):
             if sample.status == "skipped":
                 return False
             if is_piece_key(self._active_key):
-                return not any(piece.get("kind") == self._active_key for piece in sample.pieces)
+                return self._active_key not in sample.confirmed
             return self._active_key not in sample.confirmed
 
         ids = [sample.id for sample in samples]
@@ -1290,10 +1702,9 @@ class MainWindow(QMainWindow):
         return None
 
     def _select_image_id(self, sample_id: str) -> None:
-        for row in range(self.list_widget.count()):
-            item = self.list_widget.item(row)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == sample_id:
-                self.list_widget.setCurrentRow(row)
+        for row in range(self.list_widget.rowCount()):
+            if self._list_id_at(row) == sample_id:
+                self.list_widget.setCurrentCell(row, 0)
                 return
 
     def go_next_image(self) -> None:
@@ -1315,8 +1726,9 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.train_worker is not None and self.train_worker.isRunning():
+            self.train_worker.requestInterruption()
+            self.train_worker.wait(15000)
             self._train_fx.stop()
-            self.train_worker.wait(1000)
         event.accept()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:

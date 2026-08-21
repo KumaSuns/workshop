@@ -3,9 +3,9 @@ from __future__ import annotations
 import math
 import random
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QRadialGradient
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QPushButton, QWidget
 
 COLORS = [
     "#FF6B9D",
@@ -24,14 +24,30 @@ QUIPS = [
     "〇の場所を覚えています",
     "ボムの形もメモ中…",
     "フィーバー！もうちょっと！",
-    "つながっても見逃さないぞ",
     "がんばるぞ〜",
     "スコアより学習が大事",
     "コンボより正解が大事",
 ]
 
+BUBBLES = [
+    "おぼえた！",
+    "ここだよ",
+    "むずかしい…",
+    "がんばれ",
+    "フィーバー！",
+    "〇つけた",
+    "ボムだ！",
+    "わかった",
+    "もういっちょ",
+    "できた！",
+    "みてみて",
+    "つむっ",
+]
+
 
 class TrainEffect(QWidget):
+    cancelRequested = Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
@@ -45,6 +61,15 @@ class TrainEffect(QWidget):
         self._status = "学習中です"
         self._quip = QUIPS[0]
         self._pulse = 0.0
+        self._cancel_btn = QPushButton("中止", self)
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.setStyleSheet(
+            "QPushButton { background: #c23b4a; color: #f2f5f8; font-size: 16px; font-weight: 700; "
+            "border: none; border-radius: 10px; padding: 8px 22px; min-width: 120px; min-height: 40px; }"
+            "QPushButton:hover { background: #e04b5c; }"
+            "QPushButton:disabled { background: #5a3a40; color: #c5cad3; }"
+        )
+        self._cancel_btn.clicked.connect(self.cancelRequested.emit)
 
     def start(self) -> None:
         self.setGeometry(self.parentWidget().rect() if self.parentWidget() else self.rect())
@@ -55,8 +80,12 @@ class TrainEffect(QWidget):
         self._status = "学習中です"
         self._quip = random.choice(QUIPS)
         self._spawn_blobs()
+        self._cancel_btn.setEnabled(True)
+        self._cancel_btn.setText("中止")
         self.show()
         self.raise_()
+        self._place_cancel()
+        self._cancel_btn.raise_()
         self._timer.start(16)
 
     def stop(self) -> None:
@@ -64,6 +93,23 @@ class TrainEffect(QWidget):
         self.hide()
         self._blobs = []
         self._sparkles = []
+
+    def set_cancelling(self) -> None:
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("中止しています…")
+        self._status = "学習を中止しています"
+
+    def _place_cancel(self) -> None:
+        bar_y = self.height() - 28 - 22
+        self._cancel_btn.adjustSize()
+        width = max(120, self._cancel_btn.width())
+        height = max(40, self._cancel_btn.height())
+        self._cancel_btn.setFixedSize(width, height)
+        self._cancel_btn.move(max(12, (self.width() - width) // 2), max(12, int(bar_y) - height - 40))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_cancel()
 
     def set_progress(self, epoch: int, total: int, message: str) -> None:
         self._progress = epoch / max(1, total)
@@ -89,6 +135,9 @@ class TrainEffect(QWidget):
                     "color": COLORS[index % len(COLORS)],
                     "spin": random.uniform(0, 6.28),
                     "squash": 1.0,
+                    "ears": random.choice(["round", "round", "small", "none"]),
+                    "bubble": None,
+                    "bubble_life": 0,
                 }
             )
 
@@ -99,6 +148,18 @@ class TrainEffect(QWidget):
         height = max(self.height(), 1)
         if self._tick_n % 90 == 0:
             self._quip = random.choice(QUIPS)
+        talking = sum(1 for blob in self._blobs if blob.get("bubble_life", 0) > 0)
+        if self._tick_n % 48 == 0 and talking < 3 and self._blobs:
+            quiet = [blob for blob in self._blobs if blob.get("bubble_life", 0) <= 0]
+            if quiet:
+                speaker = random.choice(quiet)
+                speaker["bubble"] = random.choice(BUBBLES)
+                speaker["bubble_life"] = random.randint(70, 110)
+        for blob in self._blobs:
+            if blob.get("bubble_life", 0) > 0:
+                blob["bubble_life"] -= 1
+                if blob["bubble_life"] <= 0:
+                    blob["bubble"] = None
         for blob in self._blobs:
             blob["vy"] += 0.28
             blob["x"] += blob["vx"]
@@ -114,8 +175,8 @@ class TrainEffect(QWidget):
                 blob["x"] = width - radius
                 blob["vx"] = -abs(blob["vx"])
                 blob["squash"] = 0.72
-            if blob["y"] > height - radius - 8:
-                blob["y"] = height - radius - 8
+            if blob["y"] > height - radius - 56:
+                blob["y"] = height - radius - 56
                 blob["vy"] = -random.uniform(8.5, 13.5)
                 blob["squash"] = 0.62
                 self._burst(blob["x"], blob["y"] + radius * 0.4, blob["color"])
@@ -156,54 +217,81 @@ class TrainEffect(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor(10, 12, 18, 210))
-        self._draw_links(painter)
         for blob in self._blobs:
             self._draw_blob(painter, blob)
+        for blob in self._blobs:
+            self._draw_bubble(painter, blob)
         for sparkle in self._sparkles:
             self._draw_sparkle(painter, sparkle)
         self._draw_banner(painter)
-
-    def _draw_links(self, painter: QPainter) -> None:
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for index, left in enumerate(self._blobs):
-            for right in self._blobs[index + 1 :]:
-                dx = left["x"] - right["x"]
-                dy = left["y"] - right["y"]
-                dist = math.hypot(dx, dy)
-                if dist > left["r"] + right["r"] + 36:
-                    continue
-                color = QColor("#7FD9FF")
-                color.setAlpha(120)
-                painter.setPen(QPen(color, 4))
-                painter.drawLine(QPointF(left["x"], left["y"]), QPointF(right["x"], right["y"]))
 
     def _draw_blob(self, painter: QPainter, blob: dict) -> None:
         radius = blob["r"]
         squash = blob["squash"]
         cx, cy = blob["x"], blob["y"]
         color = QColor(blob["color"])
-        glow = QRadialGradient(QPointF(cx, cy - radius * 0.2), radius * 1.4)
-        glow.setColorAt(0.0, color.lighter(130))
-        glow.setColorAt(0.55, color)
-        glow.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 40))
+        ry = radius * squash
         painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color.darker(118))
+        ears = blob.get("ears", "round")
+        if ears != "none":
+            ear_r = radius * (0.38 if ears == "round" else 0.26)
+            painter.drawEllipse(QPointF(cx - radius * 0.62, cy - ry * 0.72), ear_r, ear_r * 0.95)
+            painter.drawEllipse(QPointF(cx + radius * 0.62, cy - ry * 0.72), ear_r, ear_r * 0.95)
+        glow = QRadialGradient(QPointF(cx, cy - ry * 0.25), radius * 1.35)
+        glow.setColorAt(0.0, color.lighter(135))
+        glow.setColorAt(0.5, color)
+        glow.setColorAt(1.0, color.darker(120))
         painter.setBrush(glow)
-        painter.drawEllipse(QPointF(cx, cy), radius, radius * squash)
-        painter.setBrush(QColor(255, 255, 255, 70))
-        painter.drawEllipse(QPointF(cx - radius * 0.28, cy - radius * 0.32 * squash), radius * 0.22, radius * 0.16)
+        painter.drawEllipse(QPointF(cx, cy), radius, ry)
+        painter.setBrush(QColor(255, 255, 255, 80))
+        painter.drawEllipse(QPointF(cx - radius * 0.28, cy - ry * 0.38), radius * 0.28, ry * 0.18)
+        blush = QColor(color.red(), 90, 110, 90)
+        painter.setBrush(blush)
+        painter.drawEllipse(QPointF(cx - radius * 0.38, cy + ry * 0.12), radius * 0.14, ry * 0.08)
+        painter.drawEllipse(QPointF(cx + radius * 0.38, cy + ry * 0.12), radius * 0.14, ry * 0.08)
         painter.setBrush(QColor(28, 24, 36))
-        eye_y = cy - radius * 0.08 * squash
-        painter.drawEllipse(QPointF(cx - radius * 0.22, eye_y), 4.5, 5.5)
-        painter.drawEllipse(QPointF(cx + radius * 0.22, eye_y), 4.5, 5.5)
+        eye_y = cy - ry * 0.06
+        painter.drawEllipse(QPointF(cx - radius * 0.2, eye_y), 4.2, 5.4)
+        painter.drawEllipse(QPointF(cx + radius * 0.2, eye_y), 4.2, 5.4)
+        painter.setBrush(QColor(255, 255, 255, 220))
+        painter.drawEllipse(QPointF(cx - radius * 0.2 + 1.2, eye_y - 1.4), 1.6, 1.8)
+        painter.drawEllipse(QPointF(cx + radius * 0.2 + 1.2, eye_y - 1.4), 1.6, 1.8)
         smile = QPainterPath()
-        smile.moveTo(cx - radius * 0.22, cy + radius * 0.18 * squash)
+        smile.moveTo(cx - radius * 0.18, cy + ry * 0.2)
         smile.quadTo(
-            QPointF(cx, cy + radius * 0.34 * squash),
-            QPointF(cx + radius * 0.22, cy + radius * 0.18 * squash),
+            QPointF(cx, cy + ry * 0.36),
+            QPointF(cx + radius * 0.18, cy + ry * 0.2),
         )
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor(28, 24, 36), 3))
+        painter.setPen(QPen(QColor(28, 24, 36), 2.6))
         painter.drawPath(smile)
+
+    def _draw_bubble(self, painter: QPainter, blob: dict) -> None:
+        text = blob.get("bubble")
+        if not text or blob.get("bubble_life", 0) <= 0:
+            return
+        painter.setFont(QFont("Yu Gothic UI", 11, QFont.Weight.Bold))
+        metrics = painter.fontMetrics()
+        tw = metrics.horizontalAdvance(text) + 18
+        th = metrics.height() + 10
+        cx = blob["x"]
+        cy = blob["y"]
+        radius = blob["r"] * blob.get("squash", 1.0)
+        bx = int(cx - tw / 2)
+        by = int(cy - radius - th - 16)
+        bx = max(8, min(bx, self.width() - tw - 8))
+        by = max(8, by)
+        painter.setPen(QPen(QColor(40, 36, 48), 2))
+        painter.setBrush(QColor(255, 255, 255, 240))
+        painter.drawRoundedRect(bx, by, tw, th, 10, 10)
+        tail = QPainterPath()
+        tail.moveTo(cx - 7, by + th)
+        tail.lineTo(cx, by + th + 9)
+        tail.lineTo(cx + 7, by + th)
+        painter.drawPath(tail)
+        painter.setPen(QColor(40, 36, 48))
+        painter.drawText(QRect(bx, by, tw, th), Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_sparkle(self, painter: QPainter, sparkle: dict) -> None:
         color = QColor(sparkle["color"])
@@ -215,6 +303,7 @@ class TrainEffect(QWidget):
 
     def _draw_banner(self, painter: QPainter) -> None:
         width = self.width()
+        height = self.height()
         pulse = 0.5 + 0.5 * math.sin(self._pulse)
         title = QFont("Yu Gothic UI", 28, QFont.Weight.Black)
         painter.setFont(title)
@@ -224,25 +313,35 @@ class TrainEffect(QWidget):
         painter.setFont(sub)
         painter.setPen(QColor(242, 245, 248))
         painter.drawText(self.rect().adjusted(0, 74, 0, 0), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self._quip)
-        painter.setPen(QColor(154, 163, 178))
-        painter.drawText(self.rect().adjusted(0, 100, 0, 0), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self._status)
-        bar_w = min(420, width - 80)
-        bar_h = 16
+
+        bar_h = 28
+        bar_w = max(200, width - 64)
         bar_x = (width - bar_w) / 2
-        bar_y = 132
+        bar_y = height - bar_h - 22
+        painter.setPen(QColor(154, 163, 178))
+        painter.setFont(QFont("Yu Gothic UI", 12, QFont.Weight.DemiBold))
+        painter.drawText(
+            0,
+            int(bar_y) - 28,
+            width,
+            24,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+            self._status,
+        )
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(16, 18, 22, 220))
-        painter.drawRoundedRect(int(bar_x), bar_y, bar_w, bar_h, 8, 8)
-        fill = max(8, int(bar_w * min(1.0, self._progress)))
-        painter.setBrush(QColor("#FFE066"))
-        painter.drawRoundedRect(int(bar_x), bar_y, fill, bar_h, 8, 8)
-        painter.setPen(QColor("#16181d"))
-        painter.setFont(QFont("Yu Gothic UI", 9, QFont.Weight.Bold))
+        painter.setBrush(QColor(16, 18, 22, 230))
+        painter.drawRoundedRect(int(bar_x), int(bar_y), int(bar_w), bar_h, 10, 10)
+        fill = int(bar_w * min(1.0, max(0.0, self._progress)))
+        if fill > 0:
+            painter.setBrush(QColor("#FFE066"))
+            painter.drawRoundedRect(int(bar_x), int(bar_y), max(18, fill) if fill > 0 else 0, bar_h, 10, 10)
+        painter.setPen(QColor("#16181d") if fill > bar_w * 0.45 else QColor("#f2f5f8"))
+        painter.setFont(QFont("Yu Gothic UI", 12, QFont.Weight.Bold))
         painter.drawText(
             int(bar_x),
-            bar_y,
-            bar_w,
+            int(bar_y),
+            int(bar_w),
             bar_h,
             Qt.AlignmentFlag.AlignCenter,
-            f"{int(self._progress * 100)}%",
+            f"学習  {int(self._progress * 100)}%",
         )

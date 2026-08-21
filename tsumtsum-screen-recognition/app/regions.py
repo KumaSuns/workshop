@@ -26,10 +26,40 @@ PLACE_SPECS = REGION_SPECS + PIECE_SPECS
 PLACE_LABELS = {**REGION_LABELS, **PIECE_LABELS}
 PLACE_COLORS = {**REGION_COLORS, **PIECE_COLORS}
 
+TSUM_GROUP_COLORS = [
+    "#FFE066",
+    "#7EC8FF",
+    "#FF8AD4",
+    "#5CFF9E",
+    "#FF9F43",
+    "#C084FC",
+    "#4ECDC4",
+    "#FF6B6B",
+    "#F472B6",
+    "#80E0D0",
+    "#A5B4FC",
+    "#FFD166",
+]
+
+
+def tsum_group_color(group: int) -> str:
+    index = max(1, min(12, int(group or 1))) - 1
+    return TSUM_GROUP_COLORS[index]
+
 
 def is_piece_key(key: str) -> bool:
     return key in PIECE_KEYS
 
 
+def piece_radius_from_game(width: float, kind: str = "tsum") -> int:
+    span = max(1.0, float(width))
+    divisor = 12.0 if kind == "bomb" else 15.0
+    return max(8, int(round(span / divisor)))
+
+
 def model_filename(key: str) -> str:
-    return "game_region.pt" if key == "game" else f"{key}.pt"
+    if key == "game":
+        return "game_region.pt"
+    if key == "pieces":
+        return "pieces.pt"
+    return f"{key}.pt"

@@ -13,7 +13,16 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView, QLabel
 
-from app.regions import PIECE_COLORS, PIECE_KEYS, PIECE_LABELS, REGION_COLORS, REGION_LABELS, is_piece_key
+from app.regions import (
+    PIECE_COLORS,
+    PIECE_KEYS,
+    PIECE_LABELS,
+    REGION_COLORS,
+    REGION_LABELS,
+    is_piece_key,
+    piece_radius_from_game,
+    tsum_group_color,
+)
 
 MIN_BOX = 8
 MIN_RADIUS = 8
@@ -76,6 +85,7 @@ class ImageCanvas(QGraphicsView):
         self._piece_group = 1
         self._piece_radius = {key: DEFAULT_RADIUS for key in PIECE_KEYS}
         self._hover_pos: QPointF | None = None
+        self._visible_keys: set[str] | None = None
 
         self._guide = QLabel(self)
         self._guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -114,10 +124,8 @@ class ImageCanvas(QGraphicsView):
         self._hover_pos = None
         game = self._game_rect()
         if game is not None:
-            auto_r = max(DEFAULT_RADIUS, int(min(game.width(), game.height()) / 10))
             for key in PIECE_KEYS:
-                if self._piece_radius[key] == DEFAULT_RADIUS:
-                    self._piece_radius[key] = auto_r
+                self._piece_radius[key] = self._radius_from_game(key)
         self.fit_to_view()
         self._update_guide()
         self.viewport().update()
@@ -132,8 +140,8 @@ class ImageCanvas(QGraphicsView):
             self._hover_pos = None
             game = self._game_rect()
             if game is not None:
-                auto_r = max(DEFAULT_RADIUS, int(min(game.width(), game.height()) / 10))
-                if self._piece_radius[key] < auto_r:
+                auto_r = self._radius_from_game(key)
+                if self._piece_radius[key] == DEFAULT_RADIUS:
                     self._piece_radius[key] = auto_r
         else:
             self._region = self._regions.get(key)
@@ -141,6 +149,15 @@ class ImageCanvas(QGraphicsView):
         self.fit_to_view()
         self._update_guide()
         self.viewport().update()
+
+    def set_visible_keys(self, keys: list[str] | None) -> None:
+        self._visible_keys = set(keys) if keys is not None else None
+        self.viewport().update()
+
+    def _key_is_visible(self, key: str) -> bool:
+        if self._visible_keys is None:
+            return True
+        return key in self._visible_keys or key == self._active_key
 
     def all_region_boxes(self) -> dict[str, dict[str, int]]:
         self._sync_active()
@@ -169,14 +186,9 @@ class ImageCanvas(QGraphicsView):
 
     def set_piece_group(self, group: int) -> None:
         self._piece_group = max(1, min(12, int(group)))
-        if self._selected_piece is not None:
-            piece = self._pieces[self._selected_piece]
-            if piece["kind"] == "tsum":
-                piece["group"] = self._piece_group
-                self.piecesChanged.emit()
-                self.viewport().update()
         self._update_guide()
         self.pieceGroupChanged.emit(self._piece_group)
+        self.viewport().update()
 
     def piece_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -194,8 +206,17 @@ class ImageCanvas(QGraphicsView):
     def remove_selected_piece(self) -> bool:
         if self._selected_piece is None:
             return False
-        self._pieces.pop(self._selected_piece)
-        self._selected_piece = None
+        return self._remove_piece_at(self._selected_piece)
+
+    def _remove_piece_at(self, index: int) -> bool:
+        if index < 0 or index >= len(self._pieces):
+            return False
+        self._pieces.pop(index)
+        if self._selected_piece is not None:
+            if self._selected_piece == index:
+                self._selected_piece = None
+            elif self._selected_piece > index:
+                self._selected_piece -= 1
         self.piecesChanged.emit()
         self._update_guide()
         self.viewport().update()
@@ -276,6 +297,23 @@ class ImageCanvas(QGraphicsView):
             return None
         return QRectF(rect)
 
+    def _radius_from_game(self, kind: str) -> int:
+        game = self._game_rect()
+        if game is None:
+            return DEFAULT_RADIUS
+        return piece_radius_from_game(game.width(), kind)
+
+    def radius_for_kind(self, kind: str) -> int:
+        return self._radius_from_game(kind)
+
+    def _effective_radius(self, piece: dict[str, int]) -> int:
+        kind = str(piece.get("kind") or "tsum")
+        expected = self._radius_from_game(kind)
+        current = int(piece.get("r") or 0)
+        if current < expected * 0.5:
+            return expected
+        return max(MIN_RADIUS, current)
+
     def fit_to_view(self) -> None:
         if self._pixmap_item is None or self.viewport().width() < 10:
             return
@@ -299,14 +337,14 @@ class ImageCanvas(QGraphicsView):
                 self._guide.setText(f"「{name}」の前に、ゲーム範囲を保存してください")
             else:
                 self._guide.setText(
-                    f"「{name}」{extra}  大きい〇がガイドです。ツムに合わせてクリック  ・  ホイールで大きさ  ・  1つ戻す / Ctrl+Z  ・  Backspaceで削除"
+                    f"「{name}」{extra}  大きい〇がガイドです。ツムに合わせてクリック  ・  ホイールで大きさ  ・  右クリックで削除  ・  1つ戻す / Ctrl+Z"
                 )
         elif self._region is None:
             name = REGION_LABELS.get(self._active_key, "範囲")
             self._guide.setText(f"「{name}」をドラッグして囲んでください")
         else:
             name = REGION_LABELS.get(self._active_key, "範囲")
-            self._guide.setText(f"「{name}」  四隅で拡大縮小  ・  辺の中央は縦だけ / 横だけ  ・  「この範囲を保存」")
+            self._guide.setText(f"「{name}」  四隅で拡大縮小  ・  辺の中央は縦だけ / 横だけ  ・  選んでいる種類を保存")
         self._guide.adjustSize()
         self._place_guide()
 
@@ -346,6 +384,8 @@ class ImageCanvas(QGraphicsView):
             return
         for key, rect in self._regions.items():
             if rect is None or rect.width() < 1 or rect.height() < 1:
+                continue
+            if not self._key_is_visible(key):
                 continue
             view = QRectF(self._view_rect_from_scene(rect))
             accent = QColor(REGION_COLORS.get(key, "#5CFF9E"))
@@ -392,13 +432,21 @@ class ImageCanvas(QGraphicsView):
             center = self.mapFromScene(QPointF(piece["x"], piece["y"]))
             radius = self._piece_view_radius(piece)
             kind = piece["kind"]
-            accent = QColor(PIECE_COLORS.get(kind, "#FFE066"))
+            if kind == "tsum":
+                accent = QColor(tsum_group_color(int(piece.get("group") or 1)))
+            else:
+                accent = QColor(PIECE_COLORS.get(kind, "#FFE066"))
             selected = index == self._selected_piece and is_piece_key(self._active_key)
+            fill = QColor(accent)
+            fill.setAlpha(50)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawEllipse(center, radius, radius)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             if selected:
                 painter.setPen(QPen(QColor(255, 255, 255, 230), 4))
                 painter.drawEllipse(center, radius + 1, radius + 1)
-            painter.setPen(QPen(accent, 3 if selected else 2))
+            painter.setPen(QPen(accent, 3))
             painter.drawEllipse(center, radius, radius)
             if kind == "bomb":
                 text = "B"
@@ -432,26 +480,30 @@ class ImageCanvas(QGraphicsView):
             return
         kind = self._active_key
         radius = self._piece_radius.get(kind, DEFAULT_RADIUS)
+        if kind == "tsum":
+            color = QColor(tsum_group_color(self._piece_group))
+        else:
+            color = QColor(PIECE_COLORS.get(kind, "#FFE066"))
         dummy = {"x": int(self._hover_pos.x()), "y": int(self._hover_pos.y()), "r": int(radius), "kind": kind}
         self._clamp_piece(dummy)
         center = self.mapFromScene(QPointF(dummy["x"], dummy["y"]))
         view_r = self._piece_view_radius(dummy)
-        fill = QColor(PIECE_COLORS.get(kind, "#FFE066"))
+        fill = QColor(color)
         fill.setAlpha(70)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(fill)
         painter.drawEllipse(center, view_r, view_r)
-        outline = QColor(PIECE_COLORS.get(kind, "#FFE066"))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(outline, 4, Qt.PenStyle.DashLine))
+        painter.setPen(QPen(color, 4, Qt.PenStyle.DashLine))
         painter.drawEllipse(center, view_r, view_r)
-        painter.setPen(QPen(outline, 2))
+        painter.setPen(QPen(color, 2))
         painter.drawLine(center.x() - 8, center.y(), center.x() + 8, center.y())
         painter.drawLine(center.x(), center.y() - 8, center.x(), center.y() + 8)
 
     def _piece_view_radius(self, piece: dict[str, int]) -> int:
+        radius = self._effective_radius(piece)
         a = self.mapFromScene(QPointF(piece["x"], piece["y"]))
-        b = self.mapFromScene(QPointF(piece["x"] + piece["r"], piece["y"]))
+        b = self.mapFromScene(QPointF(piece["x"] + radius, piece["y"]))
         return max(MIN_RADIUS, int(round((QPointF(b) - QPointF(a)).manhattanLength())))
 
     def _hit_piece(self, scene_pos: QPointF) -> int | None:
@@ -461,7 +513,7 @@ class ImageCanvas(QGraphicsView):
             dx = scene_pos.x() - piece["x"]
             dy = scene_pos.y() - piece["y"]
             dist = (dx * dx + dy * dy) ** 0.5
-            if dist <= piece["r"] + 4 and dist < best:
+            if dist <= self._effective_radius(piece) + 4 and dist < best:
                 best = dist
                 hit = index
         return hit
@@ -593,6 +645,13 @@ class ImageCanvas(QGraphicsView):
         if self._pixmap_item is None:
             return
         self.setFocus()
+        if event.button() == Qt.MouseButton.RightButton and is_piece_key(self._active_key):
+            scene_pos = self._clamp_point(self.mapToScene(self._viewport_pos(event)))
+            hit = self._hit_piece(scene_pos)
+            if hit is not None:
+                self._remove_piece_at(hit)
+                event.accept()
+                return
         if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
             self._mode = "pan"
             self._pan_pos = event.position()
@@ -613,9 +672,6 @@ class ImageCanvas(QGraphicsView):
                 self._origin = scene_pos
                 piece = self._pieces[hit]
                 self._orig_rect = QRectF(piece["x"], piece["y"], piece["r"], piece["r"])
-                if piece["kind"] == "tsum":
-                    self._piece_group = int(piece.get("group") or 1)
-                    self.pieceGroupChanged.emit(self._piece_group)
                 self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 game = self._game_rect()
@@ -672,6 +728,9 @@ class ImageCanvas(QGraphicsView):
             self.viewport().update()
         if self._mode == "move-piece" and self._selected_piece is not None:
             delta = scene_pos - self._origin
+            if abs(delta.x()) < 0.5 and abs(delta.y()) < 0.5:
+                event.accept()
+                return
             piece = self._pieces[self._selected_piece]
             piece["x"] = int(round(self._orig_rect.x() + delta.x()))
             piece["y"] = int(round(self._orig_rect.y() + delta.y()))

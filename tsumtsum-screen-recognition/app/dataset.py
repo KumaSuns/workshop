@@ -58,7 +58,8 @@ class Sample:
             game_region = regions["game"]
         status = data.get("status", "unlabeled")
         if "confirmed" in data:
-            confirmed = [str(key) for key in data.get("confirmed") or [] if key in regions]
+            allowed = set(regions) | set(PIECE_KEYS)
+            confirmed = [str(key) for key in data.get("confirmed") or [] if key in allowed]
         elif status == "labeled":
             confirmed = list(regions.keys())
         else:
@@ -101,6 +102,20 @@ class Dataset:
             return
         raw = json.loads(self.index_path.read_text(encoding="utf-8"))
         self._samples = [Sample.from_dict(item) for item in raw.get("samples", [])]
+        self._restore_piece_labels()
+
+    def _restore_piece_labels(self) -> None:
+        if (self.models_dir / model_filename("pieces")).exists():
+            return
+        changed = False
+        for sample in self._samples:
+            kinds = {str(piece.get("kind")) for piece in sample.pieces}
+            for key in PIECE_KEYS:
+                if key in kinds and key not in sample.confirmed:
+                    sample.confirmed.append(key)
+                    changed = True
+        if changed:
+            self._save()
 
     def _save(self) -> None:
         payload = {"samples": [sample.to_dict() for sample in self._samples]}
@@ -124,6 +139,7 @@ class Dataset:
                 sample
                 for sample in self._samples
                 if sample.status != "skipped"
+                and key in sample.confirmed
                 and any(piece.get("kind") == key for piece in sample.pieces)
             ]
         return [
@@ -260,6 +276,51 @@ class Dataset:
         self._save()
         return sample
 
+    def confirm_key(
+        self,
+        sample_id: str,
+        key: str,
+        box: dict[str, int] | None = None,
+        pieces: list[dict[str, int]] | None = None,
+    ) -> Sample:
+        sample = self.get(sample_id)
+        if sample is None:
+            raise KeyError(sample_id)
+        if key in PIECE_KEYS:
+            kept = [piece for piece in sample.pieces if piece.get("kind") != key]
+            incoming = [
+                {
+                    "x": int(piece["x"]),
+                    "y": int(piece["y"]),
+                    "r": int(piece["r"]),
+                    "kind": str(piece["kind"]),
+                    "group": int(piece.get("group") or 1),
+                }
+                for piece in (pieces or [])
+                if piece.get("kind") == key and int(piece.get("r") or 0) >= 4
+            ]
+            sample.pieces = kept + incoming
+            sample.confirmed = [item for item in sample.confirmed if item != key]
+            if incoming:
+                sample.confirmed.append(key)
+        else:
+            if box is None:
+                raise ValueError(key)
+            cleaned = {
+                "x": int(box["x"]),
+                "y": int(box["y"]),
+                "w": int(box["w"]),
+                "h": int(box["h"]),
+            }
+            sample.regions[key] = cleaned
+            if key not in sample.confirmed:
+                sample.confirmed.append(key)
+            if key == "game":
+                sample.game_region = cleaned
+                sample.status = "labeled"
+        self._save()
+        return sample
+
     def set_region(
         self,
         sample_id: str,
@@ -303,6 +364,34 @@ class Dataset:
                 if sample.status == "unlabeled":
                     sample.status = "predicted"
             added.append(key)
+        if added:
+            self._save()
+        return added
+
+    def apply_piece_predictions(self, sample_id: str, pieces: list[dict[str, int]]) -> list[str]:
+        sample = self.get(sample_id)
+        if sample is None:
+            raise KeyError(sample_id)
+        added: list[str] = []
+        confirmed = set(sample.confirmed)
+        for kind in PIECE_KEYS:
+            if kind in confirmed:
+                continue
+            incoming = [
+                {
+                    "x": int(piece["x"]),
+                    "y": int(piece["y"]),
+                    "r": int(piece["r"]),
+                    "kind": str(piece["kind"]),
+                    "group": int(piece.get("group") or 1),
+                }
+                for piece in pieces
+                if piece.get("kind") == kind and int(piece.get("r") or 0) >= 4
+            ]
+            if not incoming:
+                continue
+            sample.pieces = [piece for piece in sample.pieces if piece.get("kind") != kind] + incoming
+            added.append(kind)
         if added:
             self._save()
         return added
