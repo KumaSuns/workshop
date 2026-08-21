@@ -128,9 +128,11 @@ def write_image(path: Path, image: np.ndarray) -> None:
 def extracted_file_for(output_dir: Path, stem: str, index: int) -> Path | None:
     if not output_dir.exists():
         return None
-    marker = f"_{index:03d}_"
-    matches = [path for path in output_dir.glob("*.png") if marker in path.name]
-    return sorted(matches)[-1] if matches else None
+    prefix = f"{stem}_{index:03d}_"
+    matches = [path for path in output_dir.glob("*.png") if path.name.startswith(prefix)]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
 
 
 def extract_frames(
