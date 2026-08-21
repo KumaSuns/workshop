@@ -444,11 +444,20 @@ class Dataset:
         return sample
 
     def remove(self, sample_id: str) -> None:
-        sample = self.get(sample_id)
-        if sample is None:
-            return
-        image_path = sample.image_path
-        if image_path.exists():
-            image_path.unlink()
-        self._samples = [s for s in self._samples if s.id != sample_id]
-        self._save()
+        self.remove_many([sample_id])
+
+    def remove_many(self, sample_ids: list[str]) -> int:
+        ids = set(sample_ids)
+        kept: list[Sample] = []
+        removed = 0
+        for sample in self._samples:
+            if sample.id not in ids:
+                kept.append(sample)
+                continue
+            if sample.image_path.exists():
+                sample.image_path.unlink()
+            removed += 1
+        if removed:
+            self._samples = kept
+            self._save()
+        return removed

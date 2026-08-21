@@ -12,6 +12,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -93,6 +94,27 @@ QPushButton#accent {
     font-weight: 600;
 }
 QPushButton#accent:hover { background: #27a36c; }
+QPushButton#danger {
+    background: #c4453c;
+    font-weight: 600;
+}
+QPushButton#danger:hover { background: #d85a50; }
+QPushButton#danger:disabled { color: #8a6e6c; background: #3a2a2a; }
+QCheckBox {
+    color: #9aa3b2;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 15px;
+    height: 15px;
+    border: 1px solid #2a303b;
+    border-radius: 4px;
+    background: #101216;
+}
+QCheckBox::indicator:checked {
+    background: #5b6cff;
+    border-color: #5b6cff;
+}
 QListWidget {
     background: #101216;
     border: 1px solid #2a303b;
@@ -259,7 +281,7 @@ class MainWindow(QMainWindow):
         self.paste_btn = QPushButton("貼り付け")
         self.confirm_btn = QPushButton("この範囲を保存")
         self.confirm_btn.setObjectName("accent")
-        self.skip_btn = QPushButton("この画像をパス")
+        self.skip_btn = QPushButton("使わない")
         self.next_btn = QPushButton("次へ")
         self.prev_btn = QPushButton("前へ")
         self.clear_btn = QPushButton("この場所を消す")
@@ -346,6 +368,14 @@ class MainWindow(QMainWindow):
         self.stats_label.setObjectName("hint")
         self.stats_label.setWordWrap(True)
         right_layout.addWidget(self.stats_label)
+        unused_row = QHBoxLayout()
+        self.show_unused_chk = QCheckBox("使わない画像も見る")
+        self.delete_unused_one_btn = QPushButton("この画像を消す")
+        self.delete_unused_btn = QPushButton("使わない画像を全部消す")
+        unused_row.addWidget(self.show_unused_chk, 1)
+        unused_row.addWidget(self.delete_unused_one_btn)
+        unused_row.addWidget(self.delete_unused_btn)
+        right_layout.addLayout(unused_row)
         self.list_widget = QTableWidget()
         self.list_widget.setColumnCount(len(LIST_STATUS_KEYS) + 1)
         self.list_widget.setHorizontalHeaderLabels(
@@ -371,6 +401,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(len(LIST_STATUS_KEYS), QHeaderView.ResizeMode.Stretch)
         right_layout.addWidget(self.list_widget, 1)
         self.delete_btn = QPushButton("選択を削除")
+        self.delete_btn.setObjectName("danger")
         right_layout.addWidget(self.delete_btn)
         self.copy_data_btn = QPushButton("dataをコピー")
         right_layout.addWidget(self.copy_data_btn)
@@ -434,6 +465,9 @@ class MainWindow(QMainWindow):
         self.train_btn.clicked.connect(self.on_train_button)
         self._train_fx.cancelRequested.connect(self.cancel_training)
         self.delete_btn.clicked.connect(self.delete_current)
+        self.delete_unused_one_btn.clicked.connect(self.delete_current)
+        self.delete_unused_btn.clicked.connect(self.delete_unused_images)
+        self.show_unused_chk.toggled.connect(self.on_show_unused_toggled)
         self.copy_data_btn.clicked.connect(self.copy_data_folder)
         self.import_data_btn.clicked.connect(self.import_data_folder)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
@@ -521,9 +555,15 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _visible_samples(self) -> list[Sample]:
+        samples = self.dataset.all()
+        if self.show_unused_chk.isChecked():
+            return samples
+        return [sample for sample in samples if sample.status != "skipped"]
+
     def refresh_list(self, select_id: str | None = None) -> None:
         selected = select_id or self.current_id
-        samples = list(self.dataset.all())
+        samples = self._visible_samples()
         scroll = self.list_widget.verticalScrollBar().value()
         prev_current = self._list_id_at(self.list_widget.currentRow())
         existing = [self._list_id_at(row) for row in range(self.list_widget.rowCount())]
@@ -594,7 +634,7 @@ class MainWindow(QMainWindow):
             self.list_widget.setItem(row, name_col, name_item)
         name = sample.source_name
         if skipped:
-            name = f"パス  {name}"
+            name = f"使わない  {name}"
         name_item.setText(name)
         name_item.setForeground(QColor("#7a8190") if skipped else QColor("#c5cad3"))
         name_item.setData(Qt.ItemDataRole.UserRole, sample.id)
@@ -630,7 +670,7 @@ class MainWindow(QMainWindow):
         )
         self.stats_label.setText(
             f"全 {counts['total']} 枚\n"
-            f"保存済み {counts['labeled']} / 予測 {counts['predicted']} / 未設定 {counts['unlabeled']} / パス {counts['skipped']}\n"
+            f"保存済み {counts['labeled']} / 予測 {counts['predicted']} / 未設定 {counts['unlabeled']} / 使わない {counts['skipped']}\n"
             f"{per_type}\n"
             f"学習の目安: 種類ごとに {MIN_TRAIN_SAMPLES} 枚以上"
         )
@@ -674,6 +714,7 @@ class MainWindow(QMainWindow):
             self.piece_count_label.setText("")
         self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
         self.delete_btn.setEnabled(has_sample)
+        self._update_unused_delete_buttons()
 
     def on_list_cell_changed(
         self, current_row: int, _current_col: int, previous_row: int, _previous_col: int
@@ -796,9 +837,9 @@ class MainWindow(QMainWindow):
         if sample.status == "unlabeled":
             self.hint_label.setText("左のチェックを付けた種類だけ保存します。名前をクリックすると、その枠を直せます。")
         elif sample.status == "predicted":
-            self.hint_label.setText("オレンジはゲーム範囲の予測です。他の場所も左から選んで囲めます。保存するか、使わないなら「この画像をパス」。")
+            self.hint_label.setText("オレンジはゲーム範囲の予測です。他の場所も左から選んで囲めます。保存するか、使わないなら「使わない」。")
         elif sample.status == "skipped":
-            self.hint_label.setText("この画像はパス済みです。囲んで保存すれば学習に使えます。")
+            self.hint_label.setText("この画像は使わない設定です。囲んで保存すれば学習に使えます。")
         else:
             self.hint_label.setText("色つきの四角が付いています。保存したい種類にチェックを付けて保存してください。")
         self.update_stats()
@@ -1110,7 +1151,7 @@ class MainWindow(QMainWindow):
             return
         self._set_dirty(False)
         self.dataset.skip(self.current_id)
-        self._advance_after_action("この画像をパスしました")
+        self._advance_after_action("使わない画像にしました")
 
     def _advance_after_action(self, message: str) -> None:
         next_id = self.dataset.next_pending(self.current_id)
@@ -1152,6 +1193,17 @@ class MainWindow(QMainWindow):
         name = PLACE_LABELS.get(self._active_key, "範囲")
         self.statusBar().showMessage(f"「{name}」を消しました", 3000)
 
+    def _update_unused_delete_buttons(self) -> None:
+        showing = self.show_unused_chk.isChecked()
+        unused = [sample for sample in self.dataset.all() if sample.status == "skipped"]
+        current = self.dataset.get(self.current_id) if self.current_id else None
+        self.delete_unused_one_btn.setVisible(showing)
+        self.delete_unused_btn.setVisible(showing)
+        self.delete_unused_one_btn.setEnabled(
+            showing and current is not None and current.status == "skipped"
+        )
+        self.delete_unused_btn.setEnabled(showing and bool(unused))
+
     def delete_current(self) -> None:
         if self._block_if_training() or not self.current_id:
             return
@@ -1160,10 +1212,64 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(self, "削除", f"{name} をデータセットから削除しますか？")
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.dataset.remove(self.current_id)
+        removed_id = self.current_id
+        next_id = self.dataset.next_pending(removed_id)
+        self.dataset.remove(removed_id)
+        if next_id is None:
+            visible = [item for item in self._visible_samples() if item.id != removed_id]
+            next_id = visible[0].id if visible else None
         self.current_id = None
         self.canvas.clear_image()
-        self.refresh_list()
+        self._set_spins(None)
+        self._set_dirty(False)
+        self.refresh_list(select_id=next_id)
+        if next_id:
+            self.show_sample(next_id)
+        self.statusBar().showMessage(f"{name} を削除しました", 4000)
+
+    def on_show_unused_toggled(self) -> None:
+        select = self.current_id
+        sample = self.dataset.get(select) if select else None
+        if sample is not None and sample.status == "skipped" and not self.show_unused_chk.isChecked():
+            select = self.dataset.next_pending(select)
+            if select is None:
+                visible = self._visible_samples()
+                select = visible[0].id if visible else None
+            if select is None:
+                self.current_id = None
+                self.canvas.clear_image()
+                self._set_spins(None)
+                self._set_dirty(False)
+        self.refresh_list(select_id=select)
+        if select and select != self.current_id:
+            self.show_sample(select)
+
+    def delete_unused_images(self) -> None:
+        if self._block_if_training():
+            return
+        unused = [sample for sample in self.dataset.all() if sample.status == "skipped"]
+        if not unused:
+            QMessageBox.information(self, "使わない画像", "使わない画像はありません。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "使わない画像を消す",
+            f"使わない {len(unused)} 枚をデータセットから削除しますか？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        current_unused = self.current_id in {sample.id for sample in unused} if self.current_id else False
+        self.dataset.remove_many([sample.id for sample in unused])
+        if current_unused:
+            self.current_id = None
+            self.canvas.clear_image()
+            self._set_spins(None)
+            self._set_dirty(False)
+        next_id = self.current_id or (self._visible_samples()[0].id if self._visible_samples() else None)
+        self.refresh_list(select_id=next_id)
+        if next_id and next_id != self.current_id:
+            self.show_sample(next_id)
+        self.statusBar().showMessage(f"使わない画像を {len(unused)} 枚消しました", 4000)
 
     def copy_data_folder(self) -> None:
         if not DATA_DIR.exists():
@@ -1452,6 +1558,8 @@ class MainWindow(QMainWindow):
             self.undo_piece_btn,
             self.predict_btn,
             self.delete_btn,
+            self.delete_unused_one_btn,
+            self.delete_unused_btn,
             self.copy_data_btn,
             self.import_data_btn,
             self.shortcut_btn,
