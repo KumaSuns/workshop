@@ -143,8 +143,8 @@ class MainWindow(QMainWindow):
         self._coin_reader: CoinReader | None = None
         self._coin_cache: dict[tuple[str, int, str], str] = {}
 
-        self._build_ui()
         self._start_ipc()
+        self._build_ui()
         QShortcut(QKeySequence.StandardKey.Open, self, self.open_video)
 
     def _build_ui(self) -> None:

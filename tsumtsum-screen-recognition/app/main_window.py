@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -983,10 +985,18 @@ class MainWindow(QMainWindow):
 
     def launch_video_extractor(self) -> None:
         if self._activate_extractor():
-            self.statusBar().showMessage("動画フレーム抜き出しはすでに開いています", 4000)
+            QMessageBox.information(
+                self,
+                "すでに起動しています",
+                "動画フレーム抜き出しは、すでに開いています。",
+            )
             return
         if self._extractor_process is not None and self._extractor_process.poll() is None:
-            self.statusBar().showMessage("動画フレーム抜き出しはすでに開いています", 4000)
+            QMessageBox.information(
+                self,
+                "すでに起動しています",
+                "動画フレーム抜き出しは、すでに起動しています。",
+            )
             return
         script = VIDEO_EXTRACTOR_MAIN
         if not script.exists():
@@ -996,23 +1006,90 @@ class MainWindow(QMainWindow):
                 f"動画抜き出しアプリが見つかりません。\n{script}",
             )
             return
-        kwargs: dict = {"cwd": str(script.parent)}
+        kwargs: dict = {
+            "cwd": str(script.parent),
+            "env": self._subprocess_env(),
+        }
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             self._extractor_process = subprocess.Popen(
-                [sys.executable, str(script)],
+                [str(self._resolve_launch_python()), str(script)],
                 **kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "起動に失敗", str(exc))
             return
-        self.statusBar().showMessage("動画フレーム抜き出しを起動しました", 4000)
+        dialog = QProgressDialog("動画フレーム抜き出しを起動しています…", None, 0, 0, self)
+        dialog.setWindowTitle("起動中")
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.show()
+        QApplication.processEvents()
+        self._extractor_launch_dialog = dialog
+        self._extractor_launch_attempt = 0
+        QTimer.singleShot(500, self._confirm_extractor_launch)
 
-    def _activate_extractor(self) -> bool:
+    def _close_extractor_launch_dialog(self) -> None:
+        dialog = getattr(self, "_extractor_launch_dialog", None)
+        if dialog is not None:
+            dialog.close()
+            self._extractor_launch_dialog = None
+
+    def _subprocess_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        return env
+
+    def _resolve_launch_python(self) -> Path:
+        venv = APP_ROOT / ".venv" / ("Scripts" if sys.platform == "win32" else "bin") / (
+            "python.exe" if sys.platform == "win32" else "python"
+        )
+        if venv.exists():
+            return venv
+        return Path(sys.executable)
+
+    def _confirm_extractor_launch(self) -> None:
+        proc = self._extractor_process
+        if proc is None:
+            self._close_extractor_launch_dialog()
+            return
+        attempt = getattr(self, "_extractor_launch_attempt", 0) + 1
+        self._extractor_launch_attempt = attempt
+        dialog = getattr(self, "_extractor_launch_dialog", None)
+        if dialog is not None:
+            dialog.setLabelText(
+                "動画フレーム抜き出しを起動しています…\n\n"
+                f"待機: {attempt // 2} 秒"
+            )
+        if proc.poll() is not None:
+            self._close_extractor_launch_dialog()
+            self._extractor_process = None
+            QMessageBox.critical(
+                self,
+                "起動に失敗",
+                f"動画フレーム抜き出しがすぐ終了しました（コード {proc.returncode}）。",
+            )
+            return
+        if self._activate_extractor():
+            self._close_extractor_launch_dialog()
+            self.statusBar().showMessage("動画フレーム抜き出しを起動しました", 5000)
+            return
+        if attempt >= 60:
+            self._close_extractor_launch_dialog()
+            self.statusBar().showMessage(
+                "動画フレーム抜き出しを起動しました。Dock のウィンドウを確認してください。",
+                8000,
+            )
+            return
+        QTimer.singleShot(500, self._confirm_extractor_launch)
+
+    def _activate_extractor(self, timeout_ms: int = 1000) -> bool:
         sock = QLocalSocket()
         sock.connectToServer(EXTRACTOR_IPC_NAME)
-        if not sock.waitForConnected(400):
+        if not sock.waitForConnected(timeout_ms):
             return False
         sock.write(b'{"action":"activate"}\n')
         sock.waitForBytesWritten(800)
@@ -1546,10 +1623,53 @@ class MainWindow(QMainWindow):
         image.save(path, format="ICO", sizes=[(256, 256), (64, 64), (48, 48), (32, 32), (16, 16)])
         return path
 
+    def _create_macos_launch_shortcut(self, desktop: Path) -> Path:
+        app_name = "ツムツム ゲーム範囲トレーナー.app"
+        app_path = desktop / app_name
+        contents = app_path / "Contents"
+        macos_dir = contents / "MacOS"
+        if app_path.exists():
+            import shutil
+
+            shutil.rmtree(app_path)
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        python = self._resolve_launch_python()
+        launcher = macos_dir / "launch"
+        launcher.write_text(
+            "#!/bin/bash\n"
+            "export OMP_NUM_THREADS=1\n"
+            "export KMP_DUPLICATE_LIB_OK=TRUE\n"
+            f'cd "{APP_ROOT}"\n'
+            f'exec "{python}" main.py\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        (contents / "Info.plist").write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>launch</string>
+  <key>CFBundleIdentifier</key><string>workshop.tsumtsum-screen-trainer</string>
+  <key>CFBundleName</key><string>ツムツム ゲーム範囲トレーナー</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>10.13</string>
+</dict>
+</plist>
+""",
+            encoding="utf-8",
+        )
+        return app_path
+
     def create_launch_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
         if not desktop:
             QMessageBox.warning(self, "デスクトップがありません", "デスクトップの場所が分かりませんでした。")
+            return
+        if sys.platform == "darwin":
+            dest = self._create_macos_launch_shortcut(Path(desktop))
+            QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{dest}")
             return
         lnk = Path(desktop) / "ツムツム ゲーム範囲トレーナー.lnk"
         python = Path(sys.executable)
