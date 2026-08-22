@@ -24,6 +24,7 @@ from app.hud_number import crop_box
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, KIND_CHANNELS, PIECE_INPUT, PieceNet, draw_gaussian
 from app.regions import REGION_LABELS
+from app.scene_model import SCENE_INPUT, SceneNet, scene_index
 
 MIN_TRAIN_SAMPLES = 5
 
@@ -143,6 +144,33 @@ class CoinDigitDataset(Dataset):
         return self.normalize(crop), encode_digits(sample.readings.get(self.key, ""))
 
 
+class SceneDataset(Dataset):
+    def __init__(self, samples: list[Sample], augment: bool = True) -> None:
+        self.samples = samples
+        self.augment = augment
+        self.jitter = transforms.ColorJitter(0.2, 0.2, 0.2, 0.04)
+        self.normalize = transforms.Compose(
+            [
+                transforms.Resize((SCENE_INPUT, SCENE_INPUT)),
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            ]
+        )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        sample = self.samples[index]
+        image = Image.open(sample.image_path).convert("RGB")
+        if self.augment:
+            image = self.jitter(image)
+            if random.random() < 0.5:
+                image = TF.hflip(image)
+        label = scene_index(sample.confirmed)
+        return self.normalize(image), torch.tensor(label, dtype=torch.long)
+
+
 def box_iou(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     pred_x2 = pred[:, 0] + pred[:, 2]
     pred_y2 = pred[:, 1] + pred[:, 3]
@@ -177,6 +205,8 @@ class TrainWorker(QThread):
         metrics = None
         error: str | None = None
         try:
+            self.progress.emit(1, max(len(self.jobs), 1) * 1000, "学習中です  準備しています")
+            self.msleep(1)
             metrics = self._train()
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
@@ -200,6 +230,20 @@ class TrainWorker(QThread):
         if self.isInterruptionRequested():
             raise TrainingCancelled()
 
+    def _emit_job_progress(
+        self,
+        job_index: int,
+        epoch: int,
+        batch_index: int,
+        batches: int,
+        message: str,
+    ) -> None:
+        frac = ((epoch - 1) + batch_index / max(batches, 1)) / max(self.epochs, 1)
+        step = int(round((job_index + min(1.0, frac)) * 1000))
+        total = max(len(self.jobs), 1) * 1000
+        self.progress.emit(max(1, step), total, message)
+        self.msleep(1)
+
     def _train(self) -> dict:
         if not self.jobs:
             raise ValueError(f"学習にはラベル済み画像が {MIN_TRAIN_SAMPLES} 枚以上必要です")
@@ -215,10 +259,19 @@ class TrainWorker(QThread):
                     label = "ツム・ボム"
                 else:
                     label = REGION_LABELS.get(key, key)
+                self._emit_job_progress(
+                    job_index,
+                    1,
+                    0,
+                    1,
+                    f"学習中です  {label}  準備しています",
+                )
                 if key == "pieces":
                     result = self._train_pieces(samples, model_path, job_index, total_steps, label)
                 elif key == "coin_digits":
                     result = self._train_digits(samples, model_path, job_index, total_steps, label)
+                elif key == "scene":
+                    result = self._train_scene(samples, model_path, job_index, total_steps, label)
                 else:
                     result = self._train_one(key, samples, model_path, job_index, total_steps, label)
                 results.append(result)
@@ -265,7 +318,8 @@ class TrainWorker(QThread):
             total_loss = 0.0
             total_iou = 0.0
             seen = 0
-            for images, boxes in loader:
+            batches = max(len(loader), 1)
+            for batch_index, (images, boxes) in enumerate(loader, start=1):
                 self._raise_if_cancelled()
                 images = images.to(device)
                 boxes = boxes.to(device)
@@ -278,16 +332,25 @@ class TrainWorker(QThread):
                 total_loss += loss.item() * batch
                 total_iou += box_iou(preds.detach(), boxes).sum().item()
                 seen += batch
+                self._emit_job_progress(
+                    job_index,
+                    epoch,
+                    batch_index,
+                    batches,
+                    f"学習中です  {label}  {epoch}/{self.epochs}  （{batch_index}/{batches}）",
+                )
             scheduler.step()
             mean_loss = total_loss / max(seen, 1)
             mean_iou = total_iou / max(seen, 1)
             if mean_iou > best_iou:
                 best_iou = mean_iou
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            self.progress.emit(
-                job_index * self.epochs + epoch,
-                total_steps,
-                f"{label}  epoch {epoch}/{self.epochs}  loss {mean_loss:.4f}  IoU {mean_iou:.3f}",
+            self._emit_job_progress(
+                job_index,
+                epoch,
+                batches,
+                batches,
+                f"学習中です  {label}  {epoch}/{self.epochs}  IoU {mean_iou:.3f}",
             )
             self._raise_if_cancelled()
 
@@ -336,7 +399,8 @@ class TrainWorker(QThread):
             model.train()
             total_loss = 0.0
             seen = 0
-            for images, heat_t, radius_t in loader:
+            batches = max(len(loader), 1)
+            for batch_index, (images, heat_t, radius_t) in enumerate(loader, start=1):
                 self._raise_if_cancelled()
                 images = images.to(device)
                 heat_t = heat_t.to(device)
@@ -355,15 +419,24 @@ class TrainWorker(QThread):
                 batch = images.size(0)
                 total_loss += loss.item() * batch
                 seen += batch
+                self._emit_job_progress(
+                    job_index,
+                    epoch,
+                    batch_index,
+                    batches,
+                    f"学習中です  {label}  {epoch}/{self.epochs}  （{batch_index}/{batches}）",
+                )
             scheduler.step()
             mean_loss = total_loss / max(seen, 1)
             if mean_loss < best_loss:
                 best_loss = mean_loss
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            self.progress.emit(
-                job_index * self.epochs + epoch,
-                total_steps,
-                f"{label}  epoch {epoch}/{self.epochs}  loss {mean_loss:.4f}",
+            self._emit_job_progress(
+                job_index,
+                epoch,
+                batches,
+                batches,
+                f"学習中です  {label}  {epoch}/{self.epochs}  loss {mean_loss:.4f}",
             )
             self._raise_if_cancelled()
         if best_state is None:
@@ -414,7 +487,8 @@ class TrainWorker(QThread):
             total_loss = 0.0
             total_correct = 0
             seen = 0
-            for images, targets in loader:
+            batches = max(len(loader), 1)
+            for batch_index, (images, targets) in enumerate(loader, start=1):
                 self._raise_if_cancelled()
                 images = images.to(device)
                 targets = targets.to(device)
@@ -427,16 +501,25 @@ class TrainWorker(QThread):
                 total_loss += loss.item() * batch
                 total_correct += int((logits.argmax(dim=-1) == targets).sum().item())
                 seen += batch
+                self._emit_job_progress(
+                    job_index,
+                    epoch,
+                    batch_index,
+                    batches,
+                    f"学習中です  {label}  {epoch}/{self.epochs}  （{batch_index}/{batches}）",
+                )
             scheduler.step()
             mean_loss = total_loss / max(seen, 1)
             acc = total_correct / max(seen * MAX_DIGITS, 1)
             if acc > best_acc:
                 best_acc = acc
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-            self.progress.emit(
-                job_index * self.epochs + epoch,
-                total_steps,
-                f"{label}  epoch {epoch}/{self.epochs}  loss {mean_loss:.4f}  acc {acc:.3f}",
+            self._emit_job_progress(
+                job_index,
+                epoch,
+                batches,
+                batches,
+                f"学習中です  {label}  {epoch}/{self.epochs}  acc {acc:.3f}",
             )
             self._raise_if_cancelled()
         if best_state is None:
@@ -447,6 +530,97 @@ class TrainWorker(QThread):
         )
         return {
             "key": "coin_digits",
+            "label": label,
+            "iou": float(best_acc),
+            "samples": len(samples),
+        }
+
+    def _train_scene(
+        self,
+        samples: list[Sample],
+        model_path: Path,
+        job_index: int,
+        total_steps: int,
+        label: str,
+    ) -> dict:
+        if len(samples) < MIN_TRAIN_SAMPLES:
+            raise ValueError(f"「{label}」の学習には {MIN_TRAIN_SAMPLES} 枚以上必要です")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dataset = SceneDataset(samples, augment=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=min(8, len(dataset)),
+            shuffle=True,
+            num_workers=0,
+        )
+        model = SceneNet()
+        model.freeze_backbone(train_last_block=True)
+        model.to(device)
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
+        class_counts = [0, 0, 0]
+        for sample in samples:
+            class_counts[scene_index(sample.confirmed)] += 1
+        weights = torch.tensor(
+            [1.0 / max(count, 1) for count in class_counts],
+            dtype=torch.float32,
+            device=device,
+        )
+        weights = weights / weights.sum() * len(class_counts)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+        best_acc = -1.0
+        best_state = None
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        for epoch in range(1, self.epochs + 1):
+            self._raise_if_cancelled()
+            model.train()
+            total_loss = 0.0
+            total_correct = 0
+            seen = 0
+            batches = max(len(loader), 1)
+            for batch_index, (images, targets) in enumerate(loader, start=1):
+                self._raise_if_cancelled()
+                images = images.to(device)
+                targets = targets.to(device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(images)
+                loss = loss_fn(logits, targets)
+                loss.backward()
+                optimizer.step()
+                batch = images.size(0)
+                total_loss += loss.item() * batch
+                total_correct += int((logits.argmax(dim=-1) == targets).sum().item())
+                seen += batch
+                self._emit_job_progress(
+                    job_index,
+                    epoch,
+                    batch_index,
+                    batches,
+                    f"学習中です  {label}  {epoch}/{self.epochs}  （{batch_index}/{batches}）",
+                )
+            scheduler.step()
+            mean_loss = total_loss / max(seen, 1)
+            acc = total_correct / max(seen, 1)
+            if acc > best_acc:
+                best_acc = acc
+                best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            self._emit_job_progress(
+                job_index,
+                epoch,
+                batches,
+                batches,
+                f"学習中です  {label}  {epoch}/{self.epochs}  acc {acc:.3f}",
+            )
+            self._raise_if_cancelled()
+        if best_state is None:
+            raise RuntimeError(f"「{label}」の学習結果を保存できませんでした")
+        torch.save(
+            {"state_dict": best_state, "acc": best_acc, "key": "scene", "samples": len(samples)},
+            model_path,
+        )
+        return {
+            "key": "scene",
             "label": label,
             "iou": float(best_acc),
             "samples": len(samples),

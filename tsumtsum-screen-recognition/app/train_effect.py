@@ -5,7 +5,7 @@ import random
 
 from PySide6.QtCore import QPointF, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QRadialGradient
-from PySide6.QtWidgets import QPushButton, QWidget
+from PySide6.QtWidgets import QLabel, QProgressBar, QPushButton, QWidget
 
 COLORS = [
     "#FF6B9D",
@@ -70,22 +70,46 @@ class TrainEffect(QWidget):
             "QPushButton:disabled { background: #5a3a40; color: #c5cad3; }"
         )
         self._cancel_btn.clicked.connect(self.cancelRequested.emit)
+        self._title = QLabel("学習中です", self)
+        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title.setStyleSheet("color: #ffe066; font-size: 32px; font-weight: 800; background: transparent;")
+        self._detail = QLabel("準備しています…", self)
+        self._detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._detail.setWordWrap(True)
+        self._detail.setStyleSheet("color: #f2f5f8; font-size: 18px; background: transparent;")
+        self._bar = QProgressBar(self)
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setFormat("%p%")
+        self._bar.setStyleSheet(
+            "QProgressBar { background: #101216; border: 1px solid #3a4250; border-radius: 8px; "
+            "text-align: center; color: #e8eaed; min-height: 22px; font-size: 14px; }"
+            "QProgressBar::chunk { background: #ffe066; border-radius: 8px; }"
+        )
 
     def start(self) -> None:
-        self.setGeometry(self.parentWidget().rect() if self.parentWidget() else self.rect())
+        host = self.parentWidget()
+        if host is not None:
+            self.setGeometry(0, 0, host.width(), host.height())
         self._blobs = []
         self._sparkles = []
         self._tick_n = 0
         self._progress = 0.0
         self._status = "学習中です"
         self._quip = random.choice(QUIPS)
+        self._title.setText("学習中です")
+        self._detail.setText("準備しています…")
+        self._bar.setValue(0)
         self._spawn_blobs()
         self._cancel_btn.setEnabled(True)
         self._cancel_btn.setText("中止")
         self.show()
         self.raise_()
-        self._place_cancel()
+        self._place_hud()
         self._cancel_btn.raise_()
+        self._title.raise_()
+        self._detail.raise_()
+        self._bar.raise_()
         self._timer.start(16)
 
     def stop(self) -> None:
@@ -99,21 +123,32 @@ class TrainEffect(QWidget):
         self._cancel_btn.setText("中止しています…")
         self._status = "学習を中止しています"
 
-    def _place_cancel(self) -> None:
+    def _place_hud(self) -> None:
+        width = max(self.width(), 200)
+        self._title.setGeometry(24, 24, width - 48, 48)
+        self._detail.setGeometry(24, 76, width - 48, 48)
+        bar_w = max(240, width - 80)
+        bar_x = (width - bar_w) // 2
         bar_y = self.height() - 28 - 22
+        self._bar.setGeometry(bar_x, max(120, bar_y), bar_w, 28)
         self._cancel_btn.adjustSize()
-        width = max(120, self._cancel_btn.width())
-        height = max(40, self._cancel_btn.height())
-        self._cancel_btn.setFixedSize(width, height)
-        self._cancel_btn.move(max(12, (self.width() - width) // 2), max(12, int(bar_y) - height - 40))
+        btn_w = max(120, self._cancel_btn.width())
+        btn_h = max(40, self._cancel_btn.height())
+        self._cancel_btn.setFixedSize(btn_w, btn_h)
+        self._cancel_btn.move(max(12, (self.width() - btn_w) // 2), max(12, self._bar.y() - btn_h - 16))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._place_cancel()
+        self._place_hud()
 
     def set_progress(self, epoch: int, total: int, message: str) -> None:
         self._progress = epoch / max(1, total)
         self._status = message
+        self._detail.setText(message)
+        self._bar.setRange(0, max(total, 1))
+        self._bar.setValue(epoch)
+        self._place_hud()
+        self.update()
 
     def _spawn_blobs(self) -> None:
         width = max(self.width(), 200)
@@ -308,7 +343,7 @@ class TrainEffect(QWidget):
         title = QFont("Yu Gothic UI", 28, QFont.Weight.Black)
         painter.setFont(title)
         painter.setPen(QColor(255, 224, 80, int(200 + 55 * pulse)))
-        painter.drawText(self.rect().adjusted(0, 28, 0, 0), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, "FEVER LEARNING")
+        painter.drawText(self.rect().adjusted(0, 28, 0, 0), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, "学習中です")
         sub = QFont("Yu Gothic UI", 14, QFont.Weight.DemiBold)
         painter.setFont(sub)
         painter.setPen(QColor(242, 245, 248))

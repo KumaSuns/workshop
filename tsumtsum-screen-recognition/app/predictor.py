@@ -16,7 +16,8 @@ from app.digit_model import (
 )
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, peaks_from_heat
-from app.regions import PIECE_KEYS, REGION_KEYS, model_filename, piece_radius_from_game
+from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename, piece_radius_from_game
+from app.scene_model import SCENE_INPUT, SceneNet, scene_name
 
 
 class Predictor:
@@ -26,6 +27,7 @@ class Predictor:
         self.models: dict[str, GameRegionNet] = {}
         self.piece_model: PieceNet | None = None
         self.digit_model: CoinDigitNet | None = None
+        self.scene_model: SceneNet | None = None
         self._transform = transforms.Compose(
             [
                 transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
@@ -47,12 +49,20 @@ class Predictor:
                 transforms.Normalize(DIGIT_MEAN, DIGIT_STD),
             ]
         )
+        self._scene_transform = transforms.Compose(
+            [
+                transforms.Resize((SCENE_INPUT, SCENE_INPUT)),
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            ]
+        )
         self.reload()
 
     def release(self) -> None:
         self.models = {}
         self.piece_model = None
         self.digit_model = None
+        self.scene_model = None
         if self.device.type == "cuda":
             try:
                 torch.cuda.empty_cache()
@@ -60,7 +70,12 @@ class Predictor:
                 pass
 
     def is_ready(self) -> bool:
-        return bool(self.models) or self.piece_model is not None or self.digit_model is not None
+        return (
+            bool(self.models)
+            or self.piece_model is not None
+            or self.digit_model is not None
+            or self.scene_model is not None
+        )
 
     def ready_keys(self) -> list[str]:
         keys = [key for key in REGION_KEYS if key in self.models]
@@ -68,12 +83,15 @@ class Predictor:
             keys.extend(PIECE_KEYS)
         if self.digit_model is not None:
             keys.append("coin_digits")
+        if self.scene_model is not None:
+            keys.extend(SCENE_KEYS)
         return keys
 
     def reload(self) -> bool:
         self.models = {}
         self.piece_model = None
         self.digit_model = None
+        self.scene_model = None
         for key in REGION_KEYS:
             path = self.models_dir / model_filename(key)
             if not path.exists():
@@ -115,7 +133,31 @@ class Predictor:
             model.to(self.device)
             model.eval()
             self.digit_model = model
+        scene_path = self.models_dir / model_filename("scene")
+        if scene_path.exists():
+            checkpoint = torch.load(scene_path, map_location=self.device, weights_only=False)
+            model = SceneNet(pretrained=False)
+            state = (
+                checkpoint["state_dict"]
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint
+                else checkpoint
+            )
+            model.load_state_dict(state)
+            model.to(self.device)
+            model.eval()
+            self.scene_model = model
         return self.is_ready()
+
+    def predict_scene(self, image_path: Path) -> tuple[str, float]:
+        if self.scene_model is None:
+            return "other", 0.0
+        with Image.open(image_path) as image:
+            tensor = self._scene_transform(image.convert("RGB")).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.scene_model(tensor)
+            probs = torch.softmax(logits, dim=1)[0]
+        index = int(probs.argmax().item())
+        return scene_name(index), float(probs[index].item())
 
     def predict_coin_digits(self, crop: Image.Image) -> str:
         if self.digit_model is None:

@@ -12,7 +12,7 @@ from PySide6.QtCore import QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QImage, QPixmap
 
 from app.paths import DATA_DIR, IMAGE_EXTENSIONS
-from app.regions import PIECE_KEYS, REGION_KEYS, model_filename
+from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename
 
 
 @dataclass
@@ -60,7 +60,7 @@ class Sample:
             game_region = regions["game"]
         status = data.get("status", "unlabeled")
         if "confirmed" in data:
-            allowed = set(regions) | set(PIECE_KEYS)
+            allowed = set(regions) | set(PIECE_KEYS) | set(SCENE_KEYS)
             confirmed = [str(key) for key in data.get("confirmed") or [] if key in allowed]
         elif status == "labeled":
             confirmed = list(regions.keys())
@@ -145,6 +145,12 @@ class Dataset:
                 and key in sample.confirmed
                 and any(piece.get("kind") == key for piece in sample.pieces)
             ]
+        if key in SCENE_KEYS:
+            return [
+                sample
+                for sample in self._samples
+                if sample.status != "skipped" and key in sample.confirmed
+            ]
         return [
             sample
             for sample in self._samples
@@ -152,7 +158,7 @@ class Dataset:
         ]
 
     def labeled_counts(self) -> dict[str, int]:
-        counts = {key: len(self.labeled_for(key)) for key in [*REGION_KEYS, *PIECE_KEYS]}
+        counts = {key: len(self.labeled_for(key)) for key in [*REGION_KEYS, *PIECE_KEYS, *SCENE_KEYS]}
         counts["coin_digits"] = len(self.labeled_readings("coin"))
         return counts
 
@@ -312,6 +318,11 @@ class Dataset:
         sample = self.get(sample_id)
         if sample is None:
             raise KeyError(sample_id)
+        if key in SCENE_KEYS:
+            sample.confirmed = [item for item in sample.confirmed if item not in SCENE_KEYS]
+            sample.confirmed.append(key)
+            self._save()
+            return sample
         if key in PIECE_KEYS:
             kept = [piece for piece in sample.pieces if piece.get("kind") != key]
             incoming = [

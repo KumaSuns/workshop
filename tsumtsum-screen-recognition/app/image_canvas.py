@@ -19,7 +19,9 @@ from app.regions import (
     PIECE_LABELS,
     REGION_COLORS,
     REGION_LABELS,
+    SCENE_LABELS,
     is_piece_key,
+    is_scene_key,
     piece_radius_from_game,
     tsum_group_color,
 )
@@ -118,7 +120,7 @@ class ImageCanvas(QGraphicsView):
         if region is not None and "game" not in self._regions:
             self._regions["game"] = QRectF(region)
         self._status = status
-        self._region = None if is_piece_key(active_key) else self._regions.get(self._active_key)
+        self._region = None if is_piece_key(active_key) or is_scene_key(active_key) else self._regions.get(self._active_key)
         self._pieces = [dict(piece) for piece in (pieces or [])]
         self._selected_piece = None
         self._hover_pos = None
@@ -134,10 +136,15 @@ class ImageCanvas(QGraphicsView):
         if not is_piece_key(self._active_key):
             self._sync_active()
         self._active_key = key
-        if is_piece_key(key):
+        if is_piece_key(key) or is_scene_key(key):
             self._region = None
             self._selected_piece = None
             self._hover_pos = None
+            if is_scene_key(key):
+                self.fit_to_view()
+                self._update_guide()
+                self.viewport().update()
+                return
             game = self._game_rect()
             if game is not None:
                 auto_r = self._radius_from_game(key)
@@ -174,7 +181,7 @@ class ImageCanvas(QGraphicsView):
         return boxes
 
     def _sync_active(self) -> None:
-        if is_piece_key(self._active_key):
+        if is_piece_key(self._active_key) or is_scene_key(self._active_key):
             return
         if self._region is None or self._region.width() < 1 or self._region.height() < 1:
             self._regions.pop(self._active_key, None)
@@ -330,6 +337,9 @@ class ImageCanvas(QGraphicsView):
     def _update_guide(self) -> None:
         if self._pixmap_item is None:
             self._guide.setText("画像をドロップ  /  Ctrl+V で貼り付け  /  「画像を開く」")
+        elif is_scene_key(self._active_key):
+            name = SCENE_LABELS.get(self._active_key, "画面")
+            self._guide.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
         elif is_piece_key(self._active_key):
             name = PIECE_LABELS.get(self._active_key, "ツム")
             extra = f"  種類 {self._piece_group}" if self._active_key == "tsum" else ""
@@ -660,6 +670,9 @@ class ImageCanvas(QGraphicsView):
             return
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
+            return
+        if is_scene_key(self._active_key):
+            event.accept()
             return
 
         view_pos = self._viewport_pos(event)

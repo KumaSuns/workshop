@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRectF, QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QEvent, QRectF, QSettings, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -37,7 +37,15 @@ from PySide6.QtWidgets import (
 from app.dataset import Dataset, Sample
 from app.hud_number import CoinNumberDialog, format_coin_number, read_coin_number as ocr_coin_number
 from app.image_canvas import ImageCanvas
-from app.paths import APP_ROOT, DATA_DIR, IMAGE_EXTENSIONS, IPC_NAME, VIDEO_EXTRACTOR_MAIN
+from app.paths import (
+    APP_ROOT,
+    DATA_DIR,
+    DATA_SYNC_PATH,
+    EXTRACTOR_IPC_NAME,
+    IMAGE_EXTENSIONS,
+    IPC_NAME,
+    VIDEO_EXTRACTOR_MAIN,
+)
 from app.predictor import Predictor
 from app.regions import (
     PIECE_KEYS,
@@ -45,7 +53,9 @@ from app.regions import (
     PLACE_SPECS,
     REGION_KEYS,
     REGION_LABELS,
+    SCENE_KEYS,
     is_piece_key,
+    is_scene_key,
 )
 from app.train_effect import TrainEffect
 from app.train_worker import MIN_TRAIN_SAMPLES, TrainWorker
@@ -62,6 +72,8 @@ LIST_STATUS_WIDTHS = {
     "fever": 120,
     "tsum": 72,
     "bomb": 72,
+    "go": 72,
+    "timeup": 88,
 }
 
 STYLESHEET = """
@@ -260,6 +272,7 @@ class MainWindow(QMainWindow):
         self._ipc_buffers: dict[int, bytes] = {}
         self._last_boxes: dict[str, dict[str, int]] = {}
         self._last_piece_radius: dict[str, int] = {}
+        self._settings = QSettings("workshop", "TsumTsumScreenTrainer")
         self._remember_last_boxes()
 
         self._build_ui()
@@ -541,12 +554,23 @@ class MainWindow(QMainWindow):
         try:
             payload = json.loads(line.decode("utf-8"))
             paths = [str(path) for path in payload.get("paths", [])]
+            action = str(payload.get("action") or "")
         except Exception:
             sock.write(b'{"ok":false}\n')
             sock.flush()
             return
         sock.write(b'{"ok":true}\n')
         sock.flush()
+        if action == "release-data":
+            if not self._is_training():
+                try:
+                    self.predictor.release()
+                except Exception:
+                    pass
+            return
+        if action == "reload-data":
+            self._reload_after_data_import()
+            return
         if paths:
             self.import_incoming_paths(paths)
         else:
@@ -668,6 +692,8 @@ class MainWindow(QMainWindow):
         return self._active_key in sample.confirmed
 
     def _key_list_state(self, sample: Sample, key: str) -> str:
+        if is_scene_key(key):
+            return "confirmed" if key in sample.confirmed else "empty"
         if is_piece_key(key):
             has = any(piece.get("kind") == key for piece in sample.pieces)
         else:
@@ -682,7 +708,8 @@ class MainWindow(QMainWindow):
         counts = self.dataset.counts()
         labeled_counts = self.dataset.labeled_counts()
         per_type = "  ".join(
-            f"{PLACE_LABELS[key]} {labeled_counts[key]}" for key in [*REGION_KEYS, *PIECE_KEYS]
+            f"{PLACE_LABELS[key]} {labeled_counts[key]}"
+            for key in [*REGION_KEYS, *PIECE_KEYS]
         )
         self.stats_label.setText(
             f"全 {counts['total']} 枚\n"
@@ -712,6 +739,7 @@ class MainWindow(QMainWindow):
         self.clear_btn.setEnabled(has_sample and has_active)
         self.clear_btn.setText(f"{PLACE_LABELS.get(self._active_key, '範囲')}を消す")
         piece_mode = is_piece_key(self._active_key)
+        scene_mode = is_scene_key(self._active_key)
         self.undo_piece_btn.setEnabled(
             has_sample and piece_mode and self.canvas.has_piece_of_kind(self._active_key)
         )
@@ -721,7 +749,7 @@ class MainWindow(QMainWindow):
             if piece_mode
             else self._active_key in self._last_boxes
         )
-        self.reuse_btn.setEnabled(has_sample and has_last)
+        self.reuse_btn.setEnabled(has_sample and has_last and not scene_mode)
         name = PLACE_LABELS.get(self._active_key, "範囲")
         self.reuse_btn.setText(f"{name}の大きさを使う" if piece_mode else f"{name}の枠を使う")
         counts_map = self.canvas.piece_counts()
@@ -780,6 +808,7 @@ class MainWindow(QMainWindow):
         self._apply_visible_keys()
         self._refresh_region_list()
         self.refresh_list(select_id=self.current_id)
+        self._apply_sample_hint()
 
     def _sync_spins_from_canvas(self) -> None:
         rect = self.canvas.current_region()
@@ -855,6 +884,40 @@ class MainWindow(QMainWindow):
         self._sync_spins_from_canvas()
         self._set_dirty(False)
         self._refresh_region_list()
+        self._apply_sample_hint(sample)
+        self.update_stats()
+
+    def _apply_sample_hint(self, sample: Sample | None = None) -> None:
+        if sample is None and self.current_id:
+            sample = self.dataset.get(self.current_id)
+        if sample is None:
+            return
+        if is_scene_key(self._active_key):
+            name = PLACE_LABELS.get(self._active_key, "画面")
+            if self._active_key in sample.confirmed:
+                self.hint_label.setText(f"この画像は「{name}」として保存済みです。")
+                return
+            if self.predictor.scene_model is None:
+                self.hint_label.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
+                return
+            try:
+                kind, score = self.predictor.predict_scene(sample.image_path)
+            except Exception:
+                self.hint_label.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
+                return
+            if kind == self._active_key:
+                self.hint_label.setText(
+                    f"予測は「{PLACE_LABELS.get(kind, kind)}」({score:.0%}) です。合っていれば保存してください。"
+                )
+            elif kind != "other":
+                self.hint_label.setText(
+                    f"予測は「{PLACE_LABELS.get(kind, kind)}」({score:.0%}) です。違うなら「{name}」を保存してください。"
+                )
+            else:
+                self.hint_label.setText(
+                    f"予測では GO / TIME UP ではありません。この画像が「{name}」なら保存してください。"
+                )
+            return
         if sample.status == "unlabeled":
             self.hint_label.setText("左のチェックを付けた種類だけ保存します。名前をクリックすると、その枠を直せます。")
         elif sample.status == "predicted":
@@ -863,7 +926,6 @@ class MainWindow(QMainWindow):
             self.hint_label.setText("この画像は使わない設定です。囲んで保存すれば学習に使えます。")
         else:
             self.hint_label.setText("色つきの四角が付いています。保存したい種類にチェックを付けて保存してください。")
-        self.update_stats()
 
     def _remember_last_boxes(self) -> None:
         self._last_boxes = {}
@@ -915,6 +977,12 @@ class MainWindow(QMainWindow):
         )
 
     def launch_video_extractor(self) -> None:
+        if self._activate_extractor():
+            self.statusBar().showMessage("動画フレーム抜き出しはすでに開いています", 4000)
+            return
+        if self._extractor_process is not None and self._extractor_process.poll() is None:
+            self.statusBar().showMessage("動画フレーム抜き出しはすでに開いています", 4000)
+            return
         script = VIDEO_EXTRACTOR_MAIN
         if not script.exists():
             QMessageBox.warning(
@@ -936,16 +1004,41 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage("動画フレーム抜き出しを起動しました", 4000)
 
+    def _activate_extractor(self) -> bool:
+        sock = QLocalSocket()
+        sock.connectToServer(EXTRACTOR_IPC_NAME)
+        if not sock.waitForConnected(400):
+            return False
+        sock.write(b'{"action":"activate"}\n')
+        sock.waitForBytesWritten(800)
+        sock.disconnectFromServer()
+        return True
+
+    def _dialog_dir(self, key: str, fallback: Path | None = None) -> str:
+        saved = str(self._settings.value(f"last_dir/{key}", "") or "")
+        if saved and Path(saved).is_dir():
+            return saved
+        if fallback is not None and Path(fallback).is_dir():
+            return str(fallback)
+        return str(Path.home())
+
+    def _remember_dialog_dir(self, key: str, path: str | Path) -> None:
+        target = Path(path)
+        folder = target if target.is_dir() else target.parent
+        if folder.is_dir():
+            self._settings.setValue(f"last_dir/{key}", str(folder.resolve()))
+
     def open_files(self) -> None:
         if self._block_if_training():
             return
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "画像を開く",
-            str(Path.home()),
+            self._dialog_dir("images"),
             "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
         )
         if files:
+            self._remember_dialog_dir("images", files[0])
             self.import_paths(files)
 
     def paste_clipboard(self) -> None:
@@ -970,6 +1063,8 @@ class MainWindow(QMainWindow):
             path = Path(raw)
             if path.suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
+            if not imported:
+                self._remember_dialog_dir("images", path)
             try:
                 imported.append(self.dataset.import_file(path))
             except Exception as exc:  # noqa: BLE001
@@ -1087,7 +1182,7 @@ class MainWindow(QMainWindow):
             spin.blockSignals(False)
 
     def on_spin_changed(self) -> None:
-        if not self.current_id or is_piece_key(self._active_key):
+        if not self.current_id or is_piece_key(self._active_key) or is_scene_key(self._active_key):
             return
         x, y, w, h = self.spin_x.value(), self.spin_y.value(), self.spin_w.value(), self.spin_h.value()
         self.canvas.set_region(QRectF(x, y, w, h), status="labeled", emit=False)
@@ -1103,10 +1198,14 @@ class MainWindow(QMainWindow):
             return False
         keys = self._selected_place_keys()
         ready = [key for key in keys if self._key_has_content(key)]
+        scene_ready = [key for key in ready if is_scene_key(key)]
+        if len(scene_ready) > 1:
+            keep = self._active_key if self._active_key in scene_ready else scene_ready[0]
+            ready = [key for key in ready if not is_scene_key(key) or key == keep]
         missing = [key for key in keys if key not in ready]
         if not ready:
             names = "、".join(PLACE_LABELS.get(key, key) for key in keys)
-            QMessageBox.information(self, "範囲がありません", f"選んだ「{names}」に、まだ枠や〇がありません。")
+            QMessageBox.information(self, "まだありません", f"選んだ「{names}」に、まだ枠や〇がありません。")
             return False
         if not any(self._key_needs_save(key) for key in ready):
             names = "、".join(PLACE_LABELS.get(key, key) for key in ready)
@@ -1122,6 +1221,7 @@ class MainWindow(QMainWindow):
         self._set_dirty(False)
         self.refresh_list(select_id=self.current_id)
         self._refresh_region_list()
+        self._apply_sample_hint()
         self.update_stats()
         toast = "、".join(saved_names)
         extra = ""
@@ -1133,6 +1233,9 @@ class MainWindow(QMainWindow):
 
     def _save_one_key(self, key: str) -> str:
         name = PLACE_LABELS.get(key, "範囲")
+        if is_scene_key(key):
+            self.dataset.confirm_key(self.current_id, key)
+            return name
         if is_piece_key(key):
             pieces = [piece for piece in self.canvas.all_pieces() if piece["kind"] == key]
             expected = self.canvas.radius_for_kind(key)
@@ -1210,6 +1313,7 @@ class MainWindow(QMainWindow):
         self.refresh_list(select_id=self.current_id)
         self._sync_spins_from_canvas()
         self._refresh_region_list()
+        self._apply_sample_hint()
         self.update_stats()
         name = PLACE_LABELS.get(self._active_key, "範囲")
         self.statusBar().showMessage(f"「{name}」を消しました", 3000)
@@ -1303,15 +1407,37 @@ class MainWindow(QMainWindow):
         base = self._resolved_path(root)
         return resolved == base or base in resolved.parents
 
+    def _data_sync(self):
+        cached = getattr(self, "_data_sync_mod", None)
+        if cached is not None:
+            return cached
+        spec = importlib.util.spec_from_file_location("workshop_data_sync", DATA_SYNC_PATH)
+        if spec is None or spec.loader is None:
+            raise FileNotFoundError(f"dataの共通処理が見つかりません。\n{DATA_SYNC_PATH}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self._data_sync_mod = module
+        return module
+
+    def _notify_extractor(self, action: str) -> None:
+        sock = QLocalSocket()
+        sock.connectToServer(EXTRACTOR_IPC_NAME)
+        if not sock.waitForConnected(400):
+            return
+        sock.write(json.dumps({"action": action}, ensure_ascii=False).encode("utf-8") + b"\n")
+        sock.waitForBytesWritten(800)
+        sock.disconnectFromServer()
+
+    def _pack_scene_into_data(self) -> dict[str, int]:
+        return self._data_sync().ensure_scene_packed(DATA_DIR)
+
     def copy_data_folder(self) -> None:
         if self._block_if_training():
             return
-        if not DATA_DIR.exists():
-            QMessageBox.warning(self, "dataがありません", f"コピーするフォルダがありません。\n{DATA_DIR}")
-            return
-        dest_parent = QFileDialog.getExistingDirectory(self, "貼り付ける場所を選ぶ", str(Path.home()))
+        dest_parent = QFileDialog.getExistingDirectory(self, "貼り付ける場所を選ぶ", self._dialog_dir("copy_data"))
         if not dest_parent:
             return
+        self._remember_dialog_dir("copy_data", dest_parent)
         dest_parent_path = Path(dest_parent)
         dest = dest_parent_path / DATA_DIR.name
         if self._is_same_or_inside(dest, DATA_DIR) or self._is_same_or_inside(dest_parent_path, DATA_DIR):
@@ -1329,24 +1455,26 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        tmp = dest_parent_path / "_data_copying"
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            if tmp.exists():
-                shutil.rmtree(tmp)
-            shutil.copytree(DATA_DIR, tmp)
-            if dest.exists():
-                shutil.rmtree(dest)
-            tmp.rename(dest)
+            packed = self._pack_scene_into_data()
+            if not DATA_DIR.exists():
+                raise FileNotFoundError(f"コピーするフォルダがありません。\n{DATA_DIR}")
+            dest = self._data_sync().copy_data_folder(DATA_DIR, dest_parent_path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "コピーに失敗", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
-            if tmp.exists() and dest.exists():
-                shutil.rmtree(tmp, ignore_errors=True)
+        extra = f"\n画面の学習画像 {packed.get('images', 0)} 枚"
+        if packed.get("missing"):
+            extra += f"（見つからない画像 {packed['missing']} 枚は除きました）"
         self.statusBar().showMessage(f"dataをコピーしました: {dest}", 5000)
-        QMessageBox.information(self, "コピーしました", f"dataをコピーしました。\n{dest}")
+        QMessageBox.information(
+            self,
+            "コピーしました",
+            f"ツムの data と、画面の学習データをコピーしました。\n{dest}{extra}",
+        )
 
     def _ensure_app_icon(self) -> Path | None:
         path = APP_ROOT / "app.ico"
@@ -1412,38 +1540,39 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
 
     def _looks_like_data_dir(self, path: Path) -> bool:
-        if (path / "index.json").is_file():
-            return True
-        images = path / "images"
-        if images.is_dir() and any(
-            child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS for child in images.iterdir()
-        ):
-            return True
-        models = path / "models"
-        if models.is_dir() and any(child.is_file() and child.suffix.lower() == ".pt" for child in models.iterdir()):
-            return True
-        return False
+        return self._data_sync().looks_like_data_dir(path)
 
     def _resolve_data_dir(self, path: Path) -> Path | None:
-        if self._looks_like_data_dir(path):
-            return path
-        inner = path / "data"
-        if self._looks_like_data_dir(inner):
-            return inner
-        return None
+        return self._data_sync().resolve_data_dir(path)
+
+    def _reload_after_data_import(self) -> None:
+        if self._is_training():
+            return
+        self.current_id = None
+        self.canvas.clear_image()
+        try:
+            self.predictor.release()
+        except Exception:
+            pass
+        self.dataset.reload()
+        self.predictor.reload()
+        self._remember_last_boxes()
+        self.refresh_list()
+        self.statusBar().showMessage("dataを取り込みました", 5000)
 
     def import_data_folder(self) -> None:
         if self._block_if_training():
             return
-        chosen = QFileDialog.getExistingDirectory(self, "取り込む data を選ぶ", str(Path.home()))
+        chosen = QFileDialog.getExistingDirectory(self, "取り込む data を選ぶ", self._dialog_dir("import_data"))
         if not chosen:
             return
+        self._remember_dialog_dir("import_data", chosen)
         source = self._resolve_data_dir(Path(chosen))
         if source is None:
             QMessageBox.warning(
                 self,
                 "dataではありません",
-                "index.json か、画像の入った images か、モデルの入った models があるフォルダを選んでください。",
+                "index.json か、画像の入った images か、モデルの入った models か、画面の学習データがあるフォルダを選んでください。",
             )
             return
         if self._resolved_path(source) == self._resolved_path(DATA_DIR):
@@ -1459,7 +1588,8 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "dataを取り込む",
-            "今の画像・枠・モデルを、選んだ data で置き換えます。続けますか？",
+            "今のツムの画像・枠・モデルと、画面の学習データを、選んだ data で置き換えます。続けますか？\n"
+            "画面の学習データが入っていない古い data のときは、今の画面学習はそのまま残します。",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -1469,42 +1599,17 @@ class MainWindow(QMainWindow):
         self.canvas.clear_image()
         self.predictor.release()
         QApplication.processEvents()
-        incoming = DATA_DIR.parent / "_data_importing"
-        outgoing = DATA_DIR.parent / "_data_replacing"
-        imported = False
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            if incoming.exists():
-                shutil.rmtree(incoming)
-            if outgoing.exists():
-                shutil.rmtree(outgoing)
-            shutil.copytree(source, incoming)
-            if DATA_DIR.exists():
-                DATA_DIR.rename(outgoing)
-            incoming.rename(DATA_DIR)
-            imported = True
-            if outgoing.exists():
-                shutil.rmtree(outgoing)
+            self._data_sync().import_data_folder(DATA_DIR, source)
         except Exception as exc:  # noqa: BLE001
-            if not DATA_DIR.exists() and outgoing.exists():
-                try:
-                    outgoing.rename(DATA_DIR)
-                except OSError:
-                    pass
             QMessageBox.critical(self, "取り込みに失敗", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
-            if incoming.exists():
-                shutil.rmtree(incoming, ignore_errors=True)
-            if imported and outgoing.exists():
-                shutil.rmtree(outgoing, ignore_errors=True)
-        self.dataset.reload()
-        self.predictor.reload()
-        self._remember_last_boxes()
-        self.refresh_list()
-        self.statusBar().showMessage("dataを取り込みました", 5000)
-        QMessageBox.information(self, "取り込みました", "dataを取り込みました。")
+        self._reload_after_data_import()
+        self._notify_extractor("reload-scene")
+        QMessageBox.information(self, "取り込みました", "ツムの data と、画面の学習データを取り込みました。")
 
     def read_coin_number(self) -> None:
         if self._block_if_training() or not self.current_id:
@@ -1590,7 +1695,31 @@ class MainWindow(QMainWindow):
                         "コインの数字",
                     )
                 )
+        scene_selected = [key for key in SCENE_KEYS if key in selected]
+        if scene_selected:
+            playable = [sample for sample in self.dataset.all() if sample.status != "skipped"]
+            others = self._scene_other_count()
+            if (
+                all(len(self.dataset.labeled_for(key)) >= MIN_TRAIN_SAMPLES for key in scene_selected)
+                and others >= MIN_TRAIN_SAMPLES
+            ):
+                jobs.append(
+                    (
+                        "scene",
+                        playable,
+                        self.dataset.model_path_for("scene"),
+                        "GO・TIME UP",
+                    )
+                )
         return jobs
+
+    def _scene_other_count(self) -> int:
+        return sum(
+            1
+            for sample in self.dataset.all()
+            if sample.status != "skipped"
+            and not any(key in sample.confirmed for key in SCENE_KEYS)
+        )
 
     def _piece_job_label(self, keys: list[str] | None = None) -> str:
         selected = keys or [key for key in PIECE_KEYS if key in self._selected_place_keys()]
@@ -1603,6 +1732,8 @@ class MainWindow(QMainWindow):
             return self._piece_job_label()
         if key == "coin_digits":
             return "コインの数字"
+        if key == "scene":
+            return "GO・TIME UP"
         return PLACE_LABELS.get(key, key)
 
     def _needs_save(self) -> bool:
@@ -1613,6 +1744,8 @@ class MainWindow(QMainWindow):
             return "保存済み"
         keys = self._selected_place_keys()
         if len(keys) == 1:
+            if is_scene_key(keys[0]):
+                return f"この画像は{PLACE_LABELS.get(keys[0], keys[0])}"
             return f"「{PLACE_LABELS.get(keys[0], '範囲')}」を保存"
         return f"選んだ{len(keys)}件を保存"
 
@@ -1673,6 +1806,8 @@ class MainWindow(QMainWindow):
         return keys
 
     def _key_has_content(self, key: str) -> bool:
+        if is_scene_key(key):
+            return self.canvas.has_image()
         if is_piece_key(key):
             return self.canvas.has_piece_of_kind(key)
         return key in self.canvas.all_region_boxes()
@@ -1684,6 +1819,8 @@ class MainWindow(QMainWindow):
         if not self.current_id or not self.canvas.has_image():
             return False
         sample = self.dataset.get(self.current_id)
+        if is_scene_key(key):
+            return sample is None or key not in sample.confirmed
         if is_piece_key(key):
             canvas = [piece for piece in self.canvas.all_pieces() if piece["kind"] == key]
             saved = [piece for piece in (sample.pieces if sample else []) if piece.get("kind") == key]
@@ -1758,9 +1895,13 @@ class MainWindow(QMainWindow):
 
     def _place_train_fx(self) -> None:
         host = self._train_fx.parentWidget() or self
-        top_left = self.canvas.mapTo(host, self.canvas.rect().topLeft())
-        self._train_fx.setGeometry(top_left.x(), top_left.y(), self.canvas.width(), self.canvas.height())
+        self._train_fx.setGeometry(0, 0, host.width(), host.height())
         self._train_fx.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_train_fx"):
+            self._place_train_fx()
 
     def start_training(self) -> None:
         if self._is_training():
@@ -1774,6 +1915,8 @@ class MainWindow(QMainWindow):
                 "",
             ]
             lines.extend(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚" for key in selected)
+            if any(key in SCENE_KEYS for key in selected):
+                lines.append(f"GO/TIME UP以外: {self._scene_other_count()} 枚")
             QMessageBox.information(self, "まだ足りません", "\n".join(lines))
             return
         ready_lines = [f"{job[3]}: {len(job[1])} 枚" for job in jobs]
@@ -1784,10 +1927,18 @@ class MainWindow(QMainWindow):
                 if "pieces" in trained_keys:
                     continue
                 skipped.append(f"{PLACE_LABELS[key]}: {counts[key]} 枚")
+            elif key in SCENE_KEYS:
+                if "scene" in trained_keys:
+                    continue
+                skipped.append(f"{PLACE_LABELS[key]}: {counts[key]} 枚")
             elif key not in trained_keys:
                 skipped.append(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚")
         if "coin" in selected and "coin_digits" not in trained_keys:
             skipped.append(f"コインの数字: {counts.get('coin_digits', 0)} 枚")
+        if any(key in SCENE_KEYS for key in selected) and "scene" not in trained_keys:
+            others = self._scene_other_count()
+            if others < MIN_TRAIN_SAMPLES:
+                skipped.append(f"GO/TIME UP以外: {others} 枚")
         message = "チェックした種類だけ学習します。\n" + "\n".join(ready_lines)
         piece_selected = [key for key in PIECE_KEYS if key in selected]
         if len(piece_selected) == 1 and "pieces" in trained_keys:
@@ -1805,11 +1956,12 @@ class MainWindow(QMainWindow):
         self.train_worker.progress.connect(self.on_train_progress)
         self.train_worker.finished_ok.connect(self.on_train_finished)
         self.train_worker.failed.connect(self.on_train_failed)
-        self.train_worker.start()
         self._lock_for_training()
         self._place_train_fx()
         self._train_fx.start()
+        QApplication.processEvents()
         self.statusBar().showMessage("学習中です。中止できます")
+        self.train_worker.start()
 
     def on_train_button(self) -> None:
         if self._is_training():
@@ -1831,6 +1983,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(epoch)
         self._train_fx.set_progress(epoch, total, message)
         self.statusBar().showMessage(message)
+        QApplication.processEvents()
 
     def on_train_finished(self, metrics: dict) -> None:
         worker = self.train_worker
@@ -1862,7 +2015,7 @@ class MainWindow(QMainWindow):
         for item in results:
             if item.get("key") == "pieces":
                 lines.append(f"{item['label']}  loss {item.get('loss', 0):.4f}（{item['samples']} 枚）")
-            elif item.get("key") == "coin_digits":
+            elif item.get("key") in {"coin_digits", "scene"}:
                 lines.append(f"{item['label']}  acc {item.get('iou', 0):.3f}（{item['samples']} 枚）")
             else:
                 lines.append(f"{item['label']}  IoU {item['iou']:.3f}（{item['samples']} 枚）")

@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from app.extractor import SamplePoint, VideoInfo, extract_frames
+from app.scene_scan import extract_scene_frames, find_scene_points
 
 
 class ExtractWorker(QThread):
@@ -27,5 +28,44 @@ class ExtractWorker(QThread):
                 progress=lambda current, total, name: self.progress.emit(current, total, name),
             )
             self.finished_ok.emit([str(path) for path in paths])
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class SceneExtractWorker(QThread):
+    progress = Signal(int, int, str)
+    finished_ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        info: VideoInfo,
+        output_dir: Path,
+        points: list[SamplePoint] | None = None,
+    ) -> None:
+        super().__init__()
+        self.info = info
+        self.output_dir = output_dir
+        self.points = points
+        self.found_points: list[SamplePoint] = list(points or [])
+
+    def run(self) -> None:
+        try:
+            if self.points is not None:
+                paths = extract_scene_frames(
+                    self.info,
+                    self.points,
+                    self.output_dir,
+                    progress=lambda current, total, name: self.progress.emit(current, total, name),
+                )
+                self.finished_ok.emit([str(path) for path in paths])
+                return
+            self.progress.emit(0, max(self.info.frame_count, 1), "画面を探しています")
+            points = find_scene_points(
+                self.info,
+                progress=lambda current, total, name: self.progress.emit(current, total, name),
+            )
+            self.found_points = points
+            self.finished_ok.emit([])
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))

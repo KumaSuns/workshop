@@ -30,6 +30,8 @@ class SamplePoint:
     percent: float
     seconds: float
     frame: int
+    kind: str = "sample"
+    score: float = 0.0
 
 
 def format_timecode(seconds: float) -> str:

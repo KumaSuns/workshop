@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 
 import cv2
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QImage, QPixmap, QShortcut, QKeySequence, QDragEnterEvent, QDropEvent
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -35,8 +41,21 @@ from app.extractor import (
     extracted_file_for,
     write_image,
 )
-from app.worker import ExtractWorker
+from app.worker import ExtractWorker, SceneExtractWorker
 from app.handoff import send_images_to_tsumtsum
+from app.data_sync import (
+    copy_data_folder,
+    ensure_scene_packed,
+    import_data_folder,
+    is_same_or_inside,
+    resolve_data_dir,
+    resolved,
+    trainer_data_dir,
+)
+from app.paths import IMAGE_EXTENSIONS, IPC_NAME, TRAINER_IPC_NAME
+from app.scene_labels import MIN_SCENE_SAMPLES, OTHER_KEY, SceneLabels, scene_model_ready
+from app.scene_train import SceneTrainWorker
+from app.train_overlay import TrainOverlay
 
 STYLESHEET = """
 QMainWindow, QWidget {
@@ -106,7 +125,8 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLESHEET)
 
         self.info: VideoInfo | None = None
-        self.worker: ExtractWorker | None = None
+        self.worker: ExtractWorker | SceneExtractWorker | SceneTrainWorker | None = None
+        self.scene_labels = SceneLabels()
         self._settings = QSettings("workshop", "VideoFrameExtractor")
         self.output_dir = Path(__file__).resolve().parent.parent / "output"
         saved_out = str(self._settings.value("last_output_dir", "") or "")
@@ -116,8 +136,10 @@ class MainWindow(QMainWindow):
         self._full_pixmap: QPixmap | None = None
         self._saved_by_index: dict[int, Path] = {}
         self._preview_point = None
+        self._ipc_buffers: dict[int, bytes] = {}
 
         self._build_ui()
+        self._start_ipc()
         QShortcut(QKeySequence.StandardKey.Open, self, self.open_video)
 
     def _build_ui(self) -> None:
@@ -136,6 +158,8 @@ class MainWindow(QMainWindow):
         self.hint_label = QLabel(
             f"動画をドロップまたは「動画を開く」。再生時間の {int(RANGE_START*100)}%〜{int(RANGE_END*100)}% から、指定枚数を等間隔で画像にします。"
             "1枚のときは再生時間の中心（50%）です。"
+            "探したい画面は種類を追加し、用意した画像を取り込んで学習します。"
+            "間違った画面は「これは違う」で教えて、もう一度学習してください。"
         )
         self.hint_label.setObjectName("hint")
         self.hint_label.setWordWrap(True)
@@ -144,11 +168,8 @@ class MainWindow(QMainWindow):
         top_layout.addLayout(title_box, 1)
         self.open_btn = QPushButton("動画を開く")
         self.folder_btn = QPushButton("保存先")
-        self.extract_btn = QPushButton("画像に抜き出す")
-        self.extract_btn.setObjectName("primary")
         top_layout.addWidget(self.open_btn, 0, Qt.AlignmentFlag.AlignTop)
         top_layout.addWidget(self.folder_btn, 0, Qt.AlignmentFlag.AlignTop)
-        top_layout.addWidget(self.extract_btn, 0, Qt.AlignmentFlag.AlignTop)
         layout.addWidget(top)
 
         body = QSplitter(Qt.Orientation.Horizontal)
@@ -170,6 +191,36 @@ class MainWindow(QMainWindow):
         count_row.addStretch(1)
         left_layout.addLayout(count_row)
 
+        self.extract_btn = QPushButton("画像に抜き出す")
+        self.extract_btn.setObjectName("primary")
+        self.scene_btn = QPushButton("画面を抜き出す")
+        left_layout.addWidget(self.extract_btn)
+        left_layout.addWidget(self.scene_btn)
+
+        kind_row = QHBoxLayout()
+        kind_row.addWidget(QLabel("種類"))
+        self.kind_combo = QComboBox()
+        kind_row.addWidget(self.kind_combo, 1)
+        self.add_kind_btn = QPushButton("種類を追加")
+        kind_row.addWidget(self.add_kind_btn)
+        left_layout.addLayout(kind_row)
+        self.teach_label = QLabel()
+        self.teach_label.setObjectName("hint")
+        self.teach_label.setWordWrap(True)
+        left_layout.addWidget(self.teach_label)
+        teach_row = QHBoxLayout()
+        self.teach_btn = QPushButton("この画像はこの種類")
+        self.import_btn = QPushButton("用意した画像を取り込む")
+        teach_row.addWidget(self.teach_btn)
+        teach_row.addWidget(self.import_btn)
+        left_layout.addLayout(teach_row)
+        teach_row2 = QHBoxLayout()
+        self.other_btn = QPushButton("どちらでもない")
+        self.scene_train_btn = QPushButton("学習する")
+        teach_row2.addWidget(self.other_btn)
+        teach_row2.addWidget(self.scene_train_btn)
+        left_layout.addLayout(teach_row2)
+
         self.folder_label = QLabel(f"保存先: {self.output_dir}")
         self.folder_label.setObjectName("hint")
         self.folder_label.setWordWrap(True)
@@ -178,10 +229,20 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("抜き出し位置（クリックでプレビュー）"))
         self.point_list = QListWidget()
         left_layout.addWidget(self.point_list, 1)
+        review_row = QHBoxLayout()
+        self.wrong_btn = QPushButton("これは違う")
+        self.right_btn = QPushButton("合っている")
+        review_row.addWidget(self.wrong_btn)
+        review_row.addWidget(self.right_btn)
+        left_layout.addLayout(review_row)
         self.send_one_btn = QPushButton("この画像をツムツムに渡す")
         self.send_all_btn = QPushButton("すべてツムツムに渡す")
         left_layout.addWidget(self.send_one_btn)
         left_layout.addWidget(self.send_all_btn)
+        self.copy_data_btn = QPushButton("dataをコピー")
+        self.import_data_btn = QPushButton("dataを取り込む")
+        left_layout.addWidget(self.copy_data_btn)
+        left_layout.addWidget(self.import_data_btn)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -208,46 +269,127 @@ class MainWindow(QMainWindow):
         body.setSizes([360, 740])
         layout.addWidget(body, 1)
         self.setCentralWidget(root)
+        self._train_fx = TrainOverlay(root)
+        self._train_fx.cancelRequested.connect(self.cancel_scene_train)
         self.statusBar().showMessage("準備完了")
 
         self.open_btn.clicked.connect(self.open_video)
         self.folder_btn.clicked.connect(self.choose_folder)
         self.extract_btn.clicked.connect(self.start_extract)
+        self.scene_btn.clicked.connect(self.start_scene_extract)
+        self.wrong_btn.clicked.connect(self.reject_current_scene)
+        self.right_btn.clicked.connect(self.accept_current_scene)
+        self.add_kind_btn.clicked.connect(self.add_scene_kind)
+        self.teach_btn.clicked.connect(self.teach_current_kind)
+        self.import_btn.clicked.connect(self.import_prepared_images)
+        self.other_btn.clicked.connect(lambda: self.teach_current(OTHER_KEY))
+        self.scene_train_btn.clicked.connect(self.start_scene_train)
+        self._fill_kind_combo()
         self.count_spin.valueChanged.connect(self.refresh_points)
         self.point_list.currentItemChanged.connect(self.on_point_selected)
         self.send_one_btn.clicked.connect(self.send_current_to_tsumtsum)
         self.send_all_btn.clicked.connect(self.send_all_to_tsumtsum)
+        self.copy_data_btn.clicked.connect(self.copy_data_folder)
+        self.import_data_btn.clicked.connect(self.import_data_folder)
         self._update_buttons()
 
     def _update_buttons(self) -> None:
         busy = self.worker is not None
         ready = self.info is not None and not busy
         self.extract_btn.setEnabled(ready)
+        self.scene_btn.setEnabled(ready)
         self.open_btn.setEnabled(not busy)
         self.count_spin.setEnabled(not busy)
-        self.send_one_btn.setEnabled(ready and self.point_list.currentItem() is not None)
+        has_point = ready and self.point_list.currentItem() is not None
+        reviewing = has_point and self._current_is_found_scene()
+        self.wrong_btn.setEnabled(reviewing)
+        self.right_btn.setEnabled(reviewing)
+        self.send_one_btn.setEnabled(has_point)
         self.send_all_btn.setEnabled(ready and self.point_list.count() > 0)
+        has_kind = self._selected_kind() is not None
+        self.teach_btn.setEnabled(has_point and has_kind)
+        self.import_btn.setEnabled(not busy and has_kind)
+        self.other_btn.setEnabled(has_point)
+        self.add_kind_btn.setEnabled(not busy)
+        self.kind_combo.setEnabled(not busy)
+        self.copy_data_btn.setEnabled(not busy)
+        self.import_data_btn.setEnabled(not busy)
+        training = isinstance(self.worker, SceneTrainWorker)
+        self.scene_train_btn.setEnabled(not busy or training)
+        self.scene_train_btn.setText("中止" if training else "学習する")
+        self._refresh_teach_label()
 
-    def _last_video_dir(self) -> str:
-        saved = str(self._settings.value("last_video_dir", "") or "")
+    def _fill_kind_combo(self) -> None:
+        current = self._selected_kind()
+        self.kind_combo.blockSignals(True)
+        self.kind_combo.clear()
+        self.kind_combo.addItem(self.scene_labels.name_of(OTHER_KEY), OTHER_KEY)
+        for key, name in self.scene_labels.kinds():
+            self.kind_combo.addItem(name, key)
+        if current:
+            index = self.kind_combo.findData(current)
+            if index >= 0:
+                self.kind_combo.setCurrentIndex(index)
+        self.kind_combo.blockSignals(False)
+        self.scene_btn.setText(f"{self.scene_labels.extract_names()}を抜き出す")
+
+    def _selected_kind(self) -> str | None:
+        key = self.kind_combo.currentData()
+        return str(key) if key else None
+
+    def _found_scene_points(self) -> list:
+        points = []
+        for point in self._list_points():
+            kind = getattr(point, "kind", "sample")
+            if kind and kind not in {"sample", OTHER_KEY}:
+                points.append(point)
+        return points
+
+    def _current_is_found_scene(self) -> bool:
+        item = self.point_list.currentItem()
+        if item is None:
+            return False
+        point = item.data(Qt.ItemDataRole.UserRole)
+        kind = getattr(point, "kind", "sample") if point is not None else "sample"
+        return bool(kind) and kind not in {"sample", OTHER_KEY}
+
+    def _refresh_teach_label(self) -> None:
+        counts = self.scene_labels.counts()
+        parts = [f"{self.scene_labels.name_of(key)} {counts.get(key, 0)}" for key in self.scene_labels.classes()]
+        self.teach_label.setText("  ".join(parts) + f"  （学習は各{MIN_SCENE_SAMPLES}枚）")
+
+    def _dialog_dir(self, key: str, fallback: Path | None = None) -> str:
+        saved = str(self._settings.value(f"last_dir/{key}", "") or "")
+        if not saved:
+            saved = str(self._settings.value(f"last_{key}_dir", "") or "")
         if saved and Path(saved).is_dir():
             return saved
+        if fallback is not None and Path(fallback).is_dir():
+            return str(fallback)
         return str(Path.home())
+
+    def _remember_dialog_dir(self, key: str, path: str | Path) -> None:
+        target = Path(path)
+        folder = target if target.is_dir() else target.parent
+        if folder.is_dir():
+            self._settings.setValue(f"last_dir/{key}", str(folder.resolve()))
 
     def open_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "動画を開く",
-            self._last_video_dir(),
+            self._dialog_dir("video"),
             "Video (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.wmv)",
         )
         if path:
+            self._remember_dialog_dir("video", path)
             self.load_video(Path(path))
 
     def choose_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "保存先フォルダ", str(self.output_dir))
+        path = QFileDialog.getExistingDirectory(self, "保存先フォルダ", self._dialog_dir("output", self.output_dir))
         if path:
             self.output_dir = Path(path)
+            self._remember_dialog_dir("output", self.output_dir)
             self._settings.setValue("last_output_dir", str(self.output_dir))
             self.folder_label.setText(f"保存先: {self.output_dir}")
 
@@ -270,6 +412,7 @@ class MainWindow(QMainWindow):
         )
         self.refresh_points()
         self._update_buttons()
+        self._remember_dialog_dir("video", path)
         self._settings.setValue("last_video_dir", str(path.parent.resolve()))
         self._settings.setValue("last_video_path", str(path.resolve()))
         self.statusBar().showMessage(f"{path.name} を読み込みました", 4000)
@@ -282,8 +425,12 @@ class MainWindow(QMainWindow):
             return
         points = sample_points(self.info, self.count_spin.value())
         for point in points:
+            label = ""
+            kind = getattr(point, "kind", "sample")
+            if kind and kind not in {"sample", OTHER_KEY}:
+                label = f"  {self.scene_labels.name_of(kind)}  {point.score:.0%}"
             item = QListWidgetItem(
-                f"{point.index:3d}  {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%)"
+                f"{point.index:3d}  {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%){label}"
             )
             item.setData(Qt.ItemDataRole.UserRole, point)
             self.point_list.addItem(item)
@@ -329,8 +476,12 @@ class MainWindow(QMainWindow):
             pixmap = QPixmap.fromImage(image)
         self._full_pixmap = pixmap
         self._preview_point = point
+        extra = ""
+        kind = getattr(point, "kind", "sample")
+        if kind and kind not in {"sample", OTHER_KEY}:
+            extra = f"  {self.scene_labels.name_of(kind)}  {point.score:.0%}"
         self.preview_title.setText(
-            f"プレビュー  {point.index} / {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%)  {source}"
+            f"プレビュー  {point.index} / {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%){extra}  {source}"
         )
         self._fit_preview()
         self.statusBar().showMessage(
@@ -371,6 +522,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self._full_pixmap is not None and not self._full_pixmap.isNull():
             self._fit_preview()
+        if hasattr(self, "_train_fx"):
+            self._train_fx._place()
 
     def _point_image_path(self, point) -> Path:
         saved = self._saved_by_index.get(point.index)
@@ -430,16 +583,23 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "渡せませんでした", str(exc))
             return
         count = len(paths)
-        if result == "sent":
-            message = f"{count} 枚をツムツムアプリに渡しました。そちらで四角を囲んで「この範囲を保存」してください。"
+        kinds = {getattr(point, "kind", "sample") for point in points}
+        extract_keys = set(self.scene_labels.extract_keys())
+        if kinds and kinds <= extract_keys:
+            teach = "探した画面を確認してください。"
         else:
-            message = f"ツムツムアプリを開いて {count} 枚を取り込みました。四角を囲んで「この範囲を保存」してください。"
+            teach = "四角を囲んで「この範囲を保存」してください。"
+        if result == "sent":
+            message = f"{count} 枚をツムツムアプリに渡しました。そちらで{teach}"
+        else:
+            message = f"ツムツムアプリを開いて {count} 枚を取り込みました。{teach}"
         self.statusBar().showMessage(message, 6000)
         QMessageBox.information(self, "渡しました", message)
 
     def start_extract(self) -> None:
         if self.info is None or self.worker is not None:
             return
+        self.refresh_points()
         points = sample_points(self.info, self.count_spin.value())
         self.progress.setVisible(True)
         self.progress.setRange(0, len(points))
@@ -452,10 +612,231 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         self.statusBar().showMessage("抜き出し中です…")
 
+    def start_scene_extract(self) -> None:
+        if self.info is None or self.worker is not None:
+            return
+        if not scene_model_ready():
+            QMessageBox.information(
+                self,
+                "まだ学習していません",
+                "種類ごとに用意した画像を取り込み、「どちらでもない」も教えてから"
+                f"それぞれ {MIN_SCENE_SAMPLES} 枚以上そろえて「学習する」を押してください。",
+            )
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, max(self.info.frame_count, 1))
+        self.progress.setValue(0)
+        self.worker = SceneExtractWorker(self.info, self.output_dir)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_scene_finished)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+        self._update_buttons()
+        self.statusBar().showMessage(f"{self.scene_labels.extract_names()}を探しています…")
+
+    def add_scene_kind(self) -> None:
+        name, ok = QInputDialog.getText(self, "種類を追加", "画面の名前")
+        if not ok:
+            return
+        try:
+            key = self.scene_labels.add_kind(name)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.information(self, "追加できません", str(exc))
+            return
+        self._fill_kind_combo()
+        index = self.kind_combo.findData(key)
+        if index >= 0:
+            self.kind_combo.setCurrentIndex(index)
+        self._update_buttons()
+        self.statusBar().showMessage(f"「{self.scene_labels.name_of(key)}」を追加しました", 4000)
+
+    def teach_current_kind(self) -> None:
+        kind = self._selected_kind()
+        if kind:
+            self.teach_current(kind)
+
+    def import_prepared_images(self) -> None:
+        kind = self._selected_kind()
+        if kind is None:
+            return
+        name = self.scene_labels.name_of(kind)
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            f"「{name}」の画像を取り込む",
+            self._dialog_dir(f"import_{kind}", Path(self._dialog_dir("import"))),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        paths = [Path(path) for path in files if Path(path).suffix.lower() in IMAGE_EXTENSIONS]
+        if not paths:
+            return
+        self._remember_dialog_dir(f"import_{kind}", paths[0])
+        self._remember_dialog_dir("import", paths[0])
+        added = self.scene_labels.add_many(paths, kind)
+        self._update_buttons()
+        counts = self.scene_labels.counts()
+        QMessageBox.information(
+            self,
+            "取り込みました",
+            f"「{name}」に {added} 枚取り込みました。\nいま {counts.get(kind, 0)} 枚です。",
+        )
+        self.statusBar().showMessage(f"「{name}」 {counts.get(kind, 0)} 枚", 5000)
+
+    def teach_current(self, kind: str) -> bool:
+        item = self.point_list.currentItem()
+        if item is None:
+            return False
+        point = item.data(Qt.ItemDataRole.UserRole)
+        if point is None:
+            return False
+        try:
+            path = self._point_image_path(point)
+            self.scene_labels.add(path, kind)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "教えられませんでした", str(exc))
+            return False
+        self._saved_by_index[point.index] = path
+        self._update_buttons()
+        name = self.scene_labels.name_of(kind)
+        count = self.scene_labels.counts().get(kind, 0)
+        self.statusBar().showMessage(f"「{name}」として覚えました。いま {count} 枚です", 5000)
+        return True
+
+    def reject_current_scene(self) -> None:
+        if not self.teach_current(OTHER_KEY):
+            return
+        self._remove_current_point()
+        left = self.point_list.count()
+        self.statusBar().showMessage(
+            f"違う画面として覚えました。残り {left} 枚。直したら「学習する」を押してください",
+            6000,
+        )
+
+    def accept_current_scene(self) -> None:
+        item = self.point_list.currentItem()
+        if item is None:
+            return
+        point = item.data(Qt.ItemDataRole.UserRole)
+        kind = getattr(point, "kind", None) if point is not None else None
+        if not kind or kind in {"sample", OTHER_KEY}:
+            return
+        if not self.teach_current(kind):
+            return
+        self._remove_current_point()
+        self.statusBar().showMessage(
+            f"「{self.scene_labels.name_of(kind)}」で合っています。残り {self.point_list.count()} 枚",
+            5000,
+        )
+
+    def _remove_current_point(self) -> None:
+        row = self.point_list.currentRow()
+        item = self.point_list.takeItem(row)
+        del item
+        if self.point_list.count():
+            self.point_list.setCurrentRow(min(row, self.point_list.count() - 1))
+        self._update_buttons()
+
+    def start_scene_train(self) -> None:
+        if isinstance(self.worker, SceneTrainWorker):
+            self.cancel_scene_train()
+            return
+        if self.worker is not None:
+            return
+        missing = self.scene_labels.missing_for_train()
+        if missing:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("まだ足りません")
+            box.setText(
+                f"それぞれ {MIN_SCENE_SAMPLES} 枚以上必要です。\n" + "\n".join(missing)
+            )
+            other_count = self.scene_labels.counts().get(OTHER_KEY, 0)
+            import_btn = None
+            if other_count < MIN_SCENE_SAMPLES:
+                import_btn = box.addButton("どちらでもない画像を取り込む", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("OK", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if import_btn is not None and box.clickedButton() is import_btn:
+                index = self.kind_combo.findData(OTHER_KEY)
+                if index >= 0:
+                    self.kind_combo.setCurrentIndex(index)
+                self.import_prepared_images()
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 40)
+        self.progress.setValue(0)
+        self.worker = SceneTrainWorker(self.scene_labels)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_scene_trained)
+        self.worker.failed.connect(self.on_failed)
+        self._train_fx.start()
+        QApplication.processEvents()
+        self.worker.start()
+        self._update_buttons()
+        self.statusBar().showMessage("学習中です")
+
+    def cancel_scene_train(self) -> None:
+        if not isinstance(self.worker, SceneTrainWorker) or not self.worker.isRunning():
+            return
+        self._train_fx.set_cancelling()
+        self.worker.requestInterruption()
+        self.scene_train_btn.setEnabled(False)
+        self.scene_train_btn.setText("中止しています…")
+        self.statusBar().showMessage("学習を中止しています")
+
+    def on_scene_trained(self, metrics: dict) -> None:
+        self.worker = None
+        self.progress.setVisible(False)
+        self._train_fx.stop()
+        self._update_buttons()
+        acc = float(metrics.get("acc") or 0)
+        samples = int(metrics.get("samples") or 0)
+        QMessageBox.information(
+            self,
+            "学習完了",
+            f"{samples} 枚で学習しました。精度 {acc:.0%}\n「{self.scene_labels.extract_names()}を抜き出す」が使えます。",
+        )
+        self.statusBar().showMessage(f"学習しました  精度 {acc:.0%}", 5000)
+
+    def on_scene_finished(self, _paths: list[str]) -> None:
+        points = getattr(self.worker, "found_points", []) if self.worker is not None else []
+        self.worker = None
+        self.progress.setVisible(False)
+        self._saved_by_index = {}
+        names = self.scene_labels.extract_names()
+        if points:
+            self.point_list.blockSignals(True)
+            self.point_list.clear()
+            for point in points:
+                name = self.scene_labels.name_of(point.kind)
+                item = QListWidgetItem(
+                    f"{point.index:3d}  {format_timecode(point.seconds)}  {name}  {point.score:.0%}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, point)
+                self.point_list.addItem(item)
+            self.point_list.blockSignals(False)
+            if self.point_list.count():
+                self.point_list.setCurrentRow(0)
+        self._update_buttons()
+        if not points:
+            QMessageBox.information(self, "見つかりませんでした", f"{names} の画面は見つかりませんでした。")
+            self.statusBar().showMessage(f"{names} は見つかりませんでした", 5000)
+            return
+        QMessageBox.information(
+            self,
+            "見つかりました",
+            f"{names} を {len(points)} 枚見つけました。\n"
+            "間違っていたら「これは違う」、合っていたら「合っている」を押してください。\n"
+            "直したあと「学習する」と、次から精度が上がります。",
+        )
+        self.statusBar().showMessage(f"{len(points)} 枚見つかりました。間違いは「これは違う」", 6000)
+
     def on_progress(self, current: int, total: int, name: str) -> None:
         self.progress.setRange(0, total)
         self.progress.setValue(current)
-        self.statusBar().showMessage(f"{current}/{total}  {name}")
+        if isinstance(self.worker, SceneTrainWorker):
+            self._train_fx.set_progress(current, total, name)
+        self.statusBar().showMessage(name)
+        QApplication.processEvents()
 
     def on_finished(self, paths: list[str]) -> None:
         self.worker = None
@@ -481,8 +862,13 @@ class MainWindow(QMainWindow):
     def on_failed(self, message: str) -> None:
         self.worker = None
         self.progress.setVisible(False)
+        self._train_fx.stop()
         self._update_buttons()
-        QMessageBox.critical(self, "抜き出しに失敗", message)
+        if "中止" in message:
+            QMessageBox.information(self, "学習を中止", "学習を中止しました。")
+            self.statusBar().showMessage("学習を中止しました", 4000)
+            return
+        QMessageBox.critical(self, "失敗しました", message)
 
     def _open_folder(self, folder: Path) -> None:
         folder.mkdir(parents=True, exist_ok=True)
@@ -498,13 +884,171 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        for url in event.mimeData().urls():
-            path = Path(url.toLocalFile())
-            if path.suffix.lower() in VIDEO_EXTENSIONS:
-                self.load_video(path)
-                event.acceptProposedAction()
-                return
+        paths = [Path(url.toLocalFile()) for url in event.mimeData().urls()]
+        videos = [path for path in paths if path.suffix.lower() in VIDEO_EXTENSIONS]
+        if videos:
+            self.load_video(videos[0])
+            event.acceptProposedAction()
+            return
+        images = [path for path in paths if path.suffix.lower() in IMAGE_EXTENSIONS]
+        kind = self._selected_kind()
+        if images and kind:
+            added = self.scene_labels.add_many(images, kind)
+            self._update_buttons()
+            name = self.scene_labels.name_of(kind)
+            count = self.scene_labels.counts().get(kind, 0)
+            QMessageBox.information(
+                self,
+                "取り込みました",
+                f"「{name}」に {added} 枚取り込みました。\nいま {count} 枚です。",
+            )
+            self.statusBar().showMessage(f"「{name}」 {count} 枚", 5000)
+            event.acceptProposedAction()
+            return
         event.ignore()
+
+    def _notify_trainer(self, action: str) -> None:
+        sock = QLocalSocket()
+        sock.connectToServer(TRAINER_IPC_NAME)
+        if not sock.waitForConnected(400):
+            return
+        sock.write(json.dumps({"action": action}, ensure_ascii=False).encode("utf-8") + b"\n")
+        sock.waitForBytesWritten(800)
+        sock.disconnectFromServer()
+
+    def _reload_scene_bundle(self) -> None:
+        self.scene_labels.reload()
+        self._fill_kind_combo()
+        self._update_buttons()
+        self.statusBar().showMessage("画面の学習データを取り込みました", 5000)
+
+    def copy_data_folder(self) -> None:
+        if self.worker is not None:
+            return
+        dest_parent = QFileDialog.getExistingDirectory(self, "貼り付ける場所を選ぶ", self._dialog_dir("copy_data"))
+        if not dest_parent:
+            return
+        self._remember_dialog_dir("copy_data", dest_parent)
+        data_dir = trainer_data_dir()
+        dest_parent_path = Path(dest_parent)
+        dest = dest_parent_path / data_dir.name
+        if is_same_or_inside(dest, data_dir) or is_same_or_inside(dest_parent_path, data_dir):
+            QMessageBox.warning(
+                self,
+                "コピーできません",
+                "今使っている data と同じ場所、またはその中にはコピーできません。",
+            )
+            return
+        if dest.exists():
+            answer = QMessageBox.question(
+                self,
+                "すでにあります",
+                f"{dest}\nすでに data フォルダがあります。中身を置き換えますか？",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            packed = ensure_scene_packed(data_dir)
+            if not data_dir.exists():
+                raise FileNotFoundError(f"コピーするフォルダがありません。\n{data_dir}")
+            dest = copy_data_folder(data_dir, dest_parent_path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "コピーに失敗", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        extra = f"\n画面の学習画像 {packed.get('images', 0)} 枚"
+        if packed.get("missing"):
+            extra += f"（見つからない画像 {packed['missing']} 枚は除きました）"
+        self.statusBar().showMessage(f"dataをコピーしました: {dest}", 5000)
+        QMessageBox.information(
+            self,
+            "コピーしました",
+            f"ツムの data と、画面の学習データをコピーしました。\n{dest}{extra}",
+        )
+
+    def import_data_folder(self) -> None:
+        if self.worker is not None:
+            return
+        chosen = QFileDialog.getExistingDirectory(self, "取り込む data を選ぶ", self._dialog_dir("import_data"))
+        if not chosen:
+            return
+        self._remember_dialog_dir("import_data", chosen)
+        data_dir = trainer_data_dir()
+        source = resolve_data_dir(Path(chosen))
+        if source is None:
+            QMessageBox.warning(
+                self,
+                "dataではありません",
+                "index.json か、画像の入った images か、モデルの入った models か、画面の学習データがあるフォルダを選んでください。",
+            )
+            return
+        if resolved(source) == resolved(data_dir):
+            QMessageBox.information(self, "同じ場所です", "今使っている data と同じ場所です。")
+            return
+        if is_same_or_inside(data_dir, source):
+            QMessageBox.warning(
+                self,
+                "取り込めません",
+                "今使っている data を含むフォルダは取り込めません。",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "dataを取り込む",
+            "今のツムの画像・枠・モデルと、画面の学習データを、選んだ data で置き換えます。続けますか？\n"
+            "画面の学習データが入っていない古い data のときは、今の画面学習はそのまま残します。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._notify_trainer("release-data")
+        QApplication.processEvents()
+        time.sleep(0.2)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            import_data_folder(data_dir, source)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "取り込みに失敗", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._reload_scene_bundle()
+        self._notify_trainer("reload-data")
+        QMessageBox.information(self, "取り込みました", "ツムの data と、画面の学習データを取り込みました。")
+
+    def _start_ipc(self) -> None:
+        self._ipc_server = QLocalServer(self)
+        self._ipc_server.newConnection.connect(self._on_ipc_connection)
+        if self._ipc_server.listen(IPC_NAME):
+            return
+        QLocalServer.removeServer(IPC_NAME)
+        self._ipc_server.listen(IPC_NAME)
+
+    def _on_ipc_connection(self) -> None:
+        sock = self._ipc_server.nextPendingConnection()
+        if sock is None:
+            return
+        self._ipc_buffers[id(sock)] = b""
+        sock.readyRead.connect(lambda s=sock: self._on_ipc_ready(s))
+        sock.disconnected.connect(lambda s=sock: self._ipc_buffers.pop(id(s), None))
+        self.raise_()
+        self.activateWindow()
+        self.showNormal()
+
+    def _on_ipc_ready(self, sock: QLocalSocket) -> None:
+        self._ipc_buffers[id(sock)] = self._ipc_buffers.get(id(sock), b"") + bytes(sock.readAll())
+        buffer = self._ipc_buffers[id(sock)]
+        if b"\n" not in buffer:
+            return
+        line, rest = buffer.split(b"\n", 1)
+        self._ipc_buffers[id(sock)] = rest
+        try:
+            payload = json.loads(line.decode("utf-8"))
+        except Exception:
+            return
+        if str(payload.get("action") or "") == "reload-scene":
+            self._reload_scene_bundle()
 
     def closeEvent(self, event) -> None:
         if self.worker is not None and self.worker.isRunning():
