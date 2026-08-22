@@ -42,6 +42,7 @@ from app.extractor import (
     write_image,
 )
 from app.worker import ExtractWorker, SceneExtractWorker
+from app.scene_scan import REJECT_HASH_LIMIT, hashes_too_close, scene_ahash_path
 from app.handoff import send_images_to_tsumtsum
 from app.data_sync import (
     copy_data_folder,
@@ -164,7 +165,7 @@ class MainWindow(QMainWindow):
             f"動画をドロップまたは「動画を開く」。再生時間の {int(RANGE_START*100)}%〜{int(RANGE_END*100)}% から、指定枚数を等間隔で画像にします。"
             "1枚のときは再生時間の中心（50%）です。"
             "探したい画面は種類を追加し、用意した画像を取り込んで学習します。"
-            "間違った画面は「これは違う」で教えて、もう一度学習してください。"
+            "間違った画面は「これは違う」で教えます。似た画面は次から出ません。"
         )
         self.hint_label.setObjectName("hint")
         self.hint_label.setWordWrap(True)
@@ -903,14 +904,52 @@ class MainWindow(QMainWindow):
         return True
 
     def reject_current_scene(self) -> None:
+        item = self.point_list.currentItem()
+        if item is None:
+            return
+        point = item.data(Qt.ItemDataRole.UserRole)
+        rejected_hash = self._scene_hash_for_point(point)
         if not self.teach_current(OTHER_KEY):
             return
-        self._remove_current_point()
+        removed = self._remove_points_like(rejected_hash)
+        if removed <= 0:
+            self._remove_current_point()
+            removed = 1
         left = self.point_list.count()
+        extra = f"  似た画面も {removed} 枚外しました" if removed > 1 else ""
         self.statusBar().showMessage(
-            f"違う画面として覚えました。残り {left} 枚。直したら「学習する」を押してください",
-            6000,
+            f"違う画面として覚えました。残り {left} 枚。{extra} 学習しなくても、次から同じ画面は出しません",
+            7000,
         )
+
+    def _scene_hash_for_point(self, point) -> int | None:
+        if point is None:
+            return None
+        try:
+            return scene_ahash_path(self._point_image_path(point))
+        except Exception:
+            return None
+
+    def _remove_points_like(self, rejected_hash: int | None) -> int:
+        if rejected_hash is None:
+            return 0
+        removed = 0
+        for row in range(self.point_list.count() - 1, -1, -1):
+            item = self.point_list.item(row)
+            if item is None:
+                continue
+            digest = self._scene_hash_for_point(item.data(Qt.ItemDataRole.UserRole))
+            if digest is None or not hashes_too_close(digest, rejected_hash, REJECT_HASH_LIMIT):
+                continue
+            self.point_list.takeItem(row)
+            removed += 1
+        if self.point_list.count():
+            self.point_list.setCurrentRow(min(self.point_list.currentRow(), self.point_list.count() - 1))
+            if self.point_list.currentRow() < 0:
+                self.point_list.setCurrentRow(0)
+        self._update_buttons()
+        self._refresh_info_pane()
+        return removed
 
     def accept_current_scene(self) -> None:
         item = self.point_list.currentItem()
@@ -1030,6 +1069,7 @@ class MainWindow(QMainWindow):
             "見つかりました",
             f"{names} を {len(points)} 枚見つけました。\n"
             "間違っていたら「これは違う」、合っていたら「合っている」を押してください。\n"
+            "「これは違う」とした画面と似たものは、次から出ません。\n"
             "直したあと「学習する」と、次から精度が上がります。",
         )
         self.statusBar().showMessage(f"{len(points)} 枚見つかりました。間違いは「これは違う」", 6000)

@@ -10,12 +10,14 @@ from torchvision import transforms
 from torchvision.models import ResNet18_Weights, resnet18
 
 from app.extractor import SamplePoint, VideoInfo, format_timecode, write_image
-from app.scene_labels import OTHER_KEY, scene_model_path, scene_model_ready
+from app.scene_labels import OTHER_KEY, SceneLabels, scene_model_path, scene_model_ready
 
 SCENE_INPUT = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 SCENE_THRESHOLD = 0.55
+REJECT_HASH_SIZE = 8
+REJECT_HASH_LIMIT = 12
 
 
 class SceneNet(nn.Module):
@@ -42,6 +44,47 @@ class SceneNet(nn.Module):
             last_block = self.features[-2]
             for parameter in last_block.parameters():
                 parameter.requires_grad = True
+
+
+def scene_ahash(image: Image.Image, size: int = REJECT_HASH_SIZE) -> int:
+    small = image.convert("L").resize((size, size), Image.Resampling.BILINEAR)
+    pixels = list(small.getdata())
+    avg = sum(pixels) / max(len(pixels), 1)
+    bits = 0
+    for value in pixels:
+        bits = (bits << 1) | int(value >= avg)
+    return bits
+
+
+def scene_ahash_path(path: Path) -> int | None:
+    try:
+        with Image.open(path) as image:
+            return scene_ahash(image)
+    except Exception:
+        return None
+
+
+def hashes_too_close(left: int, right: int, limit: int = REJECT_HASH_LIMIT) -> bool:
+    return (left ^ right).bit_count() <= limit
+
+
+def other_scene_hashes() -> list[int]:
+    hashes: list[int] = []
+    for item in SceneLabels().items():
+        if item.get("kind") != OTHER_KEY:
+            continue
+        path = Path(str(item.get("path") or ""))
+        digest = scene_ahash_path(path)
+        if digest is not None:
+            hashes.append(digest)
+    return hashes
+
+
+def _looks_rejected(image: Image.Image, rejected: list[int]) -> bool:
+    if not rejected:
+        return False
+    current = scene_ahash(image)
+    return any(hashes_too_close(current, other) for other in rejected)
 
 
 def load_scene_checkpoint(device: torch.device) -> tuple[SceneNet, tuple[str, ...]]:
@@ -81,6 +124,7 @@ def find_scene_points(
         raise ValueError("画面のモデルがありません。画像を教えて学習してください。")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, classes = load_scene_checkpoint(device)
+    rejected = other_scene_hashes()
     transform = transforms.Compose(
         [
             transforms.Resize((SCENE_INPUT, SCENE_INPUT)),
@@ -108,7 +152,12 @@ def find_scene_points(
                     probs = torch.softmax(model(tensor), dim=1)[0]
                 score, index = float(probs.max().item()), int(probs.argmax().item())
                 kind = classes[index] if 0 <= index < len(classes) else OTHER_KEY
-                if kind != OTHER_KEY and score >= SCENE_THRESHOLD and (want_kinds is None or kind in want_kinds):
+                if (
+                    kind != OTHER_KEY
+                    and score >= SCENE_THRESHOLD
+                    and (want_kinds is None or kind in want_kinds)
+                    and not _looks_rejected(image, rejected)
+                ):
                     hits.append((kind, frame_index, frame_index / info.fps, score))
                 if progress is not None:
                     progress(frame_index + 1, total, f"{kind} {score:.2f}")
