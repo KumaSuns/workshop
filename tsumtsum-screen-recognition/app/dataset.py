@@ -27,6 +27,7 @@ class Sample:
     regions: dict[str, dict[str, int]]
     confirmed: list[str]
     pieces: list[dict[str, int]]
+    readings: dict[str, str]
     status: str  # unlabeled | predicted | labeled | skipped
 
     @property
@@ -45,6 +46,7 @@ class Sample:
             "regions": self.regions,
             "confirmed": self.confirmed,
             "pieces": self.pieces,
+            "readings": self.readings,
             "status": self.status,
         }
 
@@ -75,6 +77,7 @@ class Sample:
             regions=regions,
             confirmed=confirmed,
             pieces=[dict(item) for item in data.get("pieces") or []],
+            readings={str(key): str(value) for key, value in (data.get("readings") or {}).items()},
             status=status,
         )
 
@@ -149,7 +152,29 @@ class Dataset:
         ]
 
     def labeled_counts(self) -> dict[str, int]:
-        return {key: len(self.labeled_for(key)) for key in [*REGION_KEYS, *PIECE_KEYS]}
+        counts = {key: len(self.labeled_for(key)) for key in [*REGION_KEYS, *PIECE_KEYS]}
+        counts["coin_digits"] = len(self.labeled_readings("coin"))
+        return counts
+
+    def labeled_readings(self, key: str = "coin") -> list[Sample]:
+        return [
+            sample
+            for sample in self._samples
+            if sample.status != "skipped"
+            and sample.regions.get(key)
+            and str(sample.readings.get(key) or "").isdigit()
+        ]
+
+    def set_reading(self, sample_id: str, key: str, number: str) -> Sample:
+        sample = self.get(sample_id)
+        if sample is None:
+            raise KeyError(sample_id)
+        digits = "".join(char for char in number if char.isdigit())
+        if not digits:
+            raise ValueError("数字がありません")
+        sample.readings[key] = digits
+        self._save()
+        return sample
 
     def model_path_for(self, key: str) -> Path:
         return self.models_dir / model_filename(key)
@@ -227,6 +252,7 @@ class Dataset:
             regions={},
             confirmed=[],
             pieces=[],
+            readings={},
             status="unlabeled",
         )
         self._samples.append(sample)

@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.dataset import Dataset, Sample
+from app.hud_number import CoinNumberDialog, format_coin_number, read_coin_number as ocr_coin_number
 from app.image_canvas import ImageCanvas
 from app.paths import APP_ROOT, DATA_DIR, IMAGE_EXTENSIONS, IPC_NAME, VIDEO_EXTRACTOR_MAIN
 from app.predictor import Predictor
@@ -49,9 +50,19 @@ from app.regions import (
 from app.train_effect import TrainEffect
 from app.train_worker import MIN_TRAIN_SAMPLES, TrainWorker
 
-LIST_STATUS_KEYS = ("game", "tsum", "bomb")
-LIST_STATUS_HEADERS = {"game": "ゲーム範囲", "tsum": "ツム", "bomb": "ボム"}
-LIST_STATUS_WIDTHS = {"game": 110, "tsum": 88, "bomb": 88}
+LIST_STATUS_WIDTHS = {
+    "game": 110,
+    "score": 72,
+    "coin": 72,
+    "coin_digits": 100,
+    "timer": 88,
+    "skill": 110,
+    "fan": 80,
+    "pause": 88,
+    "fever": 120,
+    "tsum": 72,
+    "bomb": 72,
+}
 
 STYLESHEET = """
 QMainWindow, QWidget {
@@ -220,7 +231,7 @@ QFrame#coords {
 class FileListDelegate(QStyledItemDelegate):
     def initStyleOption(self, option, index) -> None:
         super().initStyleOption(option, index)
-        if index.column() < len(LIST_STATUS_KEYS):
+        if index.model() is not None and index.column() < index.model().columnCount() - 1:
             option.textElideMode = Qt.TextElideMode.ElideNone
         else:
             option.textElideMode = Qt.TextElideMode.ElideMiddle
@@ -336,6 +347,8 @@ class MainWindow(QMainWindow):
             first.setCheckState(Qt.CheckState.Checked)
         self._fit_region_list()
         left_layout.addWidget(self.region_list)
+        self.read_coin_btn = QPushButton("コインの数字を取る")
+        left_layout.addWidget(self.read_coin_btn)
         self.model_label = QLabel()
         self.model_label.setObjectName("hint")
         self.model_label.setWordWrap(True)
@@ -377,10 +390,6 @@ class MainWindow(QMainWindow):
         unused_row.addWidget(self.delete_unused_btn)
         right_layout.addLayout(unused_row)
         self.list_widget = QTableWidget()
-        self.list_widget.setColumnCount(len(LIST_STATUS_KEYS) + 1)
-        self.list_widget.setHorizontalHeaderLabels(
-            [LIST_STATUS_HEADERS[key] for key in LIST_STATUS_KEYS] + ["ファイル"]
-        )
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.list_widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -395,10 +404,7 @@ class MainWindow(QMainWindow):
         header = self.list_widget.horizontalHeader()
         header.setHighlightSections(False)
         header.setStretchLastSection(True)
-        for col, key in enumerate(LIST_STATUS_KEYS):
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-            self.list_widget.setColumnWidth(col, LIST_STATUS_WIDTHS[key])
-        header.setSectionResizeMode(len(LIST_STATUS_KEYS), QHeaderView.ResizeMode.Stretch)
+        self._sync_list_columns()
         right_layout.addWidget(self.list_widget, 1)
         self.delete_btn = QPushButton("選択を削除")
         self.delete_btn.setObjectName("danger")
@@ -461,6 +467,7 @@ class MainWindow(QMainWindow):
         self.clear_btn.clicked.connect(self.clear_current_region)
         self.undo_piece_btn.clicked.connect(self.undo_last_piece)
         self.reuse_btn.clicked.connect(self.reuse_last_box)
+        self.read_coin_btn.clicked.connect(self.read_coin_number)
         self.predict_btn.clicked.connect(self.predict_current)
         self.train_btn.clicked.connect(self.on_train_button)
         self._train_fx.cancelRequested.connect(self.cancel_training)
@@ -562,6 +569,7 @@ class MainWindow(QMainWindow):
         return [sample for sample in samples if sample.status != "skipped"]
 
     def refresh_list(self, select_id: str | None = None) -> None:
+        self._sync_list_columns()
         selected = select_id or self.current_id
         samples = self._visible_samples()
         scroll = self.list_widget.verticalScrollBar().value()
@@ -608,14 +616,22 @@ class MainWindow(QMainWindow):
 
     def _style_list_row(self, row: int, sample: Sample) -> None:
         skipped = sample.status == "skipped"
-        for col, key in enumerate(LIST_STATUS_KEYS):
-            state = self._key_list_state(sample, key)
-            if state == "confirmed":
-                text, color = "済", QColor("#3DDC97")
-            elif state == "predicted":
-                text, color = "予測", QColor("#FFB020")
+        status_keys = self._list_status_keys()
+        for col, key in enumerate(status_keys):
+            if key == "coin_digits":
+                digits = "".join(char for char in (sample.readings or {}).get("coin", "") if char.isdigit())
+                if digits:
+                    text, color = format_coin_number(digits), QColor("#3DDC97")
+                else:
+                    text, color = "未", QColor("#8b93a0")
             else:
-                text, color = "未", QColor("#8b93a0")
+                state = self._key_list_state(sample, key)
+                if state == "confirmed":
+                    text, color = "済", QColor("#3DDC97")
+                elif state == "predicted":
+                    text, color = "予測", QColor("#FFB020")
+                else:
+                    text, color = "未", QColor("#8b93a0")
             if skipped:
                 color = QColor("#7a8190")
             item = self.list_widget.item(row, col)
@@ -627,7 +643,7 @@ class MainWindow(QMainWindow):
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item.setData(Qt.ItemDataRole.UserRole, sample.id)
             item.setFlags((item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled) & ~Qt.ItemFlag.ItemIsEditable)
-        name_col = len(LIST_STATUS_KEYS)
+        name_col = len(status_keys)
         name_item = self.list_widget.item(row, name_col)
         if name_item is None:
             name_item = QTableWidgetItem()
@@ -672,7 +688,8 @@ class MainWindow(QMainWindow):
             f"全 {counts['total']} 枚\n"
             f"保存済み {counts['labeled']} / 予測 {counts['predicted']} / 未設定 {counts['unlabeled']} / 使わない {counts['skipped']}\n"
             f"{per_type}\n"
-            f"学習の目安: 種類ごとに {MIN_TRAIN_SAMPLES} 枚以上"
+            f"コイン数字 {labeled_counts.get('coin_digits', 0)}\n"
+            f"学習の目安: 種類ごとに {MIN_TRAIN_SAMPLES} 枚以上。コインの数字も同じです。"
         )
         ready = self.predictor.ready_keys()
         if ready:
@@ -713,6 +730,7 @@ class MainWindow(QMainWindow):
         else:
             self.piece_count_label.setText("")
         self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
+        self.read_coin_btn.setEnabled(has_sample and "coin" in self.canvas.all_region_boxes())
         self.delete_btn.setEnabled(has_sample)
         self._update_unused_delete_buttons()
 
@@ -740,7 +758,9 @@ class MainWindow(QMainWindow):
     def on_place_item_changed(self, _item: QListWidgetItem) -> None:
         if self.region_list.signalsBlocked():
             return
+        self._sync_piece_game_checks()
         self._apply_visible_keys()
+        self.refresh_list(select_id=self.current_id)
         self.update_stats()
 
     def on_region_type_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
@@ -756,6 +776,7 @@ class MainWindow(QMainWindow):
             self.region_list.blockSignals(True)
             current.setCheckState(Qt.CheckState.Checked)
             self.region_list.blockSignals(False)
+        self._sync_piece_game_checks()
         self._apply_visible_keys()
         self._refresh_region_list()
         self.refresh_list(select_id=self.current_id)
@@ -1427,6 +1448,35 @@ class MainWindow(QMainWindow):
         self.refresh_list()
         self.statusBar().showMessage("dataを取り込みました", 5000)
 
+    def read_coin_number(self) -> None:
+        if self._block_if_training() or not self.current_id:
+            return
+        sample = self.dataset.get(self.current_id)
+        box = self.canvas.all_region_boxes().get("coin")
+        if sample is None or box is None:
+            QMessageBox.information(self, "コインの枠がありません", "先にコインの枠を囲んでください。")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            crop, number = ocr_coin_number(
+                sample.image_path,
+                box,
+                predict_fn=self.predictor.predict_coin_digits if self.predictor.digit_model else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "数字を取れませんでした", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        dialog = CoinNumberDialog(crop, number, self)
+        dialog.exec()
+        if dialog.taught and dialog.number():
+            self.dataset.set_reading(self.current_id, "coin", dialog.number())
+            self.refresh_list(select_id=self.current_id)
+            self.statusBar().showMessage(f"コイン {dialog.number()} を教えました。学習すると次から使います", 5000)
+        elif dialog.number():
+            self.statusBar().showMessage(f"コイン {dialog.number()}", 5000)
+
     def predict_current(self) -> None:
         if not self.current_id or not self.predictor.is_ready():
             return
@@ -1471,6 +1521,17 @@ class MainWindow(QMainWindow):
                         self._piece_job_label(piece_keys),
                     )
                 )
+        if "coin" in selected:
+            digit_samples = self.dataset.labeled_readings("coin")
+            if len(digit_samples) >= MIN_TRAIN_SAMPLES:
+                jobs.append(
+                    (
+                        "coin_digits",
+                        digit_samples,
+                        self.dataset.model_path_for("coin_digits"),
+                        "コインの数字",
+                    )
+                )
         return jobs
 
     def _piece_job_label(self, keys: list[str] | None = None) -> str:
@@ -1482,6 +1543,8 @@ class MainWindow(QMainWindow):
     def _job_label(self, key: str) -> str:
         if key == "pieces":
             return self._piece_job_label()
+        if key == "coin_digits":
+            return "コインの数字"
         return PLACE_LABELS.get(key, key)
 
     def _needs_save(self) -> bool:
@@ -1497,6 +1560,46 @@ class MainWindow(QMainWindow):
 
     def _apply_visible_keys(self) -> None:
         self.canvas.set_visible_keys(self._selected_place_keys())
+
+    def _place_item(self, key: str) -> QListWidgetItem | None:
+        for row in range(self.region_list.count()):
+            item = self.region_list.item(row)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == key:
+                return item
+        return None
+
+    def _sync_piece_game_checks(self) -> None:
+        piece_on = False
+        for key in PIECE_KEYS:
+            item = self._place_item(key)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                piece_on = True
+                break
+        game_item = self._place_item("game")
+        if not piece_on or game_item is None or game_item.checkState() == Qt.CheckState.Checked:
+            return
+        self.region_list.blockSignals(True)
+        game_item.setCheckState(Qt.CheckState.Checked)
+        self.region_list.blockSignals(False)
+        self.statusBar().showMessage("ツムとボムにはゲーム範囲が必要です", 4000)
+
+    def _list_status_keys(self) -> list[str]:
+        keys = list(self._selected_place_keys() or ["game"])
+        if "coin" in keys:
+            index = keys.index("coin") + 1
+            keys.insert(index, "coin_digits")
+        return keys
+
+    def _sync_list_columns(self) -> None:
+        keys = self._list_status_keys()
+        headers = [PLACE_LABELS.get(key, key) for key in keys] + ["ファイル"]
+        header = self.list_widget.horizontalHeader()
+        self.list_widget.setColumnCount(len(headers))
+        self.list_widget.setHorizontalHeaderLabels(headers)
+        for col, key in enumerate(keys):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.list_widget.setColumnWidth(col, LIST_STATUS_WIDTHS.get(key, 88))
+        header.setSectionResizeMode(len(keys), QHeaderView.ResizeMode.Stretch)
 
     def _selected_place_keys(self) -> list[str]:
         keys: list[str] = []
@@ -1557,6 +1660,7 @@ class MainWindow(QMainWindow):
             self.clear_btn,
             self.undo_piece_btn,
             self.predict_btn,
+            self.read_coin_btn,
             self.delete_btn,
             self.delete_unused_one_btn,
             self.delete_unused_btn,
@@ -1624,6 +1728,8 @@ class MainWindow(QMainWindow):
                 skipped.append(f"{PLACE_LABELS[key]}: {counts[key]} 枚")
             elif key not in trained_keys:
                 skipped.append(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚")
+        if "coin" in selected and "coin_digits" not in trained_keys:
+            skipped.append(f"コインの数字: {counts.get('coin_digits', 0)} 枚")
         message = "チェックした種類だけ学習します。\n" + "\n".join(ready_lines)
         piece_selected = [key for key in PIECE_KEYS if key in selected]
         if len(piece_selected) == 1 and "pieces" in trained_keys:
@@ -1698,6 +1804,8 @@ class MainWindow(QMainWindow):
         for item in results:
             if item.get("key") == "pieces":
                 lines.append(f"{item['label']}  loss {item.get('loss', 0):.4f}（{item['samples']} 枚）")
+            elif item.get("key") == "coin_digits":
+                lines.append(f"{item['label']}  acc {item.get('iou', 0):.3f}（{item['samples']} 枚）")
             else:
                 lines.append(f"{item['label']}  IoU {item['iou']:.3f}（{item['samples']} 枚）")
         QMessageBox.information(

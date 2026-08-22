@@ -6,6 +6,14 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+from app.digit_model import (
+    DIGIT_HEIGHT,
+    DIGIT_WIDTH,
+    IMAGENET_MEAN as DIGIT_MEAN,
+    IMAGENET_STD as DIGIT_STD,
+    CoinDigitNet,
+    decode_logits,
+)
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, peaks_from_heat
 from app.regions import PIECE_KEYS, REGION_KEYS, model_filename, piece_radius_from_game
@@ -17,6 +25,7 @@ class Predictor:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.models: dict[str, GameRegionNet] = {}
         self.piece_model: PieceNet | None = None
+        self.digit_model: CoinDigitNet | None = None
         self._transform = transforms.Compose(
             [
                 transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
@@ -31,20 +40,30 @@ class Predictor:
                 transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
             ]
         )
+        self._digit_transform = transforms.Compose(
+            [
+                transforms.Resize((DIGIT_HEIGHT, DIGIT_WIDTH)),
+                transforms.ToTensor(),
+                transforms.Normalize(DIGIT_MEAN, DIGIT_STD),
+            ]
+        )
         self.reload()
 
     def is_ready(self) -> bool:
-        return bool(self.models) or self.piece_model is not None
+        return bool(self.models) or self.piece_model is not None or self.digit_model is not None
 
     def ready_keys(self) -> list[str]:
         keys = [key for key in REGION_KEYS if key in self.models]
         if self.piece_model is not None:
             keys.extend(PIECE_KEYS)
+        if self.digit_model is not None:
+            keys.append("coin_digits")
         return keys
 
     def reload(self) -> bool:
         self.models = {}
         self.piece_model = None
+        self.digit_model = None
         for key in REGION_KEYS:
             path = self.models_dir / model_filename(key)
             if not path.exists():
@@ -73,7 +92,28 @@ class Predictor:
             model.to(self.device)
             model.eval()
             self.piece_model = model
+        digit_path = self.models_dir / model_filename("coin_digits")
+        if digit_path.exists():
+            checkpoint = torch.load(digit_path, map_location=self.device, weights_only=False)
+            model = CoinDigitNet(pretrained=False)
+            state = (
+                checkpoint["state_dict"]
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint
+                else checkpoint
+            )
+            model.load_state_dict(state)
+            model.to(self.device)
+            model.eval()
+            self.digit_model = model
         return self.is_ready()
+
+    def predict_coin_digits(self, crop: Image.Image) -> str:
+        if self.digit_model is None:
+            return ""
+        tensor = self._digit_transform(crop.convert("RGB")).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.digit_model(tensor)
+        return decode_logits(logits.cpu())
 
     def predict_all(self, image_path: Path) -> dict[str, dict[str, int]]:
         if not self.models:

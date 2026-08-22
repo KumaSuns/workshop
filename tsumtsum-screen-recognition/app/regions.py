@@ -23,8 +23,9 @@ PIECE_LABELS = {key: label for key, label, _color in PIECE_SPECS}
 PIECE_COLORS = {key: color for key, _label, color in PIECE_SPECS}
 PIECE_KEYS = [key for key, _label, _color in PIECE_SPECS]
 PLACE_SPECS = REGION_SPECS + PIECE_SPECS
-PLACE_LABELS = {**REGION_LABELS, **PIECE_LABELS}
+PLACE_LABELS = {**REGION_LABELS, **PIECE_LABELS, "coin_digits": "コイン数値"}
 PLACE_COLORS = {**REGION_COLORS, **PIECE_COLORS}
+COIN_DIGIT_KEY = "coin_digits"
 
 TSUM_GROUP_COLORS = [
     "#FFE066",
@@ -62,4 +63,6 @@ def model_filename(key: str) -> str:
         return "game_region.pt"
     if key == "pieces":
         return "pieces.pt"
+    if key == "coin_digits":
+        return "coin_digits.pt"
     return f"{key}.pt"
