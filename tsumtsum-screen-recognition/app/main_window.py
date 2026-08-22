@@ -1292,20 +1292,35 @@ class MainWindow(QMainWindow):
             self.show_sample(next_id)
         self.statusBar().showMessage(f"使わない画像を {len(unused)} 枚消しました", 4000)
 
+    def _resolved_path(self, path: Path) -> Path:
+        try:
+            return path.resolve()
+        except OSError:
+            return path.absolute()
+
+    def _is_same_or_inside(self, path: Path, root: Path) -> bool:
+        resolved = self._resolved_path(path)
+        base = self._resolved_path(root)
+        return resolved == base or base in resolved.parents
+
     def copy_data_folder(self) -> None:
+        if self._block_if_training():
+            return
         if not DATA_DIR.exists():
             QMessageBox.warning(self, "dataがありません", f"コピーするフォルダがありません。\n{DATA_DIR}")
             return
         dest_parent = QFileDialog.getExistingDirectory(self, "貼り付ける場所を選ぶ", str(Path.home()))
         if not dest_parent:
             return
-        dest = Path(dest_parent) / DATA_DIR.name
-        try:
-            if dest.resolve() == DATA_DIR.resolve():
-                QMessageBox.information(self, "同じ場所です", "コピー元と同じ場所です。")
-                return
-        except OSError:
-            pass
+        dest_parent_path = Path(dest_parent)
+        dest = dest_parent_path / DATA_DIR.name
+        if self._is_same_or_inside(dest, DATA_DIR) or self._is_same_or_inside(dest_parent_path, DATA_DIR):
+            QMessageBox.warning(
+                self,
+                "コピーできません",
+                "今使っている data と同じ場所、またはその中にはコピーできません。",
+            )
+            return
         if dest.exists():
             answer = QMessageBox.question(
                 self,
@@ -1314,16 +1329,24 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            shutil.rmtree(dest)
+        tmp = dest_parent_path / "_data_copying"
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            shutil.copytree(DATA_DIR, dest)
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            shutil.copytree(DATA_DIR, tmp)
+            if dest.exists():
+                shutil.rmtree(dest)
+            tmp.rename(dest)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "コピーに失敗", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
+            if tmp.exists() and dest.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
         self.statusBar().showMessage(f"dataをコピーしました: {dest}", 5000)
+        QMessageBox.information(self, "コピーしました", f"dataをコピーしました。\n{dest}")
 
     def _ensure_app_icon(self) -> Path | None:
         path = APP_ROOT / "app.ico"
@@ -1388,15 +1411,30 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
 
+    def _looks_like_data_dir(self, path: Path) -> bool:
+        if (path / "index.json").is_file():
+            return True
+        images = path / "images"
+        if images.is_dir() and any(
+            child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS for child in images.iterdir()
+        ):
+            return True
+        models = path / "models"
+        if models.is_dir() and any(child.is_file() and child.suffix.lower() == ".pt" for child in models.iterdir()):
+            return True
+        return False
+
     def _resolve_data_dir(self, path: Path) -> Path | None:
-        if (path / "index.json").exists() or (path / "images").is_dir() or (path / "models").is_dir():
+        if self._looks_like_data_dir(path):
             return path
         inner = path / "data"
-        if (inner / "index.json").exists() or (inner / "images").is_dir() or (inner / "models").is_dir():
+        if self._looks_like_data_dir(inner):
             return inner
         return None
 
     def import_data_folder(self) -> None:
+        if self._block_if_training():
+            return
         chosen = QFileDialog.getExistingDirectory(self, "取り込む data を選ぶ", str(Path.home()))
         if not chosen:
             return
@@ -1405,15 +1443,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "dataではありません",
-                "index.json か images か models があるフォルダを選んでください。",
+                "index.json か、画像の入った images か、モデルの入った models があるフォルダを選んでください。",
             )
             return
-        try:
-            if source.resolve() == DATA_DIR.resolve():
-                QMessageBox.information(self, "同じ場所です", "今使っている data と同じ場所です。")
-                return
-        except OSError:
-            pass
+        if self._resolved_path(source) == self._resolved_path(DATA_DIR):
+            QMessageBox.information(self, "同じ場所です", "今使っている data と同じ場所です。")
+            return
+        if self._is_same_or_inside(DATA_DIR, source):
+            QMessageBox.warning(
+                self,
+                "取り込めません",
+                "今使っている data を含むフォルダは取り込めません。",
+            )
+            return
         answer = QMessageBox.question(
             self,
             "dataを取り込む",
@@ -1425,28 +1467,44 @@ class MainWindow(QMainWindow):
             return
         self.current_id = None
         self.canvas.clear_image()
+        self.predictor.release()
         QApplication.processEvents()
-        tmp = DATA_DIR.parent / "_data_importing"
+        incoming = DATA_DIR.parent / "_data_importing"
+        outgoing = DATA_DIR.parent / "_data_replacing"
+        imported = False
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            if tmp.exists():
-                shutil.rmtree(tmp)
-            shutil.copytree(source, tmp)
+            if incoming.exists():
+                shutil.rmtree(incoming)
+            if outgoing.exists():
+                shutil.rmtree(outgoing)
+            shutil.copytree(source, incoming)
             if DATA_DIR.exists():
-                shutil.rmtree(DATA_DIR)
-            tmp.rename(DATA_DIR)
+                DATA_DIR.rename(outgoing)
+            incoming.rename(DATA_DIR)
+            imported = True
+            if outgoing.exists():
+                shutil.rmtree(outgoing)
         except Exception as exc:  # noqa: BLE001
+            if not DATA_DIR.exists() and outgoing.exists():
+                try:
+                    outgoing.rename(DATA_DIR)
+                except OSError:
+                    pass
             QMessageBox.critical(self, "取り込みに失敗", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
-            if tmp.exists():
-                shutil.rmtree(tmp, ignore_errors=True)
+            if incoming.exists():
+                shutil.rmtree(incoming, ignore_errors=True)
+            if imported and outgoing.exists():
+                shutil.rmtree(outgoing, ignore_errors=True)
         self.dataset.reload()
         self.predictor.reload()
         self._remember_last_boxes()
         self.refresh_list()
         self.statusBar().showMessage("dataを取り込みました", 5000)
+        QMessageBox.information(self, "取り込みました", "dataを取り込みました。")
 
     def read_coin_number(self) -> None:
         if self._block_if_training() or not self.current_id:

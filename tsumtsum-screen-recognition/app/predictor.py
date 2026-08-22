@@ -49,6 +49,16 @@ class Predictor:
         )
         self.reload()
 
+    def release(self) -> None:
+        self.models = {}
+        self.piece_model = None
+        self.digit_model = None
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     def is_ready(self) -> bool:
         return bool(self.models) or self.piece_model is not None or self.digit_model is not None
 
