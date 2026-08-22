@@ -72,7 +72,11 @@ def _group_hits(hits: list[tuple[str, int, float, float]], gap_frames: int) -> l
     return [max(group, key=lambda row: row[3]) for group in groups]
 
 
-def find_scene_points(info: VideoInfo, progress=None) -> list[SamplePoint]:
+def find_scene_points(
+    info: VideoInfo,
+    progress=None,
+    want_kinds: set[str] | None = None,
+) -> list[SamplePoint]:
     if not scene_model_ready():
         raise ValueError("画面のモデルがありません。画像を教えて学習してください。")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -104,7 +108,7 @@ def find_scene_points(info: VideoInfo, progress=None) -> list[SamplePoint]:
                     probs = torch.softmax(model(tensor), dim=1)[0]
                 score, index = float(probs.max().item()), int(probs.argmax().item())
                 kind = classes[index] if 0 <= index < len(classes) else OTHER_KEY
-                if kind != OTHER_KEY and score >= SCENE_THRESHOLD:
+                if kind != OTHER_KEY and score >= SCENE_THRESHOLD and (want_kinds is None or kind in want_kinds):
                     hits.append((kind, frame_index, frame_index / info.fps, score))
                 if progress is not None:
                     progress(frame_index + 1, total, f"{kind} {score:.2f}")

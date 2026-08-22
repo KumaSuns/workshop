@@ -439,9 +439,11 @@ class ImageCanvas(QGraphicsView):
         font = QFont("Yu Gothic UI", 8, QFont.Weight.DemiBold)
         painter.setFont(font)
         for index, piece in enumerate(self._pieces):
+            kind = piece["kind"]
+            if not self._key_is_visible(kind):
+                continue
             center = self.mapFromScene(QPointF(piece["x"], piece["y"]))
             radius = self._piece_view_radius(piece)
-            kind = piece["kind"]
             if kind == "tsum":
                 accent = QColor(tsum_group_color(int(piece.get("group") or 1)))
             else:
@@ -520,6 +522,8 @@ class ImageCanvas(QGraphicsView):
         hit = None
         best = 10**9
         for index, piece in enumerate(self._pieces):
+            if not self._key_is_visible(str(piece.get("kind") or "")):
+                continue
             dx = scene_pos.x() - piece["x"]
             dy = scene_pos.y() - piece["y"]
             dist = (dx * dx + dy * dy) ** 0.5

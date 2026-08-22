@@ -130,6 +130,22 @@ class SceneLabels:
             return names[0]
         return "と".join(names)
 
+    def keys_named(self, *names: str) -> list[str]:
+        aliases = {name.lower() for name in names}
+        return [
+            key
+            for key, name in self._kinds
+            if key.lower() in aliases or name.lower() in aliases
+        ]
+
+    def names_of(self, keys: list[str]) -> str:
+        names = [self.name_of(key) for key in keys]
+        if not names:
+            return "画面"
+        if len(names) == 1:
+            return names[0]
+        return "と".join(names)
+
     def add_kind(self, name: str) -> str:
         label = name.strip()
         if not label:

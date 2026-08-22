@@ -138,10 +138,16 @@ class CoinDigitDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         sample = self.samples[index]
-        crop = crop_box(sample.image_path, sample.regions[self.key])
+        key = self.key
+        if key not in sample.regions or not str(sample.readings.get(key) or "").isdigit():
+            for item in ("result_coin", "coin"):
+                if sample.regions.get(item) and str(sample.readings.get(item) or "").isdigit():
+                    key = item
+                    break
+        crop = crop_box(sample.image_path, sample.regions[key])
         if self.augment:
             crop = self.jitter(crop)
-        return self.normalize(crop), encode_digits(sample.readings.get(self.key, ""))
+        return self.normalize(crop), encode_digits(sample.readings.get(key, ""))
 
 
 class SceneDataset(Dataset):

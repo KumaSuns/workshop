@@ -42,11 +42,15 @@ class SceneExtractWorker(QThread):
         info: VideoInfo,
         output_dir: Path,
         points: list[SamplePoint] | None = None,
+        want_kinds: set[str] | None = None,
+        search_names: str = "画面",
     ) -> None:
         super().__init__()
         self.info = info
         self.output_dir = output_dir
         self.points = points
+        self.want_kinds = want_kinds
+        self.search_names = search_names
         self.found_points: list[SamplePoint] = list(points or [])
 
     def run(self) -> None:
@@ -60,10 +64,11 @@ class SceneExtractWorker(QThread):
                 )
                 self.finished_ok.emit([str(path) for path in paths])
                 return
-            self.progress.emit(0, max(self.info.frame_count, 1), "画面を探しています")
+            self.progress.emit(0, max(self.info.frame_count, 1), f"{self.search_names}を探しています")
             points = find_scene_points(
                 self.info,
                 progress=lambda current, total, name: self.progress.emit(current, total, name),
+                want_kinds=self.want_kinds,
             )
             self.found_points = points
             self.finished_ok.emit([])

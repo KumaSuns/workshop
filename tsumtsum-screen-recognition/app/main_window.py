@@ -48,12 +48,14 @@ from app.paths import (
 )
 from app.predictor import Predictor
 from app.regions import (
+    COIN_BOX_KEYS,
     PIECE_KEYS,
     PLACE_LABELS,
     PLACE_SPECS,
     REGION_KEYS,
     REGION_LABELS,
     SCENE_KEYS,
+    is_coin_box_key,
     is_piece_key,
     is_scene_key,
 )
@@ -64,6 +66,7 @@ LIST_STATUS_WIDTHS = {
     "game": 110,
     "score": 72,
     "coin": 72,
+    "result_coin": 140,
     "coin_digits": 100,
     "timer": 88,
     "skill": 110,
@@ -362,6 +365,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.region_list)
         self.read_coin_btn = QPushButton("コインの数字を取る")
         left_layout.addWidget(self.read_coin_btn)
+        self.open_result_train_btn = QPushButton("resultの学習画像を開く")
+        left_layout.addWidget(self.open_result_train_btn)
         self.model_label = QLabel()
         self.model_label.setObjectName("hint")
         self.model_label.setWordWrap(True)
@@ -422,13 +427,13 @@ class MainWindow(QMainWindow):
         self.delete_btn = QPushButton("選択を削除")
         self.delete_btn.setObjectName("danger")
         right_layout.addWidget(self.delete_btn)
-        self.copy_data_btn = QPushButton("dataをコピー")
+        self.copy_data_btn = QPushButton("DATAをアップ")
         right_layout.addWidget(self.copy_data_btn)
-        self.import_data_btn = QPushButton("dataを取り込む")
+        self.import_data_btn = QPushButton("DATA DOWNLOAD")
         right_layout.addWidget(self.import_data_btn)
-        self.shortcut_btn = QPushButton("起動アイコンを作る")
+        self.shortcut_btn = QPushButton("起動アイコン作成")
         right_layout.addWidget(self.shortcut_btn)
-        self.video_app_btn = QPushButton("動画から画像を抜き出す")
+        self.video_app_btn = QPushButton("動画編集・生成")
         right_layout.addWidget(self.video_app_btn)
         right.setMinimumWidth(480)
 
@@ -445,15 +450,10 @@ class MainWindow(QMainWindow):
         coords.setObjectName("coords")
         coords_layout = QHBoxLayout(coords)
         coords_layout.setContentsMargins(12, 8, 12, 8)
-        coords_layout.addWidget(QLabel("微調整"))
-        self.spin_x = self._make_spin("X")
-        self.spin_y = self._make_spin("Y")
-        self.spin_w = self._make_spin("W")
-        self.spin_h = self._make_spin("H")
-        for spin in (self.spin_x, self.spin_y, self.spin_w, self.spin_h):
-            coords_layout.addWidget(spin)
         self.reuse_btn = QPushButton("同じ枠を使う")
         coords_layout.addWidget(self.reuse_btn)
+        self.copy_box_btn = QPushButton("この枠をコピー")
+        coords_layout.addWidget(self.copy_box_btn)
         coords_layout.addWidget(QLabel("ツム種類"))
         self.spin_group = QSpinBox()
         self.spin_group.setPrefix("No.  ")
@@ -480,7 +480,9 @@ class MainWindow(QMainWindow):
         self.clear_btn.clicked.connect(self.clear_current_region)
         self.undo_piece_btn.clicked.connect(self.undo_last_piece)
         self.reuse_btn.clicked.connect(self.reuse_last_box)
+        self.copy_box_btn.clicked.connect(self.copy_current_box)
         self.read_coin_btn.clicked.connect(self.read_coin_number)
+        self.open_result_train_btn.clicked.connect(self.open_result_train_images)
         self.predict_btn.clicked.connect(self.predict_current)
         self.train_btn.clicked.connect(self.on_train_button)
         self._train_fx.cancelRequested.connect(self.cancel_training)
@@ -503,15 +505,6 @@ class MainWindow(QMainWindow):
         self.canvas.imageDropped.connect(self.import_qimage)
         self.canvas.installEventFilter(self)
         self.spin_group.valueChanged.connect(self.on_group_changed)
-        for spin in (self.spin_x, self.spin_y, self.spin_w, self.spin_h):
-            spin.valueChanged.connect(self.on_spin_changed)
-
-    def _make_spin(self, prefix: str) -> QSpinBox:
-        spin = QSpinBox()
-        spin.setPrefix(f"{prefix}  ")
-        spin.setRange(0, 20000)
-        spin.setEnabled(False)
-        return spin
 
     def _bind_shortcuts(self) -> None:
         QShortcut(QKeySequence.StandardKey.Undo, self, self.undo_last_piece)
@@ -643,7 +636,11 @@ class MainWindow(QMainWindow):
         status_keys = self._list_status_keys()
         for col, key in enumerate(status_keys):
             if key == "coin_digits":
-                digits = "".join(char for char in (sample.readings or {}).get("coin", "") if char.isdigit())
+                digits = ""
+                for box_key in COIN_BOX_KEYS:
+                    digits = "".join(char for char in (sample.readings or {}).get(box_key, "") if char.isdigit())
+                    if digits:
+                        break
                 if digits:
                     text, color = format_coin_number(digits), QColor("#3DDC97")
                 else:
@@ -752,13 +749,19 @@ class MainWindow(QMainWindow):
         self.reuse_btn.setEnabled(has_sample and has_last and not scene_mode)
         name = PLACE_LABELS.get(self._active_key, "範囲")
         self.reuse_btn.setText(f"{name}の大きさを使う" if piece_mode else f"{name}の枠を使う")
+        has_box = has_sample and not piece_mode and not scene_mode and self._active_key in self.canvas.all_region_boxes()
+        self.copy_box_btn.setEnabled(has_box)
+        self.copy_box_btn.setText(f"{name}をコピー")
         counts_map = self.canvas.piece_counts()
         if counts_map:
             self.piece_count_label.setText("  ".join(f"{k} {v}" for k, v in counts_map.items()))
         else:
             self.piece_count_label.setText("")
         self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
-        self.read_coin_btn.setEnabled(has_sample and "coin" in self.canvas.all_region_boxes())
+        self.read_coin_btn.setEnabled(
+            has_sample and any(key in self.canvas.all_region_boxes() for key in COIN_BOX_KEYS)
+        )
+        self.open_result_train_btn.setEnabled(True)
         self.delete_btn.setEnabled(has_sample)
         self._update_unused_delete_buttons()
 
@@ -776,7 +779,6 @@ class MainWindow(QMainWindow):
         if sample_id is None:
             self.current_id = None
             self.canvas.clear_image()
-            self._set_spins(None)
             self._set_dirty(False)
             self._refresh_region_list()
             self.update_stats()
@@ -799,7 +801,6 @@ class MainWindow(QMainWindow):
             return
         self._active_key = key
         self.canvas.set_active_key(key)
-        self._sync_spins_from_canvas()
         if current.checkState() != Qt.CheckState.Checked:
             self.region_list.blockSignals(True)
             current.setCheckState(Qt.CheckState.Checked)
@@ -809,20 +810,6 @@ class MainWindow(QMainWindow):
         self._refresh_region_list()
         self.refresh_list(select_id=self.current_id)
         self._apply_sample_hint()
-
-    def _sync_spins_from_canvas(self) -> None:
-        rect = self.canvas.current_region()
-        if rect is None:
-            self._set_spins(None)
-            return
-        self._set_spins(
-            {
-                "x": int(round(rect.x())),
-                "y": int(round(rect.y())),
-                "w": int(round(rect.width())),
-                "h": int(round(rect.height())),
-            }
-        )
 
     def _refresh_region_list(self) -> None:
         self.region_list.blockSignals(True)
@@ -852,11 +839,13 @@ class MainWindow(QMainWindow):
         sample = self.dataset.get(sample_id)
         if sample is None:
             return
-        if self.predictor.piece_model is not None:
+        selected = set(self._selected_place_keys())
+        if self.predictor.piece_model is not None and any(key in selected for key in PIECE_KEYS):
             missing = [
                 key
                 for key in PIECE_KEYS
-                if key not in sample.confirmed
+                if key in selected
+                and key not in sample.confirmed
                 and not any(piece.get("kind") == key for piece in sample.pieces)
             ]
             if missing:
@@ -881,7 +870,6 @@ class MainWindow(QMainWindow):
         )
         self.canvas.setFocus()
         self._apply_visible_keys()
-        self._sync_spins_from_canvas()
         self._set_dirty(False)
         self._refresh_region_list()
         self._apply_sample_hint(sample)
@@ -968,12 +956,29 @@ class MainWindow(QMainWindow):
             status="labeled",
             emit=False,
         )
-        self._sync_spins_from_canvas()
         self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
         self.statusBar().showMessage(
             f"「{name}」の前の枠を載せました。位置を直して保存してください",
             4000,
+        )
+
+    def copy_current_box(self) -> None:
+        if self._block_if_training() or not self.current_id:
+            return
+        if is_piece_key(self._active_key) or is_scene_key(self._active_key):
+            return
+        key = self._active_key
+        name = PLACE_LABELS.get(key, "範囲")
+        box = self.canvas.all_region_boxes().get(key)
+        if box is None:
+            QMessageBox.information(self, "枠がありません", f"先に「{name}」を囲んでください。")
+            return
+        self._last_boxes[key] = dict(box)
+        self.update_stats()
+        self.statusBar().showMessage(
+            f"「{name}」の枠をコピーしました。次の画像で「{name}の枠を使う」を押してください",
+            5000,
         )
 
     def launch_video_extractor(self) -> None:
@@ -1055,6 +1060,87 @@ class MainWindow(QMainWindow):
                 return
         self.statusBar().showMessage("クリップボードに画像がありません", 3000)
 
+    def open_result_train_images(self) -> None:
+        if self._block_if_training():
+            return
+        candidates = self._result_train_image_entries()
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "resultの画像がありません",
+                "動画フレーム抜き出しで教えた result の学習画像が見つかりませんでした。",
+            )
+            return
+        self._select_place("result_coin")
+        imported: list[Sample] = []
+        missing = 0
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(candidates))
+        self.progress.setValue(0)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            sync = self._data_sync()
+            root = sync.labels_file(DATA_DIR).parent
+            for index, raw in enumerate(candidates, start=1):
+                self.progress.setValue(index)
+                self.statusBar().showMessage(f"resultの学習画像を開いています {index}/{len(candidates)}")
+                QApplication.processEvents()
+                path = sync.resolve_sample_path(raw, root)
+                if path is None:
+                    missing += 1
+                    continue
+                try:
+                    imported.append(self.dataset.import_file(path, save=False))
+                except Exception as exc:  # noqa: BLE001
+                    QApplication.restoreOverrideCursor()
+                    QMessageBox.warning(self, "読み込みに失敗", f"{path.name}\n{exc}")
+                    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            if imported:
+                self.dataset.save()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.progress.setVisible(False)
+        if not imported:
+            extra = f"\n見つからない画像が {missing} 枚ありました。" if missing else ""
+            QMessageBox.information(self, "開けませんでした", f"resultの学習画像を開けませんでした。{extra}")
+            return
+        self._after_import(imported, predict=False)
+        target = next((sample for sample in imported if "result_coin" not in sample.confirmed), imported[0])
+        self.refresh_list(select_id=target.id)
+        self.show_sample(target.id)
+        extra = f"（見つからない {missing} 枚は除きました）" if missing else ""
+        self.statusBar().showMessage(
+            f"resultの学習画像 {len(imported)} 枚を開きました。リザルトのコインを囲んで保存してください{extra}",
+            6000,
+        )
+
+    def _result_train_image_entries(self) -> list[str]:
+        payload = self._data_sync().read_scene_payload(DATA_DIR)
+        found: list[str] = []
+        seen: set[str] = set()
+        for item in payload.get("samples") or []:
+            kind = str(item.get("kind") or "").strip().lower()
+            if kind != "result":
+                continue
+            raw = str(item.get("path") or "").strip()
+            if not raw or raw in seen:
+                continue
+            seen.add(raw)
+            found.append(raw)
+        return found
+
+    def _select_place(self, key: str) -> None:
+        item = self._place_item(key)
+        if item is None:
+            return
+        self.region_list.setCurrentItem(item)
+        if item.checkState() != Qt.CheckState.Checked:
+            self.region_list.blockSignals(True)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.region_list.blockSignals(False)
+            self._sync_piece_game_checks()
+            self._apply_visible_keys()
+
     def import_paths(self, paths: list[str]) -> None:
         if self._block_if_training():
             return
@@ -1083,9 +1169,9 @@ class MainWindow(QMainWindow):
             return
         self._after_import([sample])
 
-    def _after_import(self, samples: list[Sample]) -> None:
+    def _after_import(self, samples: list[Sample], predict: bool = True) -> None:
         predicted = 0
-        if self.predictor.is_ready():
+        if predict and self.predictor.is_ready():
             for sample in samples:
                 if sample.status != "unlabeled":
                     continue
@@ -1104,12 +1190,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{len(samples)} 枚を取り込みました。種類を選んで囲み、その種類を保存してください", 4000)
 
     def on_region_changed(self, x: int, y: int, w: int, h: int) -> None:
-        self._set_spins({"x": x, "y": y, "w": w, "h": h})
         self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
 
     def on_region_committed(self, x: int, y: int, w: int, h: int) -> None:
-        self._set_spins({"x": x, "y": y, "w": w, "h": h})
         self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
         name = PLACE_LABELS.get(self._active_key, "範囲")
@@ -1159,34 +1243,6 @@ class MainWindow(QMainWindow):
             self._set_dirty(False)
             return True
         return False
-
-    def _set_spins(self, region: dict | None, width: int | None = None, height: int | None = None) -> None:
-        for spin in (self.spin_x, self.spin_y, self.spin_w, self.spin_h):
-            spin.blockSignals(True)
-        sample = self.dataset.get(self.current_id) if self.current_id else None
-        max_w = width or (sample.width if sample else 20000)
-        max_h = height or (sample.height if sample else 20000)
-        self.spin_x.setRange(0, max(0, max_w - 1))
-        self.spin_y.setRange(0, max(0, max_h - 1))
-        self.spin_w.setRange(1, max(1, max_w))
-        self.spin_h.setRange(1, max(1, max_h))
-        enabled = region is not None
-        for spin in (self.spin_x, self.spin_y, self.spin_w, self.spin_h):
-            spin.setEnabled(enabled)
-        if region:
-            self.spin_x.setValue(int(region["x"]))
-            self.spin_y.setValue(int(region["y"]))
-            self.spin_w.setValue(int(region["w"]))
-            self.spin_h.setValue(int(region["h"]))
-        for spin in (self.spin_x, self.spin_y, self.spin_w, self.spin_h):
-            spin.blockSignals(False)
-
-    def on_spin_changed(self) -> None:
-        if not self.current_id or is_piece_key(self._active_key) or is_scene_key(self._active_key):
-            return
-        x, y, w, h = self.spin_x.value(), self.spin_y.value(), self.spin_w.value(), self.spin_h.value()
-        self.canvas.set_region(QRectF(x, y, w, h), status="labeled", emit=False)
-        self._set_dirty(self._active_needs_save())
 
     def confirm_current(self) -> None:
         if self._block_if_training():
@@ -1311,7 +1367,6 @@ class MainWindow(QMainWindow):
             self.canvas.all_region_boxes() != saved_boxes or self.canvas.all_pieces() != saved_pieces
         )
         self.refresh_list(select_id=self.current_id)
-        self._sync_spins_from_canvas()
         self._refresh_region_list()
         self._apply_sample_hint()
         self.update_stats()
@@ -1345,7 +1400,6 @@ class MainWindow(QMainWindow):
             next_id = visible[0].id if visible else None
         self.current_id = None
         self.canvas.clear_image()
-        self._set_spins(None)
         self._set_dirty(False)
         self.refresh_list(select_id=next_id)
         if next_id:
@@ -1363,7 +1417,6 @@ class MainWindow(QMainWindow):
             if select is None:
                 self.current_id = None
                 self.canvas.clear_image()
-                self._set_spins(None)
                 self._set_dirty(False)
         self.refresh_list(select_id=select)
         if select and select != self.current_id:
@@ -1388,7 +1441,6 @@ class MainWindow(QMainWindow):
         if current_unused:
             self.current_id = None
             self.canvas.clear_image()
-            self._set_spins(None)
             self._set_dirty(False)
         next_id = self.current_id or (self._visible_samples()[0].id if self._visible_samples() else None)
         self.refresh_list(select_id=next_id)
@@ -1615,8 +1667,10 @@ class MainWindow(QMainWindow):
         if self._block_if_training() or not self.current_id:
             return
         sample = self.dataset.get(self.current_id)
-        box = self.canvas.all_region_boxes().get("coin")
-        if sample is None or box is None:
+        boxes = self.canvas.all_region_boxes()
+        key = self._coin_read_key(boxes)
+        box = boxes.get(key) if key else None
+        if sample is None or key is None or box is None:
             QMessageBox.information(self, "コインの枠がありません", "先にコインの枠を囲んでください。")
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -1634,11 +1688,20 @@ class MainWindow(QMainWindow):
         dialog = CoinNumberDialog(crop, number, self)
         dialog.exec()
         if dialog.taught and dialog.number():
-            self.dataset.set_reading(self.current_id, "coin", dialog.number())
+            self.dataset.set_reading(self.current_id, key, dialog.number())
             self.refresh_list(select_id=self.current_id)
             self.statusBar().showMessage(f"コイン {dialog.number()} を教えました。学習すると次から使います", 5000)
         elif dialog.number():
             self.statusBar().showMessage(f"コイン {dialog.number()}", 5000)
+
+    def _coin_read_key(self, boxes: dict[str, dict[str, int]] | None = None) -> str | None:
+        boxes = boxes if boxes is not None else self.canvas.all_region_boxes()
+        if is_coin_box_key(self._active_key) and self._active_key in boxes:
+            return self._active_key
+        for key in COIN_BOX_KEYS:
+            if key in boxes:
+                return key
+        return None
 
     def predict_current(self) -> None:
         if not self.current_id or not self.predictor.is_ready():
@@ -1684,8 +1747,8 @@ class MainWindow(QMainWindow):
                         self._piece_job_label(piece_keys),
                     )
                 )
-        if "coin" in selected:
-            digit_samples = self.dataset.labeled_readings("coin")
+        if set(selected) & set(COIN_BOX_KEYS):
+            digit_samples = self.dataset.labeled_digit_samples()
             if len(digit_samples) >= MIN_TRAIN_SAMPLES:
                 jobs.append(
                     (
@@ -1776,9 +1839,9 @@ class MainWindow(QMainWindow):
 
     def _list_status_keys(self) -> list[str]:
         keys = list(self._selected_place_keys() or ["game"])
-        if "coin" in keys:
-            index = keys.index("coin") + 1
-            keys.insert(index, "coin_digits")
+        coin_index = next((index for index, key in enumerate(keys) if is_coin_box_key(key)), -1)
+        if coin_index >= 0 and "coin_digits" not in keys:
+            keys.insert(coin_index + 1, "coin_digits")
         return keys
 
     def _sync_list_columns(self) -> None:
@@ -1856,6 +1919,7 @@ class MainWindow(QMainWindow):
             self.undo_piece_btn,
             self.predict_btn,
             self.read_coin_btn,
+            self.open_result_train_btn,
             self.delete_btn,
             self.delete_unused_one_btn,
             self.delete_unused_btn,
@@ -1864,13 +1928,10 @@ class MainWindow(QMainWindow):
             self.shortcut_btn,
             self.video_app_btn,
             self.reuse_btn,
+            self.copy_box_btn,
             self.region_list,
             self.list_widget,
             self.canvas,
-            self.spin_x,
-            self.spin_y,
-            self.spin_w,
-            self.spin_h,
             self.spin_group,
         )
 
@@ -1933,7 +1994,7 @@ class MainWindow(QMainWindow):
                 skipped.append(f"{PLACE_LABELS[key]}: {counts[key]} 枚")
             elif key not in trained_keys:
                 skipped.append(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚")
-        if "coin" in selected and "coin_digits" not in trained_keys:
+        if set(selected) & set(COIN_BOX_KEYS) and "coin_digits" not in trained_keys:
             skipped.append(f"コインの数字: {counts.get('coin_digits', 0)} 枚")
         if any(key in SCENE_KEYS for key in selected) and "scene" not in trained_keys:
             others = self._scene_other_count()

@@ -38,7 +38,7 @@ def main() -> None:
     QLocalServer.removeServer(IPC_NAME)
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 

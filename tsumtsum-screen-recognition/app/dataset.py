@@ -159,7 +159,7 @@ class Dataset:
 
     def labeled_counts(self) -> dict[str, int]:
         counts = {key: len(self.labeled_for(key)) for key in [*REGION_KEYS, *PIECE_KEYS, *SCENE_KEYS]}
-        counts["coin_digits"] = len(self.labeled_readings("coin"))
+        counts["coin_digits"] = len(self.labeled_digit_samples())
         return counts
 
     def labeled_readings(self, key: str = "coin") -> list[Sample]:
@@ -170,6 +170,13 @@ class Dataset:
             and sample.regions.get(key)
             and str(sample.readings.get(key) or "").isdigit()
         ]
+
+    def labeled_digit_samples(self) -> list[Sample]:
+        by_id: dict[str, Sample] = {}
+        for key in ("coin", "result_coin"):
+            for sample in self.labeled_readings(key):
+                by_id[sample.id] = sample
+        return list(by_id.values())
 
     def set_reading(self, sample_id: str, key: str, number: str) -> Sample:
         sample = self.get(sample_id)
@@ -216,12 +223,12 @@ class Dataset:
             "skipped": sum(1 for s in self._samples if s.status == "skipped"),
         }
 
-    def import_file(self, path: Path) -> Sample:
+    def import_file(self, path: Path, save: bool = True) -> Sample:
         data = path.read_bytes()
         ext = path.suffix.lower()
         if ext not in IMAGE_EXTENSIONS:
             ext = ".png"
-        return self._import_bytes(data, ext, path.name)
+        return self._import_bytes(data, ext, path.name, save=save)
 
     def import_qimage(self, image: QImage | QPixmap, source_name: str = "clipboard.png") -> Sample:
         if isinstance(image, QPixmap):
@@ -234,7 +241,7 @@ class Dataset:
         data = bytes(QByteArray(buffer.data()))
         return self._import_bytes(data, ".png", source_name)
 
-    def _import_bytes(self, data: bytes, ext: str, source_name: str) -> Sample:
+    def _import_bytes(self, data: bytes, ext: str, source_name: str, save: bool = True) -> Sample:
         digest = hashlib.sha256(data).hexdigest()[:12]
         existing = self.get(digest)
         if existing:
@@ -262,8 +269,12 @@ class Dataset:
             status="unlabeled",
         )
         self._samples.append(sample)
-        self._save()
+        if save:
+            self._save()
         return sample
+
+    def save(self) -> None:
+        self._save()
 
     def set_regions(
         self,

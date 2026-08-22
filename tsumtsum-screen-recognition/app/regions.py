@@ -4,6 +4,7 @@ REGION_SPECS: list[tuple[str, str, str]] = [
     ("game", "ゲーム範囲", "#5CFF9E"),
     ("score", "スコア", "#7EC8FF"),
     ("coin", "コイン", "#FFD166"),
+    ("result_coin", "リザルトのコイン", "#FFC14D"),
     ("timer", "タイマー", "#FF8AD4"),
     ("skill", "スキルボタン", "#C084FC"),
     ("fan", "扇風機", "#80E0D0"),
@@ -33,6 +34,7 @@ PLACE_SPECS = REGION_SPECS + PIECE_SPECS
 PLACE_LABELS = {**REGION_LABELS, **PIECE_LABELS, **SCENE_LABELS, "coin_digits": "コイン数値"}
 PLACE_COLORS = {**REGION_COLORS, **PIECE_COLORS, **SCENE_COLORS}
 COIN_DIGIT_KEY = "coin_digits"
+COIN_BOX_KEYS = ("coin", "result_coin")
 
 TSUM_GROUP_COLORS = [
     "#FFE066",
@@ -53,6 +55,10 @@ TSUM_GROUP_COLORS = [
 def tsum_group_color(group: int) -> str:
     index = max(1, min(12, int(group or 1))) - 1
     return TSUM_GROUP_COLORS[index]
+
+
+def is_coin_box_key(key: str) -> bool:
+    return key in COIN_BOX_KEYS
 
 
 def is_piece_key(key: str) -> bool:

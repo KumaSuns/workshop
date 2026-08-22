@@ -56,6 +56,7 @@ from app.paths import IMAGE_EXTENSIONS, IPC_NAME, TRAINER_IPC_NAME
 from app.scene_labels import MIN_SCENE_SAMPLES, OTHER_KEY, SceneLabels, scene_model_ready
 from app.scene_train import SceneTrainWorker
 from app.train_overlay import TrainOverlay
+from app.coin_read import CoinReader
 
 STYLESHEET = """
 QMainWindow, QWidget {
@@ -107,11 +108,13 @@ QProgressBar {
     color: #e8eaed;
 }
 QProgressBar::chunk { background: #5b6cff; border-radius: 6px; }
-QLabel#preview {
+QLabel#preview, QFrame#infoPane {
     background: #101216;
     border: 1px solid #2a303b;
     border-radius: 10px;
 }
+QLabel#infoCaption { color: #9aa3b2; font-size: 12px; padding-top: 8px; }
+QLabel#infoValue { color: #f2f5f8; font-size: 20px; font-weight: 700; }
 """
 
 
@@ -137,6 +140,8 @@ class MainWindow(QMainWindow):
         self._saved_by_index: dict[int, Path] = {}
         self._preview_point = None
         self._ipc_buffers: dict[int, bytes] = {}
+        self._coin_reader: CoinReader | None = None
+        self._coin_cache: dict[tuple[str, int, str], str] = {}
 
         self._build_ui()
         self._start_ipc()
@@ -194,8 +199,10 @@ class MainWindow(QMainWindow):
         self.extract_btn = QPushButton("画像に抜き出す")
         self.extract_btn.setObjectName("primary")
         self.scene_btn = QPushButton("画面を抜き出す")
+        self.result_btn = QPushButton("resultを抜き出す")
         left_layout.addWidget(self.extract_btn)
         left_layout.addWidget(self.scene_btn)
+        left_layout.addWidget(self.result_btn)
 
         kind_row = QHBoxLayout()
         kind_row.addWidget(QLabel("種類"))
@@ -239,8 +246,8 @@ class MainWindow(QMainWindow):
         self.send_all_btn = QPushButton("すべてツムツムに渡す")
         left_layout.addWidget(self.send_one_btn)
         left_layout.addWidget(self.send_all_btn)
-        self.copy_data_btn = QPushButton("dataをコピー")
-        self.import_data_btn = QPushButton("dataを取り込む")
+        self.copy_data_btn = QPushButton("DATAをアップ")
+        self.import_data_btn = QPushButton("DATA DOWNLOAD")
         left_layout.addWidget(self.copy_data_btn)
         left_layout.addWidget(self.import_data_btn)
 
@@ -258,15 +265,38 @@ class MainWindow(QMainWindow):
         self.preview = QLabel("動画を取り込むと、一覧をクリックして画像を確認できます")
         self.preview.setObjectName("preview")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(420, 280)
+        self.preview.setMinimumSize(320, 280)
         self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        right_layout.addWidget(self.preview, 1)
+
+        self.info_pane = QFrame()
+        self.info_pane.setObjectName("infoPane")
+        self.info_pane.setMinimumWidth(200)
+        self.info_pane.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        info_pane_layout = QVBoxLayout(self.info_pane)
+        info_pane_layout.setContentsMargins(14, 14, 14, 14)
+        info_pane_layout.setSpacing(4)
+        self.video_time_value = self._add_info_block(info_pane_layout, "動画の時間")
+        self.go_timeup_value = self._add_info_block(info_pane_layout, "GO → TIME UP")
+        self.play_coin_value = self._add_info_block(info_pane_layout, "coin のコイン")
+        self.result_coin_value = self._add_info_block(info_pane_layout, "result のコイン")
+        self.coin_ratio_value = self._add_info_block(info_pane_layout, "result は coin の何倍")
+        info_pane_layout.addStretch(1)
+
+        preview_split = QSplitter(Qt.Orientation.Horizontal)
+        preview_split.setChildrenCollapsible(False)
+        preview_split.addWidget(self.preview)
+        preview_split.addWidget(self.info_pane)
+        preview_split.setStretchFactor(0, 3)
+        preview_split.setStretchFactor(1, 2)
+        preview_split.setSizes([720, 400])
+        preview_split.splitterMoved.connect(lambda *_: self._fit_preview())
+        right_layout.addWidget(preview_split, 1)
 
         body.addWidget(left)
         body.addWidget(right)
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 1)
-        body.setSizes([360, 740])
+        body.setSizes([360, 1100])
         layout.addWidget(body, 1)
         self.setCentralWidget(root)
         self._train_fx = TrainOverlay(root)
@@ -277,6 +307,7 @@ class MainWindow(QMainWindow):
         self.folder_btn.clicked.connect(self.choose_folder)
         self.extract_btn.clicked.connect(self.start_extract)
         self.scene_btn.clicked.connect(self.start_scene_extract)
+        self.result_btn.clicked.connect(self.start_result_extract)
         self.wrong_btn.clicked.connect(self.reject_current_scene)
         self.right_btn.clicked.connect(self.accept_current_scene)
         self.add_kind_btn.clicked.connect(self.add_scene_kind)
@@ -293,11 +324,23 @@ class MainWindow(QMainWindow):
         self.import_data_btn.clicked.connect(self.import_data_folder)
         self._update_buttons()
 
+    def _add_info_block(self, layout: QVBoxLayout, caption: str) -> QLabel:
+        cap = QLabel(caption)
+        cap.setObjectName("infoCaption")
+        layout.addWidget(cap)
+        value = QLabel("—")
+        value.setObjectName("infoValue")
+        value.setWordWrap(True)
+        value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(value)
+        return value
+
     def _update_buttons(self) -> None:
         busy = self.worker is not None
         ready = self.info is not None and not busy
         self.extract_btn.setEnabled(ready)
         self.scene_btn.setEnabled(ready)
+        self.result_btn.setEnabled(ready and bool(self.scene_labels.keys_named("result")))
         self.open_btn.setEnabled(not busy)
         self.count_spin.setEnabled(not busy)
         has_point = ready and self.point_list.currentItem() is not None
@@ -404,6 +447,7 @@ class MainWindow(QMainWindow):
             return
         self._release_cap()
         self._saved_by_index = {}
+        self._coin_cache = {}
         self.info_label.setText(
             f"{path.name}\n"
             f"{self.info.width} × {self.info.height}  /  {self.info.fps:.2f} fps\n"
@@ -438,6 +482,7 @@ class MainWindow(QMainWindow):
         self._relink_extracted_files()
         if self.point_list.count():
             self.point_list.setCurrentRow(0)
+        self._refresh_info_pane()
 
     def _relink_extracted_files(self) -> None:
         found: dict[int, Path] = {}
@@ -488,6 +533,143 @@ class MainWindow(QMainWindow):
             f"{point.index}枚目  {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%)",
             3000,
         )
+
+    def _coin_box_key_for_point(self, point) -> str | None:
+        kind = str(getattr(point, "kind", "") or "")
+        if not kind or kind in {"sample", OTHER_KEY}:
+            return None
+        name = self.scene_labels.name_of(kind).lower()
+        if kind in self.scene_labels.keys_named("result") or name == "result":
+            return "result_coin"
+        if kind in self.scene_labels.keys_named("coin", "コイン") or name in {"coin", "コイン"}:
+            return "coin"
+        return None
+
+    def _coin_reader_instance(self) -> CoinReader:
+        if self._coin_reader is None:
+            self._coin_reader = CoinReader()
+        return self._coin_reader
+
+    def _coin_cache_key(self, point, box_key: str) -> tuple[str, int, str]:
+        return (str(self.info.path) if self.info else "", int(point.frame), box_key)
+
+    def _read_point_coin(self, point, box_key: str) -> str:
+        cache_key = self._coin_cache_key(point, box_key)
+        if cache_key in self._coin_cache:
+            return self._coin_cache[cache_key]
+        number = ""
+        try:
+            path = self._point_image_path(point)
+            number = self._coin_reader_instance().read_path(path, box_key)
+        except Exception:
+            number = ""
+        self._coin_cache[cache_key] = number
+        return number
+
+    def _go_timeup_spans(self, points: list) -> list[float]:
+        go_keys = set(self.scene_labels.keys_named("go"))
+        timeup_keys = set(self.scene_labels.keys_named("timeup", "time up", "time_up"))
+        goes = sorted((p for p in points if getattr(p, "kind", "") in go_keys), key=lambda p: p.seconds)
+        timeups = sorted((p for p in points if getattr(p, "kind", "") in timeup_keys), key=lambda p: p.seconds)
+        used: set[int] = set()
+        spans: list[float] = []
+        for go in goes:
+            nxt = next((item for item in timeups if item.seconds > go.seconds and id(item) not in used), None)
+            if nxt is None:
+                continue
+            used.add(id(nxt))
+            spans.append(max(0.0, nxt.seconds - go.seconds))
+        return spans
+
+    def _coin_int(self, text: str) -> int | None:
+        digits = "".join(char for char in (text or "") if char.isdigit())
+        if not digits:
+            return None
+        return int(digits)
+
+    def _format_ratio(self, result: int, coin: int) -> str:
+        if coin <= 0:
+            return "—"
+        times = result / coin
+        if abs(times - round(times)) < 0.05:
+            return f"{int(round(times))}倍"
+        return f"{times:.2f}倍"
+
+    def _refresh_info_pane(self, read_coins: bool = False) -> None:
+        if self.info is None:
+            self.video_time_value.setText("—")
+            self.go_timeup_value.setText("—")
+            self.play_coin_value.setText("—")
+            self.result_coin_value.setText("—")
+            self.coin_ratio_value.setText("—")
+            return
+        self.video_time_value.setText(self.info.format_duration())
+        points = self._list_points()
+        spans = self._go_timeup_spans(points)
+        if spans:
+            if len(spans) == 1:
+                self.go_timeup_value.setText(format_timecode(spans[0]))
+            else:
+                lines = [f"{index}回目  {format_timecode(span)}" for index, span in enumerate(spans, start=1)]
+                self.go_timeup_value.setText("\n".join(lines))
+        else:
+            self.go_timeup_value.setText("—")
+
+        coin_points = [point for point in points if self._coin_box_key_for_point(point) == "coin"]
+        result_points = [point for point in points if self._coin_box_key_for_point(point) == "result_coin"]
+        if read_coins and (coin_points or result_points):
+            pending = coin_points + result_points
+            self.play_coin_value.setText("読み取り中…")
+            self.result_coin_value.setText("読み取り中…")
+            QApplication.processEvents()
+            self.coin_ratio_value.setText("—")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                for index, point in enumerate(pending, start=1):
+                    key = self._coin_box_key_for_point(point)
+                    if key:
+                        self._read_point_coin(point, key)
+                    self.statusBar().showMessage(f"コインを読んでいます {index}/{len(pending)}")
+                    QApplication.processEvents()
+            except Exception:
+                pass
+            finally:
+                QApplication.restoreOverrideCursor()
+
+        def _join(values: list[str]) -> str:
+            shown = [value for value in values if value]
+            return "\n".join(shown) if shown else "—"
+
+        coin_texts = [
+            self._coin_cache.get(self._coin_cache_key(point, "coin"), "") for point in coin_points
+        ]
+        result_texts = [
+            self._coin_cache.get(self._coin_cache_key(point, "result_coin"), "")
+            for point in result_points
+        ]
+        self.play_coin_value.setText(_join(coin_texts))
+        self.result_coin_value.setText(_join(result_texts))
+        self.coin_ratio_value.setText(self._ratio_text(coin_points, result_points))
+
+    def _ratio_text(self, coin_points: list, result_points: list) -> str:
+        coins: list[tuple[float, int]] = []
+        for point in sorted(coin_points, key=lambda item: item.seconds):
+            number = self._coin_int(self._coin_cache.get(self._coin_cache_key(point, "coin"), ""))
+            if number is not None:
+                coins.append((point.seconds, number))
+        results: list[tuple[float, int]] = []
+        for point in sorted(result_points, key=lambda item: item.seconds):
+            number = self._coin_int(self._coin_cache.get(self._coin_cache_key(point, "result_coin"), ""))
+            if number is not None:
+                results.append((point.seconds, number))
+        if not coins or not results:
+            return "—"
+        lines: list[str] = []
+        for seconds, result_number in results:
+            previous = [item for item in coins if item[0] <= seconds]
+            play_number = previous[-1][1] if previous else coins[0][1]
+            lines.append(self._format_ratio(result_number, play_number))
+        return "\n".join(lines)
 
     def _read_frame(self, frame_index: int):
         if self.info is None:
@@ -613,6 +795,20 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("抜き出し中です…")
 
     def start_scene_extract(self) -> None:
+        self._start_kind_extract(None, self.scene_labels.extract_names())
+
+    def start_result_extract(self) -> None:
+        keys = self.scene_labels.keys_named("result")
+        if not keys:
+            QMessageBox.information(
+                self,
+                "resultがありません",
+                "種類に result がありません。先に「種類を追加」してください。",
+            )
+            return
+        self._start_kind_extract(set(keys), self.scene_labels.names_of(keys))
+
+    def _start_kind_extract(self, want_kinds: set[str] | None, names: str) -> None:
         if self.info is None or self.worker is not None:
             return
         if not scene_model_ready():
@@ -626,13 +822,18 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress.setRange(0, max(self.info.frame_count, 1))
         self.progress.setValue(0)
-        self.worker = SceneExtractWorker(self.info, self.output_dir)
+        self.worker = SceneExtractWorker(
+            self.info,
+            self.output_dir,
+            want_kinds=want_kinds,
+            search_names=names,
+        )
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_ok.connect(self.on_scene_finished)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
         self._update_buttons()
-        self.statusBar().showMessage(f"{self.scene_labels.extract_names()}を探しています…")
+        self.statusBar().showMessage(f"{names}を探しています…")
 
     def add_scene_kind(self) -> None:
         name, ok = QInputDialog.getText(self, "種類を追加", "画面の名前")
@@ -734,6 +935,7 @@ class MainWindow(QMainWindow):
         if self.point_list.count():
             self.point_list.setCurrentRow(min(row, self.point_list.count() - 1))
         self._update_buttons()
+        self._refresh_info_pane()
 
     def start_scene_train(self) -> None:
         if isinstance(self.worker, SceneTrainWorker):
@@ -799,10 +1001,11 @@ class MainWindow(QMainWindow):
 
     def on_scene_finished(self, _paths: list[str]) -> None:
         points = getattr(self.worker, "found_points", []) if self.worker is not None else []
+        names = getattr(self.worker, "search_names", "") if self.worker is not None else ""
         self.worker = None
         self.progress.setVisible(False)
         self._saved_by_index = {}
-        names = self.scene_labels.extract_names()
+        names = names or self.scene_labels.extract_names()
         if points:
             self.point_list.blockSignals(True)
             self.point_list.clear()
@@ -817,6 +1020,7 @@ class MainWindow(QMainWindow):
             if self.point_list.count():
                 self.point_list.setCurrentRow(0)
         self._update_buttons()
+        self._refresh_info_pane(read_coins=bool(points))
         if not points:
             QMessageBox.information(self, "見つかりませんでした", f"{names} の画面は見つかりませんでした。")
             self.statusBar().showMessage(f"{names} は見つかりませんでした", 5000)
@@ -1032,9 +1236,9 @@ class MainWindow(QMainWindow):
         self._ipc_buffers[id(sock)] = b""
         sock.readyRead.connect(lambda s=sock: self._on_ipc_ready(s))
         sock.disconnected.connect(lambda s=sock: self._ipc_buffers.pop(id(s), None))
+        self.showMaximized()
         self.raise_()
         self.activateWindow()
-        self.showNormal()
 
     def _on_ipc_ready(self, sock: QLocalSocket) -> None:
         self._ipc_buffers[id(sock)] = self._ipc_buffers.get(id(sock), b"") + bytes(sock.readAll())
