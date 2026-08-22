@@ -138,8 +138,8 @@ class MainWindow(QMainWindow):
         self._preview_point = None
         self._ipc_buffers: dict[int, bytes] = {}
 
-        self._build_ui()
         self._start_ipc()
+        self._build_ui()
         QShortcut(QKeySequence.StandardKey.Open, self, self.open_video)
 
     def _build_ui(self) -> None:

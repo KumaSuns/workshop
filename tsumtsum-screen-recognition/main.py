@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from PySide6.QtCore import QDir, QLockFile, QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -34,15 +38,41 @@ def _handoff_to_running(paths: list[str]) -> bool:
     return True
 
 
+def _lock_holder_dead(lock: QLockFile) -> bool:
+    try:
+        pid, _hostname, _app = lock.getLockInfo()
+    except Exception:
+        return False
+    if pid <= 0:
+        return True
+    try:
+        os.kill(int(pid), 0)
+        return False
+    except OSError:
+        return True
+
+
+def _acquire_instance_lock() -> QLockFile | None:
+    lock = QLockFile(str(Path(QDir.tempPath()) / f"{IPC_NAME}.lock"))
+    if lock.tryLock(100):
+        return lock
+    if _lock_holder_dead(lock):
+        lock.removeStaleLockFile()
+        if lock.tryLock(100):
+            return lock
+    if lock.removeStaleLockFile() and lock.tryLock(100):
+        return lock
+    return None
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("TsumTsum Screen Trainer")
     app.setOrganizationName("workshop")
     paths = _initial_paths(sys.argv)
 
-    lock = QLockFile(str(Path(QDir.tempPath()) / f"{IPC_NAME}.lock"))
-    lock.setStaleLockTime(0)
-    if not lock.tryLock(100):
+    lock = _acquire_instance_lock()
+    if lock is None:
         if _handoff_to_running(paths):
             sys.exit(0)
         QMessageBox.information(
