@@ -6,6 +6,7 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 WORKSHOP_ROOT = APP_ROOT.parent
 VIDEO_EXTRACTOR_MAIN = WORKSHOP_ROOT / "video-frame-extractor" / "main.py"
 DATA_SYNC_PATH = WORKSHOP_ROOT / "video-frame-extractor" / "app" / "data_sync.py"
+SERVER_SYNC_PATH = WORKSHOP_ROOT / "video-frame-extractor" / "app" / "server_sync.py"
 DATA_DIR = APP_ROOT / "data"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 IPC_NAME = "workshop-tsumtsum-screen-recognition"

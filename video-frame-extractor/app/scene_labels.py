@@ -10,7 +10,9 @@ from app.data_sync import (
     model_file,
     resolve_sample_path,
     store_image,
+    image_names_in,
 )
+from app.paths import kind_folder_name
 
 LABELS_PATH = bundle_dir() / "scene_labels.json"
 SCENE_MODEL_PATH = bundle_dir() / "scene.pt"
@@ -77,14 +79,17 @@ class SceneLabels:
         dest = bundle_dir()
         dest.mkdir(parents=True, exist_ok=True)
         images_dir = dest / "images"
-        used = {child.name for child in images_dir.iterdir()} if images_dir.is_dir() else set()
+        used_by_kind: dict[str, set[str]] = {}
         packed = []
         items = []
         for item in self._items:
             src = resolve_sample_path(item["path"], dest)
             if src is None:
                 continue
-            relative = store_image(src, images_dir, used)
+            kind = item["kind"]
+            folder_name = kind_folder_name(kind)
+            used = used_by_kind.setdefault(folder_name, image_names_in(images_dir / folder_name))
+            relative = store_image(src, images_dir, used, kind)
             if relative is None:
                 continue
             packed.append({"path": relative, "kind": item["kind"]})
@@ -166,12 +171,14 @@ class SceneLabels:
         added = 0
         dest = bundle_dir()
         images_dir = dest / "images"
-        used = {child.name for child in images_dir.iterdir()} if images_dir.is_dir() else set()
+        used_by_kind: dict[str, set[str]] = {}
         by_path = {item["path"]: item for item in self._items}
         for image_path in image_paths:
             if not image_path.is_file():
                 continue
-            relative = store_image(image_path, images_dir, used)
+            folder_name = kind_folder_name(kind)
+            used = used_by_kind.setdefault(folder_name, image_names_in(images_dir / folder_name))
+            relative = store_image(image_path, images_dir, used, kind)
             if relative is None:
                 continue
             stored = resolve_sample_path(relative, dest)

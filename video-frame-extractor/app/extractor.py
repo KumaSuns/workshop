@@ -131,7 +131,11 @@ def extracted_file_for(output_dir: Path, stem: str, index: int) -> Path | None:
     if not output_dir.exists():
         return None
     prefix = f"{stem}_{index:03d}_"
-    matches = [path for path in output_dir.glob("*.png") if path.name.startswith(prefix)]
+    matches = [
+        path
+        for path in output_dir.rglob("*.png")
+        if path.name.startswith(prefix)
+    ]
     if not matches:
         return None
     return max(matches, key=lambda path: path.stat().st_mtime)

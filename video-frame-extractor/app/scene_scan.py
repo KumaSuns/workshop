@@ -10,6 +10,7 @@ from torchvision import transforms
 from torchvision.models import ResNet18_Weights, resnet18
 
 from app.extractor import SamplePoint, VideoInfo, format_timecode, write_image
+from app.paths import kind_dir
 from app.scene_labels import OTHER_KEY, SceneLabels, scene_model_path, scene_model_ready
 
 SCENE_INPUT = 224
@@ -204,7 +205,7 @@ def extract_scene_frames(
             if image is None:
                 raise ValueError(f"{format_timecode(point.seconds)} のフレームを取得できませんでした")
             stamp = format_timecode(point.seconds).replace(":", "-")
-            dest = output_dir / f"{stem}_{point.kind}_{point.index:03d}_{stamp}.png"
+            dest = kind_dir(output_dir, point.kind) / f"{stem}_{point.index:03d}_{stamp}.png"
             write_image(dest, image)
             saved.append(dest)
             if progress is not None:

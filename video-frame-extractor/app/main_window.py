@@ -58,6 +58,7 @@ from app.scene_labels import MIN_SCENE_SAMPLES, OTHER_KEY, SceneLabels, scene_mo
 from app.scene_train import SceneTrainWorker
 from app.train_overlay import TrainOverlay
 from app.coin_read import CoinReader
+from app.scene_still_window import SceneStillWindow
 
 STYLESHEET = """
 QMainWindow, QWidget {
@@ -93,7 +94,7 @@ QFrame#panel {
     border: 1px solid #2a303b;
     border-radius: 12px;
 }
-QSpinBox {
+QSpinBox, QComboBox {
     background: #101216;
     color: #e8eaed;
     border: 1px solid #2a303b;
@@ -143,6 +144,7 @@ class MainWindow(QMainWindow):
         self._ipc_buffers: dict[int, bytes] = {}
         self._coin_reader: CoinReader | None = None
         self._coin_cache: dict[tuple[str, int, str], str] = {}
+        self._scene_still: SceneStillWindow | None = None
 
         self._start_ipc()
         self._build_ui()
@@ -201,9 +203,11 @@ class MainWindow(QMainWindow):
         self.extract_btn.setObjectName("primary")
         self.scene_btn = QPushButton("画面を抜き出す")
         self.result_btn = QPushButton("resultを抜き出す")
+        self.scene_still_btn = QPushButton("シーンを画像にする")
         left_layout.addWidget(self.extract_btn)
         left_layout.addWidget(self.scene_btn)
         left_layout.addWidget(self.result_btn)
+        left_layout.addWidget(self.scene_still_btn)
 
         kind_row = QHBoxLayout()
         kind_row.addWidget(QLabel("種類"))
@@ -249,8 +253,14 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.send_all_btn)
         self.copy_data_btn = QPushButton("DATAをアップ")
         self.import_data_btn = QPushButton("DATA DOWNLOAD")
+        self.server_save_btn = QPushButton("サーバーに保存")
+        self.server_load_btn = QPushButton("サーバーから開く")
+        self.server_settings_btn = QPushButton("サーバー接続")
         left_layout.addWidget(self.copy_data_btn)
         left_layout.addWidget(self.import_data_btn)
+        left_layout.addWidget(self.server_save_btn)
+        left_layout.addWidget(self.server_load_btn)
+        left_layout.addWidget(self.server_settings_btn)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -309,6 +319,7 @@ class MainWindow(QMainWindow):
         self.extract_btn.clicked.connect(self.start_extract)
         self.scene_btn.clicked.connect(self.start_scene_extract)
         self.result_btn.clicked.connect(self.start_result_extract)
+        self.scene_still_btn.clicked.connect(self.open_scene_still)
         self.wrong_btn.clicked.connect(self.reject_current_scene)
         self.right_btn.clicked.connect(self.accept_current_scene)
         self.add_kind_btn.clicked.connect(self.add_scene_kind)
@@ -323,6 +334,9 @@ class MainWindow(QMainWindow):
         self.send_all_btn.clicked.connect(self.send_all_to_tsumtsum)
         self.copy_data_btn.clicked.connect(self.copy_data_folder)
         self.import_data_btn.clicked.connect(self.import_data_folder)
+        self.server_save_btn.clicked.connect(self.upload_data_to_server)
+        self.server_load_btn.clicked.connect(self.download_data_from_server)
+        self.server_settings_btn.clicked.connect(self.edit_server_settings)
         self._update_buttons()
 
     def _add_info_block(self, layout: QVBoxLayout, caption: str) -> QLabel:
@@ -342,6 +356,7 @@ class MainWindow(QMainWindow):
         self.extract_btn.setEnabled(ready)
         self.scene_btn.setEnabled(ready)
         self.result_btn.setEnabled(ready and bool(self.scene_labels.keys_named("result")))
+        self.scene_still_btn.setEnabled(self.info is not None)
         self.open_btn.setEnabled(not busy)
         self.count_spin.setEnabled(not busy)
         has_point = ready and self.point_list.currentItem() is not None
@@ -358,6 +373,9 @@ class MainWindow(QMainWindow):
         self.kind_combo.setEnabled(not busy)
         self.copy_data_btn.setEnabled(not busy)
         self.import_data_btn.setEnabled(not busy)
+        self.server_save_btn.setEnabled(not busy)
+        self.server_load_btn.setEnabled(not busy)
+        self.server_settings_btn.setEnabled(not busy)
         training = isinstance(self.worker, SceneTrainWorker)
         self.scene_train_btn.setEnabled(not busy or training)
         self.scene_train_btn.setText("中止" if training else "学習する")
@@ -436,6 +454,8 @@ class MainWindow(QMainWindow):
             self._remember_dialog_dir("output", self.output_dir)
             self._settings.setValue("last_output_dir", str(self.output_dir))
             self.folder_label.setText(f"保存先: {self.output_dir}")
+            if self._scene_still is not None and self.info is not None:
+                self._scene_still.output_dir = self.output_dir
 
     def load_video(self, path: Path) -> None:
         if path.suffix.lower() not in VIDEO_EXTENSIONS:
@@ -461,6 +481,8 @@ class MainWindow(QMainWindow):
         self._settings.setValue("last_video_dir", str(path.parent.resolve()))
         self._settings.setValue("last_video_path", str(path.resolve()))
         self.statusBar().showMessage(f"{path.name} を読み込みました", 4000)
+        if self._scene_still is not None:
+            self._scene_still.set_video(self.info, self.output_dir)
 
     def refresh_points(self) -> None:
         self.point_list.blockSignals(True)
@@ -809,6 +831,26 @@ class MainWindow(QMainWindow):
             return
         self._start_kind_extract(set(keys), self.scene_labels.names_of(keys))
 
+    def open_scene_still(self) -> None:
+        start_frame = None
+        if self._preview_point is not None:
+            start_frame = int(getattr(self._preview_point, "frame", 0) or 0)
+        if self._scene_still is None:
+            window = SceneStillWindow(self)
+            window.setStyleSheet(self.styleSheet())
+            window.destroyed.connect(self._clear_scene_still)
+            self._scene_still = window
+        if self.info is not None:
+            self._scene_still.set_video(self.info, self.output_dir, start_frame=start_frame)
+        else:
+            self._scene_still.output_dir = self.output_dir
+        self._scene_still.show()
+        self._scene_still.raise_()
+        self._scene_still.activateWindow()
+
+    def _clear_scene_still(self, *_args) -> None:
+        self._scene_still = None
+
     def _start_kind_extract(self, want_kinds: set[str] | None, names: str) -> None:
         if self.info is None or self.worker is not None:
             return
@@ -846,6 +888,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "追加できません", str(exc))
             return
         self._fill_kind_combo()
+        if self._scene_still is not None:
+            self._scene_still._fill_kind_combo()
         index = self.kind_combo.findData(key)
         if index >= 0:
             self.kind_combo.setCurrentIndex(index)
@@ -1261,6 +1305,87 @@ class MainWindow(QMainWindow):
         self._notify_trainer("reload-data")
         QMessageBox.information(self, "取り込みました", "ツムの data と、画面の学習データを取り込みました。")
 
+    def edit_server_settings(self) -> None:
+        from app.server_sync import edit_settings
+
+        if edit_settings(self):
+            self.statusBar().showMessage("サーバー接続を保存しました", 4000)
+
+    def upload_data_to_server(self) -> None:
+        if self.worker is not None:
+            return
+        import importlib
+
+        from app import server_sync
+
+        importlib.reload(server_sync)
+
+        answer = QMessageBox.question(
+            self,
+            "サーバーに保存",
+            "今のPCの内容でサーバーを上書きします。管理画面で種類を直したあとは、先に「サーバーから開く」をしてください。続けますか？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        data_dir = trainer_data_dir()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            packed = ensure_scene_packed(data_dir)
+            if not data_dir.exists():
+                raise FileNotFoundError(f"送るフォルダがありません。\n{data_dir}")
+            report = server_sync.run_with_progress(
+                self,
+                "サーバーに保存しています",
+                lambda progress: server_sync.upload_data_dir(data_dir, progress),
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "保存できませんでした", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        extra = f"画面の学習画像 {packed.get('images', 0)} 枚"
+        title, body = server_sync.format_upload_report(report, extra)
+        QMessageBox.information(self, title, body)
+
+    def download_data_from_server(self) -> None:
+        if self.worker is not None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "サーバーから開く",
+            "サーバーの画像・種類・モデルで、今のPCの内容を置き換えます。管理画面で直した種類も、ここで取り込まれます。続けますか？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        import shutil
+        import tempfile
+
+        from app import server_sync
+
+        data_dir = trainer_data_dir()
+        tmp = Path(tempfile.mkdtemp(prefix="workshop_dl_"))
+        self._notify_trainer("release-data")
+        QApplication.processEvents()
+        time.sleep(0.2)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            server_sync.run_with_progress(
+                self,
+                "サーバーから開いています",
+                lambda progress: server_sync.download_data_dir(tmp, progress),
+            )
+            import_data_folder(data_dir, tmp)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "開けませんでした", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._reload_scene_bundle()
+        self._notify_trainer("reload-data")
+        QMessageBox.information(self, "開きました", "サーバーの画像とモデルを取り込みました。")
+
     def _start_ipc(self) -> None:
         self._ipc_server = QLocalServer(self)
         self._ipc_server.newConnection.connect(self._on_ipc_connection)
@@ -1297,5 +1422,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if self.worker is not None and self.worker.isRunning():
             self.worker.wait(1000)
+        if self._scene_still is not None:
+            self._scene_still.close()
         self._release_cap()
         event.accept()

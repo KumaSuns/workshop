@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 EXTRACTOR_ROOT = Path(__file__).resolve().parents[1]
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+_KIND_FOLDER_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def kind_folder_name(kind: str) -> str:
+    name = _KIND_FOLDER_RE.sub("_", str(kind or "other").strip()).strip("._") or "other"
+    if name in {".", ".."}:
+        return "other"
+    return name
 WORKSHOP_ROOT = EXTRACTOR_ROOT.parent
 TRAINER_DATA_DIR = WORKSHOP_ROOT / "tsumtsum-screen-recognition" / "data"
 BUNDLE_NAME = "extractor"
@@ -64,7 +73,7 @@ def looks_like_data_dir(path: Path) -> bool:
         return True
     images = path / "images"
     if images.is_dir() and any(
-        child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS for child in images.iterdir()
+        child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS for child in images.rglob("*")
     ):
         return True
     models = path / "models"
@@ -107,7 +116,7 @@ def resolve_sample_path(raw: str, root: Path | None = None) -> Path | None:
 
 def _unique_name(src: Path, used: set[str]) -> str:
     suffix = src.suffix.lower() if src.suffix else ".png"
-    base = f"{src.parent.name}_{src.name}"
+    base = src.name
     safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in base)
     if not safe.lower().endswith(suffix):
         safe = f"{safe}{suffix}"
@@ -117,23 +126,36 @@ def _unique_name(src: Path, used: set[str]) -> str:
     return f"{Path(safe).stem}_{digest}{suffix}"
 
 
-def store_image(src: Path, images_dir: Path, used: set[str] | None = None) -> str | None:
+def image_names_in(folder: Path) -> set[str]:
+    if not folder.is_dir():
+        return set()
+    return {child.name for child in folder.iterdir() if child.is_file()}
+
+
+def store_image(src: Path, images_dir: Path, used: set[str] | None = None, kind: str = "other") -> str | None:
     if not src.is_file():
         return None
-    images_dir.mkdir(parents=True, exist_ok=True)
-    names = used if used is not None else {child.name for child in images_dir.iterdir() if child.is_file()}
+    folder_name = kind_folder_name(kind)
+    dest_dir = images_dir / folder_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    names = used if used is not None else image_names_in(dest_dir)
+    src_resolved = resolved(src)
+    dest_resolved = resolved(dest_dir)
     try:
-        if resolved(src).parent == resolved(images_dir):
+        if src_resolved.parent == dest_resolved:
             names.add(src.name)
-            return f"images/{src.name}"
+            return f"images/{folder_name}/{src.name}"
     except OSError:
         pass
-    name = _unique_name(src, names)
-    dest = images_dir / name
-    if resolved(src) != resolved(dest):
-        shutil.copy2(src, dest)
+    name = src.name if src.name not in names else _unique_name(src, names)
+    dest = dest_dir / name
+    if src_resolved != resolved(dest):
+        if is_same_or_inside(src_resolved, images_dir):
+            shutil.move(str(src_resolved), str(dest))
+        else:
+            shutil.copy2(src, dest)
     names.add(name)
-    return f"images/{name}"
+    return f"images/{folder_name}/{name}"
 
 
 def pack_scene_into(dest: Path, data_dir: Path | None = None) -> dict[str, int]:
@@ -143,17 +165,19 @@ def pack_scene_into(dest: Path, data_dir: Path | None = None) -> dict[str, int]:
     payload = read_scene_payload(data_dir)
     kinds = payload.get("kinds") or []
     samples = payload.get("samples") or []
-    used = {child.name for child in images_dir.iterdir() if child.is_file()}
+    used_by_kind: dict[str, set[str]] = {}
     packed = []
     missing = 0
     source_root = labels_file(data_dir).parent
     for item in samples:
-        kind = str(item.get("kind") or "")
+        kind = str(item.get("kind") or "other")
         src = resolve_sample_path(str(item.get("path") or ""), source_root)
         if src is None:
             missing += 1
             continue
-        relative = store_image(src, images_dir, used)
+        folder_name = kind_folder_name(kind)
+        used = used_by_kind.setdefault(folder_name, image_names_in(images_dir / folder_name))
+        relative = store_image(src, images_dir, used, kind)
         if relative is None:
             missing += 1
             continue

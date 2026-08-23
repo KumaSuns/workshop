@@ -46,6 +46,7 @@ from app.paths import (
     EXTRACTOR_IPC_NAME,
     IMAGE_EXTENSIONS,
     IPC_NAME,
+    SERVER_SYNC_PATH,
     VIDEO_EXTRACTOR_MAIN,
 )
 from app.predictor import Predictor
@@ -433,6 +434,12 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.copy_data_btn)
         self.import_data_btn = QPushButton("DATA DOWNLOAD")
         right_layout.addWidget(self.import_data_btn)
+        self.server_save_btn = QPushButton("サーバーに保存")
+        right_layout.addWidget(self.server_save_btn)
+        self.server_load_btn = QPushButton("サーバーから開く")
+        right_layout.addWidget(self.server_load_btn)
+        self.server_settings_btn = QPushButton("サーバー接続")
+        right_layout.addWidget(self.server_settings_btn)
         self.shortcut_btn = QPushButton("起動アイコン作成")
         right_layout.addWidget(self.shortcut_btn)
         self.video_app_btn = QPushButton("動画編集・生成")
@@ -494,6 +501,9 @@ class MainWindow(QMainWindow):
         self.show_unused_chk.toggled.connect(self.on_show_unused_toggled)
         self.copy_data_btn.clicked.connect(self.copy_data_folder)
         self.import_data_btn.clicked.connect(self.import_data_folder)
+        self.server_save_btn.clicked.connect(self.upload_data_to_server)
+        self.server_load_btn.clicked.connect(self.download_data_from_server)
+        self.server_settings_btn.clicked.connect(self.edit_server_settings)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
         self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
@@ -1547,6 +1557,88 @@ class MainWindow(QMainWindow):
         spec.loader.exec_module(module)
         self._data_sync_mod = module
         return module
+
+    def _server_sync(self):
+        spec = importlib.util.spec_from_file_location("workshop_server_sync", SERVER_SYNC_PATH)
+        if spec is None or spec.loader is None:
+            raise FileNotFoundError(f"サーバー同期が見つかりません。\n{SERVER_SYNC_PATH}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self._server_sync_mod = module
+        return module
+
+    def edit_server_settings(self) -> None:
+        if self._server_sync().edit_settings(self):
+            self.statusBar().showMessage("サーバー接続を保存しました", 4000)
+
+    def upload_data_to_server(self) -> None:
+        if self._block_if_training():
+            return
+        sync = self._server_sync()
+        answer = QMessageBox.question(
+            self,
+            "サーバーに保存",
+            "今のPCの内容でサーバーを上書きします。管理画面で種類を直したあとは、先に「サーバーから開く」をしてください。続けますか？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            packed = self._pack_scene_into_data()
+            if not DATA_DIR.exists():
+                raise FileNotFoundError(f"送るフォルダがありません。\n{DATA_DIR}")
+            report = sync.run_with_progress(
+                self,
+                "サーバーに保存しています",
+                lambda progress: sync.upload_data_dir(DATA_DIR, progress),
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "保存できませんでした", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        extra = f"画面の学習画像 {packed.get('images', 0)} 枚"
+        title, body = sync.format_upload_report(report, extra)
+        QMessageBox.information(self, title, body)
+
+    def download_data_from_server(self) -> None:
+        if self._block_if_training():
+            return
+        answer = QMessageBox.question(
+            self,
+            "サーバーから開く",
+            "サーバーの画像・種類・モデルで、今のPCの内容を置き換えます。管理画面で直した種類も、ここで取り込まれます。続けますか？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self._confirm_discard():
+            return
+        import shutil
+        import tempfile
+
+        sync = self._server_sync()
+        tmp = Path(tempfile.mkdtemp(prefix="workshop_dl_"))
+        self.current_id = None
+        self.canvas.clear_image()
+        self.predictor.release()
+        QApplication.processEvents()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            sync.run_with_progress(
+                self,
+                "サーバーから開いています",
+                lambda progress: sync.download_data_dir(tmp, progress),
+            )
+            self._data_sync().import_data_folder(DATA_DIR, tmp)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "開けませんでした", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            shutil.rmtree(tmp, ignore_errors=True)
+        self._reload_after_data_import()
+        self._notify_extractor("reload-scene")
+        QMessageBox.information(self, "開きました", "サーバーの画像とモデルを取り込みました。")
 
     def _notify_extractor(self, action: str) -> None:
         sock = QLocalSocket()
