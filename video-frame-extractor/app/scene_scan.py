@@ -16,7 +16,12 @@ from app.scene_labels import OTHER_KEY, SceneLabels, scene_model_path, scene_mod
 SCENE_INPUT = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-SCENE_THRESHOLD = 0.55
+KIND_THRESHOLD = 0.18
+RAREDY_KEY = "raredy"
+GO_KEY = "go"
+RAREDY_CUE_THRESHOLD = 0.35
+GO_AFTER_RAREDY_SEC = 2.5
+GO_AFTER_RAREDY_THRESHOLD = 0.22
 REJECT_HASH_SIZE = 8
 REJECT_HASH_LIMIT = 12
 
@@ -69,25 +74,6 @@ def hashes_too_close(left: int, right: int, limit: int = REJECT_HASH_LIMIT) -> b
     return (left ^ right).bit_count() <= limit
 
 
-def other_scene_hashes() -> list[int]:
-    hashes: list[int] = []
-    for item in SceneLabels().items():
-        if item.get("kind") != OTHER_KEY:
-            continue
-        path = Path(str(item.get("path") or ""))
-        digest = scene_ahash_path(path)
-        if digest is not None:
-            hashes.append(digest)
-    return hashes
-
-
-def _looks_rejected(image: Image.Image, rejected: list[int]) -> bool:
-    if not rejected:
-        return False
-    current = scene_ahash(image)
-    return any(hashes_too_close(current, other) for other in rejected)
-
-
 def load_scene_checkpoint(device: torch.device) -> tuple[SceneNet, tuple[str, ...]]:
     checkpoint = torch.load(scene_model_path(), map_location=device, weights_only=False)
     classes = tuple(checkpoint.get("classes") or (OTHER_KEY, "go", "timeup"))
@@ -106,14 +92,47 @@ def load_scene_checkpoint(device: torch.device) -> tuple[SceneNet, tuple[str, ..
 def _group_hits(hits: list[tuple[str, int, float, float]], gap_frames: int) -> list[tuple[str, int, float, float]]:
     if not hits:
         return []
-    groups: list[list[tuple[str, int, float, float]]] = [[hits[0]]]
-    for item in hits[1:]:
-        last = groups[-1][-1]
-        if item[0] == last[0] and item[1] - last[1] <= gap_frames:
-            groups[-1].append(item)
-        else:
-            groups.append([item])
-    return [max(group, key=lambda row: row[3]) for group in groups]
+    by_kind: dict[str, list[tuple[str, int, float, float]]] = {}
+    for item in hits:
+        by_kind.setdefault(item[0], []).append(item)
+    picked: list[tuple[str, int, float, float]] = []
+    for rows in by_kind.values():
+        rows.sort(key=lambda row: row[1])
+        groups: list[list[tuple[str, int, float, float]]] = [[rows[0]]]
+        for item in rows[1:]:
+            if item[1] - groups[-1][-1][1] <= gap_frames:
+                groups[-1].append(item)
+            else:
+                groups.append([item])
+        picked.extend(max(group, key=lambda row: row[3]) for group in groups)
+    picked.sort(key=lambda row: row[1])
+    return picked
+
+
+def _class_score(probs: torch.Tensor, classes: tuple[str, ...], key: str) -> float:
+    try:
+        return float(probs[classes.index(key)].item())
+    except ValueError:
+        return 0.0
+
+
+def _wanted(kind: str, want_kinds: set[str] | None) -> bool:
+    return want_kinds is None or kind in want_kinds
+
+
+def _best_wanted(probs: torch.Tensor, classes: tuple[str, ...], want_kinds: set[str] | None) -> tuple[str, float]:
+    best_kind = OTHER_KEY
+    best_score = -1.0
+    for index, key in enumerate(classes):
+        if key == OTHER_KEY:
+            continue
+        if not _wanted(key, want_kinds):
+            continue
+        score = float(probs[index].item())
+        if score > best_score:
+            best_kind = key
+            best_score = score
+    return best_kind, best_score
 
 
 def find_scene_points(
@@ -123,9 +142,11 @@ def find_scene_points(
 ) -> list[SamplePoint]:
     if not scene_model_ready():
         raise ValueError("画面のモデルがありません。画像を教えて学習してください。")
+    if want_kinds is None:
+        labels = SceneLabels()
+        want_kinds = set(labels.extract_keys()) | set(labels.hidden_keys())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, classes = load_scene_checkpoint(device)
-    rejected = other_scene_hashes()
     transform = transforms.Compose(
         [
             transforms.Resize((SCENE_INPUT, SCENE_INPUT)),
@@ -133,16 +154,21 @@ def find_scene_points(
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
     )
-    step = max(1, int(round(info.fps * 0.2)))
+    coarse_step = max(1, int(round(info.fps * 0.1)))
+    window_frames = max(1, int(round(info.fps * GO_AFTER_RAREDY_SEC)))
     cap = cv2.VideoCapture(str(info.path))
     if not cap.isOpened():
         raise ValueError(f"動画を開けませんでした: {info.path.name}")
     hits: list[tuple[str, int, float, float]] = []
     frame_index = 0
     total = max(info.frame_count, 1)
+    last_raredy_frame = -1
+    hunt_until = -1
     try:
         while True:
-            if frame_index % step == 0:
+            hunting = frame_index <= hunt_until
+            step_now = 1 if hunting else coarse_step
+            if hunting or frame_index % step_now == 0:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break
@@ -151,15 +177,27 @@ def find_scene_points(
                 tensor = transform(image).unsqueeze(0).to(device)
                 with torch.no_grad():
                     probs = torch.softmax(model(tensor), dim=1)[0]
-                score, index = float(probs.max().item()), int(probs.argmax().item())
-                kind = classes[index] if 0 <= index < len(classes) else OTHER_KEY
+                raredy_score = _class_score(probs, classes, RAREDY_KEY)
+                go_score = _class_score(probs, classes, GO_KEY)
+                if raredy_score >= RAREDY_CUE_THRESHOLD and raredy_score >= go_score:
+                    last_raredy_frame = frame_index
+                    hunt_until = frame_index + window_frames
+                after_raredy = last_raredy_frame >= 0 and last_raredy_frame < frame_index <= hunt_until
                 if (
-                    kind != OTHER_KEY
-                    and score >= SCENE_THRESHOLD
-                    and (want_kinds is None or kind in want_kinds)
-                    and not _looks_rejected(image, rejected)
+                    after_raredy
+                    and _wanted(GO_KEY, want_kinds)
+                    and go_score >= GO_AFTER_RAREDY_THRESHOLD
+                    and go_score >= raredy_score
                 ):
-                    hits.append((kind, frame_index, frame_index / info.fps, score))
+                    hits.append((GO_KEY, frame_index, frame_index / info.fps, go_score))
+                for key in classes:
+                    if key == OTHER_KEY or not _wanted(key, want_kinds):
+                        continue
+                    score = _class_score(probs, classes, key)
+                    if score < KIND_THRESHOLD:
+                        continue
+                    hits.append((key, frame_index, frame_index / info.fps, score))
+                kind, score = _best_wanted(probs, classes, want_kinds)
                 if progress is not None:
                     progress(frame_index + 1, total, f"{kind} {score:.2f}")
             elif not cap.grab():
@@ -170,8 +208,9 @@ def find_scene_points(
         if device.type == "cuda":
             torch.cuda.empty_cache()
     last_frame = max(info.frame_count - 1, 0)
+    gap_frames = max(int(round(info.fps * 2.5)), coarse_step * 3)
     points: list[SamplePoint] = []
-    for i, (kind, frame, seconds, score) in enumerate(_group_hits(hits, max(step * 3, 1)), start=1):
+    for i, (kind, frame, seconds, score) in enumerate(_group_hits(hits, gap_frames), start=1):
         points.append(
             SamplePoint(
                 index=i,

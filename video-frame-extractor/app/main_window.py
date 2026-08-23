@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap, QShortcut, QKeySequence, QDragEnterEvent, QDropEvent
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -13,9 +13,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -58,7 +61,15 @@ from app.scene_labels import MIN_SCENE_SAMPLES, OTHER_KEY, SceneLabels, scene_mo
 from app.scene_train import SceneTrainWorker
 from app.train_overlay import TrainOverlay
 from app.coin_read import CoinReader
+from app.coin_teach import (
+    MIN_DIGIT_SAMPLES,
+    DigitTrainWorker,
+    digit_teaching_count,
+    save_coin_teaching,
+)
+from app.preview_label import ImagePreview
 from app.scene_still_window import SceneStillWindow
+from app.scene_train_images_window import SceneTrainImagesWindow
 
 STYLESHEET = """
 QMainWindow, QWidget {
@@ -73,8 +84,9 @@ QPushButton {
     background: #2a303b;
     color: #e8eaed;
     border: none;
-    padding: 8px 14px;
-    border-radius: 8px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    min-height: 0px;
 }
 QPushButton:hover { background: #3a4250; }
 QPushButton:disabled { color: #6b7380; background: #22262e; }
@@ -87,14 +99,14 @@ QListWidget {
     padding: 6px;
     outline: none;
 }
-QListWidget::item { padding: 7px 10px; border-radius: 6px; }
+QListWidget::item { padding: 4px; border-radius: 8px; }
 QListWidget::item:selected { background: #2c3344; }
 QFrame#panel {
     background: #1c2028;
     border: 1px solid #2a303b;
     border-radius: 12px;
 }
-QSpinBox, QComboBox {
+QSpinBox, QComboBox, QLineEdit {
     background: #101216;
     color: #e8eaed;
     border: 1px solid #2a303b;
@@ -115,8 +127,15 @@ QLabel#preview, QFrame#infoPane {
     border: 1px solid #2a303b;
     border-radius: 10px;
 }
-QLabel#infoCaption { color: #9aa3b2; font-size: 12px; padding-top: 8px; }
-QLabel#infoValue { color: #f2f5f8; font-size: 20px; font-weight: 700; }
+QLabel#infoCaption { color: #9aa3b2; font-size: 12px; }
+QLabel#infoValue { color: #f2f5f8; font-size: 16px; font-weight: 700; }
+QFrame#kindsPane {
+    background: #101216;
+    border: 1px solid #2a303b;
+    border-radius: 12px;
+}
+QLabel#kindsCaption { color: #9aa3b2; font-size: 12px; }
+QLabel#kindsValue { color: #f2f5f8; font-size: 16px; font-weight: 600; }
 """
 
 
@@ -124,13 +143,13 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("動画フレーム抜き出し")
-        self.resize(1100, 760)
-        self.setMinimumSize(860, 600)
+        self.resize(1480, 900)
+        self.setMinimumSize(1280, 800)
         self.setAcceptDrops(True)
         self.setStyleSheet(STYLESHEET)
 
         self.info: VideoInfo | None = None
-        self.worker: ExtractWorker | SceneExtractWorker | SceneTrainWorker | None = None
+        self.worker: ExtractWorker | SceneExtractWorker | SceneTrainWorker | DigitTrainWorker | None = None
         self.scene_labels = SceneLabels()
         self._settings = QSettings("workshop", "VideoFrameExtractor")
         self.output_dir = Path(__file__).resolve().parent.parent / "output"
@@ -144,7 +163,10 @@ class MainWindow(QMainWindow):
         self._ipc_buffers: dict[int, bytes] = {}
         self._coin_reader: CoinReader | None = None
         self._coin_cache: dict[tuple[str, int, str], str] = {}
+        self._coin_box_cache: dict[tuple[str, int, str], dict[str, int]] = {}
+        self._preview_coin_box: dict[str, int] | None = None
         self._scene_still: SceneStillWindow | None = None
+        self._train_images: SceneTrainImagesWindow | None = None
 
         self._start_ipc()
         self._build_ui()
@@ -164,10 +186,11 @@ class MainWindow(QMainWindow):
         title = QLabel("動画フレーム抜き出し")
         title.setObjectName("title")
         self.hint_label = QLabel(
-            f"動画をドロップまたは「動画を開く」。再生時間の {int(RANGE_START*100)}%〜{int(RANGE_END*100)}% から、指定枚数を等間隔で画像にします。"
+            f"動画をドロップまたは「動画を開く」。開いただけでは抜き出しません。"
+            f"再生時間の {int(RANGE_START*100)}%〜{int(RANGE_END*100)}% から、枚数を指定して「指定枚数を出す」を押します。"
             "1枚のときは再生時間の中心（50%）です。"
             "探したい画面は種類を追加し、用意した画像を取り込んで学習します。"
-            "間違った画面は「これは違う」で教えます。似た画面は次から出ません。"
+            "間違った画面は「これは違う」で、正しい種類か「どちらでもない」を選びます。"
         )
         self.hint_label.setObjectName("hint")
         self.hint_label.setWordWrap(True)
@@ -180,11 +203,26 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.folder_btn, 0, Qt.AlignmentFlag.AlignTop)
         layout.addWidget(top)
 
+        kinds_pane = QFrame()
+        kinds_pane.setObjectName("kindsPane")
+        kinds_layout = QVBoxLayout(kinds_pane)
+        kinds_layout.setContentsMargins(16, 10, 16, 10)
+        kinds_layout.setSpacing(4)
+        kinds_cap = QLabel("解析する画面")
+        kinds_cap.setObjectName("kindsCaption")
+        self.extract_kinds_label = QLabel()
+        self.extract_kinds_label.setObjectName("kindsValue")
+        self.extract_kinds_label.setWordWrap(True)
+        kinds_layout.addWidget(kinds_cap)
+        kinds_layout.addWidget(self.extract_kinds_label)
+        layout.addWidget(kinds_pane)
+
         body = QSplitter(Qt.Orientation.Horizontal)
         left = QFrame()
         left.setObjectName("panel")
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(6)
         self.info_label = QLabel("まだ動画がありません")
         self.info_label.setObjectName("hint")
         self.info_label.setWordWrap(True)
@@ -198,16 +236,19 @@ class MainWindow(QMainWindow):
         count_row.addWidget(self.count_spin)
         count_row.addStretch(1)
         left_layout.addLayout(count_row)
+        self.sample_btn = QPushButton("指定枚数を出す")
+        self.sample_btn.setObjectName("primary")
+        left_layout.addWidget(self.sample_btn)
 
         self.extract_btn = QPushButton("画像に抜き出す")
         self.extract_btn.setObjectName("primary")
-        self.scene_btn = QPushButton("画面を抜き出す")
-        self.result_btn = QPushButton("resultを抜き出す")
-        self.scene_still_btn = QPushButton("シーンを画像にする")
-        left_layout.addWidget(self.extract_btn)
-        left_layout.addWidget(self.scene_btn)
-        left_layout.addWidget(self.result_btn)
-        left_layout.addWidget(self.scene_still_btn)
+        self.scene_still_btn = QPushButton("CAPTURE")
+        extract_grid = QGridLayout()
+        extract_grid.setHorizontalSpacing(6)
+        extract_grid.setVerticalSpacing(6)
+        extract_grid.addWidget(self.extract_btn, 0, 0)
+        extract_grid.addWidget(self.scene_still_btn, 0, 1)
+        left_layout.addLayout(extract_grid)
 
         kind_row = QHBoxLayout()
         kind_row.addWidget(QLabel("種類"))
@@ -220,94 +261,126 @@ class MainWindow(QMainWindow):
         self.teach_label.setObjectName("hint")
         self.teach_label.setWordWrap(True)
         left_layout.addWidget(self.teach_label)
-        teach_row = QHBoxLayout()
         self.teach_btn = QPushButton("この画像はこの種類")
         self.import_btn = QPushButton("用意した画像を取り込む")
-        teach_row.addWidget(self.teach_btn)
-        teach_row.addWidget(self.import_btn)
-        left_layout.addLayout(teach_row)
+        left_layout.addWidget(self.teach_btn)
+        left_layout.addWidget(self.import_btn)
         teach_row2 = QHBoxLayout()
+        teach_row2.setSpacing(6)
         self.other_btn = QPushButton("どちらでもない")
         self.scene_train_btn = QPushButton("学習する")
-        teach_row2.addWidget(self.other_btn)
-        teach_row2.addWidget(self.scene_train_btn)
+        teach_row2.addWidget(self.other_btn, 1)
+        teach_row2.addWidget(self.scene_train_btn, 1)
         left_layout.addLayout(teach_row2)
-
+        self.browse_train_btn = QPushButton("学習画像を見る")
+        left_layout.addWidget(self.browse_train_btn)
         self.folder_label = QLabel(f"保存先: {self.output_dir}")
         self.folder_label.setObjectName("hint")
         self.folder_label.setWordWrap(True)
         left_layout.addWidget(self.folder_label)
-
-        left_layout.addWidget(QLabel("抜き出し位置（クリックでプレビュー）"))
-        self.point_list = QListWidget()
-        left_layout.addWidget(self.point_list, 1)
-        review_row = QHBoxLayout()
-        self.wrong_btn = QPushButton("これは違う")
-        self.right_btn = QPushButton("合っている")
-        review_row.addWidget(self.wrong_btn)
-        review_row.addWidget(self.right_btn)
-        left_layout.addLayout(review_row)
-        self.send_one_btn = QPushButton("この画像をツムツムに渡す")
-        self.send_all_btn = QPushButton("すべてツムツムに渡す")
-        left_layout.addWidget(self.send_one_btn)
-        left_layout.addWidget(self.send_all_btn)
         self.copy_data_btn = QPushButton("DATAをアップ")
         self.import_data_btn = QPushButton("DATA DOWNLOAD")
         self.server_save_btn = QPushButton("サーバーに保存")
         self.server_load_btn = QPushButton("サーバーから開く")
         self.server_settings_btn = QPushButton("サーバー接続")
-        left_layout.addWidget(self.copy_data_btn)
-        left_layout.addWidget(self.import_data_btn)
-        left_layout.addWidget(self.server_save_btn)
-        left_layout.addWidget(self.server_load_btn)
-        left_layout.addWidget(self.server_settings_btn)
+        data_grid = QGridLayout()
+        data_grid.setHorizontalSpacing(6)
+        data_grid.setVerticalSpacing(6)
+        data_grid.addWidget(self.copy_data_btn, 0, 0)
+        data_grid.addWidget(self.import_data_btn, 0, 1)
+        data_grid.addWidget(self.server_save_btn, 1, 0)
+        data_grid.addWidget(self.server_load_btn, 1, 1)
+        data_grid.addWidget(self.server_settings_btn, 2, 0, 1, 2)
+        left_layout.addLayout(data_grid)
+        left_layout.addStretch(1)
+        left.setMinimumWidth(260)
 
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        left_layout.addWidget(self.progress)
-        left.setMinimumWidth(300)
-
-        right = QFrame()
-        right.setObjectName("panel")
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(12, 12, 12, 12)
+        preview_col = QFrame()
+        preview_col.setObjectName("panel")
+        preview_layout = QVBoxLayout(preview_col)
+        preview_layout.setContentsMargins(12, 12, 12, 12)
+        preview_layout.setSpacing(6)
         self.preview_title = QLabel("プレビュー")
-        right_layout.addWidget(self.preview_title)
-        self.preview = QLabel("動画を取り込むと、一覧をクリックして画像を確認できます")
+        preview_layout.addWidget(self.preview_title)
+        self.preview = ImagePreview("動画を開いて、「指定枚数を出す」を押すと右に出ます")
         self.preview.setObjectName("preview")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(320, 280)
+        self.preview.setMinimumSize(280, 280)
         self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        preview_layout.addWidget(self.preview, 1)
+        self.coin_box_hint = QLabel("緑の枠がコインを読んでいる場所です。枠が違うときは、ドラッグして囲み直してください。")
+        self.coin_box_hint.setObjectName("hint")
+        self.coin_box_hint.setWordWrap(True)
+        preview_layout.addWidget(self.coin_box_hint)
+        coin_fix = QHBoxLayout()
+        coin_fix.setSpacing(6)
+        self.coin_edit = QLineEdit()
+        self.coin_edit.setPlaceholderText("この枠の数字")
+        self.coin_save_btn = QPushButton("この数字を覚える")
+        self.coin_train_btn = QPushButton("コイン数字を学習する")
+        coin_fix.addWidget(self.coin_edit, 1)
+        coin_fix.addWidget(self.coin_save_btn)
+        coin_fix.addWidget(self.coin_train_btn)
+        preview_layout.addLayout(coin_fix)
+        self._set_coin_fix_visible(False)
 
-        self.info_pane = QFrame()
-        self.info_pane.setObjectName("infoPane")
-        self.info_pane.setMinimumWidth(200)
-        self.info_pane.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        info_pane_layout = QVBoxLayout(self.info_pane)
-        info_pane_layout.setContentsMargins(14, 14, 14, 14)
-        info_pane_layout.setSpacing(4)
-        self.video_time_value = self._add_info_block(info_pane_layout, "動画の時間")
-        self.go_timeup_value = self._add_info_block(info_pane_layout, "GO → TIME UP")
-        self.play_coin_value = self._add_info_block(info_pane_layout, "coin のコイン")
-        self.result_coin_value = self._add_info_block(info_pane_layout, "result のコイン")
-        self.coin_ratio_value = self._add_info_block(info_pane_layout, "result は coin の何倍")
-        info_pane_layout.addStretch(1)
+        info_col = QFrame()
+        info_col.setObjectName("panel")
+        info_layout = QVBoxLayout(info_col)
+        info_layout.setContentsMargins(12, 12, 12, 12)
+        info_layout.setSpacing(8)
+        info_layout.addWidget(QLabel("動画の情報"))
+        self.result_btn = QPushButton("resultを抜き出す")
+        self.scene_btn = QPushButton("解析")
+        self.scene_btn.setObjectName("primary")
+        scene_row = QHBoxLayout()
+        scene_row.setSpacing(6)
+        scene_row.addWidget(self.result_btn, 1)
+        scene_row.addWidget(self.scene_btn, 1)
+        info_layout.addLayout(scene_row)
+        self.video_time_value = self._add_info_block(info_layout, "動画の時間")
+        self.go_timeup_value = self._add_info_block(info_layout, "GO → TIME UP")
+        self.play_coin_value = self._add_info_block(info_layout, "coin のコイン")
+        self.result_coin_value = self._add_info_block(info_layout, "result のコイン")
+        self.coin_ratio_value = self._add_info_block(info_layout, "コイン倍率")
+        self.wrong_btn = QPushButton("これは違う")
+        self.right_btn = QPushButton("合っている")
+        self.send_one_btn = QPushButton("指定した枚数をツムツムに渡す")
+        self.send_all_btn = QPushButton("一覧をすべて渡す")
+        info_layout.addWidget(self.wrong_btn)
+        info_layout.addWidget(self.right_btn)
+        info_layout.addWidget(self.send_one_btn)
+        info_layout.addWidget(self.send_all_btn)
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        info_layout.addWidget(self.progress)
+        info_layout.addStretch(1)
+        info_col.setMinimumWidth(220)
 
-        preview_split = QSplitter(Qt.Orientation.Horizontal)
-        preview_split.setChildrenCollapsible(False)
-        preview_split.addWidget(self.preview)
-        preview_split.addWidget(self.info_pane)
-        preview_split.setStretchFactor(0, 3)
-        preview_split.setStretchFactor(1, 2)
-        preview_split.setSizes([720, 400])
-        preview_split.splitterMoved.connect(lambda *_: self._fit_preview())
-        right_layout.addWidget(preview_split, 1)
+        points_col = QFrame()
+        points_col.setObjectName("panel")
+        points_layout = QVBoxLayout(points_col)
+        points_layout.setContentsMargins(12, 12, 12, 12)
+        points_layout.setSpacing(6)
+        points_layout.addWidget(QLabel("抜き出し位置（クリックでプレビュー）"))
+        self.point_list = QListWidget()
+        self.point_list.setViewMode(QListView.ViewMode.ListMode)
+        self.point_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.point_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.point_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        points_layout.addWidget(self.point_list, 1)
+        points_col.setMinimumWidth(260)
 
         body.addWidget(left)
-        body.addWidget(right)
+        body.addWidget(preview_col)
+        body.addWidget(points_col)
+        body.addWidget(info_col)
         body.setStretchFactor(0, 0)
-        body.setStretchFactor(1, 1)
-        body.setSizes([360, 1100])
+        body.setStretchFactor(1, 3)
+        body.setStretchFactor(2, 2)
+        body.setStretchFactor(3, 1)
+        body.setSizes([320, 560, 360, 240])
+        body.splitterMoved.connect(lambda *_: self._fit_preview())
         layout.addWidget(body, 1)
         self.setCentralWidget(root)
         self._train_fx = TrainOverlay(root)
@@ -316,6 +389,7 @@ class MainWindow(QMainWindow):
 
         self.open_btn.clicked.connect(self.open_video)
         self.folder_btn.clicked.connect(self.choose_folder)
+        self.sample_btn.clicked.connect(self.refresh_points)
         self.extract_btn.clicked.connect(self.start_extract)
         self.scene_btn.clicked.connect(self.start_scene_extract)
         self.result_btn.clicked.connect(self.start_result_extract)
@@ -327,8 +401,12 @@ class MainWindow(QMainWindow):
         self.import_btn.clicked.connect(self.import_prepared_images)
         self.other_btn.clicked.connect(lambda: self.teach_current(OTHER_KEY))
         self.scene_train_btn.clicked.connect(self.start_scene_train)
+        self.browse_train_btn.clicked.connect(self.open_train_images)
+        self.preview.box_changed.connect(self.on_coin_box_changed)
+        self.coin_save_btn.clicked.connect(self.save_current_coin)
+        self.coin_train_btn.clicked.connect(self.start_digit_train)
+        self.coin_edit.returnPressed.connect(self.save_current_coin)
         self._fill_kind_combo()
-        self.count_spin.valueChanged.connect(self.refresh_points)
         self.point_list.currentItemChanged.connect(self.on_point_selected)
         self.send_one_btn.clicked.connect(self.send_current_to_tsumtsum)
         self.send_all_btn.clicked.connect(self.send_all_to_tsumtsum)
@@ -340,20 +418,27 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
     def _add_info_block(self, layout: QVBoxLayout, caption: str) -> QLabel:
+        box = QFrame()
+        box.setObjectName("infoPane")
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(10, 8, 10, 8)
+        box_layout.setSpacing(2)
         cap = QLabel(caption)
         cap.setObjectName("infoCaption")
-        layout.addWidget(cap)
         value = QLabel("—")
         value.setObjectName("infoValue")
         value.setWordWrap(True)
         value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(value)
+        box_layout.addWidget(cap)
+        box_layout.addWidget(value, 1)
+        layout.addWidget(box, 1)
         return value
 
     def _update_buttons(self) -> None:
         busy = self.worker is not None
         ready = self.info is not None and not busy
         self.extract_btn.setEnabled(ready)
+        self.sample_btn.setEnabled(ready)
         self.scene_btn.setEnabled(ready)
         self.result_btn.setEnabled(ready and bool(self.scene_labels.keys_named("result")))
         self.scene_still_btn.setEnabled(self.info is not None)
@@ -363,7 +448,7 @@ class MainWindow(QMainWindow):
         reviewing = has_point and self._current_is_found_scene()
         self.wrong_btn.setEnabled(reviewing)
         self.right_btn.setEnabled(reviewing)
-        self.send_one_btn.setEnabled(has_point)
+        self.send_one_btn.setEnabled(ready)
         self.send_all_btn.setEnabled(ready and self.point_list.count() > 0)
         has_kind = self._selected_kind() is not None
         self.teach_btn.setEnabled(has_point and has_kind)
@@ -377,8 +462,14 @@ class MainWindow(QMainWindow):
         self.server_load_btn.setEnabled(not busy)
         self.server_settings_btn.setEnabled(not busy)
         training = isinstance(self.worker, SceneTrainWorker)
+        digit_training = isinstance(self.worker, DigitTrainWorker)
         self.scene_train_btn.setEnabled(not busy or training)
         self.scene_train_btn.setText("中止" if training else "学習する")
+        coin_ready = has_point and self._coin_box_key_for_point(self._current_point()) is not None
+        self.coin_save_btn.setEnabled(coin_ready and not busy)
+        self.coin_train_btn.setEnabled((not busy or digit_training) and digit_teaching_count() >= MIN_DIGIT_SAMPLES)
+        self.coin_train_btn.setText("中止" if digit_training else "コイン数字を学習する")
+        self.coin_edit.setEnabled(coin_ready and not busy)
         self._refresh_teach_label()
 
     def _fill_kind_combo(self) -> None:
@@ -393,7 +484,15 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self.kind_combo.setCurrentIndex(index)
         self.kind_combo.blockSignals(False)
-        self.scene_btn.setText(f"{self.scene_labels.extract_names()}を抜き出す")
+        self.scene_btn.setText("解析")
+        self._refresh_extract_kinds()
+
+    def _refresh_extract_kinds(self) -> None:
+        names = [name for key, name in self.scene_labels.kinds() if key not in self.scene_labels.hidden_keys()]
+        if not names:
+            self.extract_kinds_label.setText("まだありません")
+            return
+        self.extract_kinds_label.setText("  /  ".join(names))
 
     def _selected_kind(self) -> str | None:
         key = self.kind_combo.currentData()
@@ -403,7 +502,7 @@ class MainWindow(QMainWindow):
         points = []
         for point in self._list_points():
             kind = getattr(point, "kind", "sample")
-            if kind and kind not in {"sample", OTHER_KEY}:
+            if kind in self.scene_labels.extract_keys():
                 points.append(point)
         return points
 
@@ -413,12 +512,14 @@ class MainWindow(QMainWindow):
             return False
         point = item.data(Qt.ItemDataRole.UserRole)
         kind = getattr(point, "kind", "sample") if point is not None else "sample"
-        return bool(kind) and kind not in {"sample", OTHER_KEY}
+        return kind in self.scene_labels.extract_keys()
 
     def _refresh_teach_label(self) -> None:
         counts = self.scene_labels.counts()
         parts = [f"{self.scene_labels.name_of(key)} {counts.get(key, 0)}" for key in self.scene_labels.classes()]
         self.teach_label.setText("  ".join(parts) + f"  （学習は各{MIN_SCENE_SAMPLES}枚）")
+        if self._train_images is not None:
+            self._train_images.reload()
 
     def _dialog_dir(self, key: str, fallback: Path | None = None) -> str:
         saved = str(self._settings.value(f"last_dir/{key}", "") or "")
@@ -469,43 +570,95 @@ class MainWindow(QMainWindow):
         self._release_cap()
         self._saved_by_index = {}
         self._coin_cache = {}
+        self._coin_box_cache = {}
+        self._preview_coin_box = None
         self.info_label.setText(
             f"{path.name}\n"
             f"{self.info.width} × {self.info.height}  /  {self.info.fps:.2f} fps\n"
             f"再生時間 {self.info.format_duration()}  /  {self.info.frame_count} フレーム\n"
             f"抜き出し範囲 {int(RANGE_START*100)}%〜{int(RANGE_END*100)}%"
         )
-        self.refresh_points()
+        self._clear_points()
+        self._preview_opened_video()
         self._update_buttons()
         self._remember_dialog_dir("video", path)
         self._settings.setValue("last_video_dir", str(path.parent.resolve()))
         self._settings.setValue("last_video_path", str(path.resolve()))
-        self.statusBar().showMessage(f"{path.name} を読み込みました", 4000)
+        self.statusBar().showMessage(
+            f"{path.name} を読み込みました。枚数を指定して「指定枚数を出す」を押してください。",
+            5000,
+        )
         if self._scene_still is not None:
             self._scene_still.set_video(self.info, self.output_dir)
+
+    def _clear_points(self) -> None:
+        self.point_list.blockSignals(True)
+        self.point_list.clear()
+        self.point_list.blockSignals(False)
+        self._saved_by_index = {}
+        self._preview_point = None
+        self._full_pixmap = None
+        self._preview_coin_box = None
+        if hasattr(self, "preview"):
+            self.preview.editable = False
+            self._set_coin_fix_visible(False)
+        self._fit_point_list()
+        self._refresh_info_pane()
+
+    def _preview_opened_video(self) -> None:
+        if self.info is None:
+            return
+        last = max(self.info.frame_count - 1, 0)
+        frame = self._read_frame(int(round(0.5 * last)))
+        if frame is None:
+            self.preview.setText("動画は開きました。枚数を指定して「指定枚数を出す」を押してください")
+            self.preview_title.setText("プレビュー")
+            self._preview_coin_box = None
+            self.preview.editable = False
+            self._set_coin_fix_visible(False)
+            return
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+        self._full_pixmap = QPixmap.fromImage(image)
+        self._preview_coin_box = None
+        self.preview.editable = False
+        self._set_coin_fix_visible(False)
+        self.preview_title.setText("プレビュー  開いただけです。枚数を指定して「指定枚数を出す」")
+        self._fit_preview()
 
     def refresh_points(self) -> None:
         self.point_list.blockSignals(True)
         self.point_list.clear()
         if self.info is None:
             self.point_list.blockSignals(False)
+            self._fit_point_list()
             return
         points = sample_points(self.info, self.count_spin.value())
         for point in points:
-            label = ""
+            extra = ""
             kind = getattr(point, "kind", "sample")
             if kind and kind not in {"sample", OTHER_KEY}:
-                label = f"  {self.scene_labels.name_of(kind)}  {point.score:.0%}"
-            item = QListWidgetItem(
-                f"{point.index:3d}  {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%){label}"
-            )
-            item.setData(Qt.ItemDataRole.UserRole, point)
-            self.point_list.addItem(item)
+                extra = f"{self.scene_labels.name_of(kind)} {point.score:.0%}"
+            self.point_list.addItem(self._point_item(point, extra))
         self.point_list.blockSignals(False)
         self._relink_extracted_files()
         if self.point_list.count():
             self.point_list.setCurrentRow(0)
+        self._fit_point_list()
+        QTimer.singleShot(0, self._fit_point_list)
         self._refresh_info_pane()
+
+    def _point_item(self, point, extra: str = "") -> QListWidgetItem:
+        label = f"  {extra}" if extra else ""
+        text = f"{point.index}    {format_timecode(point.seconds)}    {point.percent * 100:.1f}%{label}"
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, point)
+        return item
+
+    def _fit_point_list(self) -> None:
+        self.point_list.setMinimumHeight(0)
+        self.point_list.setMaximumHeight(16777215)
 
     def _relink_extracted_files(self) -> None:
         found: dict[int, Path] = {}
@@ -537,6 +690,9 @@ class MainWindow(QMainWindow):
             if frame is None:
                 self.preview.setText("この位置の画像を取得できませんでした")
                 self.preview_title.setText("プレビュー")
+                self._preview_coin_box = None
+                self.preview.editable = False
+                self._set_coin_fix_visible(False)
                 return
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channels = rgb.shape
@@ -551,6 +707,7 @@ class MainWindow(QMainWindow):
         self.preview_title.setText(
             f"プレビュー  {point.index} / {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%){extra}  {source}"
         )
+        self._sync_coin_preview(point)
         self._fit_preview()
         self.statusBar().showMessage(
             f"{point.index}枚目  {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%)",
@@ -583,11 +740,148 @@ class MainWindow(QMainWindow):
         number = ""
         try:
             path = self._point_image_path(point)
-            number = self._coin_reader_instance().read_path(path, box_key)
+            box, number = self._coin_reader_instance().inspect_path(path, box_key)
+            if box is not None:
+                self._coin_box_cache[cache_key] = box
         except Exception:
             number = ""
         self._coin_cache[cache_key] = number
         return number
+
+    def _current_point(self):
+        item = self.point_list.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _set_coin_fix_visible(self, visible: bool) -> None:
+        self.coin_box_hint.setVisible(visible)
+        self.coin_edit.setVisible(visible)
+        self.coin_save_btn.setVisible(visible)
+        self.coin_train_btn.setVisible(visible)
+
+    def _format_coin_edit(self, number: str) -> str:
+        digits = "".join(char for char in (number or "") if char.isdigit())
+        if not digits:
+            return ""
+        return f"{int(digits):,}"
+
+    def _sync_coin_preview(self, point) -> None:
+        key = self._coin_box_key_for_point(point)
+        if key is None:
+            self._preview_coin_box = None
+            self.preview.editable = False
+            self._set_coin_fix_visible(False)
+            return
+        cache_key = self._coin_cache_key(point, key)
+        number = self._read_point_coin(point, key)
+        box = self._coin_box_cache.get(cache_key)
+        if box is None:
+            try:
+                path = self._point_image_path(point)
+                box, number = self._coin_reader_instance().inspect_path(path, key)
+                if box is not None:
+                    self._coin_box_cache[cache_key] = box
+                self._coin_cache[cache_key] = number
+            except Exception:
+                box = None
+        self._preview_coin_box = box
+        self.preview.editable = True
+        self._set_coin_fix_visible(True)
+        self.coin_edit.setText(self._format_coin_edit(number))
+        self._refresh_info_pane()
+
+    def on_coin_box_changed(self, box: dict) -> None:
+        point = self._current_point()
+        key = self._coin_box_key_for_point(point) if point is not None else None
+        if point is None or key is None:
+            return
+        cache_key = self._coin_cache_key(point, key)
+        self._preview_coin_box = dict(box)
+        self._coin_box_cache[cache_key] = dict(box)
+        try:
+            path = self._point_image_path(point)
+            number = self._coin_reader_instance().read_box(path, box)
+        except Exception:
+            number = ""
+        self._coin_cache[cache_key] = number
+        self.coin_edit.setText(self._format_coin_edit(number))
+        self._refresh_info_pane()
+
+    def save_current_coin(self) -> None:
+        point = self._current_point()
+        key = self._coin_box_key_for_point(point) if point is not None else None
+        if point is None or key is None:
+            return
+        box = self.preview.box() or self._preview_coin_box
+        if box is None:
+            QMessageBox.information(self, "枠がありません", "プレビューをドラッグして、コインの数字を囲んでください。")
+            return
+        try:
+            path = self._point_image_path(point)
+            count = save_coin_teaching(path, box, key, self.coin_edit.text())
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "覚えられませんでした", str(exc))
+            return
+        digits = "".join(char for char in self.coin_edit.text() if char.isdigit())
+        cache_key = self._coin_cache_key(point, key)
+        self._coin_cache[cache_key] = digits
+        self._coin_box_cache[cache_key] = dict(box)
+        self._preview_coin_box = dict(box)
+        self.coin_edit.setText(self._format_coin_edit(digits))
+        self._refresh_info_pane()
+        self._update_buttons()
+        extra = "「コイン数字を学習する」が使えます。" if count >= MIN_DIGIT_SAMPLES else f"学習にはあと {MIN_DIGIT_SAMPLES - count} 枚です。"
+        self.statusBar().showMessage(f"コイン {self._format_coin_edit(digits)} を覚えました。いま {count} 枚。{extra}", 6000)
+
+    def start_digit_train(self) -> None:
+        if isinstance(self.worker, DigitTrainWorker):
+            self.worker.requestInterruption()
+            self.coin_train_btn.setEnabled(False)
+            self.coin_train_btn.setText("中止しています…")
+            self.statusBar().showMessage("コイン数字の学習を中止しています")
+            return
+        if self.worker is not None:
+            return
+        count = digit_teaching_count()
+        if count < MIN_DIGIT_SAMPLES:
+            QMessageBox.information(
+                self,
+                "まだ足りません",
+                f"コイン数字の学習には {MIN_DIGIT_SAMPLES} 枚以上必要です。いま {count} 枚です。",
+            )
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 20)
+        self.progress.setValue(0)
+        self.worker = DigitTrainWorker()
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_digits_trained)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+        self._update_buttons()
+        self.statusBar().showMessage("コイン数字を学習しています")
+
+    def on_digits_trained(self, metrics: dict) -> None:
+        self.worker = None
+        self.progress.setVisible(False)
+        if self._coin_reader is not None:
+            self._coin_reader.reload()
+        self._coin_cache = {}
+        self._coin_box_cache = {}
+        self._update_buttons()
+        acc = float(metrics.get("acc") or 0)
+        samples = int(metrics.get("samples") or 0)
+        QMessageBox.information(
+            self,
+            "学習完了",
+            f"コイン数字を {samples} 枚で学習しました。精度 {acc:.0%}\n次の解析から使います。",
+        )
+        point = self._current_point()
+        if point is not None:
+            self._sync_coin_preview(point)
+            self._fit_preview()
+        self.statusBar().showMessage(f"コイン数字を学習しました  精度 {acc:.0%}", 5000)
 
     def _go_timeup_spans(self, points: list) -> list[float]:
         go_keys = set(self.scene_labels.keys_named("go"))
@@ -710,13 +1004,7 @@ class MainWindow(QMainWindow):
     def _fit_preview(self) -> None:
         if self._full_pixmap is None or self._full_pixmap.isNull():
             return
-        self.preview.setPixmap(
-            self._full_pixmap.scaled(
-                self.preview.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        self.preview.set_image(self._full_pixmap, self._preview_coin_box)
 
     def _release_cap(self) -> None:
         if self._cap is not None:
@@ -727,6 +1015,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self._full_pixmap is not None and not self._full_pixmap.isNull():
             self._fit_preview()
+        if hasattr(self, "point_list"):
+            self._fit_point_list()
         if hasattr(self, "_train_fx"):
             self._train_fx._place()
 
@@ -765,13 +1055,15 @@ class MainWindow(QMainWindow):
         return points
 
     def send_current_to_tsumtsum(self) -> None:
-        item = self.point_list.currentItem()
-        if item is None:
+        if self.info is None:
+            QMessageBox.information(self, "動画がありません", "先に動画を開いてください。")
             return
-        point = item.data(Qt.ItemDataRole.UserRole)
-        if point is None:
+        self.refresh_points()
+        points = sample_points(self.info, self.count_spin.value())
+        if not points:
+            QMessageBox.information(self, "画像がありません", "抜き出す枚数を確認してください。")
             return
-        self._handoff_points([point])
+        self._handoff_points(points)
 
     def send_all_to_tsumtsum(self) -> None:
         points = self._list_points()
@@ -818,7 +1110,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("抜き出し中です…")
 
     def start_scene_extract(self) -> None:
-        self._start_kind_extract(None, self.scene_labels.extract_names())
+        keys = set(self.scene_labels.extract_keys()) | set(self.scene_labels.hidden_keys())
+        self._start_kind_extract(keys or None, self.scene_labels.extract_names())
 
     def start_result_extract(self) -> None:
         keys = self.scene_labels.keys_named("result")
@@ -850,6 +1143,20 @@ class MainWindow(QMainWindow):
 
     def _clear_scene_still(self, *_args) -> None:
         self._scene_still = None
+
+    def open_train_images(self) -> None:
+        if self._train_images is None:
+            window = SceneTrainImagesWindow(self)
+            window.setStyleSheet(self.styleSheet())
+            window.destroyed.connect(self._clear_train_images)
+            self._train_images = window
+        self._train_images.reload(select_kind=self._selected_kind())
+        self._train_images.show()
+        self._train_images.raise_()
+        self._train_images.activateWindow()
+
+    def _clear_train_images(self, *_args) -> None:
+        self._train_images = None
 
     def _start_kind_extract(self, want_kinds: set[str] | None, names: str) -> None:
         if self.info is None or self.worker is not None:
@@ -952,19 +1259,42 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         point = item.data(Qt.ItemDataRole.UserRole)
-        rejected_hash = self._scene_hash_for_point(point)
-        if not self.teach_current(OTHER_KEY):
+        if point is None:
             return
-        removed = self._remove_points_like(rejected_hash)
-        if removed <= 0:
-            self._remove_current_point()
-            removed = 1
-        left = self.point_list.count()
-        extra = f"  似た画面も {removed} 枚外しました" if removed > 1 else ""
-        self.statusBar().showMessage(
-            f"違う画面として覚えました。残り {left} 枚。{extra} 学習しなくても、次から同じ画面は出しません",
-            7000,
+        detected = str(getattr(point, "kind", "") or "")
+        options: list[tuple[str, str]] = [(OTHER_KEY, self.scene_labels.name_of(OTHER_KEY))]
+        for key in self.scene_labels.extract_keys():
+            if key == detected:
+                continue
+            options.append((key, self.scene_labels.name_of(key)))
+        names = [name for _key, name in options]
+        picked, ok = QInputDialog.getItem(
+            self,
+            "これは違う",
+            "では、どれですか？",
+            names,
+            0,
+            False,
         )
+        if not ok or not picked:
+            return
+        kind = next(key for key, name in options if name == picked)
+        if not self.teach_current(kind):
+            return
+        if kind == OTHER_KEY:
+            self._remove_current_point()
+            self.statusBar().showMessage(
+                f"「{self.scene_labels.name_of(OTHER_KEY)}」として覚えました。残り {self.point_list.count()} 枚",
+                5000,
+            )
+            return
+        point.kind = kind
+        extra = f"{self.scene_labels.name_of(kind)} {point.score:.0%}"
+        item.setText(self._point_item(point, extra).text())
+        self.show_point(point)
+        self._update_buttons()
+        self._refresh_info_pane(read_coins=True)
+        self.statusBar().showMessage(f"「{self.scene_labels.name_of(kind)}」に直して覚えました", 5000)
 
     def _scene_hash_for_point(self, point) -> int | None:
         if point is None:
@@ -1078,42 +1408,57 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "学習完了",
-            f"{samples} 枚で学習しました。精度 {acc:.0%}\n「{self.scene_labels.extract_names()}を抜き出す」が使えます。",
+            f"{samples} 枚で学習しました。精度 {acc:.0%}\n「解析」が使えます。探す種類は上の枠に出ています。",
         )
         self.statusBar().showMessage(f"学習しました  精度 {acc:.0%}", 5000)
 
-    def on_scene_finished(self, _paths: list[str]) -> None:
+    def on_scene_finished(self, paths: list[str]) -> None:
         points = getattr(self.worker, "found_points", []) if self.worker is not None else []
         names = getattr(self.worker, "search_names", "") if self.worker is not None else ""
         self.worker = None
         self.progress.setVisible(False)
-        self._saved_by_index = {}
         names = names or self.scene_labels.extract_names()
+        show = set(self.scene_labels.extract_keys())
+        hidden = set(self.scene_labels.hidden_keys())
+        hidden_hits = [point for point in points if getattr(point, "kind", "") in hidden]
+        points = [point for point in points if getattr(point, "kind", "") in show]
+        self._saved_by_index = {}
+        for point, path in zip(points, paths):
+            self._saved_by_index[point.index] = Path(path)
         if points:
             self.point_list.blockSignals(True)
             self.point_list.clear()
             for point in points:
                 name = self.scene_labels.name_of(point.kind)
-                item = QListWidgetItem(
-                    f"{point.index:3d}  {format_timecode(point.seconds)}  {name}  {point.score:.0%}"
-                )
-                item.setData(Qt.ItemDataRole.UserRole, point)
-                self.point_list.addItem(item)
+                self.point_list.addItem(self._point_item(point, f"{name} {point.score:.0%}"))
             self.point_list.blockSignals(False)
             if self.point_list.count():
                 self.point_list.setCurrentRow(0)
+            self._fit_point_list()
+            QTimer.singleShot(0, self._fit_point_list)
         self._update_buttons()
         self._refresh_info_pane(read_coins=bool(points))
         if not points:
-            QMessageBox.information(self, "見つかりませんでした", f"{names} の画面は見つかりませんでした。")
-            self.statusBar().showMessage(f"{names} は見つかりませんでした", 5000)
+            if hidden_hits:
+                hidden_names = self.scene_labels.names_of(
+                    list(dict.fromkeys(point.kind for point in hidden_hits))
+                )
+                QMessageBox.information(
+                    self,
+                    "見つかりませんでした",
+                    f"{names} の画面は見つかりませんでした。\n"
+                    f"「{hidden_names}」は見つかりましたが、今は結果に出さない種類です。",
+                )
+                self.statusBar().showMessage(f"{hidden_names} は結果に出していません", 5000)
+            else:
+                QMessageBox.information(self, "見つかりませんでした", f"{names} の画面は見つかりませんでした。")
+                self.statusBar().showMessage(f"{names} は見つかりませんでした", 5000)
             return
         QMessageBox.information(
             self,
             "見つかりました",
             f"{names} を {len(points)} 枚見つけました。\n"
-            "間違っていたら「これは違う」、合っていたら「合っている」を押してください。\n"
-            "「これは違う」とした画面と似たものは、次から出ません。\n"
+            "間違っていたら「これは違う」で正しい種類を選ぶか、「合っている」を押してください。\n"
             "直したあと「学習する」と、次から精度が上がります。",
         )
         self.statusBar().showMessage(f"{len(points)} 枚見つかりました。間違いは「これは違う」", 6000)
@@ -1424,5 +1769,7 @@ class MainWindow(QMainWindow):
             self.worker.wait(1000)
         if self._scene_still is not None:
             self._scene_still.close()
+        if self._train_images is not None:
+            self._train_images.close()
         self._release_cap()
         event.accept()

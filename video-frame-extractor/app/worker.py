@@ -71,6 +71,18 @@ class SceneExtractWorker(QThread):
                 want_kinds=self.want_kinds,
             )
             self.found_points = points
-            self.finished_ok.emit([])
+            from app.scene_labels import SceneLabels
+            hidden = set(SceneLabels().hidden_keys())
+            save_points = [point for point in points if getattr(point, "kind", "") not in hidden]
+            if not save_points:
+                self.finished_ok.emit([])
+                return
+            paths = extract_scene_frames(
+                self.info,
+                save_points,
+                self.output_dir,
+                progress=lambda current, total, name: self.progress.emit(current, total, name),
+            )
+            self.finished_ok.emit([str(path) for path in paths])
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))

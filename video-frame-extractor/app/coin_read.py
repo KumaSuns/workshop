@@ -166,18 +166,33 @@ class CoinReader:
             logits = self._digit_model(tensor)
         return self._digit_mod.decode_logits(logits.cpu())
 
-    def read_path(self, path: Path, key: str) -> str:
-        with Image.open(path) as opened:
-            image = opened.convert("RGB")
-        box = self.box_for(image, key)
-        if box is None:
-            return ""
+    def _read_with_box(self, path: Path, box: dict[str, int]) -> str:
         _crop, number = self._hud.read_coin_number(
             path,
             box,
             predict_fn=self._predict_digits if self._digit_model is not None else None,
         )
         return number or ""
+
+    def inspect_path(self, path: Path, key: str) -> tuple[dict[str, int] | None, str]:
+        with Image.open(path) as opened:
+            image = opened.convert("RGB")
+        box = self.box_for(image, key)
+        if box is None:
+            return None, ""
+        return box, self._read_with_box(path, box)
+
+    def read_box(self, path: Path, box: dict[str, int]) -> str:
+        return self._read_with_box(path, box)
+
+    def read_path(self, path: Path, key: str) -> str:
+        _box, number = self.inspect_path(path, key)
+        return number
+
+    def reload(self) -> None:
+        self.close()
+        self._load_models()
+        self._load_fallbacks()
 
     def read_image(self, image: Image.Image, key: str) -> str:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:

@@ -30,7 +30,7 @@ class SceneStillWindow(QMainWindow):
         super().__init__(host)
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setWindowTitle("シーンを画像にする")
+        self.setWindowTitle("CAPTURE")
         self.resize(960, 720)
         self.setMinimumSize(640, 480)
 
@@ -58,7 +58,7 @@ class SceneStillWindow(QMainWindow):
         top_layout = QHBoxLayout(top)
         top_layout.setContentsMargins(16, 12, 16, 12)
         title_box = QVBoxLayout()
-        title = QLabel("シーンを画像にする")
+        title = QLabel("CAPTURE")
         title.setObjectName("title")
         hint = QLabel(
             "「動画を開く」か、すでに開いている動画から、見たいシーンまで動かします。"
@@ -331,8 +331,32 @@ class SceneStillWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "保存できませんでした", str(exc))
             return
+        labels = getattr(self._host, "scene_labels", None)
+        if labels is not None:
+            try:
+                labels.add(dest, key)
+            except Exception:
+                pass
+            refresh = getattr(self._host, "_refresh_teach_label", None)
+            if callable(refresh):
+                refresh()
+        extra = ""
+        try:
+            from app.handoff import send_images_to_tsumtsum
+
+            result = send_images_to_tsumtsum([dest])
+            extra = (
+                "\nツムツムアプリの一覧にも渡しました。"
+                if result == "sent"
+                else "\nツムツムアプリを開いて取り込みました。"
+            )
+        except Exception as exc:  # noqa: BLE001
+            extra = f"\nツム側には渡せませんでした。\n{exc}"
+        hint = ""
+        if key == OTHER_KEY:
+            hint = "\nリザルト画面なら、種類を result にすると result の学習からも開けます。"
         self.statusBar().showMessage(f"「{name}」で保存しました  {dest.name}", 6000)
-        QMessageBox.information(self, "保存しました", f"種類: {name}\n{dest.name}\n{dest.parent}")
+        QMessageBox.information(self, "保存しました", f"種類: {name}\n{dest.name}\n{dest.parent}{extra}{hint}")
 
     def _unique_dest(self, seconds: float, kind: str) -> Path:
         stamp = format_timecode(seconds).replace(":", "-")

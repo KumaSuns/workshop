@@ -129,6 +129,11 @@ QPushButton#danger {
 }
 QPushButton#danger:hover { background: #d85a50; }
 QPushButton#danger:disabled { color: #8a6e6c; background: #3a2a2a; }
+QPushButton#video {
+    background: #2f7fd1;
+    font-weight: 600;
+}
+QPushButton#video:hover { background: #4590de; }
 QCheckBox {
     color: #9aa3b2;
     spacing: 8px;
@@ -182,6 +187,10 @@ QHeaderView::section {
     padding: 6px 4px;
     font-size: 11px;
     font-weight: 600;
+}
+QHeaderView::section:hover {
+    color: #e8eaed;
+    background: #252a34;
 }
 QScrollBar:vertical {
     background: #101216;
@@ -278,6 +287,8 @@ class MainWindow(QMainWindow):
         self._ipc_buffers: dict[int, bytes] = {}
         self._last_boxes: dict[str, dict[str, int]] = {}
         self._last_piece_radius: dict[str, int] = {}
+        self._list_sort_key: str | None = None
+        self._list_sort_asc = True
         self._settings = QSettings("workshop", "TsumTsumScreenTrainer")
         self._remember_last_boxes()
 
@@ -425,6 +436,9 @@ class MainWindow(QMainWindow):
         header = self.list_widget.horizontalHeader()
         header.setHighlightSections(False)
         header.setStretchLastSection(True)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(False)
+        header.sectionClicked.connect(self.on_list_header_clicked)
         self._sync_list_columns()
         right_layout.addWidget(self.list_widget, 1)
         self.delete_btn = QPushButton("選択を削除")
@@ -443,6 +457,7 @@ class MainWindow(QMainWindow):
         self.shortcut_btn = QPushButton("起動アイコン作成")
         right_layout.addWidget(self.shortcut_btn)
         self.video_app_btn = QPushButton("動画編集・生成")
+        self.video_app_btn.setObjectName("video")
         right_layout.addWidget(self.video_app_btn)
         right.setMinimumWidth(480)
 
@@ -597,10 +612,52 @@ class MainWindow(QMainWindow):
             return samples
         return [sample for sample in samples if sample.status != "skipped"]
 
+    def _coin_digits_of(self, sample: Sample) -> str:
+        for box_key in COIN_BOX_KEYS:
+            digits = "".join(char for char in (sample.readings or {}).get(box_key, "") if char.isdigit())
+            if digits:
+                return digits
+        return ""
+
+    def _sample_sort_value(self, sample: Sample, key: str):
+        if key == "file":
+            return (sample.source_name.casefold(), sample.id)
+        if key == "coin_digits":
+            digits = self._coin_digits_of(sample)
+            if not digits:
+                return (1, 0, sample.id)
+            return (0, int(digits), sample.id)
+        state = self._key_list_state(sample, key)
+        rank = {"confirmed": 0, "predicted": 1}.get(state, 2)
+        return (rank, sample.source_name.casefold(), sample.id)
+
+    def _ordered_visible_samples(self) -> list[Sample]:
+        samples = self._visible_samples()
+        key = self._list_sort_key
+        if not key:
+            return samples
+        return sorted(
+            samples,
+            key=lambda sample: self._sample_sort_value(sample, key),
+            reverse=not self._list_sort_asc,
+        )
+
+    def on_list_header_clicked(self, section: int) -> None:
+        keys = self._list_status_keys() + ["file"]
+        if section < 0 or section >= len(keys):
+            return
+        key = keys[section]
+        if self._list_sort_key == key:
+            self._list_sort_asc = not self._list_sort_asc
+        else:
+            self._list_sort_key = key
+            self._list_sort_asc = True
+        self.refresh_list(self.current_id)
+
     def refresh_list(self, select_id: str | None = None) -> None:
         self._sync_list_columns()
         selected = select_id or self.current_id
-        samples = self._visible_samples()
+        samples = self._ordered_visible_samples()
         scroll = self.list_widget.verticalScrollBar().value()
         prev_current = self._list_id_at(self.list_widget.currentRow())
         existing = [self._list_id_at(row) for row in range(self.list_widget.rowCount())]
@@ -2066,6 +2123,19 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             self.list_widget.setColumnWidth(col, LIST_STATUS_WIDTHS.get(key, 88))
         header.setSectionResizeMode(len(keys), QHeaderView.ResizeMode.Stretch)
+        if self._list_sort_key:
+            order = list(keys) + ["file"]
+            if self._list_sort_key in order:
+                col = order.index(self._list_sort_key)
+                header.setSortIndicatorShown(True)
+                header.setSortIndicator(
+                    col,
+                    Qt.SortOrder.AscendingOrder if self._list_sort_asc else Qt.SortOrder.DescendingOrder,
+                )
+            else:
+                header.setSortIndicatorShown(False)
+        else:
+            header.setSortIndicatorShown(False)
 
     def _selected_place_keys(self) -> list[str]:
         keys: list[str] = []

@@ -77,8 +77,9 @@ class SceneTrainWorker(QThread):
             raise ValueError(
                 f"各種類 {MIN_SCENE_SAMPLES} 枚以上必要です。\n" + "\n".join(missing)
             )
-        classes = self.labels.classes()
-        items = self.labels.items()
+        classes = self.labels.train_classes()
+        allowed = set(classes)
+        items = [item for item in self.labels.items() if item["kind"] in allowed]
         counts = self.labels.counts()
         self._emit(0, max(self.epochs, 1), "学習中です  画像を読んでいます")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
