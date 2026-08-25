@@ -42,12 +42,15 @@ class SceneImageDataset(Dataset):
         return self.normalize(image), torch.tensor(label, dtype=torch.long)
 
 
+SCENE_EPOCHS = 40
+
+
 class SceneTrainWorker(QThread):
     progress = Signal(int, int, str)
     finished_ok = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, labels: SceneLabels, epochs: int = 40) -> None:
+    def __init__(self, labels: SceneLabels, epochs: int = SCENE_EPOCHS) -> None:
         super().__init__()
         self.labels = labels
         self.epochs = epochs

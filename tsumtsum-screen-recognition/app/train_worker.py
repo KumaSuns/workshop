@@ -27,6 +27,7 @@ from app.regions import REGION_LABELS
 from app.scene_model import SCENE_INPUT, SceneNet, scene_index
 
 MIN_TRAIN_SAMPLES = 5
+TRAIN_EPOCHS = 40
 
 
 class TrainingCancelled(Exception):
@@ -201,7 +202,7 @@ class TrainWorker(QThread):
     def __init__(
         self,
         jobs: list[tuple[str, list[Sample], Path]],
-        epochs: int = 40,
+        epochs: int = TRAIN_EPOCHS,
     ) -> None:
         super().__init__()
         self.jobs = jobs

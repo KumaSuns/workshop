@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2
@@ -61,10 +63,11 @@ from app.data_sync import (
 )
 from app.paths import IMAGE_EXTENSIONS, IPC_NAME, TRAINER_IPC_NAME
 from app.scene_labels import MIN_SCENE_SAMPLES, OTHER_KEY, SceneLabels, scene_model_ready
-from app.scene_train import SceneTrainWorker
+from app.scene_train import SCENE_EPOCHS, SceneTrainWorker
 from app.train_overlay import TrainOverlay
 from app.coin_read import CoinReader, _scale_box, boxes_close
 from app.coin_teach import (
+    DIGIT_EPOCHS,
     MIN_DIGIT_SAMPLES,
     DigitTrainWorker,
     digit_teaching_count,
@@ -187,6 +190,9 @@ class MainWindow(QMainWindow):
         self._coin_train_images: CoinTrainImagesWindow | None = None
         self._train_both = False
         self._both_scene_metrics: dict | None = None
+        self._scene_train_started_at: float | None = None
+        self._digit_train_started_at: float | None = None
+        self._cuda_ready: bool | None = None
         self._extract_started_at: float | None = None
         self._video_extract_started_at: float | None = None
         self._extract_progress = (0, 1)
@@ -1320,16 +1326,29 @@ class MainWindow(QMainWindow):
             5000,
         )
 
-    def _confirm_train(self, title: str, message: str) -> bool:
+    def _confirm_train(self, title: str, message: str, seconds: float | None = None) -> bool:
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle(title)
+        if seconds is not None:
+            message = self._append_train_eta(message, seconds)
         box.setText(message)
         start_btn = box.addButton("学習を始める", QMessageBox.ButtonRole.YesRole)
         box.addButton("やめる", QMessageBox.ButtonRole.NoRole)
         box.setDefaultButton(start_btn)
         box.exec()
         return box.clickedButton() is start_btn
+
+    def _append_train_eta(self, message: str, seconds: float) -> str:
+        eta = self._train_eta_line(seconds)
+        if "始めますか？" in message:
+            return message.replace("始めますか？", f"{eta}\n\n始めますか？", 1)
+        return message.rstrip() + "\n\n" + eta
+
+    def _train_eta_line(self, seconds: float) -> str:
+        seconds = max(1.0, seconds)
+        clock = (datetime.now() + timedelta(seconds=seconds)).strftime("%H:%M")
+        return f"予想完了時間  {clock}頃（約{self._format_extract_elapsed(seconds)}）"
 
     def _clear_worker(self) -> None:
         worker = self.worker
@@ -1356,6 +1375,7 @@ class MainWindow(QMainWindow):
             "コインの数字を読む学習を始めます。\n"
             "画面の種類（GO や result など）の学習ではありません。\n\n"
             f"いま {count} 枚です。\n始めますか？",
+            seconds=self._estimate_digit_train_seconds(count),
         ):
             return
         self._begin_digit_train()
@@ -1374,8 +1394,9 @@ class MainWindow(QMainWindow):
 
     def _begin_digit_train(self) -> None:
         self.progress.setVisible(True)
-        self.progress.setRange(0, 20)
+        self.progress.setRange(0, DIGIT_EPOCHS)
         self.progress.setValue(0)
+        self._digit_train_started_at = time.perf_counter()
         self.worker = DigitTrainWorker()
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_ok.connect(self.on_digits_trained)
@@ -1401,6 +1422,8 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         acc = float(metrics.get("acc") or 0)
         samples = int(metrics.get("samples") or 0)
+        self._remember_train_duration("digit", samples, DIGIT_EPOCHS, 4, self._digit_train_started_at)
+        self._digit_train_started_at = None
         if both and scene_metrics is not None:
             scene_acc = float(scene_metrics.get("acc") or 0)
             scene_samples = int(scene_metrics.get("samples") or 0)
@@ -2225,6 +2248,7 @@ class MainWindow(QMainWindow):
             "コインの数字の学習ではありません。\n\n"
             + self._scene_train_summary()
             + "\n\n始めますか？",
+            seconds=self._estimate_scene_train_seconds(),
         ):
             return
         self._begin_scene_train()
@@ -2265,6 +2289,8 @@ class MainWindow(QMainWindow):
                     self.kind_combo.setCurrentIndex(index)
                 self.import_prepared_images()
             return
+        scene_seconds = self._estimate_scene_train_seconds()
+        digit_seconds = self._estimate_digit_train_seconds(digit_count)
         if not self._confirm_train(
             "画面とコイン数字を学習します",
             "画面の種類と、コインの数字の両方を学習します。\n"
@@ -2272,6 +2298,7 @@ class MainWindow(QMainWindow):
             "【画面の種類】\n"
             + self._scene_train_summary()
             + f"\n\n【コインの数字】\nいま {digit_count} 枚\n\n始めますか？",
+            seconds=scene_seconds + digit_seconds,
         ):
             return
         self._train_both = True
@@ -2325,8 +2352,9 @@ class MainWindow(QMainWindow):
 
     def _begin_scene_train(self) -> None:
         self.progress.setVisible(True)
-        self.progress.setRange(0, 40)
+        self.progress.setRange(0, SCENE_EPOCHS)
         self.progress.setValue(0)
+        self._scene_train_started_at = time.perf_counter()
         self.worker = SceneTrainWorker(self.scene_labels)
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_ok.connect(self.on_scene_trained)
@@ -2355,6 +2383,8 @@ class MainWindow(QMainWindow):
         self._clear_worker()
         acc = float(metrics.get("acc") or 0)
         samples = int(metrics.get("samples") or 0)
+        self._remember_train_duration("scene", samples, SCENE_EPOCHS, 8, self._scene_train_started_at)
+        self._scene_train_started_at = None
         if self._train_both:
             self._both_scene_metrics = metrics
             digit_count = digit_teaching_count()
@@ -2545,7 +2575,88 @@ class MainWindow(QMainWindow):
 
     def _format_extract_elapsed(self, seconds: float) -> str:
         elapsed = max(0, int(seconds))
-        return f"{elapsed // 60:02d}分{elapsed % 60:02d}秒"
+        hours, rest = divmod(elapsed, 3600)
+        minutes, secs = divmod(rest, 60)
+        if hours:
+            return f"{hours}時間{minutes:02d}分{secs:02d}秒"
+        return f"{minutes:02d}分{secs:02d}秒"
+
+    def _cuda_available(self) -> bool:
+        if self._cuda_ready is None:
+            try:
+                import torch
+
+                self._cuda_ready = bool(torch.cuda.is_available())
+            except Exception:
+                self._cuda_ready = False
+        return self._cuda_ready
+
+    def _train_batch_count(self, samples: int, batch_size: int) -> int:
+        count = max(int(samples), 1)
+        size = max(int(batch_size), 1)
+        return max(1, math.ceil(count / min(size, count)))
+
+    def _train_batch_rate(self, key: str, default: float) -> float:
+        try:
+            rate = float(self._settings.value(f"train_sec_per_batch/{key}", default) or default)
+        except (TypeError, ValueError):
+            rate = default
+        return min(max(rate, 0.05), 20.0)
+
+    def _estimate_train_seconds(
+        self, key: str, samples: int, epochs: int, batch_size: int, overhead: float, default_rate: float
+    ) -> float:
+        batches = self._train_batch_count(samples, batch_size)
+        return max(overhead + epochs * batches * self._train_batch_rate(key, default_rate), 5.0)
+
+    def _scene_train_sample_count(self) -> int:
+        allowed = set(self.scene_labels.train_classes())
+        return sum(1 for item in self.scene_labels.items() if item["kind"] in allowed)
+
+    def _estimate_scene_train_seconds(self) -> float:
+        cuda = self._cuda_available()
+        return self._estimate_train_seconds(
+            "scene",
+            self._scene_train_sample_count(),
+            SCENE_EPOCHS,
+            8,
+            18.0 if cuda else 8.0,
+            0.28 if cuda else 2.0,
+        )
+
+    def _estimate_digit_train_seconds(self, count: int | None = None) -> float:
+        cuda = self._cuda_available()
+        return self._estimate_train_seconds(
+            "digit",
+            count if count is not None else digit_teaching_count(),
+            DIGIT_EPOCHS,
+            4,
+            8.0 if cuda else 4.0,
+            0.22 if cuda else 1.5,
+        )
+
+    def _remember_train_duration(
+        self,
+        key: str,
+        samples: int,
+        epochs: int,
+        batch_size: int,
+        started_at: float | None,
+    ) -> None:
+        if started_at is None:
+            return
+        elapsed = time.perf_counter() - started_at
+        if elapsed < 3:
+            return
+        batches = self._train_batch_count(samples, batch_size)
+        work = max(epochs * batches, 1)
+        overhead = 12.0 if key == "scene" else 5.0
+        observed = (elapsed - overhead) / work
+        if not 0.05 <= observed <= 20.0:
+            return
+        default = 0.28 if key == "scene" else 0.22
+        rate = 0.55 * self._train_batch_rate(key, default) + 0.45 * observed
+        self._settings.setValue(f"train_sec_per_batch/{key}", rate)
 
     def _analysis_rate(self) -> float:
         try:
@@ -2650,6 +2761,8 @@ class MainWindow(QMainWindow):
         self._clear_worker()
         self._train_both = False
         self._both_scene_metrics = None
+        self._scene_train_started_at = None
+        self._digit_train_started_at = None
         self._batch_extract = False
         self._update_buttons()
         if "中止" in message:

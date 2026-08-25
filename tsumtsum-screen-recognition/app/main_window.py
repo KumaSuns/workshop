@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QRectF, QSettings, QStandardPaths, Qt, QTimer
@@ -63,7 +66,7 @@ from app.regions import (
     is_scene_key,
 )
 from app.train_effect import TrainEffect
-from app.train_worker import MIN_TRAIN_SAMPLES, TrainWorker
+from app.train_worker import MIN_TRAIN_SAMPLES, TRAIN_EPOCHS, TrainWorker
 
 LIST_STATUS_WIDTHS = {
     "game": 110,
@@ -281,6 +284,8 @@ class MainWindow(QMainWindow):
         self.current_id: str | None = None
         self._active_key = "game"
         self.train_worker: TrainWorker | None = None
+        self._train_started_at: float | None = None
+        self._cuda_ready: bool | None = None
         self._dirty = False
         self._switching = False
         self._extractor_process = None
@@ -2246,6 +2251,77 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_train_fx"):
             self._place_train_fx()
 
+    def _train_eta_line(self, seconds: float) -> str:
+        seconds = max(1.0, seconds)
+        elapsed = max(0, int(seconds))
+        hours, rest = divmod(elapsed, 3600)
+        minutes, secs = divmod(rest, 60)
+        if hours:
+            duration = f"{hours}時間{minutes:02d}分{secs:02d}秒"
+        else:
+            duration = f"{minutes:02d}分{secs:02d}秒"
+        clock = (datetime.now() + timedelta(seconds=seconds)).strftime("%H:%M")
+        return f"予想完了時間  {clock}頃（約{duration}）"
+
+    def _cuda_available(self) -> bool:
+        if self._cuda_ready is None:
+            try:
+                import torch
+
+                self._cuda_ready = bool(torch.cuda.is_available())
+            except Exception:
+                self._cuda_ready = False
+        return self._cuda_ready
+
+    def _train_batch_count(self, samples: int, batch_size: int) -> int:
+        count = max(int(samples), 1)
+        size = max(int(batch_size), 1)
+        return max(1, math.ceil(count / min(size, count)))
+
+    def _train_batch_rate(self, default: float) -> float:
+        try:
+            rate = float(self._settings.value("train_sec_per_batch", default) or default)
+        except (TypeError, ValueError):
+            rate = default
+        return min(max(rate, 0.05), 20.0)
+
+    def _estimate_jobs_seconds(self, jobs: list) -> float:
+        cuda = self._cuda_available()
+        default = 0.3 if cuda else 1.8
+        rate = self._train_batch_rate(default)
+        total = 0.0
+        for job in jobs:
+            key = str(job[0])
+            samples = job[1] if len(job) > 1 else []
+            n = max(len(samples), 1)
+            batch = 8 if key == "scene" else 4
+            overhead = 15.0 if key == "scene" else 8.0
+            total += overhead + TRAIN_EPOCHS * self._train_batch_count(n, batch) * rate
+        return max(total, 5.0)
+
+    def _remember_train_duration(self, jobs: list, started_at: float | None) -> None:
+        if started_at is None:
+            return
+        elapsed = time.perf_counter() - started_at
+        if elapsed < 3:
+            return
+        work = 0
+        for job in jobs:
+            key = str(job[0])
+            samples = job[1] if len(job) > 1 else []
+            n = max(len(samples), 1)
+            batch = 8 if key == "scene" else 4
+            work += TRAIN_EPOCHS * self._train_batch_count(n, batch)
+        if work <= 0:
+            return
+        overhead = 8.0 * max(len(jobs), 1)
+        observed = (elapsed - overhead) / work
+        if not 0.05 <= observed <= 20.0:
+            return
+        default = 0.3 if self._cuda_available() else 1.8
+        rate = 0.55 * self._train_batch_rate(default) + 0.45 * observed
+        self._settings.setValue("train_sec_per_batch", rate)
+
     def start_training(self) -> None:
         if self._is_training():
             return
@@ -2289,6 +2365,7 @@ class MainWindow(QMainWindow):
             message += f"\n（ツムとボムは同じモデルです。{PLACE_LABELS[piece_selected[0]]}だけ学ぶと、{other}の予測も更新されます。）"
         if skipped:
             message += "\n\n枚数が足りないので、今回は学びません。\n" + "\n".join(skipped)
+        message += "\n\n" + self._train_eta_line(self._estimate_jobs_seconds(jobs))
         answer = QMessageBox.question(self, "学習を開始", message)
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -2303,6 +2380,7 @@ class MainWindow(QMainWindow):
         self._place_train_fx()
         self._train_fx.start()
         QApplication.processEvents()
+        self._train_started_at = time.perf_counter()
         self.statusBar().showMessage("学習中です。中止できます")
         self.train_worker.start()
 
@@ -2350,10 +2428,14 @@ class MainWindow(QMainWindow):
             if done:
                 names = "、".join(item.get("label", "") for item in done)
                 extra = f"\n終わる前に保存できたもの: {names}"
+            self._train_started_at = None
             QMessageBox.information(self, "学習を中止", "学習を中止しました。" + extra)
             self.statusBar().showMessage("学習を中止しました", 4000)
             return
         results = metrics.get("results") or []
+        jobs = getattr(worker, "jobs", None) or []
+        self._remember_train_duration(jobs, self._train_started_at)
+        self._train_started_at = None
         lines = []
         for item in results:
             if item.get("key") == "pieces":
@@ -2376,6 +2458,7 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.wait(8000)
         self.train_worker = None
+        self._train_started_at = None
         self._unlock_after_training()
         self.update_stats()
         self.hint_label.setText("学習に失敗しました。他の操作が使えます。")
