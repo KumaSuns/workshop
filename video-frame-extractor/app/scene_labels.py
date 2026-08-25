@@ -193,11 +193,7 @@ class SceneLabels:
         ]
 
     def correct_keys(self) -> list[str]:
-        return [
-            key
-            for key, _name in self._kinds
-            if key not in self._hidden_from_results
-        ]
+        return [key for key, _name in self._kinds]
 
     def hidden_keys(self) -> list[str]:
         return [key for key, _name in self._kinds if key in self._hidden_from_results]

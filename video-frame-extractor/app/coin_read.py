@@ -335,7 +335,7 @@ class CoinReader:
                 best_number = number
         return best_box, best_number
 
-    def read_box(self, path: Path, box: dict[str, int]) -> str:
+    def read_box(self, path: Path, box: dict[str, int], key: str = "coin") -> str:
         return self._read_with_box(path, box)
 
     def read_path(self, path: Path, key: str) -> str:

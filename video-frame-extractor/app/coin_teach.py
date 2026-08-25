@@ -87,6 +87,93 @@ def taught_keys_for_image(image_path: Path) -> set[str]:
     return set(_taught_by_sample_id().get(sample_id, set()))
 
 
+def _video_key(path: Path | str) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(path)
+
+
+def _load_index_samples() -> list[dict]:
+    path = _index_path()
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return list(payload.get("samples") or [])
+
+
+def taught_coin_for_image(image_path: Path, key: str) -> tuple[dict[str, int] | None, str]:
+    if key not in {"coin", "result_coin"} or not image_path.is_file():
+        return None, ""
+    try:
+        sample_id = sha256(image_path.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return None, ""
+    for sample in _load_index_samples():
+        if str(sample.get("id") or "") != sample_id:
+            continue
+        digits = _digits_only(str((sample.get("readings") or {}).get(key) or ""))
+        if not digits:
+            return None, ""
+        box = (sample.get("regions") or {}).get(key)
+        cleaned = None
+        if isinstance(box, dict):
+            cleaned = {
+                "x": int(box["x"]),
+                "y": int(box["y"]),
+                "w": max(1, int(box["w"])),
+                "h": max(1, int(box["h"])),
+            }
+        return cleaned, digits
+    return None, ""
+
+
+def taught_coin_for_frame(
+    video_path: Path | str | None,
+    frame: int,
+    key: str,
+    frame_slack: int = 8,
+) -> tuple[dict[str, int] | None, str]:
+    if key not in {"coin", "result_coin"} or video_path is None:
+        return None, ""
+    want = _video_key(video_path)
+    best: dict | None = None
+    best_dist = None
+    for sample in _load_index_samples():
+        if sample.get("status") == "skipped":
+            continue
+        source = sample.get("source_video")
+        if not source or _video_key(source) != want:
+            continue
+        digits = _digits_only(str((sample.get("readings") or {}).get(key) or ""))
+        if not digits:
+            continue
+        try:
+            src_frame = int(sample.get("source_frame"))
+        except (TypeError, ValueError):
+            continue
+        dist = abs(src_frame - int(frame))
+        if best_dist is None or dist < best_dist:
+            best = sample
+            best_dist = dist
+    if best is None or best_dist is None or best_dist > max(int(frame_slack), 0):
+        return None, ""
+    digits = _digits_only(str((best.get("readings") or {}).get(key) or ""))
+    box = (best.get("regions") or {}).get(key)
+    cleaned = None
+    if isinstance(box, dict):
+        cleaned = {
+            "x": int(box["x"]),
+            "y": int(box["y"]),
+            "w": max(1, int(box["w"])),
+            "h": max(1, int(box["h"])),
+        }
+    return cleaned, digits
+
+
 def digit_teaching_count() -> int:
     path = _index_path()
     if not path.is_file():
@@ -109,7 +196,14 @@ def digit_teaching_count() -> int:
     return count
 
 
-def save_coin_teaching(image_path: Path, box: dict[str, int], key: str, number: str) -> int:
+def save_coin_teaching(
+    image_path: Path,
+    box: dict[str, int],
+    key: str,
+    number: str,
+    source_video: Path | str | None = None,
+    source_frame: int | None = None,
+) -> int:
     digits = _digits_only(number)
     if not digits:
         raise ValueError("数字を入力してください")
@@ -166,6 +260,10 @@ def save_coin_teaching(image_path: Path, box: dict[str, int], key: str, number: 
     readings = existing.setdefault("readings", {})
     readings[key] = digits
     existing["status"] = "labeled"
+    if source_video is not None:
+        existing["source_video"] = _video_key(source_video)
+    if source_frame is not None:
+        existing["source_frame"] = int(source_frame)
     payload["samples"] = samples
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
