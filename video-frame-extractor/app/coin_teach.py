@@ -35,6 +35,58 @@ def _digits_only(text: str) -> str:
     return "".join(char for char in (text or "") if char.isdigit())
 
 
+_taught_by_id: dict[str, set[str]] | None = None
+_taught_index_mtime: float | None = None
+
+
+def _invalidate_taught_cache() -> None:
+    global _taught_by_id, _taught_index_mtime
+    _taught_by_id = None
+    _taught_index_mtime = None
+
+
+def _taught_by_sample_id() -> dict[str, set[str]]:
+    global _taught_by_id, _taught_index_mtime
+    path = _index_path()
+    mtime = path.stat().st_mtime if path.is_file() else None
+    if _taught_by_id is not None and mtime == _taught_index_mtime:
+        return _taught_by_id
+    mapping: dict[str, set[str]] = {}
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        for sample in payload.get("samples") or []:
+            if sample.get("status") == "skipped":
+                continue
+            sample_id = str(sample.get("id") or "")
+            if not sample_id:
+                continue
+            regions = sample.get("regions") or {}
+            readings = sample.get("readings") or {}
+            keys = {
+                key
+                for key in ("coin", "result_coin")
+                if regions.get(key) and _digits_only(str(readings.get(key) or ""))
+            }
+            if keys:
+                mapping[sample_id] = keys
+    _taught_by_id = mapping
+    _taught_index_mtime = mtime
+    return mapping
+
+
+def taught_keys_for_image(image_path: Path) -> set[str]:
+    if not image_path.is_file():
+        return set()
+    try:
+        sample_id = sha256(image_path.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return set()
+    return set(_taught_by_sample_id().get(sample_id, set()))
+
+
 def digit_teaching_count() -> int:
     path = _index_path()
     if not path.is_file():
@@ -117,7 +169,156 @@ def save_coin_teaching(image_path: Path, box: dict[str, int], key: str, number: 
     payload["samples"] = samples
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _invalidate_taught_cache()
     return digit_teaching_count()
+
+
+COIN_KIND_LABELS = {"coin": "coin", "result_coin": "result"}
+
+
+def coin_teaching_counts() -> dict[str, int]:
+    counts = {"coin": 0, "result_coin": 0}
+    path = _index_path()
+    if not path.is_file():
+        return counts
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return counts
+    for sample in payload.get("samples") or []:
+        if sample.get("status") == "skipped":
+            continue
+        regions = sample.get("regions") or {}
+        readings = sample.get("readings") or {}
+        for key in ("coin", "result_coin"):
+            if regions.get(key) or _digits_only(str(readings.get(key) or "")):
+                counts[key] += 1
+    return counts
+
+
+def list_coin_teaching(key: str) -> list[dict]:
+    items: list[dict] = []
+    path = _index_path()
+    if not path.is_file():
+        return items
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return items
+    for sample in payload.get("samples") or []:
+        if sample.get("status") == "skipped":
+            continue
+        sample_id = str(sample.get("id") or "")
+        image = _images_dir() / str(sample.get("image") or "")
+        if not sample_id or not image.is_file():
+            continue
+        regions = sample.get("regions") or {}
+        readings = sample.get("readings") or {}
+        box = regions.get(key)
+        digits = _digits_only(str(readings.get(key) or ""))
+        if not box and not digits:
+            continue
+        cleaned = None
+        if box:
+            cleaned = {
+                "x": int(box["x"]),
+                "y": int(box["y"]),
+                "w": max(1, int(box["w"])),
+                "h": max(1, int(box["h"])),
+            }
+        items.append(
+            {
+                "id": sample_id,
+                "path": image,
+                "key": key,
+                "box": cleaned,
+                "digits": digits,
+                "name": str(sample.get("source_name") or image.name),
+            }
+        )
+    return items
+
+
+def update_coin_teaching(
+    sample_id: str,
+    key: str,
+    *,
+    box: dict[str, int] | None = None,
+    number: str | None = None,
+) -> int:
+    if key not in {"coin", "result_coin"}:
+        raise ValueError("種類が違います")
+    if box is None and number is None:
+        raise ValueError("直す内容がありません")
+    digits = None
+    if number is not None:
+        digits = _digits_only(number)
+        if not digits:
+            raise ValueError("数字を入力してください")
+    cleaned = None
+    if box is not None:
+        cleaned = {
+            "x": int(box["x"]),
+            "y": int(box["y"]),
+            "w": max(1, int(box["w"])),
+            "h": max(1, int(box["h"])),
+        }
+    path = _index_path()
+    if not path.is_file():
+        raise ValueError("学習データがありません")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError("学習データを読めませんでした") from exc
+    samples = payload.get("samples") or []
+    existing = next((item for item in samples if item.get("id") == sample_id), None)
+    if existing is None:
+        raise ValueError("この画像は学習データにありません")
+    regions = existing.setdefault("regions", {})
+    readings = existing.setdefault("readings", {})
+    confirmed = existing.setdefault("confirmed", [])
+    if cleaned is not None:
+        regions[key] = cleaned
+    if digits is not None:
+        readings[key] = digits
+        if not regions.get(key):
+            raise ValueError("枠がありません。先に数字を囲んでください。")
+    if regions.get(key) and _digits_only(str(readings.get(key) or "")):
+        if key not in confirmed:
+            confirmed.append(key)
+        existing["status"] = "labeled"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _invalidate_taught_cache()
+    return digit_teaching_count()
+
+
+def remove_coin_teaching(sample_id: str, key: str) -> bool:
+    path = _index_path()
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    samples = payload.get("samples") or []
+    existing = next((item for item in samples if item.get("id") == sample_id), None)
+    if existing is None:
+        return False
+    regions = existing.setdefault("regions", {})
+    readings = existing.setdefault("readings", {})
+    confirmed = existing.setdefault("confirmed", [])
+    regions.pop(key, None)
+    readings.pop(key, None)
+    existing["confirmed"] = [item for item in confirmed if item != key]
+    still = any(
+        regions.get(item) or _digits_only(str(readings.get(item) or ""))
+        for item in ("coin", "result_coin")
+    )
+    if not still:
+        existing["status"] = "skipped"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _invalidate_taught_cache()
+    return True
 
 
 def _digit_items() -> list[tuple[Path, dict[str, int], str]]:
@@ -243,6 +444,10 @@ class DigitTrainWorker(QThread):
                 {"state_dict": best_state, "acc": best_acc, "key": "coin_digits", "samples": len(items)},
                 dest,
             )
+            del model, optimizer, scheduler, loader, dataset
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
             self.finished_ok.emit({"acc": float(best_acc), "samples": len(items)})
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))

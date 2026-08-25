@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap, QResizeEvent
+from PySide6.QtGui import QKeyEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -94,6 +95,7 @@ class SceneTrainImagesWindow(QMainWindow):
         left_layout.setContentsMargins(12, 12, 12, 12)
         left_layout.addWidget(QLabel("種類"))
         self.kind_list = QListWidget()
+        self.kind_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.kind_list.currentItemChanged.connect(self._on_kind_changed)
         left_layout.addWidget(self.kind_list, 1)
         split.addWidget(left)
@@ -105,6 +107,7 @@ class SceneTrainImagesWindow(QMainWindow):
         self.file_title = QLabel("画像")
         mid_layout.addWidget(self.file_title)
         self.file_list = QListWidget()
+        self.file_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.file_list.currentItemChanged.connect(self._on_file_changed)
         mid_layout.addWidget(self.file_list, 1)
         split.addWidget(mid)
@@ -138,8 +141,10 @@ class SceneTrainImagesWindow(QMainWindow):
 
         self.rekind_btn.clicked.connect(self.rekind_current)
         self.remove_btn.clicked.connect(self.remove_current)
+        self.rekind_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.remove_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-    def reload(self, select_kind: str | None = None) -> None:
+    def reload(self, select_kind: str | None = None, select_file_row: int | None = None) -> None:
         labels = self._labels()
         current = select_kind or self._current_kind()
         picker = getattr(self._host, "_selected_kind", None)
@@ -150,13 +155,14 @@ class SceneTrainImagesWindow(QMainWindow):
         current_file = self.file_list.currentItem()
         if current_file is not None:
             keep_path = current_file.data(Qt.ItemDataRole.UserRole)
+        if select_file_row is None:
+            select_file_row = self.file_list.currentRow()
         self.kind_list.blockSignals(True)
         self.kind_list.clear()
         for key in labels.classes():
             item = QListWidgetItem(f"{labels.name_of(key)}  {counts.get(key, 0)}")
             item.setData(Qt.ItemDataRole.UserRole, key)
             self.kind_list.addItem(item)
-        self.kind_list.blockSignals(False)
         row = 0
         if current:
             found = self._kind_row(current)
@@ -164,7 +170,11 @@ class SceneTrainImagesWindow(QMainWindow):
                 row = found
         if self.kind_list.count():
             self.kind_list.setCurrentRow(row)
-        self._fill_files(keep_path=str(keep_path) if keep_path else None)
+        self.kind_list.blockSignals(False)
+        self._fill_files(
+            keep_path=str(keep_path) if keep_path else None,
+            select_row=select_file_row if select_file_row >= 0 else None,
+        )
         self._update_buttons()
 
     def _kind_row(self, key: str) -> int:
@@ -193,15 +203,18 @@ class SceneTrainImagesWindow(QMainWindow):
 
     def _on_kind_changed(self, *_args) -> None:
         self._fill_files()
+        self.kind_list.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    def _fill_files(self, keep_path: str | None = None) -> None:
+    def _fill_files(self, keep_path: str | None = None, select_row: int | None = None) -> None:
         kind = self._current_kind()
         labels = self._labels()
+        focus = self.focusWidget()
         self.file_list.blockSignals(True)
         self.file_list.clear()
         items = labels.items_of(kind) if kind else []
         self.file_title.setText(f"画像  {len(items)} 枚")
         select = 0
+        found_keep = False
         for index, sample in enumerate(items):
             path = Path(sample["path"])
             row = QListWidgetItem(path.name)
@@ -209,15 +222,24 @@ class SceneTrainImagesWindow(QMainWindow):
             self.file_list.addItem(row)
             if keep_path and str(path) == keep_path:
                 select = index
+                found_keep = True
+        if not found_keep and select_row is not None and items:
+            select = min(max(select_row, 0), len(items) - 1)
         self.file_list.blockSignals(False)
         if self.file_list.count():
             self.file_list.setCurrentRow(select)
+            item = self.file_list.item(select)
+            if item is not None:
+                self.file_list.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
+            self._on_file_changed()
         else:
             self._full_pixmap = None
             self.preview.setPixmap(QPixmap())
             self.preview.setText("この種類の画像はまだありません")
             self.preview_title.setText("プレビュー")
-        self._update_buttons()
+            self._update_buttons()
+        if focus is self.kind_list:
+            self.kind_list.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_file_changed(self, *_args) -> None:
         path = self._current_path()
@@ -257,7 +279,7 @@ class SceneTrainImagesWindow(QMainWindow):
         self._fit_preview()
 
     def _update_buttons(self) -> None:
-        has_file = self._current_path() is not None
+        has_file = self.file_list.currentRow() >= 0
         self.rekind_btn.setEnabled(has_file)
         self.remove_btn.setEnabled(has_file)
 
@@ -281,35 +303,138 @@ class SceneTrainImagesWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "直せませんでした", str(exc))
             return
+        self._take_current_file()
         self._notify_host()
-        self.reload(select_kind=kind)
+        self.statusBar().showMessage(
+            f"「{path.name}」を「{labels.name_of(new_kind)}」に直しました。残り {self.file_list.count()} 枚",
+            4000,
+        )
 
     def remove_current(self) -> None:
-        path = self._current_path()
-        if path is None:
-            return
-        answer = QMessageBox.question(
-            self,
-            "学習から外す",
-            f"「{path.name}」を学習から外しますか？",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
         kind = self._current_kind()
+        row = self.file_list.currentRow()
+        if kind is None or row < 0:
+            QMessageBox.information(self, "画像がありません", "外す画像を一覧から選んでください。")
+            return
+        name = self.file_list.item(row).text() if self.file_list.item(row) else "画像"
         try:
-            if not self._labels().remove(path):
-                QMessageBox.warning(self, "外せませんでした", "この画像は学習データにありません。")
-                return
+            path = self._labels().remove_at(kind, row)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "外せませんでした", str(exc))
             return
+        if path is None:
+            QMessageBox.warning(self, "外せませんでした", "この画像は学習データにありません。")
+            return
+        self._take_current_file(row)
         self._notify_host()
-        self.reload(select_kind=kind)
+        self.statusBar().showMessage(
+            f"「{path.name or name}」を学習から外しました。残り {self.file_list.count()} 枚",
+            4000,
+        )
+
+    def _current_stored_path(self) -> Path | None:
+        item = self.file_list.currentItem()
+        if item is None:
+            return None
+        raw = item.data(Qt.ItemDataRole.UserRole)
+        return Path(str(raw)) if raw else None
+
+    def _take_current_file(self, row: int | None = None) -> None:
+        if row is None:
+            row = self.file_list.currentRow()
+        if row < 0:
+            return
+        self.file_list.blockSignals(True)
+        taken = self.file_list.takeItem(row)
+        del taken
+        self.file_list.blockSignals(False)
+        self._refresh_kind_counts()
+        if self.file_list.count():
+            next_row = min(row, self.file_list.count() - 1)
+            self.file_list.setCurrentRow(next_row)
+            item = self.file_list.item(next_row)
+            if item is not None:
+                self.file_list.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
+            self._on_file_changed()
+        else:
+            self._full_pixmap = None
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("この種類の画像はもうありません")
+            self.preview_title.setText("プレビュー")
+            self._update_buttons()
+        self.file_list.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _refresh_kind_counts(self) -> None:
+        labels = self._labels()
+        counts = labels.counts()
+        for row in range(self.kind_list.count()):
+            item = self.kind_list.item(row)
+            if item is None:
+                continue
+            key = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            item.setText(f"{labels.name_of(key)}  {counts.get(key, 0)}")
+        self.file_title.setText(f"画像  {self.file_list.count()} 枚")
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key = event.key()
+        if key in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}:
+            self.remove_current()
+            event.accept()
+            return
+        if key in {
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+            Qt.Key.Key_PageUp,
+            Qt.Key.Key_PageDown,
+            Qt.Key.Key_Home,
+            Qt.Key.Key_End,
+        }:
+            if self.kind_list.hasFocus():
+                super().keyPressEvent(event)
+                return
+            self._move_in_list(self.file_list, key)
+            event.accept()
+            return
+        if key in {Qt.Key.Key_Left, Qt.Key.Key_Right}:
+            self._move_in_list(
+                self.kind_list,
+                Qt.Key.Key_Up if key == Qt.Key.Key_Left else Qt.Key.Key_Down,
+            )
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _move_in_list(self, view: QListWidget, key: int) -> None:
+        if view.count() <= 0:
+            return
+        row = max(view.currentRow(), 0)
+        if key == Qt.Key.Key_Up:
+            row -= 1
+        elif key == Qt.Key.Key_Down:
+            row += 1
+        elif key == Qt.Key.Key_PageUp:
+            row -= max(1, view.viewport().height() // max(view.sizeHintForRow(0), 1))
+        elif key == Qt.Key.Key_PageDown:
+            row += max(1, view.viewport().height() // max(view.sizeHintForRow(0), 1))
+        elif key == Qt.Key.Key_Home:
+            row = 0
+        elif key == Qt.Key.Key_End:
+            row = view.count() - 1
+        row = min(max(row, 0), view.count() - 1)
+        view.setCurrentRow(row)
+        view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        item = view.item(row)
+        if item is not None:
+            view.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
 
     def _notify_host(self) -> None:
-        refresh = getattr(self._host, "_refresh_teach_label", None)
-        if callable(refresh):
-            refresh()
-        update = getattr(self._host, "_update_buttons", None)
-        if callable(update):
-            update()
+        setattr(self._host, "_skip_train_images_reload", True)
+        try:
+            refresh = getattr(self._host, "_refresh_teach_label", None)
+            if callable(refresh):
+                refresh()
+            update = getattr(self._host, "_update_buttons", None)
+            if callable(update):
+                update()
+        finally:
+            setattr(self._host, "_skip_train_images_reload", False)

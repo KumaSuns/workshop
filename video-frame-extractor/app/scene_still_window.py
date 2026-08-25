@@ -6,6 +6,7 @@ import cv2
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap, QCloseEvent, QResizeEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -41,6 +43,8 @@ class SceneStillWindow(QMainWindow):
         self._full_pixmap: QPixmap | None = None
         self._frame = 0
         self._syncing = False
+        self._saving = False
+        self._saved_at: dict[int, list[tuple[str, str]]] = {}
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(80)
         self._play_timer.timeout.connect(self._play_step)
@@ -134,6 +138,15 @@ class SceneStillWindow(QMainWindow):
         self.save_btn.setObjectName("primary")
         self.save_btn.setEnabled(False)
         panel_layout.addWidget(self.save_btn)
+        self.save_status = QLabel("この位置は、まだ画像にしていません")
+        self.save_status.setObjectName("hint")
+        self.save_status.setWordWrap(True)
+        panel_layout.addWidget(self.save_status)
+        self.save_progress = QProgressBar()
+        self.save_progress.setRange(0, 0)
+        self.save_progress.setTextVisible(False)
+        self.save_progress.setVisible(False)
+        panel_layout.addWidget(self.save_progress)
         layout.addWidget(panel, 1)
 
         self.setCentralWidget(root)
@@ -145,6 +158,7 @@ class SceneStillWindow(QMainWindow):
         self.fwd10_btn.clicked.connect(lambda: self._nudge(10))
         self.play_btn.clicked.connect(self.toggle_play)
         self.save_btn.clicked.connect(self.save_current)
+        self.kind_combo.currentIndexChanged.connect(self._refresh_save_status)
         self.open_btn.clicked.connect(self.open_video)
         for button in (
             self.back10_btn,
@@ -203,6 +217,7 @@ class SceneStillWindow(QMainWindow):
         self.fwd5_btn.setEnabled(True)
         self.fwd10_btn.setEnabled(True)
         self.play_btn.setEnabled(True)
+        self._saved_at.clear()
         self._fill_kind_combo()
         self._show_frame(frame)
         self.statusBar().showMessage(f"{info.path.name}  /  {info.format_duration()}", 5000)
@@ -275,6 +290,7 @@ class SceneStillWindow(QMainWindow):
         self.preview_title.setText(f"プレビュー  {format_timecode(seconds)}")
         self.time_label.setText(f"{format_timecode(seconds)}  /  {self.info.format_duration()}")
         self._fit_preview()
+        self._refresh_save_status()
 
     def _read_frame(self, frame_index: int):
         if self.info is None:
@@ -313,50 +329,146 @@ class SceneStillWindow(QMainWindow):
         name = self.kind_combo.currentText().strip() or str(key)
         return str(key), name
 
-    def save_current(self) -> None:
+    def _captures_for_frame(self, frame: int) -> list[tuple[str, str]]:
+        hits = list(self._saved_at.get(frame, []))
+        seen = {file_name for _name, file_name in hits}
         if self.info is None:
+            return hits
+        stamp = format_timecode(frame / self.info.fps).replace(":", "-")
+        stem = self.info.path.stem
+        prefix = f"{stem}_{stamp}"
+        labels = getattr(self._host, "scene_labels", None)
+        kinds: list[tuple[str, str]] = []
+        if labels is not None:
+            kinds.append((OTHER_KEY, labels.name_of(OTHER_KEY)))
+            kinds.extend(labels.kinds())
+        else:
+            kinds.append(("scene", "scene"))
+        for key, name in kinds:
+            folder = kind_dir(self.output_dir, key)
+            if not folder.is_dir():
+                continue
+            for path in sorted(folder.glob(f"{prefix}*.png")):
+                if path.name in seen:
+                    continue
+                hits.append((name, path.name))
+                seen.add(path.name)
+        return hits
+
+    def _refresh_save_status(self) -> None:
+        if self._saving:
+            return
+        if self.info is None:
+            self.save_status.setText("動画を開くと、ここで保存済みかどうかが分かります")
+            self.save_status.setObjectName("hint")
+            self.save_btn.setText("この画面を画像にする")
+            self._restyle(self.save_status)
+            return
+        hits = self._captures_for_frame(self._frame)
+        if hits:
+            parts = "  /  ".join(f"{name}  {file_name}" for name, file_name in hits)
+            self.save_status.setText(f"この位置は保存済みです\n{parts}")
+            self.save_status.setObjectName("saveDone")
+            self.save_btn.setText("もう一度画像にする")
+        else:
+            self.save_status.setText("この位置は、まだ画像にしていません")
+            self.save_status.setObjectName("hint")
+            self.save_btn.setText("この画面を画像にする")
+        self._restyle(self.save_status)
+
+    def _restyle(self, widget) -> None:
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+        widget.update()
+
+    def _set_saving(self, busy: bool) -> None:
+        self._saving = busy
+        self.save_progress.setVisible(busy)
+        if busy:
+            self.save_btn.setText("保存しています…")
+            self.save_status.setText("保存しています…")
+            self.save_status.setObjectName("hint")
+            self._restyle(self.save_status)
+            self.statusBar().showMessage("保存しています…")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.save_btn.repaint()
+            self.save_progress.repaint()
+            self.save_status.repaint()
+        else:
+            QApplication.restoreOverrideCursor()
+            self._refresh_save_status()
+
+    def save_current(self) -> None:
+        if self.info is None or self._saving:
             return
         kind = self._selected_kind()
         if kind is None:
             QMessageBox.information(self, "種類がありません", "先に種類を選んでください。")
             return
+        self._set_saving(True)
         key, name = kind
-        image = self._read_frame(self._frame)
-        if image is None:
-            QMessageBox.warning(self, "保存できませんでした", "この位置の画像を取得できませんでした。")
-            return
-        dest = self._unique_dest(self._frame / self.info.fps, key)
-        try:
-            write_image(dest, image)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "保存できませんでした", str(exc))
-            return
-        labels = getattr(self._host, "scene_labels", None)
-        if labels is not None:
-            try:
-                labels.add(dest, key)
-            except Exception:
-                pass
-            refresh = getattr(self._host, "_refresh_teach_label", None)
-            if callable(refresh):
-                refresh()
-        extra = ""
-        try:
-            from app.handoff import send_images_to_tsumtsum
+        QTimer.singleShot(0, lambda: self._save_current_body(key, name))
 
-            result = send_images_to_tsumtsum([dest])
-            extra = (
-                "\nツムツムアプリの一覧にも渡しました。"
-                if result == "sent"
-                else "\nツムツムアプリを開いて取り込みました。"
-            )
-        except Exception as exc:  # noqa: BLE001
-            extra = f"\nツム側には渡せませんでした。\n{exc}"
-        hint = ""
-        if key == OTHER_KEY:
-            hint = "\nリザルト画面なら、種類を result にすると result の学習からも開けます。"
-        self.statusBar().showMessage(f"「{name}」で保存しました  {dest.name}", 6000)
-        QMessageBox.information(self, "保存しました", f"種類: {name}\n{dest.name}\n{dest.parent}{extra}{hint}")
+    def _save_current_body(self, key: str, name: str) -> None:
+        error: tuple[str, str] | None = None
+        saved_text: str | None = None
+        dest_name = ""
+        try:
+            if self.info is None:
+                error = ("保存できませんでした", "動画がありません。")
+                return
+            image = self._read_frame(self._frame)
+            if image is None:
+                error = ("保存できませんでした", "この位置の画像を取得できませんでした。")
+                return
+            dest = self._unique_dest(self._frame / self.info.fps, key)
+            try:
+                write_image(dest, image)
+            except Exception as exc:  # noqa: BLE001
+                error = ("保存できませんでした", str(exc))
+                return
+            dest_name = dest.name
+            saved = self._saved_at.setdefault(self._frame, [])
+            saved.append((name, dest_name))
+            labels = getattr(self._host, "scene_labels", None)
+            if labels is not None:
+                try:
+                    labels.add(dest, key)
+                except Exception:
+                    pass
+                refresh = getattr(self._host, "_refresh_teach_label", None)
+                if callable(refresh):
+                    refresh()
+            extra = ""
+            try:
+                from app.handoff import send_images_to_tsumtsum
+
+                result = send_images_to_tsumtsum([dest])
+                extra = (
+                    "\nツムツムアプリの一覧にも渡しました。"
+                    if result == "sent"
+                    else "\nツムツムアプリを開いて取り込みました。"
+                )
+            except Exception as exc:  # noqa: BLE001
+                extra = f"\nツム側には渡せませんでした。\n{exc}"
+            hint = ""
+            if key == OTHER_KEY:
+                hint = "\nリザルト画面なら、種類を result にすると result の学習からも開けます。"
+            reflected = ""
+            adder = getattr(self._host, "add_captured_scene", None)
+            if callable(adder) and adder(key, self._frame, dest):
+                reflected = "\n抜き出し位置にも載せました。"
+            saved_text = f"種類: {name}\n{dest.name}\n{dest.parent}{extra}{hint}{reflected}"
+        finally:
+            self._set_saving(False)
+        if error is not None:
+            QMessageBox.warning(self, error[0], error[1])
+            return
+        if saved_text is None:
+            return
+        self.statusBar().showMessage(f"「{name}」で保存しました  {dest_name}", 6000)
+        QMessageBox.information(self, "保存しました", saved_text)
 
     def _unique_dest(self, seconds: float, kind: str) -> Path:
         stamp = format_timecode(seconds).replace(":", "-")

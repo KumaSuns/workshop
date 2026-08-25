@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 from app.data_sync import (
@@ -19,8 +18,17 @@ SCENE_MODEL_PATH = bundle_dir() / "scene.pt"
 MIN_SCENE_SAMPLES = 5
 OTHER_KEY = "other"
 OTHER_NAME = "どちらでもない"
-DEFAULT_KINDS = (("go", "GO"), ("timeup", "TIME UP"))
-HIDDEN_FROM_RESULTS = {"raredy"}
+DEFAULT_KINDS = (
+    ("go", "GO"),
+    ("timeup", "TIME UP"),
+    ("item", "item"),
+    ("result", "result"),
+    ("coin", "coin"),
+    ("fever", "fever"),
+    ("skill", "skill"),
+)
+HIDDEN_FROM_RESULTS = {"raredy", "fever"}
+IDLE_KINDS = {"skill"}
 
 
 def scene_model_path() -> Path:
@@ -29,17 +37,6 @@ def scene_model_path() -> Path:
 
 def scene_model_ready() -> bool:
     return scene_model_path().is_file()
-
-
-def slug_key(name: str, used: set[str]) -> str:
-    ascii_part = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-    base = ascii_part or "scene"
-    key = base
-    index = 2
-    while key in used or key == OTHER_KEY:
-        key = f"{base}_{index}"
-        index += 1
-    return key
 
 
 class SceneLabels:
@@ -57,6 +54,7 @@ class SceneLabels:
         self._hidden_from_results = set(HIDDEN_FROM_RESULTS)
         self._items = []
         if not source.exists():
+            self._ensure_default_kinds()
             self._ensure_hidden_kinds()
             return
         raw = json.loads(source.read_text(encoding="utf-8"))
@@ -74,6 +72,7 @@ class SceneLabels:
         if kinds:
             self._kinds = kinds
         self._hidden_from_results = hidden
+        self._ensure_default_kinds()
         self._ensure_hidden_kinds()
         allowed = set(self.classes())
         items = []
@@ -85,6 +84,24 @@ class SceneLabels:
                 continue
             items.append({"path": str(file_path), "kind": kind})
         self._items = items
+
+    def _ensure_default_kinds(self) -> None:
+        names = {key: name for key, name in DEFAULT_KINDS}
+        self._kinds = [(key, names.get(key, name)) for key, name in self._kinds]
+        have = {key for key, _name in self._kinds}
+        missing = [(key, name) for key, name in DEFAULT_KINDS if key not in have]
+        if not missing:
+            return
+        insert_at = next(
+            (
+                index
+                for index, (key, _name) in enumerate(self._kinds)
+                if key in self._hidden_from_results or key in HIDDEN_FROM_RESULTS
+            ),
+            len(self._kinds),
+        )
+        for offset, item in enumerate(missing):
+            self._kinds.insert(insert_at + offset, item)
 
     def _ensure_hidden_kinds(self) -> None:
         have = {key for key, _name in self._kinds}
@@ -114,6 +131,12 @@ class SceneLabels:
             stored = resolve_sample_path(relative, dest)
             if stored is not None:
                 items.append({"path": str(stored), "kind": item["kind"]})
+        self._write_json(packed)
+        self._items = items
+
+    def _write_json(self, samples: list[dict[str, str]]) -> None:
+        dest = bundle_dir()
+        dest.mkdir(parents=True, exist_ok=True)
         self.path = dest / "scene_labels.json"
         self.path.write_text(
             json.dumps(
@@ -126,14 +149,27 @@ class SceneLabels:
                         }
                         for key, name in self._kinds
                     ],
-                    "samples": packed,
+                    "samples": samples,
                 },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
         )
-        self._items = items
+
+    def _sample_entry(self, item: dict[str, str]) -> dict[str, str]:
+        dest = bundle_dir()
+        src = resolve_sample_path(item["path"], dest)
+        if src is None:
+            return {"path": item["path"], "kind": item["kind"]}
+        try:
+            relative = src.resolve().relative_to(dest.resolve()).as_posix()
+        except ValueError:
+            relative = str(src)
+        return {"path": relative, "kind": item["kind"]}
+
+    def _save_items(self) -> None:
+        self._write_json([self._sample_entry(item) for item in self._items])
 
     def kinds(self) -> list[tuple[str, str]]:
         return list(self._kinds)
@@ -150,22 +186,41 @@ class SceneLabels:
         return key
 
     def extract_keys(self) -> list[str]:
-        return [key for key, _name in self._kinds if key not in self._hidden_from_results]
+        return [
+            key
+            for key, _name in self._kinds
+            if key not in self._hidden_from_results and key not in IDLE_KINDS
+        ]
+
+    def correct_keys(self) -> list[str]:
+        return [
+            key
+            for key, _name in self._kinds
+            if key not in self._hidden_from_results
+        ]
 
     def hidden_keys(self) -> list[str]:
         return [key for key, _name in self._kinds if key in self._hidden_from_results]
+
+    def idle_keys(self) -> list[str]:
+        return [key for key, _name in self._kinds if key in IDLE_KINDS]
 
     def train_classes(self) -> tuple[str, ...]:
         counts = self.counts()
         keys = [
             key
             for key, _name in self._kinds
-            if key not in self._hidden_from_results or counts.get(key, 0) > 0
+            if key not in IDLE_KINDS
+            and (key not in self._hidden_from_results or counts.get(key, 0) > 0)
         ]
         return (OTHER_KEY, *keys)
 
     def extract_names(self) -> str:
-        names = [name for key, name in self._kinds if key not in self._hidden_from_results]
+        names = [
+            name
+            for key, name in self._kinds
+            if key not in self._hidden_from_results and key not in IDLE_KINDS
+        ]
         if not names:
             return "画面"
         if len(names) == 1:
@@ -187,17 +242,6 @@ class SceneLabels:
         if len(names) == 1:
             return names[0]
         return "と".join(names)
-
-    def add_kind(self, name: str) -> str:
-        label = name.strip()
-        if not label:
-            raise ValueError("名前を入力してください")
-        if any(existing == label for _key, existing in self._kinds) or label == OTHER_NAME:
-            raise ValueError(f"「{label}」はすでにあります")
-        key = slug_key(label, {item for item, _name in self._kinds})
-        self._kinds.append((key, label))
-        self._save()
-        return key
 
     def add(self, image_path: Path, kind: str) -> None:
         self.add_many([image_path], kind)
@@ -247,10 +291,15 @@ class SceneLabels:
 
     def _matches_path(self, stored: str, image_path: Path) -> bool:
         left = Path(stored)
+        right = image_path
+        if stored == str(image_path) or left == right:
+            return True
+        if left.name == right.name and left.parent.name == right.parent.name:
+            return True
         try:
-            return left.resolve() == image_path.resolve()
+            return left.resolve() == right.resolve()
         except OSError:
-            return left == image_path or stored == str(image_path)
+            return False
 
     def set_kind(self, image_path: Path, kind: str) -> bool:
         if kind not in self.classes():
@@ -261,28 +310,43 @@ class SceneLabels:
                 item["kind"] = kind
                 changed = True
         if changed:
-            self._save()
+            self._save_items()
         return changed
+
+    def remove_at(self, kind: str, index: int) -> Path | None:
+        matched = [(i, item) for i, item in enumerate(self._items) if item.get("kind") == kind]
+        if index < 0 or index >= len(matched):
+            return None
+        item_index, item = matched[index]
+        path = Path(item["path"])
+        del self._items[item_index]
+        self._save_items()
+        self._unlink_if_ours(path)
+        return path
 
     def remove(self, image_path: Path) -> bool:
         kept = []
-        removed = False
+        removed: Path | None = None
         for item in self._items:
-            if self._matches_path(item["path"], image_path):
-                removed = True
+            if removed is None and self._matches_path(item["path"], image_path):
+                removed = Path(item["path"])
                 continue
             kept.append(item)
-        if not removed:
+        if removed is None:
             return False
         self._items = kept
-        self._save()
+        self._save_items()
+        self._unlink_if_ours(removed)
+        self._unlink_if_ours(image_path)
+        return True
+
+    def _unlink_if_ours(self, image_path: Path) -> None:
         try:
             root = bundle_dir() / "images"
             if image_path.is_file() and root in image_path.resolve().parents:
                 image_path.unlink()
         except OSError:
             pass
-        return True
 
     def missing_for_train(self) -> list[str]:
         counts = self.counts()

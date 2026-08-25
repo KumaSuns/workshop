@@ -45,6 +45,49 @@ def _scale_box(box: dict, src_w: int, src_h: int, dst_w: int, dst_h: int) -> dic
     return {"x": x, "y": y, "w": w, "h": h}
 
 
+def _norm_box(box: dict, width: int, height: int) -> tuple[float, float, float, float]:
+    return (
+        int(box["x"]) / max(width, 1),
+        int(box["y"]) / max(height, 1),
+        int(box["w"]) / max(width, 1),
+        int(box["h"]) / max(height, 1),
+    )
+
+
+def boxes_close(left: dict, right: dict, width: int, height: int) -> bool:
+    a = _norm_box(left, width, height)
+    b = _norm_box(right, width, height)
+    return (
+        abs(a[0] - b[0]) < 0.04
+        and abs(a[1] - b[1]) < 0.04
+        and abs(a[2] - b[2]) < 0.05
+        and abs(a[3] - b[3]) < 0.05
+    )
+
+
+def _score_number(text: str) -> int:
+    digits = "".join(char for char in (text or "") if char.isdigit())
+    if not digits:
+        return 0
+    length = len(digits)
+    if 3 <= length <= 6:
+        return length + 10
+    return length
+
+
+def _clean_box(box: dict) -> dict[str, int]:
+    return {
+        "x": int(box["x"]),
+        "y": int(box["y"]),
+        "w": max(1, int(box["w"])),
+        "h": max(1, int(box["h"])),
+    }
+
+
+def _box_patterns_path() -> Path:
+    return trainer_data_dir() / "coin_box_patterns.json"
+
+
 class CoinReader:
     def __init__(self) -> None:
         self._hud = _load("_tsum_hud_number", "hud_number.py")
@@ -53,6 +96,7 @@ class CoinReader:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._region_models: dict[str, object] = {}
         self._digit_model = None
+        self._patterns: dict[str, list[tuple[dict[str, int], int, int]]] = {"coin": [], "result_coin": []}
         self._fallback: dict[str, tuple[dict[str, int], int, int]] = {}
         self._region_transform = transforms.Compose(
             [
@@ -106,32 +150,97 @@ class CoinReader:
             self._digit_model = model
 
     def _load_fallbacks(self) -> None:
+        self._patterns = {"coin": [], "result_coin": []}
+        self._fallback = {}
         index_path = trainer_data_dir() / "index.json"
-        if not index_path.is_file():
+        if index_path.is_file():
+            try:
+                payload = json.loads(index_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            for sample in reversed(payload.get("samples") or []):
+                width = int(sample.get("width") or 0)
+                height = int(sample.get("height") or 0)
+                regions = sample.get("regions") or {}
+                for key in ("coin", "result_coin"):
+                    box = regions.get(key)
+                    if not box or width <= 0 or height <= 0:
+                        continue
+                    cleaned = _clean_box(box)
+                    self._remember_pattern(key, cleaned, width, height)
+                    if key not in self._fallback:
+                        self._fallback[key] = (cleaned, width, height)
+        self._load_saved_box_patterns()
+
+    def _load_saved_box_patterns(self) -> None:
+        path = _box_patterns_path()
+        if not path.is_file():
             return
         try:
-            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return
-        for sample in reversed(payload.get("samples") or []):
-            width = int(sample.get("width") or 0)
-            height = int(sample.get("height") or 0)
-            regions = sample.get("regions") or {}
-            for key in ("coin", "result_coin"):
-                if key in self._fallback:
+        for key in ("coin", "result_coin"):
+            for item in payload.get(key) or []:
+                box = item.get("box") if isinstance(item, dict) else None
+                width = int(item.get("width") or 0) if isinstance(item, dict) else 0
+                height = int(item.get("height") or 0) if isinstance(item, dict) else 0
+                if not box or width <= 0 or height <= 0:
                     continue
-                box = regions.get(key)
-                if box and width > 0 and height > 0:
-                    self._fallback[key] = (
-                        {
-                            "x": int(box["x"]),
-                            "y": int(box["y"]),
-                            "w": int(box["w"]),
-                            "h": int(box["h"]),
-                        },
-                        width,
-                        height,
-                    )
+                cleaned = _clean_box(box)
+                self._remember_pattern(key, cleaned, width, height)
+                if key not in self._fallback:
+                    self._fallback[key] = (cleaned, width, height)
+
+    def _save_box_patterns(self) -> None:
+        payload = {"coin": [], "result_coin": []}
+        for key in ("coin", "result_coin"):
+            for box, width, height in self._patterns.get(key) or []:
+                payload[key].append(
+                    {"box": _clean_box(box), "width": int(width), "height": int(height)}
+                )
+        path = _box_patterns_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _remember_pattern(self, key: str, box: dict[str, int], width: int, height: int) -> bool:
+        rows = self._patterns.setdefault(key, [])
+        for existing, src_w, src_h in rows:
+            scaled = _scale_box(existing, src_w, src_h, width, height)
+            if boxes_close(scaled, box, width, height):
+                return False
+        rows.append((_clean_box(box), width, height))
+        return True
+
+    def add_session_pattern(
+        self, key: str, box: dict[str, int], width: int, height: int, persist: bool = False
+    ) -> None:
+        if key not in {"coin", "result_coin"} or width <= 0 or height <= 0:
+            return
+        added = self._remember_pattern(key, _clean_box(box), width, height)
+        if persist:
+            try:
+                self._save_box_patterns()
+            except Exception:
+                pass
+
+    def scaled_pattern_boxes(
+        self,
+        width: int,
+        height: int,
+        key: str,
+        extra: list[tuple[dict[str, int], int, int]] | None = None,
+    ) -> list[dict[str, int]]:
+        boxes: list[dict[str, int]] = []
+        rows = list(self._patterns.get(key) or [])
+        if extra:
+            rows = list(extra) + rows
+        for box, src_w, src_h in rows:
+            scaled = _scale_box(box, src_w, src_h, width, height)
+            if any(boxes_close(scaled, seen, width, height) for seen in boxes):
+                continue
+            boxes.append(scaled)
+        return boxes
 
     def _decode_box(self, model, image: Image.Image) -> dict[str, int]:
         width, height = image.size
@@ -148,15 +257,44 @@ class CoinReader:
         ph = max(1, min(ph, height - py))
         return {"x": px, "y": py, "w": pw, "h": ph}
 
-    def box_for(self, image: Image.Image, key: str) -> dict[str, int] | None:
+    def _candidate_boxes(
+        self,
+        image: Image.Image,
+        key: str,
+        extra: list[tuple[dict[str, int], int, int]] | None = None,
+    ) -> list[dict[str, int]]:
+        boxes = self.scaled_pattern_boxes(image.width, image.height, key, extra)
         model = self._region_models.get(key)
         if model is not None:
-            return self._decode_box(model, image)
+            predicted = self._decode_box(model, image)
+            if not any(boxes_close(predicted, seen, image.width, image.height) for seen in boxes):
+                boxes.append(predicted)
+        if boxes:
+            return boxes
         fallback = self._fallback.get(key)
         if fallback is None:
-            return None
+            return []
         box, src_w, src_h = fallback
-        return _scale_box(box, src_w, src_h, image.width, image.height)
+        return [_scale_box(box, src_w, src_h, image.width, image.height)]
+
+    def box_for(
+        self,
+        image: Image.Image,
+        key: str,
+        extra: list[tuple[dict[str, int], int, int]] | None = None,
+    ) -> dict[str, int] | None:
+        boxes = self._candidate_boxes(image, key, extra)
+        return boxes[0] if boxes else None
+
+    def candidate_boxes_for_path(
+        self,
+        path: Path,
+        key: str,
+        extra: list[tuple[dict[str, int], int, int]] | None = None,
+    ) -> list[dict[str, int]]:
+        with Image.open(path) as opened:
+            image = opened.convert("RGB")
+        return self._candidate_boxes(image, key, extra)
 
     def _predict_digits(self, crop: Image.Image) -> str:
         if self._digit_model is None:
@@ -174,13 +312,28 @@ class CoinReader:
         )
         return number or ""
 
-    def inspect_path(self, path: Path, key: str) -> tuple[dict[str, int] | None, str]:
+    def inspect_path(
+        self,
+        path: Path,
+        key: str,
+        extra: list[tuple[dict[str, int], int, int]] | None = None,
+    ) -> tuple[dict[str, int] | None, str]:
         with Image.open(path) as opened:
             image = opened.convert("RGB")
-        box = self.box_for(image, key)
-        if box is None:
+        boxes = self._candidate_boxes(image, key, extra)
+        if not boxes:
             return None, ""
-        return box, self._read_with_box(path, box)
+        best_box = boxes[0]
+        best_number = ""
+        best_score = -1
+        for box in boxes:
+            number = self._read_with_box(path, box)
+            score = _score_number(number)
+            if score > best_score:
+                best_score = score
+                best_box = box
+                best_number = number
+        return best_box, best_number
 
     def read_box(self, path: Path, box: dict[str, int]) -> str:
         return self._read_with_box(path, box)

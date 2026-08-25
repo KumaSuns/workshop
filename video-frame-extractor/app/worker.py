@@ -55,12 +55,14 @@ class SceneExtractWorker(QThread):
 
     def run(self) -> None:
         try:
+            stop = self.isInterruptionRequested
             if self.points is not None:
                 paths = extract_scene_frames(
                     self.info,
                     self.points,
                     self.output_dir,
                     progress=lambda current, total, name: self.progress.emit(current, total, name),
+                    should_stop=stop,
                 )
                 self.finished_ok.emit([str(path) for path in paths])
                 return
@@ -69,7 +71,10 @@ class SceneExtractWorker(QThread):
                 self.info,
                 progress=lambda current, total, name: self.progress.emit(current, total, name),
                 want_kinds=self.want_kinds,
+                should_stop=stop,
             )
+            if stop():
+                raise RuntimeError("解析を中止")
             self.found_points = points
             from app.scene_labels import SceneLabels
             hidden = set(SceneLabels().hidden_keys())
@@ -82,6 +87,7 @@ class SceneExtractWorker(QThread):
                 save_points,
                 self.output_dir,
                 progress=lambda current, total, name: self.progress.emit(current, total, name),
+                should_stop=stop,
             )
             self.finished_ok.emit([str(path) for path in paths])
         except Exception as exc:  # noqa: BLE001

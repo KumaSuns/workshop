@@ -139,6 +139,7 @@ def find_scene_points(
     info: VideoInfo,
     progress=None,
     want_kinds: set[str] | None = None,
+    should_stop=None,
 ) -> list[SamplePoint]:
     if not scene_model_ready():
         raise ValueError("画面のモデルがありません。画像を教えて学習してください。")
@@ -166,6 +167,8 @@ def find_scene_points(
     hunt_until = -1
     try:
         while True:
+            if should_stop is not None and should_stop():
+                raise RuntimeError("解析を中止")
             hunting = frame_index <= hunt_until
             step_now = 1 if hunting else coarse_step
             if hunting or frame_index % step_now == 0:
@@ -229,6 +232,7 @@ def extract_scene_frames(
     points: list[SamplePoint],
     output_dir: Path,
     progress=None,
+    should_stop=None,
 ) -> list[Path]:
     from app.extractor import grab_frame
 
@@ -240,6 +244,8 @@ def extract_scene_frames(
     stem = info.path.stem
     try:
         for i, point in enumerate(points, start=1):
+            if should_stop is not None and should_stop():
+                raise RuntimeError("解析を中止")
             image = grab_frame(cap, point.frame, info.fps)
             if image is None:
                 raise ValueError(f"{format_timecode(point.seconds)} のフレームを取得できませんでした")

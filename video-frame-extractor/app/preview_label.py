@@ -86,6 +86,7 @@ class ImagePreview(QLabel):
 
     def _render(self) -> None:
         if self._source is None or self._source.isNull():
+            self.setPixmap(QPixmap())
             return
         scaled = self._source.scaled(
             self.size(),
