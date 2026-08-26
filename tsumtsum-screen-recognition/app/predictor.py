@@ -26,7 +26,7 @@ class Predictor:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.models: dict[str, GameRegionNet] = {}
         self.piece_model: PieceNet | None = None
-        self.digit_model: CoinDigitNet | None = None
+        self.digit_models: dict[str, CoinDigitNet] = {}
         self.scene_model: SceneNet | None = None
         self._transform = transforms.Compose(
             [
@@ -61,7 +61,7 @@ class Predictor:
     def release(self) -> None:
         self.models = {}
         self.piece_model = None
-        self.digit_model = None
+        self.digit_models = {}
         self.scene_model = None
         if self.device.type == "cuda":
             try:
@@ -73,7 +73,7 @@ class Predictor:
         return (
             bool(self.models)
             or self.piece_model is not None
-            or self.digit_model is not None
+            or bool(self.digit_models)
             or self.scene_model is not None
         )
 
@@ -81,7 +81,7 @@ class Predictor:
         keys = [key for key in REGION_KEYS if key in self.models]
         if self.piece_model is not None:
             keys.extend(PIECE_KEYS)
-        if self.digit_model is not None:
+        if self.digit_models:
             keys.append("coin_digits")
         if self.scene_model is not None:
             keys.extend(SCENE_KEYS)
@@ -90,7 +90,7 @@ class Predictor:
     def reload(self) -> bool:
         self.models = {}
         self.piece_model = None
-        self.digit_model = None
+        self.digit_models = {}
         self.scene_model = None
         for key in REGION_KEYS:
             path = self.models_dir / model_filename(key)
@@ -120,19 +120,27 @@ class Predictor:
             model.to(self.device)
             model.eval()
             self.piece_model = model
-        digit_path = self.models_dir / model_filename("coin_digits")
-        if digit_path.exists():
-            checkpoint = torch.load(digit_path, map_location=self.device, weights_only=False)
+        self.digit_models = {}
+        for key, filename in (("coin", "coin_digits.pt"), ("result_coin", "result_coin_digits.pt")):
+            path = self.models_dir / filename
+            if not path.exists():
+                continue
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             model = CoinDigitNet(pretrained=False)
             state = (
                 checkpoint["state_dict"]
                 if isinstance(checkpoint, dict) and "state_dict" in checkpoint
                 else checkpoint
             )
-            model.load_state_dict(state)
+            try:
+                model.load_state_dict(state)
+            except Exception:
+                continue
             model.to(self.device)
             model.eval()
-            self.digit_model = model
+            self.digit_models[key] = model
+        if "coin" in self.digit_models and "result_coin" not in self.digit_models:
+            self.digit_models["result_coin"] = self.digit_models["coin"]
         scene_path = self.models_dir / model_filename("scene")
         if scene_path.exists():
             checkpoint = torch.load(scene_path, map_location=self.device, weights_only=False)
@@ -159,12 +167,17 @@ class Predictor:
         index = int(probs.argmax().item())
         return scene_name(index), float(probs[index].item())
 
-    def predict_coin_digits(self, crop: Image.Image) -> str:
-        if self.digit_model is None:
+    @property
+    def digit_model(self) -> CoinDigitNet | None:
+        return self.digit_models.get("coin") or next(iter(self.digit_models.values()), None)
+
+    def predict_coin_digits(self, crop: Image.Image, key: str = "coin") -> str:
+        model = self.digit_models.get(key) or self.digit_model
+        if model is None:
             return ""
         tensor = self._digit_transform(crop.convert("RGB")).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            logits = self.digit_model(tensor)
+            logits = model(tensor)
         return decode_logits(logits.cpu())
 
     def predict_all(self, image_path: Path) -> dict[str, dict[str, int]]:

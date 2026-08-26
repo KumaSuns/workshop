@@ -95,7 +95,7 @@ class CoinReader:
         self._region_mod = _load("_tsum_region_model", "model.py")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._region_models: dict[str, object] = {}
-        self._digit_model = None
+        self._digit_models: dict[str, object] = {}
         self._patterns: dict[str, list[tuple[dict[str, int], int, int]]] = {"coin": [], "result_coin": []}
         self._fallback: dict[str, tuple[dict[str, int], int, int]] = {}
         self._region_transform = transforms.Compose(
@@ -135,19 +135,28 @@ class CoinReader:
             model.to(self.device)
             model.eval()
             self._region_models[key] = model
-        digit_path = models_dir / "coin_digits.pt"
-        if digit_path.is_file():
-            checkpoint = torch.load(digit_path, map_location=self.device, weights_only=False)
+        self._digit_models = {}
+        digit_files = (("coin", "coin_digits.pt"), ("result_coin", "result_coin_digits.pt"))
+        for key, filename in digit_files:
+            path = models_dir / filename
+            if not path.is_file():
+                continue
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             model = self._digit_mod.CoinDigitNet(pretrained=False)
             state = (
                 checkpoint["state_dict"]
                 if isinstance(checkpoint, dict) and "state_dict" in checkpoint
                 else checkpoint
             )
-            model.load_state_dict(state)
+            try:
+                model.load_state_dict(state)
+            except Exception:
+                continue
             model.to(self.device)
             model.eval()
-            self._digit_model = model
+            self._digit_models[key] = model
+        if "coin" in self._digit_models and "result_coin" not in self._digit_models:
+            self._digit_models["result_coin"] = self._digit_models["coin"]
 
     def _load_fallbacks(self) -> None:
         self._patterns = {"coin": [], "result_coin": []}
@@ -296,19 +305,25 @@ class CoinReader:
             image = opened.convert("RGB")
         return self._candidate_boxes(image, key, extra)
 
-    def _predict_digits(self, crop: Image.Image) -> str:
-        if self._digit_model is None:
+    def _predict_digits(self, crop: Image.Image, key: str = "coin") -> str:
+        model = self._digit_models.get(key) or self._digit_models.get("coin")
+        if model is None and self._digit_models:
+            model = next(iter(self._digit_models.values()))
+        if model is None:
             return ""
         tensor = self._digit_transform(crop.convert("RGB")).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            logits = self._digit_model(tensor)
+            logits = model(tensor)
         return self._digit_mod.decode_logits(logits.cpu())
 
-    def _read_with_box(self, path: Path, box: dict[str, int]) -> str:
+    def _read_with_box(self, path: Path, box: dict[str, int], key: str = "coin") -> str:
+        predict = None
+        if self._digit_models:
+            predict = lambda crop, box_key=key: self._predict_digits(crop, box_key)
         _crop, number = self._hud.read_coin_number(
             path,
             box,
-            predict_fn=self._predict_digits if self._digit_model is not None else None,
+            predict_fn=predict,
         )
         return number or ""
 
@@ -327,7 +342,7 @@ class CoinReader:
         best_number = ""
         best_score = -1
         for box in boxes:
-            number = self._read_with_box(path, box)
+            number = self._read_with_box(path, box, key)
             score = _score_number(number)
             if score > best_score:
                 best_score = score
@@ -336,7 +351,7 @@ class CoinReader:
         return best_box, best_number
 
     def read_box(self, path: Path, box: dict[str, int], key: str = "coin") -> str:
-        return self._read_with_box(path, box)
+        return self._read_with_box(path, box, key)
 
     def read_path(self, path: Path, key: str) -> str:
         _box, number = self.inspect_path(path, key)
@@ -358,7 +373,7 @@ class CoinReader:
 
     def close(self) -> None:
         self._region_models = {}
-        self._digit_model = None
+        self._digit_models = {}
         if self.device.type == "cuda":
             try:
                 torch.cuda.empty_cache()

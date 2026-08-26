@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -71,6 +72,7 @@ from app.coin_teach import (
     MIN_DIGIT_SAMPLES,
     DigitTrainWorker,
     digit_teaching_count,
+    digit_train_counts,
     save_coin_teaching,
     taught_coin_for_frame,
     taught_coin_for_image,
@@ -83,6 +85,15 @@ from app.coin_train_images_window import CoinTrainImagesWindow
 
 RECENT_VIDEO_LIMIT = 10
 SAVED_COIN_COLOR = "#ff9f43"
+RESULT_ICONS = (
+    ("score", "Score.png"),
+    ("coin", "Coin.png"),
+    ("exp", "Exp.png"),
+    ("time", "Time.png"),
+    ("bomb", "Bomb.png"),
+    ("five_to_four", "5over4.png"),
+    ("combo", "Combo.png"),
+)
 
 STYLESHEET = """
 QMainWindow, QWidget {
@@ -92,6 +103,12 @@ QMainWindow, QWidget {
     font-size: 13px;
 }
 QLabel#title { font-size: 18px; font-weight: 700; }
+QLabel#previewTitle {
+    color: #c5cbd6;
+    background: #2f3642;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
 QLabel#hint { color: #9aa3b2; }
 QLabel#fileName { color: #7ec8ff; font-size: 15px; font-weight: 700; }
 QLabel#saveDone { color: #8ee0a8; font-size: 14px; font-weight: 700; }
@@ -321,6 +338,7 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(12, 12, 12, 12)
         preview_layout.setSpacing(6)
         self.preview_title = QLabel("プレビュー")
+        self.preview_title.setObjectName("previewTitle")
         preview_layout.addWidget(self.preview_title)
         self.preview = ImagePreview("動画を開いて、「指定枚数を出す」を押すと右に出ます")
         self.preview.setObjectName("preview")
@@ -370,6 +388,31 @@ class MainWindow(QMainWindow):
         scene_row.addWidget(self.result_btn, 1)
         scene_row.addWidget(self.scene_btn, 1)
         info_layout.addLayout(scene_row)
+
+        icon_row = QHBoxLayout()
+        icon_row.setContentsMargins(0, 0, 0, 0)
+        icon_row.setSpacing(4)
+        icons_dir = Path(__file__).resolve().parent / "assets" / "icons"
+        self._info_icons: dict[str, QLabel] = {}
+        for key, filename in RESULT_ICONS:
+            icon = QLabel()
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pixmap = QPixmap(str(icons_dir / filename))
+            if not pixmap.isNull():
+                icon.setPixmap(
+                    pixmap.scaled(
+                        28,
+                        28,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+            fade = QGraphicsOpacityEffect(icon)
+            fade.setOpacity(0.28)
+            icon.setGraphicsEffect(fade)
+            icon_row.addWidget(icon, 1)
+            self._info_icons[key] = icon
+        info_layout.addLayout(icon_row)
 
         self.video_time_value = self._add_info_block(info_layout, "動画の時間")
         self.go_timeup_value = self._add_info_block(info_layout, "GO → TIME UP")
@@ -885,7 +928,7 @@ class MainWindow(QMainWindow):
         self._preview_coin_box = None
         self.preview.editable = False
         self._set_coin_fix_visible(False)
-        self.preview_title.setText("プレビュー  開いただけです。枚数を指定して「指定枚数を出す」")
+        self.preview_title.setText("プレビュー")
         self._fit_preview()
 
     def refresh_points(self) -> None:
@@ -990,10 +1033,8 @@ class MainWindow(QMainWindow):
     def show_point(self, point) -> None:
         saved = self._saved_by_index.get(point.index)
         pixmap = None
-        source = "動画"
         if saved is not None and saved.exists():
             pixmap = QPixmap(str(saved))
-            source = "保存済み"
         if pixmap is None or pixmap.isNull():
             frame = self._read_frame(point.frame)
             if frame is None:
@@ -1009,13 +1050,7 @@ class MainWindow(QMainWindow):
             pixmap = QPixmap.fromImage(image)
         self._full_pixmap = pixmap
         self._preview_point = point
-        extra = ""
-        kind = getattr(point, "kind", "sample")
-        if kind and kind not in {"sample", OTHER_KEY}:
-            extra = f"  {self.scene_labels.name_of(kind)}  {point.score:.0%}"
-        self.preview_title.setText(
-            f"プレビュー  {point.index} / {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%){extra}  {source}"
-        )
+        self.preview_title.setText("プレビュー")
         self._sync_coin_preview(point)
         self._fit_preview()
         self.statusBar().showMessage(
@@ -1393,20 +1428,24 @@ class MainWindow(QMainWindow):
             return
         if self.worker is not None:
             return
-        count = digit_teaching_count()
-        if count < MIN_DIGIT_SAMPLES:
+        counts = digit_train_counts()
+        coin_n = counts["coin"]
+        result_n = counts["result_coin"]
+        if coin_n < MIN_DIGIT_SAMPLES and result_n < MIN_DIGIT_SAMPLES:
             QMessageBox.information(
                 self,
                 "まだ足りません",
-                f"コイン数字の学習には {MIN_DIGIT_SAMPLES} 枚以上必要です。いま {count} 枚です。",
+                f"コイン数字の学習には {MIN_DIGIT_SAMPLES} 枚以上必要です。"
+                f"いま coin {coin_n} 枚、result {result_n} 枚です。",
             )
             return
         if not self._confirm_train(
             "コインの数字を学習します",
             "コインの数字を読む学習を始めます。\n"
-            "画面の種類（GO や result など）の学習ではありません。\n\n"
-            f"いま {count} 枚です。\n始めますか？",
-            seconds=self._estimate_digit_train_seconds(count),
+            "画面の種類（GO や result など）の学習ではありません。\n"
+            "coin と result は別々に学習します。\n\n"
+            f"coin {coin_n} 枚、result {result_n} 枚です。\n始めますか？",
+            seconds=self._estimate_digit_train_seconds(coin_n + result_n),
         ):
             return
         self._begin_digit_train()
@@ -1452,6 +1491,7 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         acc = float(metrics.get("acc") or 0)
         samples = int(metrics.get("samples") or 0)
+        digit_lines = self._digit_train_summary(metrics)
         self._remember_train_duration("digit", samples, DIGIT_EPOCHS, 4, self._digit_train_started_at)
         self._digit_train_started_at = None
         if both and scene_metrics is not None:
@@ -1461,7 +1501,7 @@ class MainWindow(QMainWindow):
                 self,
                 "学習完了",
                 f"画面の種類を {scene_samples} 枚で学習しました。精度 {scene_acc:.0%}\n"
-                f"コイン数字を {samples} 枚で学習しました。精度 {acc:.0%}\n"
+                f"{digit_lines}\n"
                 "次の解析から使います。",
             )
             self.statusBar().showMessage("画面とコイン数字を学習しました", 5000)
@@ -1469,13 +1509,30 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "学習完了",
-                f"コイン数字を {samples} 枚で学習しました。精度 {acc:.0%}\n次の解析から使います。",
+                f"{digit_lines}\n次の解析から使います。",
             )
             self.statusBar().showMessage(f"コイン数字を学習しました  精度 {acc:.0%}", 5000)
         point = self._current_point()
         if point is not None:
             self._sync_coin_preview(point)
             self._fit_preview()
+
+    def _digit_train_summary(self, metrics: dict) -> str:
+        by_key = metrics.get("by_key") or {}
+        labels = {"coin": "coin の数字", "result_coin": "result の数字"}
+        lines = []
+        for key in ("coin", "result_coin"):
+            item = by_key.get(key)
+            if not item:
+                continue
+            acc = float(item.get("acc") or 0)
+            samples = int(item.get("samples") or 0)
+            lines.append(f"{labels[key]}を {samples} 枚で学習しました。数字の一致 {acc:.0%}")
+        if lines:
+            return "\n".join(lines)
+        acc = float(metrics.get("acc") or 0)
+        samples = int(metrics.get("samples") or 0)
+        return f"コイン数字を {samples} 枚で学習しました。数字の一致 {acc:.0%}"
 
     def _go_timeup_pairs(self, points: list) -> list[tuple[float, float]]:
         go_keys = set(self.scene_labels.keys_named("go"))
@@ -1702,11 +1759,13 @@ class MainWindow(QMainWindow):
         split = getattr(self, "_body_split", None)
         if col is None or split is None or not hasattr(self, "preview"):
             return
-        height = self.preview.height()
+        margins = col.contentsMargins()
+        spacing = col.layout().spacing() if col.layout() is not None else 0
+        title_h = self.preview_title.sizeHint().height() if hasattr(self, "preview_title") else 0
+        height = col.height() - margins.top() - margins.bottom() - title_h - spacing
         if height < 80:
             return
         width = (height * 2) // 3
-        margins = col.contentsMargins()
         col_w = width + margins.left() + margins.right()
         if self.preview.width() == width and col.minimumWidth() == col_w and col.maximumWidth() == col_w:
             return
@@ -2329,15 +2388,17 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             return
         missing = self.scene_labels.missing_for_train()
-        digit_count = digit_teaching_count()
-        digit_short = digit_count < MIN_DIGIT_SAMPLES
+        counts = digit_train_counts()
+        digit_count = counts["coin"] + counts["result_coin"]
+        digit_short = counts["coin"] < MIN_DIGIT_SAMPLES and counts["result_coin"] < MIN_DIGIT_SAMPLES
         if missing or digit_short:
             parts = []
             if missing:
                 parts.append(f"画面の種類はそれぞれ {MIN_SCENE_SAMPLES} 枚以上必要です。\n" + "\n".join(missing))
             if digit_short:
                 parts.append(
-                    f"コイン数字の学習には {MIN_DIGIT_SAMPLES} 枚以上必要です。いま {digit_count} 枚です。"
+                    f"コイン数字の学習には {MIN_DIGIT_SAMPLES} 枚以上必要です。"
+                    f"いま coin {counts['coin']} 枚、result {counts['result_coin']} 枚です。"
                 )
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Information)
@@ -2363,7 +2424,7 @@ class MainWindow(QMainWindow):
             "確認はこの1回だけです。画面の学習のあと、続けて数字の学習を始めます。\n\n"
             "【画面の種類】\n"
             + self._scene_train_summary()
-            + f"\n\n【コインの数字】\nいま {digit_count} 枚\n\n始めますか？",
+            + f"\n\n【コインの数字】\ncoin {counts['coin']} 枚、result {counts['result_coin']} 枚\n\n始めますか？",
             seconds=scene_seconds + digit_seconds,
         ):
             return
@@ -2454,8 +2515,8 @@ class MainWindow(QMainWindow):
         self._scene_train_started_at = None
         if self._train_both:
             self._both_scene_metrics = metrics
-            digit_count = digit_teaching_count()
-            if digit_count < MIN_DIGIT_SAMPLES:
+            counts = digit_train_counts()
+            if counts["coin"] < MIN_DIGIT_SAMPLES and counts["result_coin"] < MIN_DIGIT_SAMPLES:
                 self._train_both = False
                 self._both_scene_metrics = None
                 self._update_buttons()
@@ -2463,7 +2524,8 @@ class MainWindow(QMainWindow):
                     self,
                     "学習完了",
                     f"画面の種類を {samples} 枚で学習しました。精度 {acc:.0%}\n"
-                    f"コイン数字は {MIN_DIGIT_SAMPLES} 枚以上必要です。いま {digit_count} 枚です。",
+                    f"コイン数字は {MIN_DIGIT_SAMPLES} 枚以上必要です。"
+                    f"いま coin {counts['coin']} 枚、result {counts['result_coin']} 枚です。",
                 )
                 self.statusBar().showMessage(f"画面を学習しました  精度 {acc:.0%}", 5000)
                 return

@@ -1952,7 +1952,9 @@ class MainWindow(QMainWindow):
             crop, number = ocr_coin_number(
                 sample.image_path,
                 box,
-                predict_fn=self.predictor.predict_coin_digits if self.predictor.digit_model else None,
+                predict_fn=(lambda crop, box_key=key: self.predictor.predict_coin_digits(crop, box_key))
+                if self.predictor.digit_model
+                else None,
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "数字を取れませんでした", str(exc))

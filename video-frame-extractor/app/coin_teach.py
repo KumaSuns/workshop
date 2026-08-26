@@ -419,7 +419,13 @@ def remove_coin_teaching(sample_id: str, key: str) -> bool:
     return True
 
 
-def _digit_items() -> list[tuple[Path, dict[str, int], str]]:
+DIGIT_MODEL_FILES = (
+    ("coin", "coin_digits.pt", "coin の数字"),
+    ("result_coin", "result_coin_digits.pt", "result の数字"),
+)
+
+
+def _digit_items(key: str) -> list[tuple[Path, dict[str, int], str]]:
     path = _index_path()
     if not path.is_file():
         return []
@@ -431,26 +437,26 @@ def _digit_items() -> list[tuple[Path, dict[str, int], str]]:
         image = _images_dir() / str(sample.get("image") or "")
         if not image.is_file():
             continue
-        regions = sample.get("regions") or {}
-        readings = sample.get("readings") or {}
-        for key in ("result_coin", "coin"):
-            box = regions.get(key)
-            digits = _digits_only(str(readings.get(key) or ""))
-            if box and digits:
-                items.append(
-                    (
-                        image,
-                        {
-                            "x": int(box["x"]),
-                            "y": int(box["y"]),
-                            "w": int(box["w"]),
-                            "h": int(box["h"]),
-                        },
-                        digits,
-                    )
+        box = (sample.get("regions") or {}).get(key)
+        digits = _digits_only(str((sample.get("readings") or {}).get(key) or ""))
+        if box and digits:
+            items.append(
+                (
+                    image,
+                    {
+                        "x": int(box["x"]),
+                        "y": int(box["y"]),
+                        "w": int(box["w"]),
+                        "h": int(box["h"]),
+                    },
+                    digits,
                 )
-                break
+            )
     return items
+
+
+def digit_train_counts() -> dict[str, int]:
+    return {key: len(_digit_items(key)) for key, _filename, _label in DIGIT_MODEL_FILES}
 
 
 class _CropSet(Dataset):
@@ -490,62 +496,107 @@ class DigitTrainWorker(QThread):
 
     def run(self) -> None:
         try:
-            items = _digit_items()
-            if len(items) < MIN_DIGIT_SAMPLES:
+            jobs = []
+            for key, filename, label in DIGIT_MODEL_FILES:
+                items = _digit_items(key)
+                if len(items) >= MIN_DIGIT_SAMPLES:
+                    jobs.append((key, filename, label, items))
+            if not jobs:
+                counts = digit_train_counts()
                 raise ValueError(
-                    f"コイン数字の学習には {MIN_DIGIT_SAMPLES} 枚以上必要です。いま {len(items)} 枚です。"
+                    f"コイン数字の学習には {MIN_DIGIT_SAMPLES} 枚以上必要です。"
+                    f"いま coin {counts['coin']} 枚、result {counts['result_coin']} 枚です。"
                 )
             digit_mod = _load("_tsum_digit_model", "digit_model.py")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            dataset = _CropSet(items, digit_mod)
-            loader = DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=True, num_workers=0)
-            model = digit_mod.CoinDigitNet()
-            model.freeze_backbone()
-            model.to(device)
-            trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-            optimizer = torch.optim.AdamW(trainable, lr=1e-3, weight_decay=1e-4)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=DIGIT_EPOCHS)
-            loss_fn = torch.nn.CrossEntropyLoss()
-            best_acc = -1.0
-            best_state = None
-            dest = _models_dir() / "coin_digits.pt"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            for epoch in range(1, DIGIT_EPOCHS + 1):
-                if self.isInterruptionRequested():
-                    self.failed.emit("中止")
+            by_key: dict[str, dict] = {}
+            total_epochs = DIGIT_EPOCHS * len(jobs)
+            for job_index, (key, filename, label, items) in enumerate(jobs):
+                metrics = self._fit_one(
+                    items,
+                    _models_dir() / filename,
+                    digit_mod,
+                    device,
+                    key,
+                    label,
+                    job_index * DIGIT_EPOCHS,
+                    total_epochs,
+                )
+                if metrics is None:
                     return
-                model.train()
-                correct = 0
-                seen = 0
-                for images, targets in loader:
-                    if self.isInterruptionRequested():
-                        self.failed.emit("中止")
-                        return
-                    images = images.to(device)
-                    targets = targets.to(device)
-                    optimizer.zero_grad(set_to_none=True)
-                    logits = model(images)
-                    loss = loss_fn(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-                    loss.backward()
-                    optimizer.step()
-                    correct += int((logits.argmax(dim=-1) == targets).sum().item())
-                    seen += images.size(0)
-                scheduler.step()
-                acc = correct / max(seen * digit_mod.MAX_DIGITS, 1)
-                if acc > best_acc:
-                    best_acc = acc
-                    best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-                self.progress.emit(epoch, DIGIT_EPOCHS, f"コイン数字を学習しています {epoch}/{DIGIT_EPOCHS}")
-            if best_state is None:
-                raise RuntimeError("学習結果を保存できませんでした")
-            torch.save(
-                {"state_dict": best_state, "acc": best_acc, "key": "coin_digits", "samples": len(items)},
-                dest,
-            )
-            del model, optimizer, scheduler, loader, dataset
+                by_key[key] = metrics
             if device.type == "cuda":
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            self.finished_ok.emit({"acc": float(best_acc), "samples": len(items)})
+            samples = sum(int(item["samples"]) for item in by_key.values())
+            acc = by_key.get("coin", {}).get("acc")
+            if acc is None:
+                acc = next(iter(by_key.values()))["acc"]
+            self.finished_ok.emit({"acc": float(acc), "samples": samples, "by_key": by_key})
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
+
+    def _fit_one(
+        self,
+        items: list[tuple[Path, dict[str, int], str]],
+        dest: Path,
+        digit_mod,
+        device,
+        key: str,
+        label: str,
+        epoch_offset: int,
+        epoch_total: int,
+    ) -> dict | None:
+        dataset = _CropSet(items, digit_mod)
+        loader = DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=True, num_workers=0)
+        model = digit_mod.CoinDigitNet()
+        model.to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=DIGIT_EPOCHS)
+        best_acc = -1.0
+        best_state = None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        for epoch in range(1, DIGIT_EPOCHS + 1):
+            if self.isInterruptionRequested():
+                self.failed.emit("中止")
+                return None
+            model.train()
+            exact = 0
+            seen = 0
+            for images, targets in loader:
+                if self.isInterruptionRequested():
+                    self.failed.emit("中止")
+                    return None
+                images = images.to(device)
+                targets = targets.to(device)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(images)
+                loss = digit_mod.digit_ctc_loss(logits, targets)
+                loss.backward()
+                optimizer.step()
+                for row, truth in zip(logits, targets):
+                    exact += int(
+                        digit_mod.decode_logits(row.detach().cpu())
+                        == digit_mod.decode_indices(truth.detach().cpu())
+                    )
+                seen += images.size(0)
+            scheduler.step()
+            acc = exact / max(seen, 1)
+            if acc >= best_acc:
+                best_acc = acc
+                best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+            self.progress.emit(
+                epoch_offset + epoch,
+                epoch_total,
+                f"{label}を学習しています {epoch}/{DIGIT_EPOCHS}",
+            )
+        if best_state is None:
+            raise RuntimeError("学習結果を保存できませんでした")
+        torch.save(
+            {"state_dict": best_state, "acc": best_acc, "key": key, "samples": len(items)},
+            dest,
+        )
+        del model, optimizer, scheduler, loader, dataset
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return {"acc": float(best_acc), "samples": len(items)}
