@@ -185,9 +185,9 @@ QLabel#preview, QFrame#infoPane {
     border: 1px solid #2a303b;
     border-radius: 10px;
 }
-QLabel#infoCaption { color: #9aa3b2; font-size: 11px; }
-QLabel#infoValue { color: #f2f5f8; font-size: 14px; font-weight: 700; }
-QLabel#infoCoinValue { font-size: 14px; font-weight: 700; }
+QLabel#infoCaption { color: #9aa3b2; font-size: 10px; }
+QLabel#infoValue { color: #f2f5f8; font-size: 13px; font-weight: 700; }
+QLabel#infoCoinValue { font-size: 13px; font-weight: 700; }
 """
 
 
@@ -441,8 +441,8 @@ class MainWindow(QMainWindow):
         info_col = QFrame()
         info_col.setObjectName("panel")
         info_layout = QVBoxLayout(info_col)
-        info_layout.setContentsMargins(8, 8, 8, 8)
-        info_layout.setSpacing(5)
+        info_layout.setContentsMargins(6, 6, 6, 6)
+        info_layout.setSpacing(3)
         info_layout.addWidget(QLabel("動画の情報"))
         self.result_btn = QPushButton("resultを抜き出す")
         self.scene_btn = QPushButton("解析")
@@ -482,28 +482,33 @@ class MainWindow(QMainWindow):
         self.item_cost_value = self._add_info_block(info_layout, "アイテム消費")
         tsum_info = QFrame()
         tsum_info.setObjectName("infoPane")
+        tsum_info.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         tsum_info_layout = QVBoxLayout(tsum_info)
-        tsum_info_layout.setContentsMargins(8, 4, 8, 4)
-        tsum_info_layout.setSpacing(1)
+        tsum_info_layout.setContentsMargins(6, 2, 6, 2)
+        tsum_info_layout.setSpacing(2)
         tsum_cap = QLabel("使用ツム")
         tsum_cap.setObjectName("infoCaption")
         self.used_tsum_value = QLabel("—")
         self.used_tsum_value.setObjectName("infoValue")
         self.used_tsum_value.setWordWrap(True)
-        self.used_tsum_value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.used_tsum_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        tsum_head = QHBoxLayout()
+        tsum_head.setContentsMargins(0, 0, 0, 0)
+        tsum_head.setSpacing(6)
+        tsum_head.addWidget(tsum_cap)
+        tsum_head.addWidget(self.used_tsum_value, 1)
         tsum_btn_row = QHBoxLayout()
-        tsum_btn_row.setSpacing(6)
+        tsum_btn_row.setSpacing(4)
         self.tsum_fix_btn = QPushButton("修正")
         self.tsum_register_btn = QPushButton("新規登録")
         self.tsum_label_btn = QPushButton("表示名")
         for btn in (self.tsum_fix_btn, self.tsum_register_btn, self.tsum_label_btn):
             btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-            btn.setMinimumHeight(22)
+            btn.setMinimumHeight(20)
         tsum_btn_row.addWidget(self.tsum_fix_btn, 1)
         tsum_btn_row.addWidget(self.tsum_register_btn, 1)
         tsum_btn_row.addWidget(self.tsum_label_btn, 1)
-        tsum_info_layout.addWidget(tsum_cap)
-        tsum_info_layout.addWidget(self.used_tsum_value)
+        tsum_info_layout.addLayout(tsum_head)
         tsum_info_layout.addLayout(tsum_btn_row)
         info_layout.addWidget(tsum_info, 0)
 
@@ -526,7 +531,7 @@ class MainWindow(QMainWindow):
         self.send_all_btn = QPushButton("一覧をすべて渡す")
         for btn in (self.wrong_btn, self.send_one_btn, self.send_all_btn):
             btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-            btn.setMinimumHeight(28)
+            btn.setMinimumHeight(22)
         info_layout.addWidget(self.wrong_btn)
         info_layout.addWidget(self.send_one_btn)
         info_layout.addWidget(self.send_all_btn)
@@ -632,17 +637,18 @@ class MainWindow(QMainWindow):
     def _add_info_block(self, layout: QVBoxLayout, caption: str, stretch: int = 0) -> QLabel:
         box = QFrame()
         box.setObjectName("infoPane")
-        box_layout = QVBoxLayout(box)
-        box_layout.setContentsMargins(8, 4, 8, 4)
-        box_layout.setSpacing(1)
+        box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        box_layout = QHBoxLayout(box)
+        box_layout.setContentsMargins(6, 2, 6, 2)
+        box_layout.setSpacing(6)
         cap = QLabel(caption)
         cap.setObjectName("infoCaption")
         value = QLabel("—")
         value.setObjectName("infoValue")
         value.setWordWrap(True)
-        value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         box_layout.addWidget(cap)
-        box_layout.addWidget(value)
+        box_layout.addWidget(value, 1)
         layout.addWidget(box, stretch)
         return value
 
