@@ -7,8 +7,9 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from PIL import Image
 import cv2
-from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtCore import QEvent, QSettings, QTimer, Qt
 from PySide6.QtGui import QColor, QImage, QPixmap, QShortcut, QKeySequence, QDragEnterEvent, QDropEvent
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -78,6 +79,30 @@ from app.coin_teach import (
     taught_coin_for_frame,
     taught_coin_for_image,
     taught_keys_for_image,
+)
+from app.item_slots import (
+    ICON_DIM,
+    ICON_ON,
+    ITEM_ICON_KEYS,
+    ITEM_SLOT_KEYS,
+    SLOT_LABELS,
+    ItemSlotStore,
+    box_means_used,
+    item_coin_cost,
+    sample_color,
+)
+from app.item_teach import (
+    MIN_TSUM_SAMPLES,
+    TSUM_EPOCHS,
+    TsumReader,
+    TsumTrainWorker,
+    save_tsum_screen,
+    set_tsum_display_name,
+    shown_tsum_name,
+    tsum_class_names,
+    tsum_folder_entries,
+    tsum_id_for_name,
+    tsum_teaching_count,
 )
 from app.preview_label import ImagePreview
 from app.scene_still_window import SceneStillWindow
@@ -160,9 +185,9 @@ QLabel#preview, QFrame#infoPane {
     border: 1px solid #2a303b;
     border-radius: 10px;
 }
-QLabel#infoCaption { color: #9aa3b2; font-size: 12px; }
-QLabel#infoValue { color: #f2f5f8; font-size: 16px; font-weight: 700; }
-QLabel#infoCoinValue { font-size: 16px; font-weight: 700; }
+QLabel#infoCaption { color: #9aa3b2; font-size: 11px; }
+QLabel#infoValue { color: #f2f5f8; font-size: 14px; font-weight: 700; }
+QLabel#infoCoinValue { font-size: 14px; font-weight: 700; }
 """
 
 
@@ -176,7 +201,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLESHEET)
 
         self.info: VideoInfo | None = None
-        self.worker: ExtractWorker | SceneExtractWorker | SceneTrainWorker | DigitTrainWorker | None = None
+        self.worker: ExtractWorker | SceneExtractWorker | SceneTrainWorker | DigitTrainWorker | TsumTrainWorker | None = None
         self.scene_labels = SceneLabels()
         self._settings = QSettings("workshop", "VideoFrameExtractor")
         self.output_dir = Path(__file__).resolve().parent.parent / "output"
@@ -186,8 +211,15 @@ class MainWindow(QMainWindow):
         self._preview_point = None
         self._ipc_buffers: dict[int, bytes] = {}
         self._coin_reader: CoinReader | None = None
+        self._item_store = ItemSlotStore()
+        self._tsum_reader: TsumReader | None = None
         self._coin_cache: dict[tuple[str, int, str], str] = {}
         self._coin_box_cache: dict[tuple[str, int, str], dict[str, int]] = {}
+        self._item_used_cache: dict[tuple[str, int], set[str]] = {}
+        self._item_tsum_cache: dict[tuple[str, int], str] = {}
+        self._item_box_cache: dict[tuple[str, int, str], dict[str, int]] = {}
+        self._last_item_box: dict[str, int] | None = None
+        self._rate_unit = "s"
         self._remembered_coin_keys: set[tuple[str, int, str]] = set()
         self._preview_coin_box: dict[str, int] | None = None
         self._session_box_patterns: dict[str, list[tuple[dict[str, int], int, int]]] = {
@@ -373,13 +405,44 @@ class MainWindow(QMainWindow):
         self.coin_train_btn = QPushButton("コイン数字を学習する")
         coin_layout.addWidget(self.coin_train_btn)
         preview_layout.addWidget(self._coin_fix)
+        self._item_fix = QWidget()
+        item_layout = QVBoxLayout(self._item_fix)
+        item_layout.setContentsMargins(0, 0, 0, 0)
+        item_layout.setSpacing(6)
+        self.item_slot_combo = QComboBox()
+        for key in ITEM_SLOT_KEYS:
+            self.item_slot_combo.addItem(SLOT_LABELS[key], key)
+        item_layout.addWidget(self.item_slot_combo)
+        item_box_row = QHBoxLayout()
+        item_box_row.setSpacing(6)
+        self.item_reuse_btn = QPushButton("既存の枠を使う")
+        self.item_apply_btn = QPushButton("同じ種類にこの枠を使う")
+        item_box_row.addWidget(self.item_reuse_btn, 1)
+        item_box_row.addWidget(self.item_apply_btn, 1)
+        item_layout.addLayout(item_box_row)
+        self.tsum_edit = QLineEdit()
+        self.tsum_edit.setPlaceholderText("この枠のツム")
+        item_layout.addWidget(self.tsum_edit)
+        item_save_row = QHBoxLayout()
+        item_save_row.setSpacing(6)
+        self.item_box_save_btn = QPushButton("枠を保存")
+        self.tsum_name_save_btn = QPushButton("名前を保存")
+        self.tsum_save_btn = QPushButton("枠と名前を保存")
+        item_save_row.addWidget(self.item_box_save_btn, 1)
+        item_save_row.addWidget(self.tsum_name_save_btn, 1)
+        item_save_row.addWidget(self.tsum_save_btn, 1)
+        item_layout.addLayout(item_save_row)
+        self.tsum_train_btn = QPushButton("使用ツムを学習する")
+        item_layout.addWidget(self.tsum_train_btn)
+        preview_layout.addWidget(self._item_fix)
         self._set_coin_fix_visible(False)
+        self._set_item_fix_visible(False)
 
         info_col = QFrame()
         info_col.setObjectName("panel")
         info_layout = QVBoxLayout(info_col)
-        info_layout.setContentsMargins(12, 12, 12, 12)
-        info_layout.setSpacing(8)
+        info_layout.setContentsMargins(8, 8, 8, 8)
+        info_layout.setSpacing(5)
         info_layout.addWidget(QLabel("動画の情報"))
         self.result_btn = QPushButton("resultを抜き出す")
         self.scene_btn = QPushButton("解析")
@@ -395,6 +458,7 @@ class MainWindow(QMainWindow):
         icon_row.setSpacing(4)
         icons_dir = Path(__file__).resolve().parent / "assets" / "icons"
         self._info_icons: dict[str, QLabel] = {}
+        self._info_icon_fades: dict[str, QGraphicsOpacityEffect] = {}
         for key, filename in RESULT_ICONS:
             icon = QLabel()
             icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -409,11 +473,39 @@ class MainWindow(QMainWindow):
                     )
                 )
             fade = QGraphicsOpacityEffect(icon)
-            fade.setOpacity(0.28)
+            fade.setOpacity(ICON_DIM)
             icon.setGraphicsEffect(fade)
             icon_row.addWidget(icon, 1)
             self._info_icons[key] = icon
+            self._info_icon_fades[key] = fade
         info_layout.addLayout(icon_row)
+        self.item_cost_value = self._add_info_block(info_layout, "アイテム消費")
+        tsum_info = QFrame()
+        tsum_info.setObjectName("infoPane")
+        tsum_info_layout = QVBoxLayout(tsum_info)
+        tsum_info_layout.setContentsMargins(8, 4, 8, 4)
+        tsum_info_layout.setSpacing(1)
+        tsum_cap = QLabel("使用ツム")
+        tsum_cap.setObjectName("infoCaption")
+        self.used_tsum_value = QLabel("—")
+        self.used_tsum_value.setObjectName("infoValue")
+        self.used_tsum_value.setWordWrap(True)
+        self.used_tsum_value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        tsum_btn_row = QHBoxLayout()
+        tsum_btn_row.setSpacing(6)
+        self.tsum_fix_btn = QPushButton("修正")
+        self.tsum_register_btn = QPushButton("新規登録")
+        self.tsum_label_btn = QPushButton("表示名")
+        for btn in (self.tsum_fix_btn, self.tsum_register_btn, self.tsum_label_btn):
+            btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            btn.setMinimumHeight(22)
+        tsum_btn_row.addWidget(self.tsum_fix_btn, 1)
+        tsum_btn_row.addWidget(self.tsum_register_btn, 1)
+        tsum_btn_row.addWidget(self.tsum_label_btn, 1)
+        tsum_info_layout.addWidget(tsum_cap)
+        tsum_info_layout.addWidget(self.used_tsum_value)
+        tsum_info_layout.addLayout(tsum_btn_row)
+        info_layout.addWidget(tsum_info, 0)
 
         self.video_time_value = self._add_info_block(info_layout, "動画の時間")
         self.go_timeup_value = self._add_info_block(info_layout, "GO → TIME UP")
@@ -421,9 +513,14 @@ class MainWindow(QMainWindow):
         self.result_coin_value = self._add_info_block(info_layout, "result のコイン")
         self.play_coin_value.setObjectName("infoCoinValue")
         self.result_coin_value.setObjectName("infoCoinValue")
+        self.play_net_value = self._add_info_block(info_layout, "coin から引いた")
+        self.result_net_value = self._add_info_block(info_layout, "result から引いた")
         self.coin_ratio_value = self._add_info_block(info_layout, "コイン倍率")
         self.play_per_min_value = self._add_info_block(info_layout, "coin の1分あたり")
         self.result_per_min_value = self._add_info_block(info_layout, "result の1分あたり")
+        for label in (self.play_per_min_value, self.result_per_min_value):
+            label.setCursor(Qt.CursorShape.PointingHandCursor)
+            label.installEventFilter(self)
         self.wrong_btn = QPushButton("これは違う")
         self.send_one_btn = QPushButton("指定した枚数をツムツムに渡す")
         self.send_all_btn = QPushButton("一覧をすべて渡す")
@@ -502,7 +599,7 @@ class MainWindow(QMainWindow):
         self.both_train_btn.clicked.connect(self.start_both_train)
         self.browse_train_btn.clicked.connect(self.open_train_images)
         self.browse_coin_train_btn.clicked.connect(self.open_coin_train_images)
-        self.preview.box_changed.connect(self.on_coin_box_changed)
+        self.preview.box_changed.connect(self.on_preview_box_changed)
         self.coin_reuse_btn.clicked.connect(self.use_existing_coin_box)
         self.coin_apply_btn.clicked.connect(self.apply_coin_box_to_same_kind)
         self.coin_box_save_btn.clicked.connect(self.save_current_coin_box)
@@ -510,6 +607,17 @@ class MainWindow(QMainWindow):
         self.coin_save_btn.clicked.connect(self.save_current_coin)
         self.coin_train_btn.clicked.connect(self.start_digit_train)
         self.coin_edit.returnPressed.connect(self.save_current_coin_number)
+        self.item_slot_combo.currentIndexChanged.connect(self.on_item_slot_changed)
+        self.item_reuse_btn.clicked.connect(self.use_existing_item_box)
+        self.item_apply_btn.clicked.connect(self.apply_item_box_to_same_kind)
+        self.item_box_save_btn.clicked.connect(self.save_current_item_box)
+        self.tsum_name_save_btn.clicked.connect(self.save_current_tsum_name)
+        self.tsum_save_btn.clicked.connect(self.save_current_tsum)
+        self.tsum_train_btn.clicked.connect(self.start_tsum_train)
+        self.tsum_edit.returnPressed.connect(self.save_current_tsum_name)
+        self.tsum_fix_btn.clicked.connect(self.fix_used_tsum)
+        self.tsum_register_btn.clicked.connect(self.register_used_tsum)
+        self.tsum_label_btn.clicked.connect(self.edit_tsum_display_names)
         self._fill_kind_combo()
         self.point_list.currentItemChanged.connect(self.on_point_selected)
         self.send_one_btn.clicked.connect(self.send_current_to_tsumtsum)
@@ -521,12 +629,12 @@ class MainWindow(QMainWindow):
         self.server_settings_btn.clicked.connect(self.edit_server_settings)
         self._update_buttons()
 
-    def _add_info_block(self, layout: QVBoxLayout, caption: str, stretch: int = 1) -> QLabel:
+    def _add_info_block(self, layout: QVBoxLayout, caption: str, stretch: int = 0) -> QLabel:
         box = QFrame()
         box.setObjectName("infoPane")
         box_layout = QVBoxLayout(box)
-        box_layout.setContentsMargins(10, 8, 10, 8)
-        box_layout.setSpacing(2)
+        box_layout.setContentsMargins(8, 4, 8, 4)
+        box_layout.setSpacing(1)
         cap = QLabel(caption)
         cap.setObjectName("infoCaption")
         value = QLabel("—")
@@ -534,7 +642,7 @@ class MainWindow(QMainWindow):
         value.setWordWrap(True)
         value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         box_layout.addWidget(cap)
-        box_layout.addWidget(value, 1)
+        box_layout.addWidget(value)
         layout.addWidget(box, stretch)
         return value
 
@@ -567,15 +675,28 @@ class MainWindow(QMainWindow):
         self.server_settings_btn.setEnabled(not busy)
         training = isinstance(self.worker, SceneTrainWorker)
         digit_training = isinstance(self.worker, DigitTrainWorker)
+        tsum_training = isinstance(self.worker, TsumTrainWorker)
         self.scene_train_btn.setEnabled(not busy or training)
         self.scene_train_btn.setText("中止" if training else "学習する")
         coin_ready = has_point and self._coin_box_key_for_point(self._current_point()) is not None
+        item_ready = has_point and self._is_item_point(self._current_point())
         self.coin_box_save_btn.setEnabled(coin_ready and not busy)
         self.coin_number_save_btn.setEnabled(coin_ready and not busy)
         self.coin_save_btn.setEnabled(coin_ready and not busy)
         self.coin_reuse_btn.setEnabled(coin_ready and not busy)
         self.coin_apply_btn.setEnabled(coin_ready and not busy)
         self._set_coin_train_buttons(not busy or digit_training, digit_training)
+        self.item_slot_combo.setEnabled(item_ready and not busy)
+        self.item_reuse_btn.setEnabled(item_ready and not busy)
+        self.item_apply_btn.setEnabled(item_ready and not busy)
+        self.item_box_save_btn.setEnabled(item_ready and not busy)
+        self.tsum_train_btn.setEnabled((not busy or tsum_training) and (item_ready or tsum_training))
+        self.tsum_train_btn.setText("中止" if tsum_training else "使用ツムを学習する")
+        if hasattr(self, "tsum_fix_btn"):
+            tsum_fix_ready = ready and any(self._is_item_point(point) for point in self._list_points())
+            self.tsum_fix_btn.setEnabled(tsum_fix_ready)
+            self.tsum_register_btn.setEnabled(tsum_fix_ready)
+            self.tsum_label_btn.setEnabled(not busy)
         self.both_train_btn.setEnabled(not busy or self._train_both)
         self.both_train_btn.setText("中止" if self._train_both and busy else "上の2つを続けて学習する")
         self.coin_edit.setEnabled(coin_ready and not busy)
@@ -733,7 +854,9 @@ class MainWindow(QMainWindow):
     def _active_compute_device(self) -> str | None:
         if self.worker is None:
             return None
-        uses_torch = isinstance(self.worker, (SceneExtractWorker, SceneTrainWorker, DigitTrainWorker))
+        uses_torch = isinstance(
+            self.worker, (SceneExtractWorker, SceneTrainWorker, DigitTrainWorker, TsumTrainWorker)
+        )
         if uses_torch and self._cuda_available():
             return "gpu"
         return "cpu"
@@ -870,6 +993,9 @@ class MainWindow(QMainWindow):
         self._saved_by_index = {}
         self._coin_cache = {}
         self._coin_box_cache = {}
+        self._item_used_cache = {}
+        self._item_tsum_cache = {}
+        self._item_box_cache = {}
         self._preview_coin_box = None
         extra = ""
         if len(self._video_queue) > 1:
@@ -907,6 +1033,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "preview"):
             self.preview.editable = False
             self._set_coin_fix_visible(False)
+            self._set_item_fix_visible(False)
         self._fit_point_list()
         self._refresh_info_pane()
 
@@ -929,6 +1056,7 @@ class MainWindow(QMainWindow):
         self._preview_coin_box = None
         self.preview.editable = False
         self._set_coin_fix_visible(False)
+        self._set_item_fix_visible(False)
         self.preview_title.setText("プレビュー")
         self._fit_preview()
 
@@ -1044,6 +1172,7 @@ class MainWindow(QMainWindow):
                 self._preview_coin_box = None
                 self.preview.editable = False
                 self._set_coin_fix_visible(False)
+                self._set_item_fix_visible(False)
                 return
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channels = rgb.shape
@@ -1181,39 +1310,601 @@ class MainWindow(QMainWindow):
             self._coin_fix.setVisible(visible)
         QTimer.singleShot(0, self._fit_preview)
 
+    def _set_item_fix_visible(self, visible: bool) -> None:
+        if hasattr(self, "_item_fix"):
+            self._item_fix.setVisible(visible)
+        if visible:
+            self._refresh_item_fix_mode()
+        QTimer.singleShot(0, self._fit_preview)
+
+    def _is_item_point(self, point) -> bool:
+        if point is None:
+            return False
+        kind = str(getattr(point, "kind", "") or "")
+        if not kind or kind in {"sample", OTHER_KEY}:
+            return False
+        name = self.scene_labels.name_of(kind).lower()
+        return kind in self.scene_labels.keys_named("item") or name == "item"
+
+    def _current_item_slot(self) -> str:
+        if not hasattr(self, "item_slot_combo"):
+            return ITEM_SLOT_KEYS[0]
+        key = self.item_slot_combo.currentData()
+        return str(key or ITEM_SLOT_KEYS[0])
+
+    def _item_cache_key(self, point) -> tuple[str, int]:
+        return (str(self.info.path) if self.info else "", int(point.frame))
+
+    def _item_box_cache_key(self, point, slot: str) -> tuple[str, int, str]:
+        return (str(self.info.path) if self.info else "", int(point.frame), slot)
+
+    def _session_item_extras(self, slot: str) -> list[tuple[dict[str, int], int, int]]:
+        return list(self._session_box_patterns.get(slot) or [])
+
+    def _tsum_reader_instance(self) -> TsumReader:
+        if self._tsum_reader is None:
+            self._tsum_reader = TsumReader()
+        return self._tsum_reader
+
+    def _refresh_item_fix_mode(self) -> None:
+        self.tsum_edit.setVisible(False)
+        self.tsum_name_save_btn.setVisible(False)
+        self.tsum_save_btn.setVisible(False)
+        self.tsum_train_btn.setVisible(True)
+
+    def _sync_coin_preview(self, point) -> None:
+        key = self._coin_box_key_for_point(point)
+        if key is not None:
+            self._set_item_fix_visible(False)
+            cache_key = self._coin_cache_key(point, key)
+            number = self._read_point_coin(point, key)
+            box = self._coin_box_cache.get(cache_key)
+            if box is None:
+                try:
+                    path = self._point_image_path(point)
+                    box, number = self._coin_reader_instance().inspect_path(
+                        path, key, extra=self._session_box_extras(key)
+                    )
+                    if box is not None:
+                        self._coin_box_cache[cache_key] = box
+                    self._coin_cache[cache_key] = number
+                except Exception:
+                    box = None
+            self._preview_coin_box = box
+            self.preview.editable = True
+            self._set_coin_fix_visible(True)
+            self.coin_edit.setText(self._format_coin_edit(number))
+            self._refresh_coin_saved_color(self._coin_is_taught(point, key))
+            self._refresh_info_pane()
+            return
+        if self._is_item_point(point):
+            self._set_coin_fix_visible(False)
+            self._sync_item_preview(point)
+            return
+        self._preview_coin_box = None
+        self.preview.editable = False
+        self._set_coin_fix_visible(False)
+        self._set_item_fix_visible(False)
+
+    def _copy_item_box_size(self, source: dict[str, int], point) -> dict[str, int] | None:
+        width, height = self._image_size_for_point(point)
+        src_w = int(source.get("w") or 0)
+        src_h = int(source.get("h") or 0)
+        if width <= 0 or height <= 0 or src_w <= 0 or src_h <= 0:
+            return None
+        w = max(1, min(src_w, width))
+        h = max(1, min(src_h, height))
+        x = min(max(0, int(source.get("x") or 0)), width - w)
+        y = min(max(0, int(source.get("y") or 0)), height - h)
+        return {"x": x, "y": y, "w": w, "h": h}
+
+    def _remember_last_item_box(self, box: dict[str, int] | None) -> None:
+        if box:
+            self._last_item_box = dict(box)
+
+    def _item_boxes_from_other_slots(self, point, slot: str) -> list[dict[str, int]]:
+        width, height = self._image_size_for_point(point)
+        if width <= 0 or height <= 0:
+            return []
+        seen: list[dict[str, int]] = []
+        for other in ITEM_SLOT_KEYS:
+            if other == slot:
+                continue
+            for box in self._item_store.boxes_for(other, width, height, extra=self._session_item_extras(other)):
+                if any(boxes_close(box, existing, width, height) for existing in seen):
+                    continue
+                seen.append(dict(box))
+        return seen
+
+    def _sync_item_preview(self, point) -> None:
+        slot = self._current_item_slot()
+        box_key = self._item_box_cache_key(point, slot)
+        box = self._item_box_cache.get(box_key)
+        if box is None:
+            width, height = self._image_size_for_point(point)
+            box = self._item_store.box_for(slot, width, height, extra=self._session_item_extras(slot))
+            if box is not None:
+                self._item_box_cache[box_key] = dict(box)
+        if box is None:
+            shared = self._item_boxes_from_other_slots(point, slot)
+            if shared:
+                box = shared[0]
+                self._item_box_cache[box_key] = dict(box)
+        if box is None and self._last_item_box is not None:
+            box = self._copy_item_box_size(self._last_item_box, point)
+            if box is not None:
+                self._item_box_cache[box_key] = dict(box)
+        self._preview_coin_box = dict(box) if box else None
+        if box is not None:
+            self._remember_last_item_box(box)
+        self.preview.editable = True
+        self._set_item_fix_visible(True)
+        self._read_point_items(point)
+        self._refresh_info_pane()
+
+    def on_item_slot_changed(self) -> None:
+        point = self._current_point()
+        if point is None or not self._is_item_point(point):
+            return
+        self._remember_last_item_box(self.preview.box() or self._preview_coin_box)
+        self._sync_item_preview(point)
+        self._fit_preview()
+        self._update_buttons()
+
+    def on_preview_box_changed(self, box: dict) -> None:
+        point = self._current_point()
+        if point is not None and self._is_item_point(point):
+            self.on_item_box_changed(box)
+            return
+        self.on_coin_box_changed(box)
+
+    def on_item_box_changed(self, box: dict) -> None:
+        point = self._current_point()
+        if point is None or not self._is_item_point(point):
+            return
+        slot = self._current_item_slot()
+        self._preview_coin_box = dict(box)
+        self._item_box_cache[self._item_box_cache_key(point, slot)] = dict(box)
+        self._remember_last_item_box(box)
+        width, height = self._image_size_for_point(point)
+        self._session_box_patterns.setdefault(slot, [])
+        self._remember_session_box(slot, box, width, height)
+        self._read_point_items(point, force=True)
+        self._refresh_info_pane()
+
+    def _current_item_target(self):
+        point = self._current_point()
+        if point is None or not self._is_item_point(point):
+            return None, None, None
+        slot = self._current_item_slot()
+        box = self.preview.box() or self._preview_coin_box
+        return point, slot, box
+
+    def save_current_item_box(self) -> None:
+        point, slot, box = self._current_item_target()
+        if point is None or slot is None:
+            return
+        if box is None:
+            QMessageBox.information(self, "枠がありません", "プレビューをドラッグして、場所を囲んでください。")
+            return
+        width, height = self._image_size_for_point(point)
+        color = None
+        if slot in ITEM_SLOT_KEYS:
+            try:
+                with Image.open(self._point_image_path(point)) as image:
+                    color = sample_color(image.convert("RGB"), box)
+            except Exception:
+                color = None
+        self._item_store.add(slot, box, width, height, color=color, persist=True)
+        self._remember_session_box(slot, box, width, height, persist=False)
+        self._item_box_cache[self._item_box_cache_key(point, slot)] = dict(box)
+        self._preview_coin_box = dict(box)
+        self._read_point_items(point, force=True)
+        self._fit_preview()
+        self._refresh_info_pane()
+        self.statusBar().showMessage("枠の位置を保存しました。次の解析から使います。", 5000)
+
+    def save_current_tsum_name(self) -> None:
+        self._save_tsum_parts(persist_box=False)
+
+    def save_current_tsum(self) -> None:
+        self._save_tsum_parts(persist_box=True)
+
+    def _save_tsum_parts(self, persist_box: bool) -> None:
+        point = self._current_point()
+        if point is None or not self._is_item_point(point):
+            return
+        try:
+            path = self._point_image_path(point)
+            count, name = save_tsum_screen(
+                path,
+                self.tsum_edit.text(),
+                source_video=self.info.path if self.info is not None else None,
+                source_frame=int(point.frame),
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存できませんでした", str(exc))
+            return
+        self._item_tsum_cache[self._item_cache_key(point)] = name
+        self.tsum_edit.setText(name)
+        self._reload_tsum_reader()
+        self._refresh_info_pane()
+        extra = (
+            "「使用ツムを学習する」が使えます。"
+            if count >= MIN_TSUM_SAMPLES
+            else f"学習にはあと {MIN_TSUM_SAMPLES - count} 枚です。"
+        )
+        self.statusBar().showMessage(f"使用ツム {name} を保存しました。いま {count} 枚。{extra}", 6000)
+
+    def _reload_tsum_reader(self) -> None:
+        try:
+            if self._tsum_reader is None:
+                self._tsum_reader = TsumReader()
+            else:
+                self._tsum_reader.reload()
+        except Exception:
+            self._tsum_reader = None
+
+    def _used_tsum_target(self, title: str):
+        point = self._current_point()
+        if point is None or not self._is_item_point(point):
+            items = [item for item in self._list_points() if self._is_item_point(item)]
+            if len(items) == 1:
+                point = items[0]
+            elif not items:
+                QMessageBox.information(self, title, "item の画面を解析してから使ってください。")
+                return None
+            else:
+                QMessageBox.information(self, title, "直す item の画面を、右の一覧から選んでください。")
+                return None
+        return point
+
+    def _apply_used_tsum_name(self, name: str, title: str, folder_id: str | None = None) -> None:
+        point = self._used_tsum_target(title)
+        if point is None:
+            return
+        try:
+            path = self._point_image_path(point)
+            count, saved_name = save_tsum_screen(
+                path,
+                name,
+                source_video=self.info.path if self.info is not None else None,
+                source_frame=int(point.frame),
+                folder_id=folder_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存できませんでした", str(exc))
+            return
+        self._item_tsum_cache[self._item_cache_key(point)] = saved_name
+        self._reload_tsum_reader()
+        self._refresh_info_pane()
+        self.statusBar().showMessage(f"使用ツムを {saved_name} にしました。いま {count} 枚。", 6000)
+
+    def fix_used_tsum(self) -> None:
+        names = tsum_class_names()
+        if not names:
+            QMessageBox.information(
+                self,
+                "修正",
+                "まだ種類がありません。「新規登録」で名前を付けてください。",
+            )
+            return
+        point = self._used_tsum_target("修正")
+        if point is None:
+            return
+        current = self._item_tsum_cache.get(self._item_cache_key(point), "")
+        choices = [name for name in names if name != current] or names
+        dialog = QDialog(self)
+        dialog.setWindowTitle("修正")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("どれですか？"))
+        name_list = QListWidget()
+        for name in choices:
+            name_list.addItem(name)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn.setText("これに直す")
+        cancel_btn.setText("やめる")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        row = name_list.currentItem()
+        if row is None:
+            return
+        self._apply_used_tsum_name(row.text(), "修正")
+
+    def register_used_tsum(self) -> None:
+        point = self._used_tsum_target("新規登録")
+        if point is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("新規登録")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("表示名"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("キャプテンライトイヤー")
+        layout.addWidget(name_edit)
+        layout.addWidget(QLabel("フォルダ名"))
+        dir_edit = QLineEdit()
+        dir_edit.setPlaceholderText("c_bazu")
+        layout.addWidget(dir_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn.setText("登録する")
+        cancel_btn.setText("やめる")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_edit.returnPressed.connect(dialog.accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = " ".join(name_edit.text().split())
+        folder_id = "".join(dir_edit.text().split())
+        if not name:
+            QMessageBox.information(self, "新規登録", "表示名を入力してください。")
+            return
+        if tsum_id_for_name(name) is not None:
+            QMessageBox.information(
+                self,
+                "新規登録",
+                "同じ表示名があります。「修正」で選んでください。",
+            )
+            return
+        self._apply_used_tsum_name(name, "新規登録", folder_id=folder_id or None)
+
+    def edit_tsum_display_names(self) -> None:
+        entries = tsum_folder_entries()
+        if not entries:
+            QMessageBox.information(self, "表示名", "まだ種類がありません。")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("表示名")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(360)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("フォルダ"))
+        name_list = QListWidget()
+        for folder, display in entries:
+            row = QListWidgetItem(f"{display}  （{folder}）")
+            row.setData(Qt.ItemDataRole.UserRole, folder)
+            name_list.addItem(row)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        layout.addWidget(QLabel("表示名"))
+        display_edit = QLineEdit()
+        layout.addWidget(display_edit)
+
+        def fill_display() -> None:
+            row = name_list.currentItem()
+            if row is None:
+                display_edit.setText("")
+                return
+            folder = str(row.data(Qt.ItemDataRole.UserRole) or "")
+            display_edit.setText(shown_tsum_name(folder))
+
+        name_list.currentItemChanged.connect(lambda *_: fill_display())
+        fill_display()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn.setText("保存する")
+        cancel_btn.setText("やめる")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        row = name_list.currentItem()
+        if row is None:
+            return
+        folder = str(row.data(Qt.ItemDataRole.UserRole) or "")
+        display = " ".join(display_edit.text().split())
+        try:
+            saved = set_tsum_display_name(folder, display)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存できませんでした", str(exc))
+            return
+        self._reload_tsum_reader()
+        for key, name in list(self._item_tsum_cache.items()):
+            if tsum_id_for_name(name) == folder or name == folder:
+                self._item_tsum_cache[key] = saved
+        self._refresh_info_pane()
+        self.statusBar().showMessage(f"{folder} の表示名を {saved} にしました。", 5000)
+
+    def use_existing_item_box(self) -> None:
+        point, slot, current = self._current_item_target()
+        if point is None or slot is None:
+            return
+        width, height = self._image_size_for_point(point)
+        boxes = self._item_store.boxes_for(slot, width, height, extra=self._session_item_extras(slot))
+        from_own = bool(boxes)
+        if not boxes:
+            boxes = self._item_boxes_from_other_slots(point, slot)
+        if not boxes and self._last_item_box is not None:
+            copied = self._copy_item_box_size(self._last_item_box, point)
+            if copied is not None:
+                boxes = [copied]
+        if not boxes:
+            QMessageBox.information(
+                self,
+                "枠がありません",
+                "覚えている枠がまだありません。先に正しい枠で「枠を保存」をしてください。",
+            )
+            return
+        cache_key = self._item_box_cache_key(point, slot)
+        start = self._box_cycle_at.get(cache_key, 0)
+        chosen = boxes[0]
+        index = 0
+        if current is not None and width > 0 and height > 0:
+            for offset in range(1, len(boxes) + 1):
+                index = (start + offset) % len(boxes)
+                candidate = boxes[index]
+                if not boxes_close(candidate, current, width, height):
+                    chosen = candidate
+                    break
+            else:
+                QMessageBox.information(
+                    self,
+                    "既存の枠",
+                    f"この種類の枠は {len(boxes)} パターンあります。いまの枠と同じです。",
+                )
+                return
+        else:
+            index = start % len(boxes)
+            chosen = boxes[index]
+        self._box_cycle_at[cache_key] = index
+        self._item_box_cache[cache_key] = dict(chosen)
+        self._preview_coin_box = dict(chosen)
+        self._remember_last_item_box(chosen)
+        if from_own:
+            self._remember_session_box(slot, chosen, width, height)
+        self.preview.set_image(self._full_pixmap, chosen)
+        self._read_point_items(point, force=True)
+        self._refresh_info_pane()
+        self.statusBar().showMessage(
+            f"既存の枠 {index + 1}/{len(boxes)} を使いました。この位置は次の解析からも使います。",
+            5000,
+        )
+
+    def apply_item_box_to_same_kind(self) -> None:
+        point, slot, box = self._current_item_target()
+        if point is None or slot is None:
+            return
+        if box is None:
+            QMessageBox.information(self, "枠がありません", "先に枠を直してください。")
+            return
+        width, height = self._image_size_for_point(point)
+        self._remember_session_box(slot, box, width, height)
+        self._item_store.add(slot, box, width, height, persist=False)
+        updated = 0
+        for other in self._list_points():
+            if not self._is_item_point(other):
+                continue
+            other_w, other_h = self._image_size_for_point(other)
+            scaled = _scale_box(box, width, height, other_w, other_h) if other_w and other_h else dict(box)
+            self._item_box_cache[self._item_box_cache_key(other, slot)] = dict(scaled)
+            updated += 1
+        self._preview_coin_box = dict(box)
+        self._read_point_items(point, force=True)
+        self._refresh_info_pane()
+        self.statusBar().showMessage(
+            f"item {updated} 枚にこの枠を使いました。この位置は次の解析からも使います。",
+            5000,
+        )
+
+    def _read_point_items(self, point, force: bool = False) -> None:
+        cache_key = self._item_cache_key(point)
+        have_used = cache_key in self._item_used_cache
+        have_tsum = cache_key in self._item_tsum_cache
+        if not force and have_used and have_tsum:
+            return
+        used: set[str] = set(self._item_used_cache.get(cache_key) or [])
+        tsum_name = self._item_tsum_cache.get(cache_key, "")
+        try:
+            path = self._point_image_path(point)
+            with Image.open(path) as opened:
+                rgb = opened.convert("RGB")
+            width, height = rgb.size
+            if force or not have_used:
+                used = set()
+                for slot in ITEM_SLOT_KEYS:
+                    box = self._item_box_cache.get(self._item_box_cache_key(point, slot))
+                    if box is None:
+                        box = self._item_store.box_for(slot, width, height, extra=self._session_item_extras(slot))
+                        if box is not None:
+                            self._item_box_cache[self._item_box_cache_key(point, slot)] = dict(box)
+                    if box is None:
+                        continue
+                    if box_means_used(rgb, box):
+                        used.add(slot)
+            if force or not have_tsum:
+                tsum_name = self._tsum_reader_instance().read_screen(rgb)
+        except Exception:
+            pass
+        if force or not have_used:
+            self._item_used_cache[cache_key] = used
+        if force or not have_tsum:
+            self._item_tsum_cache[cache_key] = tsum_name
+
+    def start_tsum_train(self) -> None:
+        if isinstance(self.worker, TsumTrainWorker):
+            self.worker.requestInterruption()
+            self.tsum_train_btn.setEnabled(False)
+            self.tsum_train_btn.setText("中止しています…")
+            self.statusBar().showMessage("使用ツムの学習を中止しています")
+            return
+        if self.worker is not None:
+            return
+        count = tsum_teaching_count()
+        names = tsum_class_names()
+        if count < MIN_TSUM_SAMPLES:
+            QMessageBox.information(
+                self,
+                "まだ足りません",
+                f"使用ツムの学習には {MIN_TSUM_SAMPLES} 枚以上必要です。いま {count} 枚です。",
+            )
+            return
+        if not self._confirm_train(
+            "使用ツムを学習します",
+            "item 画面の使用ツムを見分けます。切り抜きは app/assets/images/use_tsums に種類ごとのフォルダで溜めます。\n"
+            f"いま {count} 枚、{len(names)} 種類です。\n始めますか？",
+        ):
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, TSUM_EPOCHS)
+        self.progress.setValue(0)
+        self.worker = TsumTrainWorker()
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_tsum_trained)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+        self._update_buttons()
+        self.statusBar().showMessage("使用ツムを学習しています")
+
+    def on_tsum_trained(self, metrics: dict) -> None:
+        self.progress.setVisible(False)
+        self._clear_worker()
+        self._reload_tsum_reader()
+        self._item_tsum_cache = {}
+        self._update_buttons()
+        acc = float(metrics.get("acc") or 0)
+        samples = int(metrics.get("samples") or 0)
+        kinds = len(metrics.get("classes") or [])
+        QMessageBox.information(
+            self,
+            "学習完了",
+            f"使用ツムを {samples} 枚、{kinds} 種類で学習しました。\n"
+            "次の解析から使います。",
+        )
+        self.statusBar().showMessage(f"使用ツムを学習しました  精度 {acc:.0%}", 5000)
+        point = self._current_point()
+        if point is not None and self._is_item_point(point):
+            self._read_point_items(point, force=True)
+            self._sync_item_preview(point)
+            self._fit_preview()
+
     def _format_coin_edit(self, number: str) -> str:
         digits = "".join(char for char in (number or "") if char.isdigit())
         if not digits:
             return ""
         return f"{int(digits):,}"
-
-    def _sync_coin_preview(self, point) -> None:
-        key = self._coin_box_key_for_point(point)
-        if key is None:
-            self._preview_coin_box = None
-            self.preview.editable = False
-            self._set_coin_fix_visible(False)
-            return
-        cache_key = self._coin_cache_key(point, key)
-        number = self._read_point_coin(point, key)
-        box = self._coin_box_cache.get(cache_key)
-        if box is None:
-            try:
-                path = self._point_image_path(point)
-                box, number = self._coin_reader_instance().inspect_path(
-                    path, key, extra=self._session_box_extras(key)
-                )
-                if box is not None:
-                    self._coin_box_cache[cache_key] = box
-                self._coin_cache[cache_key] = number
-            except Exception:
-                box = None
-        self._preview_coin_box = box
-        self.preview.editable = True
-        self._set_coin_fix_visible(True)
-        self.coin_edit.setText(self._format_coin_edit(number))
-        self._refresh_coin_saved_color(self._coin_is_taught(point, key))
-        self._refresh_info_pane()
 
     def _refresh_coin_saved_color(self, saved: bool) -> None:
         self.coin_edit.setStyleSheet(f"color: {SAVED_COIN_COLOR};" if saved else "")
@@ -1576,11 +2267,20 @@ class MainWindow(QMainWindow):
             self.go_timeup_value.setText("—")
             self.play_coin_value.setText("—")
             self.result_coin_value.setText("—")
+            if hasattr(self, "play_net_value"):
+                self.play_net_value.setText("—")
+            if hasattr(self, "result_net_value"):
+                self.result_net_value.setText("—")
             self.coin_ratio_value.setText("—")
             self.play_per_min_value.setText("—")
             self.result_per_min_value.setText("—")
             self.elapsed_value.setText("—")
             self.estimate_value.setText("—")
+            if hasattr(self, "used_tsum_value"):
+                self.used_tsum_value.setText("—")
+            if hasattr(self, "item_cost_value"):
+                self.item_cost_value.setText("—")
+            self._set_item_icons(set())
             return
         self.video_time_value.setText(self.info.format_duration())
         points = self._list_points()
@@ -1605,6 +2305,10 @@ class MainWindow(QMainWindow):
             pending = coin_points + result_points
             self.play_coin_value.setText("読み取り中…")
             self.result_coin_value.setText("読み取り中…")
+            if hasattr(self, "play_net_value"):
+                self.play_net_value.setText("—")
+            if hasattr(self, "result_net_value"):
+                self.result_net_value.setText("—")
             QApplication.processEvents()
             self.coin_ratio_value.setText("—")
             self.play_per_min_value.setText("—")
@@ -1625,9 +2329,84 @@ class MainWindow(QMainWindow):
         self._set_coin_value_text(self.play_coin_value, coin_points, "coin")
         self._set_coin_value_text(self.result_coin_value, result_points, "result_coin")
         self.coin_ratio_value.setText(self._ratio_text(coin_points, result_points))
+        item_points = [point for point in points if self._is_item_point(point)]
+        if read_coins and item_points:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                for index, point in enumerate(item_points, start=1):
+                    self._read_point_items(point, force=True)
+                    self.statusBar().showMessage(f"アイテムを読んでいます {index}/{len(item_points)}")
+                    QApplication.processEvents()
+            except Exception:
+                pass
+            finally:
+                QApplication.restoreOverrideCursor()
+        used: set[str] = set()
+        tsum_names: list[str] = []
+        cost_parts: list[str] = []
+        for point in item_points:
+            cache_key = self._item_cache_key(point)
+            point_used = set(self._item_used_cache.get(cache_key) or [])
+            used |= point_used
+            name = shown_tsum_name(self._item_tsum_cache.get(cache_key, ""))
+            if name:
+                tsum_names.append(html.escape(name))
+            if point_used or cache_key in self._item_used_cache:
+                cost_parts.append(f"{item_coin_cost(point_used):,}")
+        self._set_item_icons(used)
+        if hasattr(self, "item_cost_value"):
+            if cost_parts:
+                self.item_cost_value.setText("\n".join(cost_parts))
+            else:
+                self.item_cost_value.setText("—")
+        if hasattr(self, "used_tsum_value"):
+            if tsum_names:
+                self.used_tsum_value.setTextFormat(Qt.TextFormat.RichText)
+                self.used_tsum_value.setText("<br>".join(tsum_names))
+            else:
+                self.used_tsum_value.setTextFormat(Qt.TextFormat.PlainText)
+                self.used_tsum_value.setText("—")
+        play_net, result_net = self._net_coin_texts(coin_points, result_points)
+        if hasattr(self, "play_net_value"):
+            self.play_net_value.setText(play_net)
+        if hasattr(self, "result_net_value"):
+            self.result_net_value.setText(result_net)
         play_rate, result_rate = self._per_minute_texts(coin_points, result_points)
         self.play_per_min_value.setText(play_rate)
         self.result_per_min_value.setText(result_rate)
+        if read_coins:
+            self._relabel_item_points()
+
+    def _item_point_extra(self, point) -> str:
+        extra = f"{self.scene_labels.name_of(point.kind)} {point.score:.0%}"
+        tsum = shown_tsum_name(self._item_tsum_cache.get(self._item_cache_key(point), ""))
+        if tsum:
+            extra = f"{extra}  {tsum}"
+        return extra
+
+    def _relabel_item_points(self) -> None:
+        if not hasattr(self, "point_list"):
+            return
+        for row in range(self.point_list.count()):
+            item = self.point_list.item(row)
+            if item is None:
+                continue
+            point = item.data(Qt.ItemDataRole.UserRole)
+            if point is None or not self._is_item_point(point):
+                continue
+            label = f"  {self._item_point_extra(point)}"
+            item.setText(
+                f"{point.index}    {format_timecode(point.seconds)}    {point.percent * 100:.1f}%{label}"
+            )
+
+    def _set_item_icons(self, used: set[str]) -> None:
+        fades = getattr(self, "_info_icon_fades", None)
+        if not fades:
+            return
+        for slot, icon_key in ITEM_ICON_KEYS.items():
+            fade = fades.get(icon_key)
+            if fade is not None:
+                fade.setOpacity(ICON_ON if slot in used else ICON_DIM)
 
     def _set_coin_value_text(self, label: QLabel, points: list, box_key: str) -> None:
         parts: list[str] = []
@@ -1689,10 +2468,32 @@ class MainWindow(QMainWindow):
             return in_window[0][1]
         return None
 
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+            and watched in {getattr(self, "play_per_min_value", None), getattr(self, "result_per_min_value", None)}
+        ):
+            self._cycle_rate_unit()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _cycle_rate_unit(self) -> None:
+        nxt = {"s": "m", "m": "h", "h": "s"}
+        self._rate_unit = nxt.get(self._rate_unit, "s")
+        self._refresh_info_pane()
+
     def _format_per_minute(self, amount: int | None, duration_sec: float) -> str:
         if amount is None or duration_sec <= 0:
             return "—"
-        return f"{amount / (duration_sec / 60.0):.2f}"
+        per_sec = amount / duration_sec
+        if self._rate_unit == "s":
+            value = per_sec
+        elif self._rate_unit == "h":
+            value = per_sec * 3600.0
+        else:
+            value = per_sec * 60.0
+        return f"{value:.2f} /{self._rate_unit}"
 
     def _rate_lines(self, values: list[str]) -> str:
         if not values:
@@ -1703,29 +2504,60 @@ class MainWindow(QMainWindow):
             f"{index}回目  {text}" for index, text in enumerate(values, start=1)
         )
 
-    def _per_minute_texts(self, coin_points: list, result_points: list) -> tuple[str, str]:
-        pairs = self._go_timeup_pairs(self._list_points())
-        if not pairs:
-            return "—", "—"
+    def _format_net_amount(self, amount: int | None) -> str:
+        if amount is None:
+            return "—"
+        return f"{amount:,}"
+
+    def _item_cost_before_go(self, points: list, prev_end: float, go: float) -> int:
+        items = [
+            point
+            for point in points
+            if self._is_item_point(point) and prev_end < point.seconds <= go
+        ]
+        if not items:
+            return 0
+        used = set(self._item_used_cache.get(self._item_cache_key(items[-1])) or [])
+        return item_coin_cost(used)
+
+    def _game_net_amounts(
+        self, coin_points: list, result_points: list
+    ) -> list[tuple[float, int | None, int | None]]:
+        points = self._list_points()
+        pairs = self._go_timeup_pairs(points)
         coins = self._coin_numbers(coin_points, "coin")
         results = self._coin_numbers(result_points, "result_coin")
-        play_lines: list[str] = []
-        result_lines: list[str] = []
+        games: list[tuple[float, int | None, int | None]] = []
+        prev_end = 0.0
         for index, (go, timeup) in enumerate(pairs):
             next_go = pairs[index + 1][0] if index + 1 < len(pairs) else float("inf")
-            duration = timeup - go
-            play_lines.append(
-                self._format_per_minute(
-                    self._pick_number_in_window(coins, go, next_go, timeup),
-                    duration,
-                )
-            )
-            result_lines.append(
-                self._format_per_minute(
-                    self._pick_number_in_window(results, go, next_go, timeup),
-                    duration,
-                )
-            )
+            cost = self._item_cost_before_go(points, prev_end, go)
+            play = self._pick_number_in_window(coins, go, next_go, timeup)
+            result = self._pick_number_in_window(results, go, next_go, timeup)
+            net_play = None if play is None else play - cost
+            net_result = None if result is None else result - cost
+            games.append((timeup - go, net_play, net_result))
+            prev_end = timeup
+        return games
+
+    def _net_coin_texts(self, coin_points: list, result_points: list) -> tuple[str, str]:
+        games = self._game_net_amounts(coin_points, result_points)
+        if not games:
+            return "—", "—"
+        play_lines = [self._format_net_amount(play) for _duration, play, _result in games]
+        result_lines = [self._format_net_amount(result) for _duration, _play, result in games]
+        return self._rate_lines(play_lines), self._rate_lines(result_lines)
+
+    def _per_minute_texts(self, coin_points: list, result_points: list) -> tuple[str, str]:
+        games = self._game_net_amounts(coin_points, result_points)
+        if not games:
+            return "—", "—"
+        play_lines = [
+            self._format_per_minute(play, duration) for duration, play, _result in games
+        ]
+        result_lines = [
+            self._format_per_minute(result, duration) for duration, _play, result in games
+        ]
         return self._rate_lines(play_lines), self._rate_lines(result_lines)
 
     def _ratio_text(self, coin_points: list, result_points: list) -> str:
@@ -2641,9 +3473,39 @@ class MainWindow(QMainWindow):
         return (
             f"{name}  {found}枚\n"
             f"  GO→TIME UP  {self.go_timeup_value.text()}\n"
-            f"  coin  {self._plain_coin_join('coin')}（1分あたり {self.play_per_min_value.text()}）\n"
-            f"  result  {self._plain_coin_join('result_coin')}（1分あたり {self.result_per_min_value.text()}）"
+            f"  使用ツム  {self._plain_tsum_join()}\n"
+            f"  アイテム消費  {self._plain_item_cost_join()}\n"
+            f"  coin  {self._plain_coin_join('coin')}\n"
+            f"  coin から引いた  {self.play_net_value.text()}（1分あたり {self.play_per_min_value.text()}）\n"
+            f"  result  {self._plain_coin_join('result_coin')}\n"
+            f"  result から引いた  {self.result_net_value.text()}（1分あたり {self.result_per_min_value.text()}）"
         )
+
+    def _plain_item_cost_join(self) -> str:
+        parts: list[str] = []
+        for point in self._list_points():
+            if not self._is_item_point(point):
+                continue
+            cache_key = self._item_cache_key(point)
+            if cache_key not in self._item_used_cache:
+                continue
+            used = set(self._item_used_cache.get(cache_key) or [])
+            parts.append(f"{item_coin_cost(used):,}")
+        if not parts:
+            return "—"
+        return "、".join(parts)
+
+    def _plain_tsum_join(self) -> str:
+        names: list[str] = []
+        for point in self._list_points():
+            if not self._is_item_point(point):
+                continue
+            name = shown_tsum_name(self._item_tsum_cache.get(self._item_cache_key(point), ""))
+            if name:
+                names.append(name)
+        if not names:
+            return "—"
+        return "、".join(names)
 
     def _continue_batch_extract(self) -> None:
         if not self._batch_extract:
