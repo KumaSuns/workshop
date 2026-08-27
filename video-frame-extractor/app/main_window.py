@@ -219,7 +219,7 @@ class MainWindow(QMainWindow):
         self._item_tsum_cache: dict[tuple[str, int], str] = {}
         self._item_box_cache: dict[tuple[str, int, str], dict[str, int]] = {}
         self._last_item_box: dict[str, int] | None = None
-        self._rate_unit = "s"
+        self._rate_unit = "m"
         self._remembered_coin_keys: set[tuple[str, int, str]] = set()
         self._preview_coin_box: dict[str, int] | None = None
         self._session_box_patterns: dict[str, list[tuple[dict[str, int], int, int]]] = {
@@ -2479,17 +2479,14 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _cycle_rate_unit(self) -> None:
-        nxt = {"s": "m", "m": "h", "h": "s"}
-        self._rate_unit = nxt.get(self._rate_unit, "s")
+        self._rate_unit = "h" if self._rate_unit == "m" else "m"
         self._refresh_info_pane()
 
     def _format_per_minute(self, amount: int | None, duration_sec: float) -> str:
         if amount is None or duration_sec <= 0:
             return "—"
         per_sec = amount / duration_sec
-        if self._rate_unit == "s":
-            value = per_sec
-        elif self._rate_unit == "h":
+        if self._rate_unit == "h":
             value = per_sec * 3600.0
         else:
             value = per_sec * 60.0
