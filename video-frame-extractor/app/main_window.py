@@ -68,6 +68,7 @@ from app.scene_train import SCENE_EPOCHS, SceneTrainWorker
 from app.train_overlay import CPU_RGB, GPU_RGB, GlowBadge, TrainOverlay, apply_device_glow, soft_glow
 from app.coin_read import CoinReader, _scale_box, boxes_close
 from app.coin_teach import (
+    BOX_EPOCHS,
     DIGIT_EPOCHS,
     MIN_DIGIT_SAMPLES,
     DigitTrainWorker,
@@ -308,7 +309,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(teach_row2)
         self.left_coin_train_btn = QPushButton("コイン数字を学習する")
         left_layout.addWidget(self.left_coin_train_btn)
-        self.both_train_btn = QPushButton("画面とコイン数字を学習する")
+        self.both_train_btn = QPushButton("上の2つを続けて学習する")
         left_layout.addWidget(self.both_train_btn)
         self.browse_train_btn = QPushButton("学習画像を見る")
         left_layout.addWidget(self.browse_train_btn)
@@ -576,7 +577,7 @@ class MainWindow(QMainWindow):
         self.coin_apply_btn.setEnabled(coin_ready and not busy)
         self._set_coin_train_buttons(not busy or digit_training, digit_training)
         self.both_train_btn.setEnabled(not busy or self._train_both)
-        self.both_train_btn.setText("中止" if self._train_both and busy else "画面とコイン数字を学習する")
+        self.both_train_btn.setText("中止" if self._train_both and busy else "上の2つを続けて学習する")
         self.coin_edit.setEnabled(coin_ready and not busy)
         self._refresh_teach_label()
         self._sync_device_badges()
@@ -1143,20 +1144,20 @@ class MainWindow(QMainWindow):
                     self.info.path, int(point.frame), box_key, frame_slack=slack
                 )
             if taught_digits:
-                if taught_box is not None:
-                    self._coin_box_cache[cache_key] = dict(taught_box)
-                self._coin_cache[cache_key] = taught_digits
                 self._remembered_coin_keys.add(cache_key)
-                return taught_digits
-            box = self._coin_box_cache.get(cache_key)
-            if box is not None:
-                number = self._coin_reader_instance().read_box(path, box)
+            if taught_box is not None:
+                self._coin_box_cache[cache_key] = dict(taught_box)
+                number = self._coin_reader_instance().read_box(path, taught_box, box_key)
             else:
-                box, number = self._coin_reader_instance().inspect_path(
-                    path, box_key, extra=self._session_box_extras(box_key)
-                )
+                box = self._coin_box_cache.get(cache_key)
                 if box is not None:
-                    self._coin_box_cache[cache_key] = box
+                    number = self._coin_reader_instance().read_box(path, box, box_key)
+                else:
+                    box, number = self._coin_reader_instance().inspect_path(
+                        path, box_key, extra=self._session_box_extras(box_key)
+                    )
+                    if box is not None:
+                        self._coin_box_cache[cache_key] = box
         except Exception:
             number = ""
         self._coin_cache[cache_key] = number
@@ -1229,7 +1230,7 @@ class MainWindow(QMainWindow):
         self._remember_session_box(key, box, width, height)
         try:
             path = self._point_image_path(point)
-            number = self._coin_reader_instance().read_box(path, box)
+            number = self._coin_reader_instance().read_box(path, box, key)
         except Exception:
             number = ""
         self._coin_cache[cache_key] = number
@@ -1441,7 +1442,7 @@ class MainWindow(QMainWindow):
             return
         if not self._confirm_train(
             "コインの数字を学習します",
-            "コインの数字を読む学習を始めます。\n"
+            "コインの枠の位置と、枠の中の数字を学習します。\n"
             "画面の種類（GO や result など）の学習ではありません。\n"
             "coin と result は別々に学習します。\n\n"
             f"coin {coin_n} 枚、result {result_n} 枚です。\n始めますか？",
@@ -1473,7 +1474,7 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
         self._update_buttons()
-        self.statusBar().showMessage("コイン数字を学習しています")
+        self.statusBar().showMessage("コインの枠と数字を学習しています")
 
     def on_digits_trained(self, metrics: dict) -> None:
         self.progress.setVisible(False)
@@ -1484,6 +1485,7 @@ class MainWindow(QMainWindow):
         except Exception:
             self._coin_reader = None
         self._coin_cache = {}
+        self._coin_box_cache = {}
         both = self._train_both
         scene_metrics = self._both_scene_metrics
         self._train_both = False
@@ -1492,7 +1494,7 @@ class MainWindow(QMainWindow):
         acc = float(metrics.get("acc") or 0)
         samples = int(metrics.get("samples") or 0)
         digit_lines = self._digit_train_summary(metrics)
-        self._remember_train_duration("digit", samples, DIGIT_EPOCHS, 4, self._digit_train_started_at)
+        self._remember_train_duration("digit", samples, DIGIT_EPOCHS + BOX_EPOCHS, 4, self._digit_train_started_at)
         self._digit_train_started_at = None
         if both and scene_metrics is not None:
             scene_acc = float(scene_metrics.get("acc") or 0)
@@ -1504,7 +1506,7 @@ class MainWindow(QMainWindow):
                 f"{digit_lines}\n"
                 "次の解析から使います。",
             )
-            self.statusBar().showMessage("画面とコイン数字を学習しました", 5000)
+            self.statusBar().showMessage("画面の種類とコインを学習しました", 5000)
         else:
             QMessageBox.information(
                 self,
@@ -1519,20 +1521,25 @@ class MainWindow(QMainWindow):
 
     def _digit_train_summary(self, metrics: dict) -> str:
         by_key = metrics.get("by_key") or {}
-        labels = {"coin": "coin の数字", "result_coin": "result の数字"}
+        names = {"coin": "coin", "result_coin": "result"}
         lines = []
         for key in ("coin", "result_coin"):
             item = by_key.get(key)
             if not item:
                 continue
-            acc = float(item.get("acc") or 0)
+            name = names[key]
             samples = int(item.get("samples") or 0)
-            lines.append(f"{labels[key]}を {samples} 枚で学習しました。数字の一致 {acc:.0%}")
+            iou = float(item.get("iou") or 0)
+            acc = float(item.get("acc") or 0)
+            box_extra = "。前回より下がったので前のままです" if item.get("box_kept") else ""
+            digit_extra = "。前回より下がったので前のままです" if item.get("kept") else ""
+            lines.append(f"{name} の枠を {samples} 枚で学習しました。重なり {iou:.0%}{box_extra}")
+            lines.append(f"{name} の数字を {samples} 枚で学習しました。数字の一致 {acc:.0%}{digit_extra}")
         if lines:
             return "\n".join(lines)
         acc = float(metrics.get("acc") or 0)
         samples = int(metrics.get("samples") or 0)
-        return f"コイン数字を {samples} 枚で学習しました。数字の一致 {acc:.0%}"
+        return f"コインを {samples} 枚で学習しました。数字の一致 {acc:.0%}"
 
     def _go_timeup_pairs(self, points: list) -> list[tuple[float, float]]:
         go_keys = set(self.scene_labels.keys_named("go"))
@@ -2419,12 +2426,15 @@ class MainWindow(QMainWindow):
         scene_seconds = self._estimate_scene_train_seconds()
         digit_seconds = self._estimate_digit_train_seconds(digit_count)
         if not self._confirm_train(
-            "画面とコイン数字を学習します",
-            "画面の種類と、コインの数字の両方を学習します。\n"
-            "確認はこの1回だけです。画面の学習のあと、続けて数字の学習を始めます。\n\n"
+            "上の2つを続けて学習します",
+            "上の「学習する」と「コイン数字を学習する」を、続けて実行します。新しい学習ではありません。\n\n"
+            "「学習する」は画面の種類です。GO、result、item、timeup など、今どの画面かを見分けます。\n"
+            "「コイン数字を学習する」は、コインの緑枠の位置と、その中の数字です。\n\n"
+            "ここの画面は、緑のコイン枠ではありません。解析で使う画面の種類のことです。\n"
+            "緑の枠だけなら「コイン数字を学習する」と同じです。種類の学習も一緒にやりたいときの一括です。\n\n"
             "【画面の種類】\n"
             + self._scene_train_summary()
-            + f"\n\n【コインの数字】\ncoin {counts['coin']} 枚、result {counts['result_coin']} 枚\n\n始めますか？",
+            + f"\n\n【コインの枠と数字】\ncoin {counts['coin']} 枚、result {counts['result_coin']} 枚\n\n始めますか？",
             seconds=scene_seconds + digit_seconds,
         ):
             return
@@ -2758,7 +2768,7 @@ class MainWindow(QMainWindow):
         return self._estimate_train_seconds(
             "digit",
             count if count is not None else digit_teaching_count(),
-            DIGIT_EPOCHS,
+            DIGIT_EPOCHS + BOX_EPOCHS,
             4,
             8.0 if cuda else 4.0,
             0.22 if cuda else 1.5,

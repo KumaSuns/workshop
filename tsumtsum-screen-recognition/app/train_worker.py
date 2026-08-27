@@ -19,10 +19,10 @@ from app.digit_model import (
     CoinDigitNet,
     decode_indices,
     decode_logits,
-    digit_ctc_loss,
+    digit_layout_for_key,
     encode_digits,
 )
-from app.hud_number import crop_box
+from app.hud_number import crop_box, prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, KIND_CHANNELS, PIECE_INPUT, PieceNet, draw_gaussian
 from app.regions import REGION_LABELS
@@ -30,6 +30,18 @@ from app.scene_model import SCENE_INPUT, SceneNet, scene_index
 
 MIN_TRAIN_SAMPLES = 5
 TRAIN_EPOCHS = 40
+
+
+def _checkpoint(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {"state_dict": payload}
 
 
 class TrainingCancelled(Exception):
@@ -142,15 +154,20 @@ class CoinDigitDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         sample = self.samples[index]
         key = self.key
-        if key not in sample.regions or not str(sample.readings.get(key) or "").isdigit():
-            for item in ("result_coin", "coin"):
-                if sample.regions.get(item) and str(sample.readings.get(item) or "").isdigit():
-                    key = item
-                    break
-        crop = crop_box(sample.image_path, sample.regions[key])
+        digits = "".join(char for char in str(sample.readings.get(key) or "") if char.isdigit())
+        box = dict(sample.regions[key])
+        if self.augment and key == "coin":
+            width = max(1, int(box["w"]))
+            height = max(1, int(box["h"]))
+            box["x"] = int(box["x"]) + random.randint(-max(2, width // 16), max(2, width // 16))
+            box["y"] = int(box["y"]) + random.randint(-max(1, height // 12), max(1, height // 12))
+            box["w"] = width + random.randint(-max(2, width // 20), max(2, width // 20))
+            box["h"] = height + random.randint(-max(1, height // 12), max(1, height // 12))
+        crop = crop_box(sample.image_path, box)
         if self.augment:
             crop = self.jitter(crop)
-        return self.normalize(crop), encode_digits(sample.readings.get(key, ""))
+        crop = prepare_digit_crop(crop, key)
+        return self.normalize(crop), encode_digits(digits, key=key)
 
 
 class SceneDataset(Dataset):
@@ -286,8 +303,13 @@ class TrainWorker(QThread):
                         part = [
                             sample
                             for sample in samples
-                            if sample.regions.get(box_key)
-                            and str(sample.readings.get(box_key) or "").isdigit()
+                            if box_key in sample.confirmed
+                            and sample.regions.get(box_key)
+                            and "".join(
+                                char
+                                for char in str(sample.readings.get(box_key) or "")
+                                if char.isdigit()
+                            )
                         ]
                         if len(part) < MIN_TRAIN_SAMPLES:
                             continue
@@ -327,18 +349,39 @@ class TrainWorker(QThread):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         dataset = RegionBoxDataset(samples, key, augment=True)
+        eval_set = RegionBoxDataset(samples, key, augment=False)
         loader = DataLoader(
             dataset,
             batch_size=min(4, len(dataset)),
             shuffle=True,
             num_workers=0,
         )
-        model = GameRegionNet()
+        previous = _checkpoint(model_path)
+        prev_state = previous.get("state_dict")
+        model = GameRegionNet(pretrained=not bool(prev_state))
+        if prev_state:
+            try:
+                model.load_state_dict(prev_state)
+            except Exception:
+                prev_state = None
+                model = GameRegionNet()
         model.freeze_backbone(train_last_block=True)
         model.to(device)
 
+        def eval_iou() -> float:
+            model.eval()
+            total_iou = 0.0
+            with torch.no_grad():
+                for index in range(len(eval_set)):
+                    image, box = eval_set[index]
+                    pred = model(image.unsqueeze(0).to(device))
+                    total_iou += box_iou(pred, box.unsqueeze(0).to(device)).sum().item()
+            return total_iou / max(len(eval_set), 1)
+
+        prev_iou = eval_iou() if prev_state else None
         trainable = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=1e-3, weight_decay=1e-4)
+        lr = 3e-4 if prev_state else 1e-3
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
         loss_fn = torch.nn.SmoothL1Loss()
 
@@ -350,7 +393,6 @@ class TrainWorker(QThread):
             self._raise_if_cancelled()
             model.train()
             total_loss = 0.0
-            total_iou = 0.0
             seen = 0
             batches = max(len(loader), 1)
             for batch_index, (images, boxes) in enumerate(loader, start=1):
@@ -364,7 +406,6 @@ class TrainWorker(QThread):
                 optimizer.step()
                 batch = images.size(0)
                 total_loss += loss.item() * batch
-                total_iou += box_iou(preds.detach(), boxes).sum().item()
                 seen += batch
                 self._emit_job_progress(
                     job_index,
@@ -374,8 +415,7 @@ class TrainWorker(QThread):
                     f"学習中です  {label}  {epoch}/{self.epochs}  （{batch_index}/{batches}）",
                 )
             scheduler.step()
-            mean_loss = total_loss / max(seen, 1)
-            mean_iou = total_iou / max(seen, 1)
+            mean_iou = eval_iou()
             if mean_iou > best_iou:
                 best_iou = mean_iou
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -390,10 +430,13 @@ class TrainWorker(QThread):
 
         if best_state is None:
             raise RuntimeError(f"「{label}」の学習結果を保存できませんでした")
-        torch.save(
-            {"state_dict": best_state, "iou": best_iou, "key": key, "samples": len(samples)},
-            model_path,
-        )
+        if prev_iou is not None and best_iou < float(prev_iou):
+            best_iou = float(prev_iou)
+        else:
+            torch.save(
+                {"state_dict": best_state, "iou": best_iou, "key": key, "samples": len(samples)},
+                model_path,
+            )
         return {
             "key": key,
             "label": label,
@@ -500,16 +543,50 @@ class TrainWorker(QThread):
             raise ValueError(f"「{label}」の学習には {MIN_TRAIN_SAMPLES} 枚以上必要です")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         dataset = CoinDigitDataset(samples, key=box_key, augment=True)
+        eval_set = CoinDigitDataset(samples, key=box_key, augment=False)
         loader = DataLoader(
             dataset,
             batch_size=min(4, len(dataset)),
             shuffle=True,
             num_workers=0,
         )
-        model = CoinDigitNet()
+        previous = _checkpoint(model_path)
+        prev_state = previous.get("state_dict")
+        layout = digit_layout_for_key(box_key)
+        if previous.get("layout") != layout:
+            prev_state = None
+        model = CoinDigitNet(pretrained=not bool(prev_state))
+        if prev_state:
+            try:
+                model.load_state_dict(prev_state)
+            except Exception:
+                prev_state = None
+                model = CoinDigitNet()
         model.to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+
+        def eval_acc() -> float:
+            model.eval()
+            exact = 0
+            with torch.no_grad():
+                for index in range(len(eval_set)):
+                    image, target = eval_set[index]
+                    logits = model(image.unsqueeze(0).to(device))
+                    exact += int(
+                        decode_logits(logits[0].detach().cpu()) == decode_indices(target)
+                    )
+            return exact / max(len(eval_set), 1)
+
+        prev_acc = eval_acc() if prev_state else None
+        if prev_acc is not None and prev_acc < 0.5:
+            prev_state = None
+            prev_acc = None
+            model = CoinDigitNet()
+            model.to(device)
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        lr = 3e-4 if prev_state else 1e-3
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
+        loss_fn = torch.nn.CrossEntropyLoss()
         best_acc = -1.0
         best_state = None
         model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -517,7 +594,6 @@ class TrainWorker(QThread):
             self._raise_if_cancelled()
             model.train()
             total_loss = 0.0
-            exact = 0
             seen = 0
             batches = max(len(loader), 1)
             for batch_index, (images, targets) in enumerate(loader, start=1):
@@ -526,15 +602,11 @@ class TrainWorker(QThread):
                 targets = targets.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 logits = model(images)
-                loss = digit_ctc_loss(logits, targets)
+                loss = loss_fn(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
                 loss.backward()
                 optimizer.step()
                 batch = images.size(0)
                 total_loss += loss.item() * batch
-                for row, truth in zip(logits, targets):
-                    exact += int(
-                        decode_logits(row.detach().cpu()) == decode_indices(truth.detach().cpu())
-                    )
                 seen += batch
                 self._emit_job_progress(
                     job_index,
@@ -544,8 +616,7 @@ class TrainWorker(QThread):
                     f"学習中です  {label}  {epoch}/{self.epochs}  （{batch_index}/{batches}）",
                 )
             scheduler.step()
-            mean_loss = total_loss / max(seen, 1)
-            acc = exact / max(seen, 1)
+            acc = eval_acc()
             if acc >= best_acc:
                 best_acc = acc
                 best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
@@ -559,10 +630,19 @@ class TrainWorker(QThread):
             self._raise_if_cancelled()
         if best_state is None:
             raise RuntimeError(f"「{label}」の学習結果を保存できませんでした")
-        torch.save(
-            {"state_dict": best_state, "acc": best_acc, "key": box_key, "samples": len(samples)},
-            model_path,
-        )
+        if prev_acc is not None and best_acc < float(prev_acc):
+            best_acc = float(prev_acc)
+        else:
+            torch.save(
+                {
+                    "state_dict": best_state,
+                    "acc": best_acc,
+                    "key": box_key,
+                    "samples": len(samples),
+                    "layout": layout,
+                },
+                model_path,
+            )
         return {
             "key": "coin_digits",
             "label": label,

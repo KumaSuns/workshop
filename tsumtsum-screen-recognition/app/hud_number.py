@@ -6,7 +6,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
@@ -54,6 +54,114 @@ def crop_box(image_path: Path, box: dict[str, int]) -> Image.Image:
         right = min(rgb.width, left + max(1, int(box["w"])))
         bottom = min(rgb.height, top + max(1, int(box["h"])))
         return rgb.crop((left, top, right, bottom))
+
+
+def _tight_ink(crop: Image.Image) -> Image.Image:
+    gray = crop.convert("L")
+    width, height = gray.size
+    limit = max(48, int(gray.getextrema()[1] * 0.55))
+    pixels = gray.load()
+    xs = [x for x in range(width) if any(pixels[x, y] >= limit for y in range(height))]
+    ys = [y for y in range(height) if any(pixels[x, y] >= limit for x in range(width))]
+    if not xs or not ys:
+        return crop
+    pad = 2
+    return crop.crop(
+        (
+            max(0, xs[0] - pad),
+            max(0, ys[0] - pad),
+            min(width, xs[-1] + 1 + pad),
+            min(height, ys[-1] + 1 + pad),
+        )
+    )
+
+
+def _drop_comma(crop: Image.Image) -> Image.Image:
+    gray = crop.convert("L")
+    width, height = gray.size
+    if width < 24:
+        return crop
+    limit = max(48, int(gray.getextrema()[1] * 0.55))
+    pixels = gray.load()
+    ink = [
+        sum(1 for y in range(height) if pixels[x, y] >= limit) / max(height, 1)
+        for x in range(width)
+    ]
+    left = int(width * 0.18)
+    right = int(width * 0.72)
+    if right - left < 8:
+        return crop
+    cut = min(range(left, right), key=lambda x: ink[x])
+    if ink[cut] > 0.12:
+        return crop
+    lo, hi = cut, cut
+    while lo > left and ink[lo] < 0.14:
+        lo -= 1
+    while hi < right - 1 and ink[hi] < 0.14:
+        hi += 1
+    if not (2 <= hi - lo <= max(10, width // 10)):
+        return crop
+    left_img = crop.crop((0, 0, max(1, lo), height))
+    right_img = crop.crop((min(width, hi), 0, width, height))
+    joined = Image.new("RGB", (left_img.size[0] + right_img.size[0], height))
+    joined.paste(left_img, (0, 0))
+    joined.paste(right_img, (left_img.size[0], 0))
+    return joined
+
+
+_SLOT_COUNT = 8
+_SLOT_WIDTH_RATIO = 0.72
+
+
+def _is_gold_pixel(red: int, green: int, blue: int) -> bool:
+    return red > 160 and green > 110 and blue < 180 and red >= green - 20 and red > blue + 25
+
+
+def _gold_icon_width(crop: Image.Image) -> int:
+    rgb = crop.convert("RGB")
+    width, height = rgb.size
+    if width < 16 or height < 8:
+        return 0
+    pixels = rgb.load()
+    last = 0
+    limit = min(width - 8, max(8, int(min(height * 1.2, width * 0.45))))
+    for x in range(limit):
+        gold = 0
+        for y in range(height):
+            red, green, blue = pixels[x, y]
+            if _is_gold_pixel(red, green, blue):
+                gold += 1
+        if gold / height > 0.12:
+            last = x + 1
+    if last < 8:
+        return 0
+    return min(width - 8, last + max(2, height // 12))
+
+
+def _pad_to_slots(crop: Image.Image) -> Image.Image:
+    width, height = crop.size
+    if height < 4:
+        return crop
+    canvas_w = max(width, int(round(height * _SLOT_WIDTH_RATIO)) * _SLOT_COUNT)
+    if canvas_w <= width:
+        return crop
+    canvas = Image.new("RGB", (canvas_w, height), (0, 0, 0))
+    canvas.paste(crop.convert("RGB"), (0, 0))
+    return canvas
+
+
+def prepare_digit_crop(crop: Image.Image, key: str = "coin") -> Image.Image:
+    crop = crop.convert("RGB")
+    if key != "coin":
+        return crop
+    crop = ImageOps.autocontrast(crop, cutoff=1)
+    skip = _gold_icon_width(crop)
+    if skip >= 8:
+        crop = crop.crop((skip, 0, crop.size[0], crop.size[1]))
+        crop = ImageOps.autocontrast(crop, cutoff=1)
+    crop = _tight_ink(crop)
+    crop = _drop_comma(crop)
+    return _pad_to_slots(crop)
 
 
 def enhance_digits(image: Image.Image) -> Image.Image:

@@ -65,16 +65,6 @@ def boxes_close(left: dict, right: dict, width: int, height: int) -> bool:
     )
 
 
-def _score_number(text: str) -> int:
-    digits = "".join(char for char in (text or "") if char.isdigit())
-    if not digits:
-        return 0
-    length = len(digits)
-    if 3 <= length <= 6:
-        return length + 10
-    return length
-
-
 def _clean_box(box: dict) -> dict[str, int]:
     return {
         "x": int(box["x"]),
@@ -168,12 +158,17 @@ class CoinReader:
             except Exception:
                 payload = {}
             for sample in reversed(payload.get("samples") or []):
+                if sample.get("status") in {"skipped", "predicted"}:
+                    continue
                 width = int(sample.get("width") or 0)
                 height = int(sample.get("height") or 0)
                 regions = sample.get("regions") or {}
+                readings = sample.get("readings") or {}
+                confirmed = sample.get("confirmed") or []
                 for key in ("coin", "result_coin"):
                     box = regions.get(key)
-                    if not box or width <= 0 or height <= 0:
+                    digits = "".join(char for char in str(readings.get(key) or "") if char.isdigit())
+                    if key not in confirmed or not box or not digits or width <= 0 or height <= 0:
                         continue
                     cleaned = _clean_box(box)
                     self._remember_pattern(key, cleaned, width, height)
@@ -272,12 +267,18 @@ class CoinReader:
         key: str,
         extra: list[tuple[dict[str, int], int, int]] | None = None,
     ) -> list[dict[str, int]]:
-        boxes = self.scaled_pattern_boxes(image.width, image.height, key, extra)
+        boxes: list[dict[str, int]] = []
         model = self._region_models.get(key)
         if model is not None:
-            predicted = self._decode_box(model, image)
-            if not any(boxes_close(predicted, seen, image.width, image.height) for seen in boxes):
-                boxes.append(predicted)
+            boxes.append(self._decode_box(model, image))
+        if extra:
+            for box, src_w, src_h in extra:
+                scaled = _scale_box(box, src_w, src_h, image.width, image.height)
+                if not any(boxes_close(scaled, seen, image.width, image.height) for seen in boxes):
+                    boxes.append(scaled)
+        for scaled in self.scaled_pattern_boxes(image.width, image.height, key):
+            if not any(boxes_close(scaled, seen, image.width, image.height) for seen in boxes):
+                boxes.append(scaled)
         if boxes:
             return boxes
         fallback = self._fallback.get(key)
@@ -311,6 +312,7 @@ class CoinReader:
             model = next(iter(self._digit_models.values()))
         if model is None:
             return ""
+        crop = self._hud.prepare_digit_crop(crop, key)
         tensor = self._digit_transform(crop.convert("RGB")).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = model(tensor)
@@ -338,17 +340,9 @@ class CoinReader:
         boxes = self._candidate_boxes(image, key, extra)
         if not boxes:
             return None, ""
-        best_box = boxes[0]
-        best_number = ""
-        best_score = -1
-        for box in boxes:
-            number = self._read_with_box(path, box, key)
-            score = _score_number(number)
-            if score > best_score:
-                best_score = score
-                best_box = box
-                best_number = number
-        return best_box, best_number
+        box = boxes[0]
+        number = self._read_with_box(path, box, key)
+        return box, number
 
     def read_box(self, path: Path, box: dict[str, int], key: str = "coin") -> str:
         return self._read_with_box(path, box, key)

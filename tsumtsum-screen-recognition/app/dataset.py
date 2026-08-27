@@ -151,6 +151,15 @@ class Dataset:
                 for sample in self._samples
                 if sample.status != "skipped" and key in sample.confirmed
             ]
+        if key in {"coin", "result_coin"}:
+            return [
+                sample
+                for sample in self._samples
+                if sample.status != "skipped"
+                and key in sample.confirmed
+                and sample.regions.get(key)
+                and "".join(char for char in str(sample.readings.get(key) or "") if char.isdigit())
+            ]
         return [
             sample
             for sample in self._samples
@@ -167,8 +176,9 @@ class Dataset:
             sample
             for sample in self._samples
             if sample.status != "skipped"
+            and key in sample.confirmed
             and sample.regions.get(key)
-            and str(sample.readings.get(key) or "").isdigit()
+            and "".join(char for char in str(sample.readings.get(key) or "") if char.isdigit())
         ]
 
     def labeled_digit_samples(self) -> list[Sample]:

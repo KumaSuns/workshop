@@ -270,7 +270,7 @@ class CoinTrainImagesWindow(QMainWindow):
         getter = getattr(self._host, "_coin_reader_instance", None)
         if callable(getter):
             try:
-                number = getter().read_box(Path(sample["path"]), box)
+                number = getter().read_box(Path(sample["path"]), box, sample.get("key") or "coin")
             except Exception:
                 number = ""
         self.coin_edit.setText(self._format_number(number))

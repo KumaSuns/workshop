@@ -14,6 +14,7 @@ from app.digit_model import (
     CoinDigitNet,
     decode_logits,
 )
+from app.hud_number import prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, peaks_from_heat
 from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename, piece_radius_from_game
@@ -175,6 +176,7 @@ class Predictor:
         model = self.digit_models.get(key) or self.digit_model
         if model is None:
             return ""
+        crop = prepare_digit_crop(crop, key)
         tensor = self._digit_transform(crop.convert("RGB")).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = model(tensor)

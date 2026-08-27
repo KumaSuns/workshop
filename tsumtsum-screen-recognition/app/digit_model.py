@@ -11,6 +11,8 @@ DIGIT_WIDTH = 256
 MAX_DIGITS = 8
 BLANK_INDEX = 10
 NUM_CLASSES = 11
+DIGIT_LAYOUT = "left-slots-v1"
+RESULT_DIGIT_LAYOUT = "right-v2"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -19,8 +21,17 @@ def digit_string(text: str) -> str:
     return re.sub(r"\D", "", text or "")
 
 
-def encode_digits(text: str) -> torch.Tensor:
-    digits = [int(char) for char in digit_string(text)[-MAX_DIGITS:]]
+def digit_layout_for_key(key: str) -> str:
+    return DIGIT_LAYOUT if key == "coin" else RESULT_DIGIT_LAYOUT
+
+
+def encode_digits(text: str, key: str = "coin") -> torch.Tensor:
+    raw = digit_string(text)
+    if key == "coin":
+        digits = [int(char) for char in raw[:MAX_DIGITS]]
+        pad = [BLANK_INDEX] * (MAX_DIGITS - len(digits))
+        return torch.tensor(digits + pad, dtype=torch.long)
+    digits = [int(char) for char in raw[-MAX_DIGITS:]]
     pad = [BLANK_INDEX] * (MAX_DIGITS - len(digits))
     return torch.tensor(pad + digits, dtype=torch.long)
 
@@ -31,47 +42,14 @@ def decode_indices(indices) -> str:
     return "".join(str(int(index)) for index in indices if 0 <= int(index) <= 9)
 
 
-def decode_ctc(indices) -> str:
-    if hasattr(indices, "tolist"):
-        indices = indices.tolist()
-    out: list[str] = []
-    prev = None
-    for raw in indices:
-        index = int(raw)
-        if index == prev:
-            continue
-        prev = index
-        if 0 <= index <= 9:
-            out.append(str(index))
-    return "".join(out)
-
-
 def decode_logits(logits: torch.Tensor) -> str:
     if logits.ndim == 3:
         logits = logits[0]
-    return decode_ctc(logits.argmax(dim=-1))
-
-
-def digit_ctc_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    log_probs = logits.log_softmax(dim=-1).permute(1, 0, 2)
-    flats: list[int] = []
-    lengths: list[int] = []
-    for row in targets:
-        seq = [int(index) for index in row.tolist() if 0 <= int(index) <= 9]
-        if not seq:
-            seq = [0]
-        flats.extend(seq)
-        lengths.append(len(seq))
-    flat = torch.tensor(flats, dtype=torch.long, device=logits.device)
-    target_lengths = torch.tensor(lengths, dtype=torch.long, device=logits.device)
-    input_lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long, device=logits.device)
-    return torch.nn.functional.ctc_loss(
-        log_probs, flat, input_lengths, target_lengths, blank=BLANK_INDEX, zero_infinity=True
-    )
+    return decode_indices(logits.argmax(dim=-1))
 
 
 class CoinDigitNet(nn.Module):
-    """コイン枠から数字列を読む。空白は CTC で読み飛ばす。"""
+    """コイン枠から数字列を読む。左詰め 8 桁、余りは空白。"""
 
     def __init__(self, pretrained: bool = True) -> None:
         super().__init__()

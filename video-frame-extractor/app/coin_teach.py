@@ -17,6 +17,7 @@ from app.data_sync import trainer_data_dir
 
 MIN_DIGIT_SAMPLES = 5
 DIGIT_EPOCHS = 20
+BOX_EPOCHS = 20
 
 
 def _index_path() -> Path:
@@ -425,6 +426,10 @@ DIGIT_MODEL_FILES = (
 )
 
 
+def _box_model_name(key: str) -> str:
+    return "coin.pt" if key == "coin" else f"{key}.pt"
+
+
 def _digit_items(key: str) -> list[tuple[Path, dict[str, int], str]]:
     path = _index_path()
     if not path.is_file():
@@ -432,26 +437,28 @@ def _digit_items(key: str) -> list[tuple[Path, dict[str, int], str]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     items: list[tuple[Path, dict[str, int], str]] = []
     for sample in payload.get("samples") or []:
-        if sample.get("status") == "skipped":
+        if sample.get("status") in {"skipped", "predicted"}:
             continue
         image = _images_dir() / str(sample.get("image") or "")
         if not image.is_file():
             continue
         box = (sample.get("regions") or {}).get(key)
         digits = _digits_only(str((sample.get("readings") or {}).get(key) or ""))
-        if box and digits:
-            items.append(
-                (
-                    image,
-                    {
-                        "x": int(box["x"]),
-                        "y": int(box["y"]),
-                        "w": int(box["w"]),
-                        "h": int(box["h"]),
-                    },
-                    digits,
-                )
+        confirmed = sample.get("confirmed") or []
+        if key not in confirmed or not box or not digits:
+            continue
+        items.append(
+            (
+                image,
+                {
+                    "x": int(box["x"]),
+                    "y": int(box["y"]),
+                    "w": int(box["w"]),
+                    "h": int(box["h"]),
+                },
+                digits,
             )
+        )
     return items
 
 
@@ -460,9 +467,18 @@ def digit_train_counts() -> dict[str, int]:
 
 
 class _CropSet(Dataset):
-    def __init__(self, items: list[tuple[Path, dict[str, int], str]], digit_mod) -> None:
+    def __init__(
+        self,
+        items: list[tuple[Path, dict[str, int], str]],
+        digit_mod,
+        key: str = "coin",
+        augment: bool = True,
+    ) -> None:
         self.items = items
         self.digit_mod = digit_mod
+        self.key = key
+        self.augment = augment
+        self.hud = _load("_tsum_hud_number", "hud_number.py")
         self.jitter = transforms.ColorJitter(0.2, 0.2, 0.2, 0.04)
         self.normalize = transforms.Compose(
             [
@@ -479,14 +495,82 @@ class _CropSet(Dataset):
         path, box, digits = self.items[index]
         with Image.open(path) as image:
             rgb = image.convert("RGB")
-        left = max(0, int(box["x"]))
-        top = max(0, int(box["y"]))
-        right = min(rgb.width, left + max(1, int(box["w"])))
-        bottom = min(rgb.height, top + max(1, int(box["h"])))
+        left = int(box["x"])
+        top = int(box["y"])
+        width = max(1, int(box["w"]))
+        height = max(1, int(box["h"]))
+        if self.augment and self.key == "coin":
+            left += random.randint(-max(2, width // 16), max(2, width // 16))
+            top += random.randint(-max(1, height // 12), max(1, height // 12))
+            width += random.randint(-max(2, width // 20), max(2, width // 20))
+            height += random.randint(-max(1, height // 12), max(1, height // 12))
+        left = max(0, left)
+        top = max(0, top)
+        right = min(rgb.width, left + max(1, width))
+        bottom = min(rgb.height, top + max(1, height))
         crop = rgb.crop((left, top, right, bottom))
-        if random.random() < 0.8:
+        if self.augment and random.random() < 0.8:
             crop = self.jitter(crop)
-        return self.normalize(crop), self.digit_mod.encode_digits(digits)
+        crop = self.hud.prepare_digit_crop(crop, self.key)
+        return self.normalize(crop), self.digit_mod.encode_digits(digits, key=self.key)
+
+
+class _BoxSet(Dataset):
+    def __init__(self, items: list[tuple[Path, dict[str, int], str]], region_mod, augment: bool = True) -> None:
+        self.items = items
+        self.augment = augment
+        self.jitter = transforms.ColorJitter(0.25, 0.25, 0.25, 0.05)
+        self.normalize = transforms.Compose(
+            [
+                transforms.Resize((region_mod.INPUT_SIZE, region_mod.INPUT_SIZE)),
+                transforms.ToTensor(),
+                transforms.Normalize(region_mod.IMAGENET_MEAN, region_mod.IMAGENET_STD),
+            ]
+        )
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        path, box, _digits = self.items[index]
+        with Image.open(path) as image:
+            rgb = image.convert("RGB")
+        width, height = rgb.size
+        x = int(box["x"]) / max(width, 1)
+        y = int(box["y"]) / max(height, 1)
+        w = int(box["w"]) / max(width, 1)
+        h = int(box["h"]) / max(height, 1)
+        if self.augment:
+            rgb = self.jitter(rgb)
+        return self.normalize(rgb), torch.tensor([x, y, w, h], dtype=torch.float32)
+
+
+def _box_iou(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_x2 = pred[:, 0] + pred[:, 2]
+    pred_y2 = pred[:, 1] + pred[:, 3]
+    tgt_x2 = target[:, 0] + target[:, 2]
+    tgt_y2 = target[:, 1] + target[:, 3]
+    left = torch.max(pred[:, 0], target[:, 0])
+    top = torch.max(pred[:, 1], target[:, 1])
+    right = torch.min(pred_x2, tgt_x2)
+    bottom = torch.min(pred_y2, tgt_y2)
+    inter = (right - left).clamp(min=0) * (bottom - top).clamp(min=0)
+    area_pred = pred[:, 2] * pred[:, 3]
+    area_tgt = target[:, 2] * target[:, 3]
+    union = area_pred + area_tgt - inter
+    return inter / union.clamp(min=1e-6)
+
+
+def _checkpoint(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {"state_dict": payload}
 
 
 class DigitTrainWorker(QThread):
@@ -508,10 +592,25 @@ class DigitTrainWorker(QThread):
                     f"いま coin {counts['coin']} 枚、result {counts['result_coin']} 枚です。"
                 )
             digit_mod = _load("_tsum_digit_model", "digit_model.py")
+            region_mod = _load("_tsum_region_model", "model.py")
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             by_key: dict[str, dict] = {}
-            total_epochs = DIGIT_EPOCHS * len(jobs)
+            step = BOX_EPOCHS + DIGIT_EPOCHS
+            total_epochs = step * len(jobs)
             for job_index, (key, filename, label, items) in enumerate(jobs):
+                box_label = "coin の枠" if key == "coin" else "result の枠"
+                box_metrics = self._fit_box(
+                    items,
+                    _models_dir() / _box_model_name(key),
+                    region_mod,
+                    device,
+                    key,
+                    box_label,
+                    job_index * step,
+                    total_epochs,
+                )
+                if box_metrics is None:
+                    return
                 metrics = self._fit_one(
                     items,
                     _models_dir() / filename,
@@ -519,11 +618,13 @@ class DigitTrainWorker(QThread):
                     device,
                     key,
                     label,
-                    job_index * DIGIT_EPOCHS,
+                    job_index * step + BOX_EPOCHS,
                     total_epochs,
                 )
                 if metrics is None:
                     return
+                metrics["iou"] = box_metrics["iou"]
+                metrics["box_kept"] = box_metrics["kept"]
                 by_key[key] = metrics
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -536,6 +637,93 @@ class DigitTrainWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
+    def _fit_box(
+        self,
+        items: list[tuple[Path, dict[str, int], str]],
+        dest: Path,
+        region_mod,
+        device,
+        key: str,
+        label: str,
+        epoch_offset: int,
+        epoch_total: int,
+    ) -> dict | None:
+        previous = _checkpoint(dest)
+        prev_state = previous.get("state_dict")
+        dataset = _BoxSet(items, region_mod, augment=True)
+        eval_set = _BoxSet(items, region_mod, augment=False)
+        loader = DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=True, num_workers=0)
+        model = region_mod.GameRegionNet(pretrained=not bool(prev_state))
+        if prev_state:
+            try:
+                model.load_state_dict(prev_state)
+            except Exception:
+                prev_state = None
+                model = region_mod.GameRegionNet()
+        model.freeze_backbone(train_last_block=True)
+        model.to(device)
+
+        def eval_iou() -> float:
+            model.eval()
+            total = 0.0
+            with torch.no_grad():
+                for index in range(len(eval_set)):
+                    image, box = eval_set[index]
+                    pred = model(image.unsqueeze(0).to(device))
+                    total += _box_iou(pred, box.unsqueeze(0).to(device)).sum().item()
+            return total / max(len(eval_set), 1)
+
+        prev_iou = eval_iou() if prev_state else None
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        lr = 3e-4 if prev_state else 1e-3
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=BOX_EPOCHS)
+        loss_fn = torch.nn.SmoothL1Loss()
+        best_iou = -1.0
+        best_state = None
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        for epoch in range(1, BOX_EPOCHS + 1):
+            if self.isInterruptionRequested():
+                self.failed.emit("中止")
+                return None
+            model.train()
+            for images, boxes in loader:
+                if self.isInterruptionRequested():
+                    self.failed.emit("中止")
+                    return None
+                images = images.to(device)
+                boxes = boxes.to(device)
+                optimizer.zero_grad(set_to_none=True)
+                preds = model(images)
+                loss = loss_fn(preds, boxes)
+                loss.backward()
+                optimizer.step()
+            scheduler.step()
+            iou = eval_iou()
+            if iou > best_iou:
+                best_iou = iou
+                best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+            self.progress.emit(
+                epoch_offset + epoch,
+                epoch_total,
+                f"{label}を学習しています {epoch}/{BOX_EPOCHS}",
+            )
+        if best_state is None:
+            raise RuntimeError("学習結果を保存できませんでした")
+        kept = False
+        if prev_iou is not None and best_iou < float(prev_iou):
+            kept = True
+            best_iou = float(prev_iou)
+        else:
+            torch.save(
+                {"state_dict": best_state, "iou": best_iou, "key": key, "samples": len(items)},
+                dest,
+            )
+        del model, optimizer, scheduler, loader, dataset
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return {"iou": float(best_iou), "samples": len(items), "kept": kept}
+
     def _fit_one(
         self,
         items: list[tuple[Path, dict[str, int], str]],
@@ -547,12 +735,47 @@ class DigitTrainWorker(QThread):
         epoch_offset: int,
         epoch_total: int,
     ) -> dict | None:
-        dataset = _CropSet(items, digit_mod)
+        previous = _checkpoint(dest)
+        prev_state = previous.get("state_dict")
+        layout = digit_mod.digit_layout_for_key(key) if hasattr(digit_mod, "digit_layout_for_key") else getattr(digit_mod, "DIGIT_LAYOUT", "")
+        if previous.get("layout") != layout:
+            prev_state = None
+        dataset = _CropSet(items, digit_mod, key=key, augment=True)
+        eval_set = _CropSet(items, digit_mod, key=key, augment=False)
         loader = DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=True, num_workers=0)
-        model = digit_mod.CoinDigitNet()
+        model = digit_mod.CoinDigitNet(pretrained=not bool(prev_state))
+        if prev_state:
+            try:
+                model.load_state_dict(prev_state)
+            except Exception:
+                prev_state = None
+                model = digit_mod.CoinDigitNet()
         model.to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+
+        def eval_acc() -> float:
+            model.eval()
+            exact = 0
+            with torch.no_grad():
+                for index in range(len(eval_set)):
+                    image, target = eval_set[index]
+                    logits = model(image.unsqueeze(0).to(device))
+                    exact += int(
+                        digit_mod.decode_logits(logits[0].detach().cpu())
+                        == digit_mod.decode_indices(target)
+                    )
+            return exact / max(len(eval_set), 1)
+
+        prev_acc = eval_acc() if prev_state else None
+        if prev_acc is not None and prev_acc < 0.5:
+            prev_state = None
+            prev_acc = None
+            model = digit_mod.CoinDigitNet()
+            model.to(device)
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        lr = 3e-4 if prev_state else 1e-3
+        optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=DIGIT_EPOCHS)
+        loss_fn = torch.nn.CrossEntropyLoss()
         best_acc = -1.0
         best_state = None
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -561,8 +784,6 @@ class DigitTrainWorker(QThread):
                 self.failed.emit("中止")
                 return None
             model.train()
-            exact = 0
-            seen = 0
             for images, targets in loader:
                 if self.isInterruptionRequested():
                     self.failed.emit("中止")
@@ -571,17 +792,11 @@ class DigitTrainWorker(QThread):
                 targets = targets.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 logits = model(images)
-                loss = digit_mod.digit_ctc_loss(logits, targets)
+                loss = loss_fn(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
                 loss.backward()
                 optimizer.step()
-                for row, truth in zip(logits, targets):
-                    exact += int(
-                        digit_mod.decode_logits(row.detach().cpu())
-                        == digit_mod.decode_indices(truth.detach().cpu())
-                    )
-                seen += images.size(0)
             scheduler.step()
-            acc = exact / max(seen, 1)
+            acc = eval_acc()
             if acc >= best_acc:
                 best_acc = acc
                 best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
@@ -592,11 +807,22 @@ class DigitTrainWorker(QThread):
             )
         if best_state is None:
             raise RuntimeError("学習結果を保存できませんでした")
-        torch.save(
-            {"state_dict": best_state, "acc": best_acc, "key": key, "samples": len(items)},
-            dest,
-        )
+        kept = False
+        if prev_acc is not None and best_acc < float(prev_acc):
+            kept = True
+            best_acc = float(prev_acc)
+        else:
+            torch.save(
+                {
+                    "state_dict": best_state,
+                    "acc": best_acc,
+                    "key": key,
+                    "samples": len(items),
+                    "layout": layout,
+                },
+                dest,
+            )
         del model, optimizer, scheduler, loader, dataset
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        return {"acc": float(best_acc), "samples": len(items)}
+        return {"acc": float(best_acc), "samples": len(items), "kept": kept}
