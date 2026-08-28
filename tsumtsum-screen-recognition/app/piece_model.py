@@ -7,8 +7,8 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.models import ResNet18_Weights, resnet18
 
-PIECE_INPUT = 256
-HEATMAP_SIZE = 32
+PIECE_INPUT = 512
+HEATMAP_SIZE = 128
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 KIND_CHANNELS = {"tsum": 0, "bomb": 1}
@@ -37,6 +37,7 @@ class PieceNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.stem(x)
+        feat = F.interpolate(feat, scale_factor=2, mode="bilinear", align_corners=False)
         raw = self.head(feat)
         heat = torch.sigmoid(raw[:, :2])
         radius = torch.sigmoid(raw[:, 2:3])
@@ -45,8 +46,9 @@ class PieceNet(nn.Module):
     def freeze_backbone(self) -> None:
         for parameter in self.stem.parameters():
             parameter.requires_grad = False
-        for parameter in self.stem[-1].parameters():
-            parameter.requires_grad = True
+        for block in self.stem[-2:]:
+            for parameter in block.parameters():
+                parameter.requires_grad = True
 
 
 def draw_gaussian(canvas: torch.Tensor, cx: float, cy: float, sigma: float) -> None:

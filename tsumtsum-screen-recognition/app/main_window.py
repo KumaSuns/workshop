@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -69,20 +70,36 @@ from app.train_effect import TrainEffect
 from app.train_worker import MIN_TRAIN_SAMPLES, TRAIN_EPOCHS, TrainWorker
 
 LIST_STATUS_WIDTHS = {
-    "game": 110,
-    "score": 72,
-    "coin": 72,
-    "result_coin": 140,
-    "coin_digits": 100,
-    "timer": 88,
-    "skill": 110,
-    "fan": 80,
-    "pause": 88,
-    "fever": 120,
-    "tsum": 72,
-    "bomb": 72,
-    "go": 72,
-    "timeup": 88,
+    "game": 36,
+    "score": 36,
+    "coin": 36,
+    "result_coin": 52,
+    "coin_digits": 52,
+    "timer": 44,
+    "skill": 40,
+    "fan": 40,
+    "pause": 36,
+    "fever": 52,
+    "tsum": 32,
+    "bomb": 32,
+    "go": 32,
+    "timeup": 40,
+}
+LIST_STATUS_HEADERS = {
+    "game": "ゲーム\n範囲",
+    "score": "スコア",
+    "coin": "コイン",
+    "coin_digits": "コイン\n数値",
+    "result_coin": "リザルト\nコイン",
+    "timer": "タイマー",
+    "skill": "スキル\nボタン",
+    "fan": "扇風機",
+    "pause": "一時\n停止",
+    "fever": "フィーバー\nゲージ",
+    "tsum": "ツム",
+    "bomb": "ボム",
+    "go": "GO",
+    "timeup": "TIME\nUP",
 }
 
 STYLESHEET = """
@@ -176,7 +193,7 @@ QTableWidget {
     gridline-color: transparent;
 }
 QTableWidget::item {
-    padding: 5px 4px;
+    padding: 2px 1px;
 }
 QTableWidget::item:selected {
     background: #2c3344;
@@ -187,8 +204,8 @@ QHeaderView::section {
     border: none;
     border-bottom: 1px solid #2a303b;
     border-right: 1px solid #2a303b;
-    padding: 6px 4px;
-    font-size: 11px;
+    padding: 2px 1px;
+    font-size: 10px;
     font-weight: 600;
 }
 QHeaderView::section:hover {
@@ -394,11 +411,40 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         left_layout.addWidget(self.progress)
         left_layout.addStretch(1)
-        left.setMinimumWidth(220)
-        left.setMaximumWidth(320)
+        self.copy_data_btn = QPushButton("DATAをアップ")
+        self.import_data_btn = QPushButton("DATA DOWNLOAD")
+        self.server_save_btn = QPushButton("サーバーに保存")
+        self.server_load_btn = QPushButton("サーバーから開く")
+        self.server_settings_btn = QPushButton("サーバー接続")
+        self.shortcut_btn = QPushButton("起動アイコン作成")
+        left_grid = QGridLayout()
+        left_grid.setContentsMargins(0, 0, 0, 0)
+        left_buttons = (
+            self.copy_data_btn,
+            self.import_data_btn,
+            self.server_save_btn,
+            self.server_load_btn,
+            self.server_settings_btn,
+            self.shortcut_btn,
+        )
+        for i, button in enumerate(left_buttons):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            left_grid.addWidget(button, i // 2, i % 2)
+        for col in range(2):
+            left_grid.setColumnStretch(col, 1)
+        left_layout.addLayout(left_grid)
+        left.setMinimumWidth(317)
+        left.setMaximumWidth(461)
 
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._canvas_host = QWidget()
+        canvas_host_layout = QVBoxLayout(self._canvas_host)
+        canvas_host_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_host_layout.setSpacing(0)
+        canvas_host_layout.addWidget(self.canvas)
+        self._canvas_host.installEventFilter(self)
         self._toast = QLabel(self.canvas)
         self._toast.setObjectName("toast")
         self._toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -418,6 +464,34 @@ class MainWindow(QMainWindow):
         self.stats_label.setObjectName("hint")
         self.stats_label.setWordWrap(True)
         right_layout.addWidget(self.stats_label)
+        self.stats_grid = QGridLayout()
+        self.stats_grid.setContentsMargins(0, 0, 0, 0)
+        self.stats_grid.setHorizontalSpacing(8)
+        self.stats_grid.setVerticalSpacing(0)
+        self._stats_names: list[QLabel] = []
+        self._stats_values: list[QLabel] = []
+        for index in range(12):
+            cell = QWidget()
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 8, 0)
+            cell_layout.setSpacing(4)
+            name = QLabel()
+            name.setObjectName("hint")
+            value = QLabel()
+            value.setObjectName("hint")
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            cell_layout.addWidget(name, 1)
+            cell_layout.addWidget(value)
+            self._stats_names.append(name)
+            self._stats_values.append(value)
+            self.stats_grid.addWidget(cell, index // 6, index % 6)
+        for col in range(6):
+            self.stats_grid.setColumnStretch(col, 1)
+        right_layout.addLayout(self.stats_grid)
+        self.stats_hint = QLabel()
+        self.stats_hint.setObjectName("hint")
+        self.stats_hint.setWordWrap(True)
+        right_layout.addWidget(self.stats_hint)
         unused_row = QHBoxLayout()
         self.show_unused_chk = QCheckBox("使わない画像も見る")
         self.delete_unused_one_btn = QPushButton("この画像を消す")
@@ -443,36 +517,31 @@ class MainWindow(QMainWindow):
         header.setStretchLastSection(True)
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(False)
+        header.setMinimumSectionSize(28)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.setFixedHeight(36)
         header.sectionClicked.connect(self.on_list_header_clicked)
         self._sync_list_columns()
         right_layout.addWidget(self.list_widget, 1)
         self.delete_btn = QPushButton("選択を削除")
         self.delete_btn.setObjectName("danger")
-        right_layout.addWidget(self.delete_btn)
-        self.copy_data_btn = QPushButton("DATAをアップ")
-        right_layout.addWidget(self.copy_data_btn)
-        self.import_data_btn = QPushButton("DATA DOWNLOAD")
-        right_layout.addWidget(self.import_data_btn)
-        self.server_save_btn = QPushButton("サーバーに保存")
-        right_layout.addWidget(self.server_save_btn)
-        self.server_load_btn = QPushButton("サーバーから開く")
-        right_layout.addWidget(self.server_load_btn)
-        self.server_settings_btn = QPushButton("サーバー接続")
-        right_layout.addWidget(self.server_settings_btn)
-        self.shortcut_btn = QPushButton("起動アイコン作成")
-        right_layout.addWidget(self.shortcut_btn)
         self.video_app_btn = QPushButton("動画編集・生成")
         self.video_app_btn.setObjectName("video")
-        right_layout.addWidget(self.video_app_btn)
+        stay_row = QHBoxLayout()
+        stay_row.setContentsMargins(0, 0, 0, 0)
+        stay_row.addWidget(self.delete_btn)
+        stay_row.addWidget(self.video_app_btn)
+        right_layout.addLayout(stay_row)
         right.setMinimumWidth(480)
 
+        self._body_split = splitter
         splitter.addWidget(left)
-        splitter.addWidget(self.canvas)
+        splitter.addWidget(self._canvas_host)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
-        splitter.setSizes([240, 860, 720])
+        splitter.setSizes([346, 860, 720])
         layout.addWidget(splitter, 1)
 
         coords = QFrame()
@@ -537,6 +606,7 @@ class MainWindow(QMainWindow):
         self.canvas.imageDropped.connect(self.import_qimage)
         self.canvas.installEventFilter(self)
         self.spin_group.valueChanged.connect(self.on_group_changed)
+        QTimer.singleShot(0, self._sync_canvas_3_2)
 
     def _bind_shortcuts(self) -> None:
         QShortcut(QKeySequence.StandardKey.Undo, self, self.undo_last_piece)
@@ -778,15 +848,15 @@ class MainWindow(QMainWindow):
     def update_stats(self) -> None:
         counts = self.dataset.counts()
         labeled_counts = self.dataset.labeled_counts()
-        per_type = "  ".join(
-            f"{PLACE_LABELS[key]} {labeled_counts[key]}"
-            for key in [*REGION_KEYS, *PIECE_KEYS]
-        )
+        keys = [*REGION_KEYS, *PIECE_KEYS, "coin_digits"]
+        for name, value, key in zip(self._stats_names, self._stats_values, keys):
+            name.setText(LIST_STATUS_HEADERS.get(key, PLACE_LABELS.get(key, key)).replace("\n", ""))
+            value.setText(str(labeled_counts.get(key, 0)))
         self.stats_label.setText(
             f"全 {counts['total']} 枚\n"
-            f"保存済み {counts['labeled']} / 予測 {counts['predicted']} / 未設定 {counts['unlabeled']} / 使わない {counts['skipped']}\n"
-            f"{per_type}\n"
-            f"コイン数字 {labeled_counts.get('coin_digits', 0)}\n"
+            f"保存済み {counts['labeled']} / 予測 {counts['predicted']} / 未設定 {counts['unlabeled']} / 使わない {counts['skipped']}"
+        )
+        self.stats_hint.setText(
             f"学習の目安: 種類ごとに {MIN_TRAIN_SAMPLES} 枚以上。コインの数字も同じです。"
         )
         ready = self.predictor.ready_keys()
@@ -2114,7 +2184,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("ツムとボムにはゲーム範囲が必要です", 4000)
 
     def _list_status_keys(self) -> list[str]:
-        keys = list(self._selected_place_keys() or ["game"])
+        keys = [key for key, _label, _color in PLACE_SPECS]
         coin_index = next((index for index, key in enumerate(keys) if is_coin_box_key(key)), -1)
         if coin_index >= 0 and "coin_digits" not in keys:
             keys.insert(coin_index + 1, "coin_digits")
@@ -2122,7 +2192,7 @@ class MainWindow(QMainWindow):
 
     def _sync_list_columns(self) -> None:
         keys = self._list_status_keys()
-        headers = [PLACE_LABELS.get(key, key) for key in keys] + ["ファイル"]
+        headers = [LIST_STATUS_HEADERS.get(key, PLACE_LABELS.get(key, key)) for key in keys] + ["ファイル"]
         header = self.list_widget.horizontalHeader()
         self.list_widget.setColumnCount(len(headers))
         self.list_widget.setHorizontalHeaderLabels(headers)
@@ -2130,19 +2200,7 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             self.list_widget.setColumnWidth(col, LIST_STATUS_WIDTHS.get(key, 88))
         header.setSectionResizeMode(len(keys), QHeaderView.ResizeMode.Stretch)
-        if self._list_sort_key:
-            order = list(keys) + ["file"]
-            if self._list_sort_key in order:
-                col = order.index(self._list_sort_key)
-                header.setSortIndicatorShown(True)
-                header.setSortIndicator(
-                    col,
-                    Qt.SortOrder.AscendingOrder if self._list_sort_asc else Qt.SortOrder.DescendingOrder,
-                )
-            else:
-                header.setSortIndicatorShown(False)
-        else:
-            header.setSortIndicatorShown(False)
+        header.setSortIndicatorShown(False)
 
     def _selected_place_keys(self) -> list[str]:
         keys: list[str] = []
@@ -2248,8 +2306,38 @@ class MainWindow(QMainWindow):
         self._train_fx.setGeometry(0, 0, host.width(), host.height())
         self._train_fx.raise_()
 
+    def _sync_canvas_3_2(self) -> None:
+        if getattr(self, "_syncing_canvas", False):
+            return
+        col = getattr(self, "_canvas_host", None)
+        split = getattr(self, "_body_split", None)
+        if col is None or split is None or not hasattr(self, "canvas"):
+            return
+        height = col.height()
+        if height < 80:
+            return
+        width = (height * 2) // 3
+        if col.minimumWidth() == width and col.maximumWidth() == width:
+            return
+        self._syncing_canvas = True
+        col.setMinimumWidth(width)
+        col.setMaximumWidth(width)
+        sizes = split.sizes()
+        if len(sizes) >= 3 and sizes[1] != width:
+            leftover = sizes[1] - width
+            sizes[1] = width
+            sizes[2] = max(480, sizes[2] + leftover)
+            split.setSizes(sizes)
+        self._syncing_canvas = False
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_canvas_3_2()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if hasattr(self, "canvas"):
+            self._sync_canvas_3_2()
         if hasattr(self, "_train_fx"):
             self._place_train_fx()
 
@@ -2502,6 +2590,8 @@ class MainWindow(QMainWindow):
         return added
 
     def eventFilter(self, watched, event) -> bool:
+        if watched is getattr(self, "_canvas_host", None) and event.type() == QEvent.Type.Resize:
+            self._sync_canvas_3_2()
         if watched is self.canvas and event.type() == QEvent.Type.Resize:
             self._place_train_fx()
         if self._is_training() and watched is self.canvas and event.type() == QEvent.Type.KeyPress:

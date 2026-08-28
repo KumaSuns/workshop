@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import random
 
 from PySide6.QtCore import QPointF, QRect, Qt, QTimer, Signal
@@ -98,7 +97,7 @@ class TrainEffect(QWidget):
         self._status = "学習中です"
         self._quip = random.choice(QUIPS)
         self._title.setText("学習中です")
-        self._detail.setText("準備しています…")
+        self._detail.setText(self._quip)
         self._bar.setValue(0)
         self._spawn_blobs()
         self._cancel_btn.setEnabled(True)
@@ -135,7 +134,12 @@ class TrainEffect(QWidget):
         btn_w = max(120, self._cancel_btn.width())
         btn_h = max(40, self._cancel_btn.height())
         self._cancel_btn.setFixedSize(btn_w, btn_h)
-        self._cancel_btn.move(max(12, (self.width() - btn_w) // 2), max(12, self._bar.y() - btn_h - 16))
+        status_h = 24
+        gap = 12
+        self._cancel_btn.move(
+            max(12, (self.width() - btn_w) // 2),
+            max(12, self._bar.y() - status_h - gap - btn_h),
+        )
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -144,7 +148,6 @@ class TrainEffect(QWidget):
     def set_progress(self, epoch: int, total: int, message: str) -> None:
         self._progress = epoch / max(1, total)
         self._status = message
-        self._detail.setText(message)
         self._bar.setRange(0, max(total, 1))
         self._bar.setValue(epoch)
         self._place_hud()
@@ -183,6 +186,7 @@ class TrainEffect(QWidget):
         height = max(self.height(), 1)
         if self._tick_n % 90 == 0:
             self._quip = random.choice(QUIPS)
+            self._detail.setText(self._quip)
         talking = sum(1 for blob in self._blobs if blob.get("bubble_life", 0) > 0)
         if self._tick_n % 48 == 0 and talking < 3 and self._blobs:
             quiet = [blob for blob in self._blobs if blob.get("bubble_life", 0) <= 0]
@@ -338,45 +342,14 @@ class TrainEffect(QWidget):
 
     def _draw_banner(self, painter: QPainter) -> None:
         width = self.width()
-        height = self.height()
-        pulse = 0.5 + 0.5 * math.sin(self._pulse)
-        title = QFont("Yu Gothic UI", 28, QFont.Weight.Black)
-        painter.setFont(title)
-        painter.setPen(QColor(255, 224, 80, int(200 + 55 * pulse)))
-        painter.drawText(self.rect().adjusted(0, 28, 0, 0), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, "学習中です")
-        sub = QFont("Yu Gothic UI", 14, QFont.Weight.DemiBold)
-        painter.setFont(sub)
-        painter.setPen(QColor(242, 245, 248))
-        painter.drawText(self.rect().adjusted(0, 74, 0, 0), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self._quip)
-
-        bar_h = 28
-        bar_w = max(200, width - 64)
-        bar_x = (width - bar_w) / 2
-        bar_y = height - bar_h - 22
+        bar_y = self._bar.y()
         painter.setPen(QColor(154, 163, 178))
         painter.setFont(QFont("Yu Gothic UI", 12, QFont.Weight.DemiBold))
         painter.drawText(
             0,
-            int(bar_y) - 28,
+            bar_y - 28,
             width,
             24,
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
             self._status,
-        )
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(16, 18, 22, 230))
-        painter.drawRoundedRect(int(bar_x), int(bar_y), int(bar_w), bar_h, 10, 10)
-        fill = int(bar_w * min(1.0, max(0.0, self._progress)))
-        if fill > 0:
-            painter.setBrush(QColor("#FFE066"))
-            painter.drawRoundedRect(int(bar_x), int(bar_y), max(18, fill) if fill > 0 else 0, bar_h, 10, 10)
-        painter.setPen(QColor("#16181d") if fill > bar_w * 0.45 else QColor("#f2f5f8"))
-        painter.setFont(QFont("Yu Gothic UI", 12, QFont.Weight.Bold))
-        painter.drawText(
-            int(bar_x),
-            int(bar_y),
-            int(bar_w),
-            bar_h,
-            Qt.AlignmentFlag.AlignCenter,
-            f"学習  {int(self._progress * 100)}%",
         )
