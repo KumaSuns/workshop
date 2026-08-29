@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -25,6 +25,7 @@ from app.regions import (
     piece_radius_from_game,
     tsum_group_color,
 )
+from app.tsum_chain import tsum_chain_candidates
 
 MIN_BOX = 8
 MIN_RADIUS = 8
@@ -88,6 +89,12 @@ class ImageCanvas(QGraphicsView):
         self._piece_radius = {key: DEFAULT_RADIUS for key in PIECE_KEYS}
         self._hover_pos: QPointF | None = None
         self._visible_keys: set[str] | None = None
+        self._trace_pts: list[QPointF] = []
+        self._trace_group = 1
+        self._trace_t = 0.0
+        self._trace_timer = QTimer(self)
+        self._trace_timer.setInterval(16)
+        self._trace_timer.timeout.connect(self._on_trace_tick)
 
         self._guide = QLabel(self)
         self._guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -124,6 +131,7 @@ class ImageCanvas(QGraphicsView):
         self._pieces = [dict(piece) for piece in (pieces or [])]
         self._selected_piece = None
         self._hover_pos = None
+        self.stop_chain_trace()
         game = self._game_rect()
         if game is not None:
             for key in PIECE_KEYS:
@@ -210,6 +218,43 @@ class ImageCanvas(QGraphicsView):
             counts["ボム"] = bombs
         return counts
 
+    def chain_candidates(self) -> list[list[dict[str, int]]]:
+        return tsum_chain_candidates(self._pieces)
+
+    def start_chain_trace(self, index: int = 0) -> bool:
+        candidates = tsum_chain_candidates(self._pieces)
+        if index < 0 or index >= len(candidates):
+            return False
+        path = candidates[index]
+        if len(path) < 2:
+            return False
+        self._trace_pts = [QPointF(int(piece["x"]), int(piece["y"])) for piece in path]
+        self._trace_group = int(path[0].get("group") or 1)
+        self._trace_t = 0.0
+        self._trace_timer.start()
+        self.viewport().update()
+        return True
+
+    def stop_chain_trace(self) -> None:
+        self._trace_timer.stop()
+        self._trace_pts = []
+        self._trace_t = 0.0
+        self.viewport().update()
+
+    def _on_trace_tick(self) -> None:
+        if len(self._trace_pts) < 2:
+            self._trace_timer.stop()
+            return
+        last = float(len(self._trace_pts) - 1)
+        self._trace_t = min(last, self._trace_t + 0.12)
+        if self._trace_t >= last:
+            self._trace_timer.stop()
+        self.viewport().update()
+
+    def _clear_chain_trace(self) -> None:
+        if self._trace_pts or self._trace_timer.isActive():
+            self.stop_chain_trace()
+
     def remove_selected_piece(self) -> bool:
         if self._selected_piece is None:
             return False
@@ -224,6 +269,7 @@ class ImageCanvas(QGraphicsView):
                 self._selected_piece = None
             elif self._selected_piece > index:
                 self._selected_piece -= 1
+        self._clear_chain_trace()
         self.piecesChanged.emit()
         self._update_guide()
         self.viewport().update()
@@ -241,6 +287,7 @@ class ImageCanvas(QGraphicsView):
                         self._selected_piece = None
                     elif self._selected_piece > index:
                         self._selected_piece -= 1
+                self._clear_chain_trace()
                 self.piecesChanged.emit()
                 self._update_guide()
                 self.viewport().update()
@@ -263,6 +310,7 @@ class ImageCanvas(QGraphicsView):
     def clear_pieces_of_kind(self, kind: str) -> None:
         self._pieces = [piece for piece in self._pieces if piece["kind"] != kind]
         self._selected_piece = None
+        self._clear_chain_trace()
         self.piecesChanged.emit()
         self._update_guide()
         self.viewport().update()
@@ -276,6 +324,7 @@ class ImageCanvas(QGraphicsView):
         self._selected_piece = None
         self._status = "unlabeled"
         self._mode = None
+        self.stop_chain_trace()
         self.resetTransform()
         self._update_guide()
         self.viewport().update()
@@ -477,6 +526,43 @@ class ImageCanvas(QGraphicsView):
             painter.setPen(accent)
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
         self._draw_piece_guide(painter)
+        self._draw_chain_trace(painter)
+
+    def _draw_chain_trace(self, painter: QPainter) -> None:
+        if len(self._trace_pts) < 2:
+            return
+        last = len(self._trace_pts) - 1
+        t = max(0.0, min(float(last), self._trace_t))
+        views = [QPointF(self.mapFromScene(pt)) for pt in self._trace_pts]
+        path = QPainterPath()
+        path.moveTo(views[0])
+        whole = int(t)
+        frac = t - whole
+        for index in range(1, whole + 1):
+            path.lineTo(views[index])
+        if whole < last:
+            start = views[whole]
+            end = views[whole + 1]
+            current = QPointF(
+                start.x() + (end.x() - start.x()) * frac,
+                start.y() + (end.y() - start.y()) * frac,
+            )
+            path.lineTo(current)
+        else:
+            current = views[-1]
+        color = QColor(tsum_group_color(self._trace_group))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(
+            QPen(QColor(255, 255, 255, 220), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        )
+        painter.drawPath(path)
+        painter.setPen(
+            QPen(color, 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        )
+        painter.drawPath(path)
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 2))
+        painter.setBrush(color)
+        painter.drawEllipse(current, 9, 9)
 
     def _draw_piece_guide(self, painter: QPainter) -> None:
         if (
@@ -545,6 +631,7 @@ class ImageCanvas(QGraphicsView):
         self._clamp_piece(piece)
         self._pieces.append(piece)
         self._selected_piece = len(self._pieces) - 1
+        self._clear_chain_trace()
         self.piecesChanged.emit()
         self._update_guide()
         self.viewport().update()
@@ -689,6 +776,7 @@ class ImageCanvas(QGraphicsView):
                 self._origin = scene_pos
                 piece = self._pieces[hit]
                 self._orig_rect = QRectF(piece["x"], piece["y"], piece["r"], piece["r"])
+                self._clear_chain_trace()
                 self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 game = self._game_rect()

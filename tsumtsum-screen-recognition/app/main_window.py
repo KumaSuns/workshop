@@ -561,6 +561,12 @@ class MainWindow(QMainWindow):
         self.piece_count_label = QLabel()
         self.piece_count_label.setObjectName("hint")
         coords_layout.addWidget(self.piece_count_label, 1)
+        self.trace_chain_btns: list[QPushButton] = []
+        for index in range(3):
+            button = QPushButton("なぞる")
+            button.setEnabled(False)
+            coords_layout.addWidget(button)
+            self.trace_chain_btns.append(button)
         self.coords_hint = QLabel("上下キーで画像を切替  /  左右キーで枠を1px  /  Shift+矢印で10px  /  Ctrl+矢印でサイズ")
         self.coords_hint.setObjectName("hint")
         coords_layout.addWidget(self.coords_hint, 1)
@@ -606,6 +612,8 @@ class MainWindow(QMainWindow):
         self.canvas.imageDropped.connect(self.import_qimage)
         self.canvas.installEventFilter(self)
         self.spin_group.valueChanged.connect(self.on_group_changed)
+        for index, button in enumerate(self.trace_chain_btns):
+            button.clicked.connect(lambda _checked=False, i=index: self.trace_chain_candidate(i))
         QTimer.singleShot(0, self._sync_canvas_3_2)
 
     def _bind_shortcuts(self) -> None:
@@ -897,10 +905,18 @@ class MainWindow(QMainWindow):
         self.copy_box_btn.setEnabled(has_box)
         self.copy_box_btn.setText(f"{name}をコピー")
         counts_map = self.canvas.piece_counts()
-        if counts_map:
-            self.piece_count_label.setText("  ".join(f"{k} {v}" for k, v in counts_map.items()))
-        else:
-            self.piece_count_label.setText("")
+        parts = [f"{k} {v}" for k, v in counts_map.items()]
+        candidates = self.canvas.chain_candidates()
+        if candidates:
+            parts.append("チェーン " + " / ".join(str(len(path)) for path in candidates))
+        self.piece_count_label.setText("  ".join(parts))
+        for index, button in enumerate(self.trace_chain_btns):
+            if index < len(candidates) and len(candidates[index]) >= 2:
+                button.setText(f"なぞる {len(candidates[index])}")
+                button.setEnabled(True)
+            else:
+                button.setText("なぞる")
+                button.setEnabled(False)
         self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
         self.read_coin_btn.setEnabled(
             has_sample and any(key in self.canvas.all_region_boxes() for key in COIN_BOX_KEYS)
@@ -1418,6 +1434,10 @@ class MainWindow(QMainWindow):
 
     def on_group_changed(self, value: int) -> None:
         self.canvas.set_piece_group(value)
+
+    def trace_chain_candidate(self, index: int) -> None:
+        if not self.canvas.start_chain_trace(index):
+            self.statusBar().showMessage("つなげられるチェーンがありません", 3000)
 
     def on_piece_group_changed(self, value: int) -> None:
         self.spin_group.blockSignals(True)
