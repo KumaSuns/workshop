@@ -24,9 +24,18 @@ from app.digit_model import (
 )
 from app.hud_number import crop_box, prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
-from app.piece_model import HEATMAP_SIZE, KIND_CHANNELS, PIECE_INPUT, PieceNet, draw_gaussian
+from app.piece_model import HEATMAP_SIZE, KIND_CHANNELS, PIECE_INPUT, PieceNet, draw_gaussian, pixel_to_heat
 from app.regions import REGION_LABELS
 from app.scene_model import SCENE_INPUT, SceneNet, scene_index
+from app.tsum_type import (
+    IMAGENET_MEAN as TYPE_MEAN,
+    IMAGENET_STD as TYPE_STD,
+    TYPE_FILL,
+    TYPE_INPUT,
+    TsumTypeNet,
+    prepare_tsum_crop,
+    supcon_loss,
+)
 
 MIN_TRAIN_SAMPLES = 5
 TRAIN_EPOCHS = 40
@@ -115,6 +124,9 @@ class PieceHeatmapDataset(Dataset):
         crop = image.crop((left, top, right, bottom))
         crop_w = max(1, right - left)
         crop_h = max(1, bottom - top)
+        flip = bool(self.augment and random.random() < 0.5)
+        if flip:
+            crop = crop.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         if self.augment:
             crop = self.jitter(crop)
         heat = torch.zeros(2, HEATMAP_SIZE, HEATMAP_SIZE, dtype=torch.float32)
@@ -124,14 +136,61 @@ class PieceHeatmapDataset(Dataset):
             channel = KIND_CHANNELS.get(str(piece.get("kind")))
             if channel is None:
                 continue
-            cx = (int(piece["x"]) - left) / crop_w * HEATMAP_SIZE
-            cy = (int(piece["y"]) - top) / crop_h * HEATMAP_SIZE
+            cx, cy = pixel_to_heat(int(piece["x"]), int(piece["y"]), left, top, crop_w, crop_h)
+            if flip:
+                cx = HEATMAP_SIZE - cx
             r_hm = max(1.0, int(piece["r"]) / crop_w * HEATMAP_SIZE)
             draw_gaussian(heat[channel], cx, cy, max(1.0, r_hm / 2.2))
             ix = min(max(int(cx), 0), HEATMAP_SIZE - 1)
             iy = min(max(int(cy), 0), HEATMAP_SIZE - 1)
             radius[iy, ix] = min(1.0, int(piece["r"]) / scale)
         return self.normalize(crop), heat, radius
+
+
+class TsumTypeBoardDataset(Dataset):
+    def __init__(self, samples: list[Sample], augment: bool = True) -> None:
+        self.samples = [
+            sample
+            for sample in samples
+            if len(
+                {
+                    int(piece.get("group") or 1)
+                    for piece in sample.pieces
+                    if piece.get("kind") == "tsum"
+                }
+            )
+            >= 2
+        ]
+        self.augment = augment
+        self.jitter = transforms.ColorJitter(0.25, 0.25, 0.25, 0.12)
+        self.normalize = transforms.Compose(
+            [
+                transforms.Resize((TYPE_INPUT, TYPE_INPUT)),
+                transforms.ToTensor(),
+                transforms.Normalize(TYPE_MEAN, TYPE_STD),
+            ]
+        )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        sample = self.samples[index]
+        image = Image.open(sample.image_path).convert("RGB")
+        crops: list[torch.Tensor] = []
+        labels: list[int] = []
+        tsums = [piece for piece in sample.pieces if piece.get("kind") == "tsum"]
+        for piece in tsums:
+            crop = prepare_tsum_crop(image, piece)
+            if self.augment:
+                crop = self.jitter(crop)
+                if random.random() < 0.5:
+                    crop = TF.hflip(crop)
+                angle = random.uniform(-8.0, 8.0)
+                crop = TF.rotate(crop, angle, fill=TYPE_FILL)
+            crops.append(self.normalize(crop))
+            labels.append(int(piece.get("group") or 1))
+        return torch.stack(crops), torch.tensor(labels, dtype=torch.long)
 
 
 class CoinDigitDataset(Dataset):
@@ -283,6 +342,8 @@ class TrainWorker(QThread):
                     label = item[3]
                 elif key == "pieces":
                     label = "ツム・ボム"
+                elif key == "tsum_types":
+                    label = "ツムの種類"
                 else:
                     label = REGION_LABELS.get(key, key)
                 self._emit_job_progress(
@@ -292,7 +353,9 @@ class TrainWorker(QThread):
                     1,
                     f"学習中です  {label}  準備しています",
                 )
-                if key == "pieces":
+                if key == "tsum_types":
+                    result = self._train_tsum_types(samples, model_path, job_index, total_steps, label)
+                elif key == "pieces":
                     result = self._train_pieces(samples, model_path, job_index, total_steps, label)
                 elif key == "coin_digits":
                     digit_saved = False
@@ -444,6 +507,92 @@ class TrainWorker(QThread):
             "samples": len(samples),
         }
 
+    def _train_tsum_types(
+        self,
+        samples: list[Sample],
+        model_path: Path,
+        job_index: int,
+        total_steps: int,
+        label: str,
+    ) -> dict:
+        dataset = TsumTypeBoardDataset(samples, augment=True)
+        if len(dataset) < MIN_TRAIN_SAMPLES:
+            raise ValueError(f"「{label}」の学習には {MIN_TRAIN_SAMPLES} 枚以上必要です")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
+        previous = _checkpoint(model_path)
+        prev_state = previous.get("state_dict")
+        model = TsumTypeNet(pretrained=not bool(prev_state))
+        if prev_state:
+            try:
+                model.load_state_dict(prev_state)
+            except Exception:
+                stem = {key: value for key, value in prev_state.items() if key.startswith("stem.")}
+                if stem:
+                    model.load_state_dict(stem, strict=False)
+                else:
+                    prev_state = None
+                    model = TsumTypeNet()
+        model.freeze_backbone()
+        model.to(device)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=3e-4 if prev_state else 1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
+        best_loss = 10**9
+        best_state = None
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        for epoch in range(1, self.epochs + 1):
+            self._raise_if_cancelled()
+            model.train()
+            total_loss = 0.0
+            seen = 0
+            batches = max(len(loader), 1)
+            for batch_index, (crops, labels) in enumerate(loader, start=1):
+                self._raise_if_cancelled()
+                crops = crops[0].to(device)
+                labels = labels[0].to(device)
+                if crops.size(0) < 2:
+                    continue
+                optimizer.zero_grad(set_to_none=True)
+                loss = supcon_loss(model(crops), labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                seen += 1
+                self._emit_job_progress(
+                    job_index,
+                    epoch,
+                    batch_index,
+                    batches,
+                    f"学習中です  {label}  {epoch}/{self.epochs}  （{batch_index}/{batches}）",
+                )
+            scheduler.step()
+            mean_loss = total_loss / max(seen, 1)
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            self._emit_job_progress(
+                job_index,
+                epoch,
+                batches,
+                batches,
+                f"学習中です  {label}  {epoch}/{self.epochs}  loss {mean_loss:.4f}",
+            )
+            self._raise_if_cancelled()
+        if best_state is None:
+            raise RuntimeError(f"「{label}」の学習結果を保存できませんでした")
+        torch.save(
+            {"state_dict": best_state, "loss": best_loss, "key": "tsum_types", "samples": len(dataset)},
+            model_path,
+        )
+        return {
+            "key": "tsum_types",
+            "label": label,
+            "iou": max(0.0, 1.0 - float(best_loss)),
+            "loss": float(best_loss),
+            "samples": len(dataset),
+        }
+
     def _train_pieces(
         self,
         samples: list[Sample],
@@ -463,6 +612,12 @@ class TrainWorker(QThread):
             num_workers=0,
         )
         model = PieceNet()
+        previous = _checkpoint(model_path)
+        prev_state = previous.get("state_dict") if previous else None
+        if prev_state:
+            stem_state = {key: value for key, value in prev_state.items() if key.startswith("stem.")}
+            if stem_state:
+                model.load_state_dict(stem_state, strict=False)
         model.freeze_backbone()
         model.to(device)
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -484,7 +639,11 @@ class TrainWorker(QThread):
                 radius_t = radius_t.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 heat_p, radius_p = model(images)
-                heat_loss = torch.nn.functional.mse_loss(heat_p, heat_t)
+                heat_err = (heat_p - heat_t) ** 2
+                pos = heat_t >= 0.1
+                pos_n = pos.sum().clamp(min=1)
+                neg_n = (~pos).sum().clamp(min=1)
+                heat_loss = heat_err[pos].sum() / pos_n + 0.25 * heat_err[~pos].sum() / neg_n
                 mask = heat_t.max(dim=1).values > 0.4
                 if mask.any():
                     radius_loss = torch.nn.functional.l1_loss(radius_p[:, 0][mask], radius_t[mask])

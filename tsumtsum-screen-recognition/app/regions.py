@@ -80,6 +80,8 @@ def model_filename(key: str) -> str:
         return "game_region.pt"
     if key == "pieces":
         return "pieces.pt"
+    if key == "tsum_types":
+        return "tsum_types.pt"
     if key == "coin_digits":
         return "coin_digits.pt"
     if key == "scene":

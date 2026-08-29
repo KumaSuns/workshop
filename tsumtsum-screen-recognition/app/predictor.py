@@ -16,9 +16,17 @@ from app.digit_model import (
 )
 from app.hud_number import prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
-from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, peaks_from_heat
+from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, heat_to_pixel, peaks_from_heat
 from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename, piece_radius_from_game
 from app.scene_model import SCENE_INPUT, SceneNet, scene_name
+from app.tsum_type import (
+    IMAGENET_MEAN as TYPE_MEAN,
+    IMAGENET_STD as TYPE_STD,
+    TYPE_INPUT,
+    TsumTypeNet,
+    TYPE_CROP_SCALE,
+    prepare_tsum_crop,
+)
 
 
 class Predictor:
@@ -27,6 +35,7 @@ class Predictor:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.models: dict[str, GameRegionNet] = {}
         self.piece_model: PieceNet | None = None
+        self.type_model: TsumTypeNet | None = None
         self.digit_models: dict[str, CoinDigitNet] = {}
         self.scene_model: SceneNet | None = None
         self._transform = transforms.Compose(
@@ -57,11 +66,19 @@ class Predictor:
                 transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
             ]
         )
+        self._type_transform = transforms.Compose(
+            [
+                transforms.Resize((TYPE_INPUT, TYPE_INPUT)),
+                transforms.ToTensor(),
+                transforms.Normalize(TYPE_MEAN, TYPE_STD),
+            ]
+        )
         self.reload()
 
     def release(self) -> None:
         self.models = {}
         self.piece_model = None
+        self.type_model = None
         self.digit_models = {}
         self.scene_model = None
         if self.device.type == "cuda":
@@ -91,6 +108,7 @@ class Predictor:
     def reload(self) -> bool:
         self.models = {}
         self.piece_model = None
+        self.type_model = None
         self.digit_models = {}
         self.scene_model = None
         for key in REGION_KEYS:
@@ -117,10 +135,27 @@ class Predictor:
                 if isinstance(checkpoint, dict) and "state_dict" in checkpoint
                 else checkpoint
             )
-            model.load_state_dict(state)
+            model.load_state_dict(state, strict=False)
             model.to(self.device)
             model.eval()
             self.piece_model = model
+        type_path = self.models_dir / model_filename("tsum_types")
+        if type_path.exists():
+            checkpoint = torch.load(type_path, map_location=self.device, weights_only=False)
+            model = TsumTypeNet(pretrained=False)
+            state = (
+                checkpoint["state_dict"]
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint
+                else checkpoint
+            )
+            try:
+                model.load_state_dict(state)
+            except Exception:
+                model = None
+            if model is not None:
+                model.to(self.device)
+                model.eval()
+                self.type_model = model
         self.digit_models = {}
         for key, filename in (("coin", "coin_digits.pt"), ("result_coin", "result_coin_digits.pt")):
             path = self.models_dir / filename
@@ -221,48 +256,140 @@ class Predictor:
         board_w = int(game["w"]) if game is not None else crop_w
         for channel, kind in enumerate(("tsum", "bomb")):
             for _score, hx, hy, _r_norm in peaks_from_heat(heat[channel], radius):
-                x = int(round(left + hx / HEATMAP_SIZE * crop_w))
-                y = int(round(top + hy / HEATMAP_SIZE * crop_h))
+                x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
                 r = piece_radius_from_game(board_w, kind)
-                pieces.append({"x": x, "y": y, "r": r, "kind": kind, "group": 1})
+                pieces.append(
+                    {"x": int(round(x)), "y": int(round(y)), "r": r, "kind": kind, "group": 1}
+                )
         self._assign_groups(rgb, pieces)
         return pieces
 
     def _assign_groups(self, image: Image.Image, pieces: list[dict[str, int]]) -> None:
-        refs: list[tuple[float, float, float]] = []
+        tsums: list[dict[str, int]] = []
         for piece in pieces:
             if piece["kind"] != "tsum":
                 piece["group"] = 0
-                continue
-            color = self._mean_color(image, piece)
-            group = None
-            for index, ref in enumerate(refs, start=1):
-                dist = (
-                    (color[0] - ref[0]) ** 2
-                    + (color[1] - ref[1]) ** 2
-                    + (color[2] - ref[2]) ** 2
-                ) ** 0.5
-                if dist < 48:
-                    group = min(index, 12)
-                    break
-            if group is None:
-                refs.append(color)
-                group = min(len(refs), 12)
-            piece["group"] = group
-
-    def _mean_color(self, image: Image.Image, piece: dict[str, int]) -> tuple[float, float, float]:
-        x, y, r = int(piece["x"]), int(piece["y"]), max(4, int(piece["r"]))
-        box = (max(0, x - r), max(0, y - r), x + r, y + r)
-        crop = image.crop(box)
-        pixels = list(crop.getdata())
-        if not pixels:
-            return (0.0, 0.0, 0.0)
-        count = len(pixels)
-        return (
-            sum(p[0] for p in pixels) / count,
-            sum(p[1] for p in pixels) / count,
-            sum(p[2] for p in pixels) / count,
+            else:
+                tsums.append(piece)
+        if not tsums:
+            return
+        if self.type_model is not None:
+            embeds = self._tsum_embeddings(image, tsums)
+            colors = [self._tsum_color(image, piece) for piece in tsums]
+            points = self._mix_type_features(embeds, colors)
+        else:
+            points = [self._tsum_color(image, piece) for piece in tsums]
+        k = min(4, len(tsums))
+        labels = self._kmeans(points, k)
+        order = sorted(
+            range(k),
+            key=lambda g: (
+                -sum(1 for label in labels if label == g),
+                next((points[i][0] for i, label in enumerate(labels) if label == g), 0.0),
+            ),
         )
+        remap = {old: new for new, old in enumerate(order, start=1)}
+        for piece, label in zip(tsums, labels):
+            piece["group"] = remap[label]
+
+    def _tsum_embeddings(
+        self, image: Image.Image, pieces: list[dict[str, int]]
+    ) -> list[tuple[float, ...]]:
+        tensors = [self._type_transform(prepare_tsum_crop(image, piece)) for piece in pieces]
+        batch = torch.stack(tensors).to(self.device)
+        model = self.type_model
+        if model is None:
+            return [self._tsum_color(image, piece) for piece in pieces]
+        with torch.no_grad():
+            encoded = model(batch).cpu()
+        return [tuple(row.tolist()) for row in encoded]
+
+    def _mix_type_features(
+        self,
+        embeds: list[tuple[float, ...]],
+        colors: list[tuple[float, float, float]],
+    ) -> list[tuple[float, ...]]:
+        mixed: list[tuple[float, ...]] = []
+        for embed, color in zip(embeds, colors):
+            norm = (sum(value * value for value in color) ** 0.5) or 1.0
+            extra = tuple(0.28 * value / norm for value in color)
+            vector = [float(v) for v in embed] + list(extra)
+            scale = (sum(v * v for v in vector) ** 0.5) or 1.0
+            mixed.append(tuple(v / scale for v in vector))
+        return mixed
+
+    def _tsum_color(self, image: Image.Image, piece: dict[str, int]) -> tuple[float, float, float]:
+        x, y, r = int(piece["x"]), int(piece["y"]), max(4, int(piece["r"]))
+        span = max(8, int(round(r * TYPE_CROP_SCALE)))
+        width, height = image.size
+        box = (
+            max(0, x - span),
+            max(0, y - span),
+            min(width, x + span + 1),
+            min(height, y + span + 1),
+        )
+        crop = image.crop(box).resize((32, 32), Image.Resampling.BILINEAR).convert("LAB")
+        total = [0.0, 0.0, 0.0]
+        count = 0
+        cx = cy = 15.5
+        for index, pixel in enumerate(crop.getdata()):
+            px = index % 32
+            py = index // 32
+            dist = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+            if dist < 4.0 or dist > 9.0:
+                continue
+            total[0] += pixel[0]
+            total[1] += pixel[1]
+            total[2] += pixel[2]
+            count += 1
+        if count == 0:
+            return (0.0, 128.0, 128.0)
+        return (0.3 * total[0] / count, total[1] / count, total[2] / count)
+
+    def _kmeans(self, points: list[tuple[float, ...]], k: int, iters: int = 16) -> list[int]:
+        if k <= 1 or len(points) <= 1:
+            return [0] * len(points)
+        best_labels: list[int] | None = None
+        best_inertia = 0.0
+        for start in range(min(8, len(points))):
+            labels, inertia = self._kmeans_once(points, k, iters, start)
+            if best_labels is None or inertia < best_inertia:
+                best_labels = labels
+                best_inertia = inertia
+        return best_labels or [0] * len(points)
+
+    def _kmeans_once(
+        self,
+        points: list[tuple[float, ...]],
+        k: int,
+        iters: int,
+        start: int,
+    ) -> tuple[list[int], float]:
+        centers: list[list[float]] = [list(points[start])]
+        for _ in range(k - 1):
+            best_index = 0
+            best_dist = -1.0
+            for index, point in enumerate(points):
+                dist = min(self._dist2(point, center) for center in centers)
+                if dist > best_dist:
+                    best_dist = dist
+                    best_index = index
+            centers.append(list(points[best_index]))
+        labels = [0] * len(points)
+        dim = len(points[0])
+        for _ in range(iters):
+            for index, point in enumerate(points):
+                labels[index] = min(range(k), key=lambda g: self._dist2(point, centers[g]))
+            for group in range(k):
+                members = [points[i] for i, label in enumerate(labels) if label == group]
+                if not members:
+                    continue
+                centers[group] = [sum(member[d] for member in members) / len(members) for d in range(dim)]
+        inertia = sum(self._dist2(point, centers[label]) for point, label in zip(points, labels))
+        return labels, inertia
+
+    def _dist2(self, a: tuple[float, ...] | list[float], b: tuple[float, ...] | list[float]) -> float:
+        return sum((float(x) - float(y)) ** 2 for x, y in zip(a, b))
 
     def _decode(
         self,

@@ -985,16 +985,9 @@ class MainWindow(QMainWindow):
             return
         selected = set(self._selected_place_keys())
         if self.predictor.piece_model is not None and any(key in selected for key in PIECE_KEYS):
-            missing = [
-                key
-                for key in PIECE_KEYS
-                if key in selected
-                and key not in sample.confirmed
-                and not any(piece.get("kind") == key for piece in sample.pieces)
-            ]
-            if missing:
+            if any(key in selected and key not in sample.confirmed for key in PIECE_KEYS):
                 try:
-                    self._predict_into_sample(sample, overwrite=False)
+                    self._predict_into_sample(sample, overwrite=True)
                 except Exception:
                     pass
                 sample = self.dataset.get(sample_id) or sample
@@ -2085,6 +2078,28 @@ class MainWindow(QMainWindow):
             }
             piece_samples = list(piece_map.values())
             if len(piece_samples) >= MIN_TRAIN_SAMPLES:
+                if "tsum" in piece_keys:
+                    type_samples = [
+                        sample
+                        for sample in piece_samples
+                        if len(
+                            {
+                                int(piece.get("group") or 1)
+                                for piece in sample.pieces
+                                if piece.get("kind") == "tsum"
+                            }
+                        )
+                        >= 2
+                    ]
+                    if len(type_samples) >= MIN_TRAIN_SAMPLES:
+                        jobs.append(
+                            (
+                                "tsum_types",
+                                type_samples,
+                                self.dataset.model_path_for("tsum_types"),
+                                "ツムの種類",
+                            )
+                        )
                 jobs.append(
                     (
                         "pieces",
@@ -2139,6 +2154,8 @@ class MainWindow(QMainWindow):
     def _job_label(self, key: str) -> str:
         if key == "pieces":
             return self._piece_job_label()
+        if key == "tsum_types":
+            return "ツムの種類"
         if key == "coin_digits":
             return "コインの数字"
         if key == "scene":
@@ -2528,7 +2545,7 @@ class MainWindow(QMainWindow):
         self._train_started_at = None
         lines = []
         for item in results:
-            if item.get("key") == "pieces":
+            if item.get("key") in {"pieces", "tsum_types"}:
                 lines.append(f"{item['label']}  loss {item.get('loss', 0):.4f}（{item['samples']} 枚）")
             elif item.get("key") in {"coin_digits", "scene"}:
                 lines.append(f"{item['label']}  acc {item.get('iou', 0):.3f}（{item['samples']} 枚）")
