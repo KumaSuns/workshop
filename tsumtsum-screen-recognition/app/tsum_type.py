@@ -51,7 +51,27 @@ def prepare_tsum_crop(
     fade = torch.where(dist_self < outer, fade, torch.zeros_like(fade))
     fill = torch.tensor(TYPE_FILL, dtype=torch.float32).view(3, 1, 1)
     isolated = rgb * fade.unsqueeze(0) + fill * (1.0 - fade.unsqueeze(0))
+    isolated = _suppress_effect_pixels(isolated, fade)
     return to_pil_image(isolated.byte().clamp(0, 255))
+
+
+def _suppress_effect_pixels(rgb: torch.Tensor, fade: torch.Tensor) -> torch.Tensor:
+    luma = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    body = fade > 0.6
+    if int(body.sum()) < 16:
+        return rgb
+    median = luma[body].median()
+    sparkle = body & (luma > median + 48)
+    if not bool(sparkle.any()):
+        return rgb
+    keep = body & ~sparkle
+    if int(keep.sum()) < 8:
+        return rgb
+    out = rgb.clone()
+    out[0][sparkle] = rgb[0][keep].median()
+    out[1][sparkle] = rgb[1][keep].median()
+    out[2][sparkle] = rgb[2][keep].median()
+    return out
 
 
 class TsumTypeNet(nn.Module):

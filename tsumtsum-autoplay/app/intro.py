@@ -309,7 +309,15 @@ def _tap_to_start_button(image: QImage) -> QRect | None:
     )
 
 
-def _yellow_pills(image: QImage) -> list[QRect]:
+def _yellow_pills(image: QImage, max_w_frac: float = 0.55) -> list[QRect]:
+    return _color_pills(image, _is_start_yellow, max_w_frac)
+
+
+def _pink_pills(image: QImage, max_w_frac: float = 0.85) -> list[QRect]:
+    return _color_pills(image, _is_start_pink, max_w_frac)
+
+
+def _color_pills(image: QImage, match, max_w_frac: float) -> list[QRect]:
     sample = _sample(image)
     height = len(sample)
     width = len(sample[0]) if sample else 0
@@ -318,7 +326,7 @@ def _yellow_pills(image: QImage) -> list[QRect]:
     scale_x = image.width() / width
     scale_y = image.height() / height
     pills: list[QRect] = []
-    for blob in _all_blobs(sample, _is_start_yellow):
+    for blob in _all_blobs(sample, match):
         if len(blob) < 12:
             continue
         xs = [p[0] for p in blob]
@@ -329,7 +337,7 @@ def _yellow_pills(image: QImage) -> list[QRect]:
         box_h = bottom - top + 1
         if box_h < 3 or box_w < box_h * 1.6:
             continue
-        if box_w < width * 0.08 or box_w > width * 0.55:
+        if box_w < width * 0.08 or box_w > width * max_w_frac:
             continue
         if box_h > height * 0.22:
             continue
@@ -359,6 +367,36 @@ def _play_button(image: QImage) -> QRect | None:
     if abs(play.center().x() - image.width() / 2) > image.width() * 0.22:
         return None
     return play
+
+
+def _continue_button(image: QImage) -> QRect | None:
+    low = [
+        pill
+        for pill in _yellow_pills(image, max_w_frac=0.85)
+        if pill.center().y() > image.height() * 0.68
+        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.22
+    ]
+    if not low:
+        return None
+    button = max(low, key=lambda rect: rect.center().y())
+    if button.width() < image.width() * 0.18:
+        return None
+    return button
+
+
+def _match_start_button(image: QImage) -> QRect | None:
+    low = [
+        pill
+        for pill in _pink_pills(image)
+        if pill.center().y() > image.height() * 0.55
+        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.22
+    ]
+    if not low:
+        return None
+    button = max(low, key=lambda rect: rect.width() * rect.height())
+    if button.width() < image.width() * 0.18:
+        return None
+    return button
 
 
 def _cancel_button(image: QImage) -> QRect | None:
@@ -394,6 +432,18 @@ def _close_button(image: QImage) -> QRect | None:
 def _is_start_yellow(pixel: tuple[int, int, int]) -> bool:
     red, green, blue = pixel
     return red > 200 and green > 110 and blue < 70 and red >= green and green > blue + 60
+
+
+def _is_start_pink(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return (
+        red > 210
+        and 60 < green < 160
+        and 80 < blue < 180
+        and red > green + 70
+        and red > blue + 70
+        and abs(green - blue) < 50
+    )
 
 
 def _is_white(pixel: tuple[int, int, int]) -> bool:

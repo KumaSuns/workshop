@@ -3,18 +3,58 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QStandardPaths, Qt, QTimer, QEvent
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-from app.bluestacks import start_tsum, tsum_is_running
+from app.bluestacks import halt_input, start_tsum, tsum_is_running
 from app.intro import IntroWorker
 from app.paths import APP_ROOT
 from app.play import PlayWorker
 
 APP_NAME = "ツムツム オートプレイ"
+_STOP_HOTKEY = 1
+_WM_HOTKEY = 0x0312
+_VK_Q = 0x51
+_MOD_NOREPEAT = 0x4000
+
+
+class DebugWindow(QWidget):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("デバッグ")
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        layout = QVBoxLayout(self)
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(400)
+        layout.addWidget(self._log)
+        self.resize(420, 480)
+        self._on_stop = None
+
+    def append(self, text: str) -> None:
+        now = datetime.now().strftime("%H:%M:%S")
+        self._log.appendPlainText(f"{now}  {text}")
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat() and self._on_stop:
+            self._on_stop()
+            return
+        super().keyPressEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -30,6 +70,9 @@ class MainWindow(QMainWindow):
         self.play_btn = QPushButton("PLAY")
         self.play_btn.clicked.connect(self.on_play)
         layout.addWidget(self.play_btn)
+        self.now_btn = QPushButton("今すぐプレイ")
+        self.now_btn.clicked.connect(self.on_play_now)
+        layout.addWidget(self.now_btn)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop)
@@ -44,16 +87,23 @@ class MainWindow(QMainWindow):
         self._stop = threading.Event()
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
+        self._debug = DebugWindow()
+        self._debug._on_stop = self.on_stop
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._front_timer = QTimer(self)
         self._front_timer.setInterval(800)
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
+        self._debug.append("待機中")
 
     def on_play(self) -> None:
         if self._is_busy():
             return
         self._stop.clear()
         self._set_running(True)
+        self._set_status("PLAY")
         if not tsum_is_running():
             desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
             try:
@@ -67,10 +117,29 @@ class MainWindow(QMainWindow):
             return
         self._start_play()
 
+    def on_play_now(self) -> None:
+        if self._is_busy():
+            return
+        if not tsum_is_running():
+            QMessageBox.information(self, "今すぐプレイ", "ツムツムが起動していません。")
+            return
+        self._stop.clear()
+        self._set_running(True)
+        self._set_status("今すぐプレイ")
+        self._start_play(start_match=True)
+
     def on_stop(self) -> None:
         if not self._is_busy():
             return
+        if self._stop.is_set():
+            halt_input()
+            return
         self._stop.set()
+        if self._intro is not None:
+            self._intro.requestInterruption()
+        if self._play is not None:
+            self._play.requestInterruption()
+        halt_input()
         self._set_status("停止しています")
 
     def _is_busy(self) -> bool:
@@ -80,7 +149,15 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.play_btn.setEnabled(not running)
+        self.now_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
+        if running:
+            self._front_timer.stop()
+            self._register_stop_hotkey()
+        else:
+            self._unregister_stop_hotkey()
+            self._front_timer.start()
+            self._keep_front()
 
     def _start_intro(self) -> None:
         self._intro = IntroWorker(self._stop, self)
@@ -91,20 +168,76 @@ class MainWindow(QMainWindow):
         self._keep_front()
         self._intro.start()
 
-    def _start_play(self) -> None:
-        self._play = PlayWorker(self._stop, self)
+    def _start_play(self, start_match: bool = False) -> None:
+        self._play = PlayWorker(self._stop, self, start_match=start_match)
         self._play.status.connect(self._set_status)
         self._play.failed.connect(self._on_play_fail)
         self._play.stopped.connect(self._on_stopped)
+        self._play.completed.connect(self._on_play_done)
         self._keep_front()
         self._play.start()
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
-        self._keep_front()
+        self._debug.append(text)
 
     def _keep_front(self) -> None:
         self.raise_()
+        if self._debug.isVisible():
+            self._debug.raise_()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._debug.show()
+        geo = self.frameGeometry()
+        self._debug.move(geo.right() + 8, geo.top())
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
+            self.on_stop()
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Q:
+            if not event.isAutoRepeat() and self._is_busy():
+                self.on_stop()
+                return True
+        return super().eventFilter(watched, event)
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32":
+            raw = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
+            if raw.startswith(b"windows_generic_MSG"):
+                import ctypes
+                from ctypes import wintypes
+
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _STOP_HOTKEY:
+                    QTimer.singleShot(0, self.on_stop)
+                    return True, 0
+        return super().nativeEvent(eventType, message)
+
+    def _register_stop_hotkey(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _STOP_HOTKEY, _MOD_NOREPEAT, _VK_Q
+        )
+
+    def _unregister_stop_hotkey(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
+
+    def closeEvent(self, event) -> None:
+        self._unregister_stop_hotkey()
+        self._debug.close()
+        super().closeEvent(event)
 
     def _on_intro_ok(self) -> None:
         if self._stop.is_set():
@@ -121,6 +254,11 @@ class MainWindow(QMainWindow):
         self._set_running(False)
         self._set_status(message)
         QMessageBox.critical(self, "PLAY", message)
+
+    def _on_play_done(self) -> None:
+        self._set_running(False)
+        if self.status_label.text() != "TIME UP":
+            self._set_status("TIME UP")
 
     def _on_stopped(self) -> None:
         self._set_running(False)

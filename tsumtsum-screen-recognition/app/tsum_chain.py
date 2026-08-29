@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 CANDIDATE_COUNT = 3
-SPACING_NEIGHBOR = 1.5
+SPACING_NEIGHBOR = 1.7
 RADIUS_NEIGHBOR = 1.12
 BLOCK_FRACTION = 0.4
+MIN_CHAIN = 3
 
 
 def max_tsum_chain(pieces: list[dict[str, int]]) -> int:
@@ -30,6 +31,25 @@ def tsum_chain_candidates(
         found.extend(_paths_in_group(nodes, tsums, spacing))
     found.sort(key=len, reverse=True)
     return _pick_diverse(found, limit)
+
+
+def tsum_chain_best_per_group(
+    pieces: list[dict[str, int]],
+    limit: int = 8,
+) -> list[list[dict[str, int]]]:
+    tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
+    spacing = _typical_spacing(tsums)
+    groups: dict[int, list[dict[str, int]]] = {}
+    for piece in tsums:
+        groups.setdefault(int(piece.get("group") or 1), []).append(piece)
+    best: list[list[dict[str, int]]] = []
+    for nodes in groups.values():
+        paths = [path for path in _paths_in_group(nodes, tsums, spacing) if len(path) >= MIN_CHAIN]
+        if not paths:
+            continue
+        best.append(max(paths, key=len))
+    best.sort(key=len, reverse=True)
+    return best[:limit]
 
 
 def _typical_spacing(tsums: list[dict[str, int]]) -> float:
@@ -61,7 +81,7 @@ def _paths_in_group(
     spacing: float,
 ) -> list[list[dict[str, int]]]:
     count = len(nodes)
-    if count <= 1:
+    if count < MIN_CHAIN:
         return []
     links = [[] for _ in range(count)]
     for index, left in enumerate(nodes):
@@ -71,7 +91,7 @@ def _paths_in_group(
             links[index].append(other)
             links[other].append(index)
     orders = _collect_paths(links)
-    return [[nodes[index] for index in order] for order in orders if len(order) >= 2]
+    return [[nodes[index] for index in order] for order in orders if len(order) >= MIN_CHAIN]
 
 
 def _adjacent(
@@ -126,7 +146,7 @@ def _blocked_by_other(
 
 def _collect_paths(links: list[list[int]]) -> list[list[int]]:
     count = len(links)
-    if count <= 1:
+    if count < MIN_CHAIN:
         return []
     if count > 16:
         return _greedy_paths(links)
@@ -135,7 +155,7 @@ def _collect_paths(links: list[list[int]]) -> list[list[int]]:
     walk_limit = 8000
 
     def consider(path: list[int]) -> None:
-        if len(path) < 2:
+        if len(path) < MIN_CHAIN:
             return
         key = frozenset(path)
         prev = found.get(key)
@@ -187,7 +207,7 @@ def _greedy_paths(links: list[list[int]]) -> list[list[int]]:
             used.add(nxt)
             path.append(nxt)
             current = nxt
-        if len(path) < 2:
+        if len(path) < MIN_CHAIN:
             continue
         key = frozenset(path)
         prev = found.get(key)
@@ -203,7 +223,7 @@ def _pick_diverse(
     selected: list[list[dict[str, int]]] = []
     keys: list[frozenset[tuple[int, int, int]]] = []
     for path in paths:
-        if len(path) < 2:
+        if len(path) < MIN_CHAIN:
             continue
         key = frozenset(
             (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))

@@ -264,7 +264,12 @@ class Predictor:
         self._assign_groups(rgb, pieces)
         return pieces
 
-    def _assign_groups(self, image: Image.Image, pieces: list[dict[str, int]]) -> None:
+    def _assign_groups(
+        self,
+        image: Image.Image,
+        pieces: list[dict[str, int]],
+        kinds: int = 4,
+    ) -> None:
         tsums: list[dict[str, int]] = []
         for piece in pieces:
             if piece["kind"] != "tsum":
@@ -279,7 +284,7 @@ class Predictor:
             points = self._mix_type_features(embeds, colors)
         else:
             points = [self._tsum_color(image, piece) for piece in tsums]
-        k = min(4, len(tsums))
+        k = min(kinds, len(tsums))
         labels = self._kmeans(points, k)
         order = sorted(
             range(k),
@@ -329,22 +334,25 @@ class Predictor:
             min(height, y + span + 1),
         )
         crop = image.crop(box).resize((32, 32), Image.Resampling.BILINEAR).convert("LAB")
-        total = [0.0, 0.0, 0.0]
-        count = 0
         cx = cy = 15.5
+        ring: list[tuple[int, int, int]] = []
         for index, pixel in enumerate(crop.getdata()):
             px = index % 32
             py = index // 32
             dist = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
             if dist < 4.0 or dist > 9.0:
                 continue
-            total[0] += pixel[0]
-            total[1] += pixel[1]
-            total[2] += pixel[2]
-            count += 1
-        if count == 0:
+            ring.append((int(pixel[0]), int(pixel[1]), int(pixel[2])))
+        if not ring:
             return (0.0, 128.0, 128.0)
-        return (0.3 * total[0] / count, total[1] / count, total[2] / count)
+        luma = sorted(pixel[0] for pixel in ring)
+        median_l = luma[len(luma) // 2]
+        kept = [pixel for pixel in ring if pixel[0] <= median_l + 28]
+        if not kept:
+            kept = ring
+        count = len(kept)
+        total = [sum(pixel[i] for pixel in kept) / count for i in range(3)]
+        return (0.3 * total[0], total[1], total[2])
 
     def _kmeans(self, points: list[tuple[float, ...]], k: int, iters: int = 16) -> list[int]:
         if k <= 1 or len(points) <= 1:
