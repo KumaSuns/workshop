@@ -42,7 +42,10 @@ def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dic
         }
         predictor._dataset_cls = Dataset
         predictor._trainer_modules = keep
-        _attach_scene_model(predictor)
+        if getattr(predictor, "scene_model", None) is None:
+            raise RuntimeError(
+                "TIME UP のモデルがありません。動画フレーム抜き出しで GO / TIME UP を学習してください。"
+            )
         return predictor, chain_fn
     finally:
         if added:
@@ -56,39 +59,6 @@ def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dic
         sys.modules.update(hidden)
         if predictor is not None:
             predictor._trainer_modules = keep
-            _attach_scene_model(predictor)
-
-
-def _attach_scene_model(predictor) -> None:
-    if getattr(predictor, "scene_model", None) is not None:
-        return
-    paths = [
-        TRAINER_ROOT / "data" / "models" / "scene.pt",
-        APP_ROOT.parent / "video-frame-extractor" / "scene.pt",
-    ]
-    scene_path = next((path for path in paths if path.is_file()), None)
-    if scene_path is None:
-        return
-    mods = getattr(predictor, "_trainer_modules", {}) or {}
-    scene_mod = mods.get("app.scene_model")
-    if scene_mod is None:
-        return
-    import torch
-
-    try:
-        checkpoint = torch.load(scene_path, map_location=predictor.device, weights_only=False)
-        model = scene_mod.SceneNet(pretrained=False)
-        state = (
-            checkpoint["state_dict"]
-            if isinstance(checkpoint, dict) and "state_dict" in checkpoint
-            else checkpoint
-        )
-        model.load_state_dict(state)
-        model.to(predictor.device)
-        model.eval()
-        predictor.scene_model = model
-    except Exception:
-        return
 
 
 def save_erase_lesson(

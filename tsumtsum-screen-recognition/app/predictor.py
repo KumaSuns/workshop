@@ -17,6 +17,7 @@ from app.digit_model import (
 from app.hud_number import prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, heat_to_pixel, peaks_from_heat
+from app.paths import WORKSHOP_ROOT
 from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename, piece_radius_from_game
 from app.scene_model import SCENE_INPUT, SceneNet, scene_name
 from app.tsum_type import (
@@ -178,6 +179,8 @@ class Predictor:
         if "coin" in self.digit_models and "result_coin" not in self.digit_models:
             self.digit_models["result_coin"] = self.digit_models["coin"]
         scene_path = self.models_dir / model_filename("scene")
+        if not scene_path.exists():
+            scene_path = WORKSHOP_ROOT / "video-frame-extractor" / "scene.pt"
         if scene_path.exists():
             checkpoint = torch.load(scene_path, map_location=self.device, weights_only=False)
             model = SceneNet(pretrained=False)
@@ -229,7 +232,12 @@ class Predictor:
             boxes[key] = self._decode(model, tensor, width, height)
         return boxes
 
-    def predict_pieces(self, image_path: Path, game: dict[str, int] | None) -> list[dict[str, int]]:
+    def predict_pieces(
+        self,
+        image_path: Path,
+        game: dict[str, int] | None,
+        kinds: int = 5,
+    ) -> list[dict[str, int]]:
         if self.piece_model is None:
             return []
         with Image.open(image_path) as image:
@@ -261,14 +269,14 @@ class Predictor:
                 pieces.append(
                     {"x": int(round(x)), "y": int(round(y)), "r": r, "kind": kind, "group": 1}
                 )
-        self._assign_groups(rgb, pieces)
+        self._assign_groups(rgb, pieces, kinds=kinds)
         return pieces
 
     def _assign_groups(
         self,
         image: Image.Image,
         pieces: list[dict[str, int]],
-        kinds: int = 4,
+        kinds: int = 5,
     ) -> None:
         tsums: list[dict[str, int]] = []
         for piece in pieces:
@@ -284,7 +292,7 @@ class Predictor:
             points = self._mix_type_features(embeds, colors)
         else:
             points = [self._tsum_color(image, piece) for piece in tsums]
-        k = min(kinds, len(tsums))
+        k = min(max(1, kinds), len(tsums))
         labels = self._kmeans(points, k)
         order = sorted(
             range(k),

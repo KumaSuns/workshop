@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,11 @@ _REMOTE_CAP = "/data/local/tmp/tsum_autoplay.png"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _REMOTE_DRAG = "/data/local/tmp/tsum_drag.sh"
 _touch_dev: tuple[str, int, int] | None | bool = None
+_view_cache: tuple[float, tuple[int, int, int, int]] | None = None
+_mouse_ready = False
+_capture_how: str | None = None
+_adb_ok = False
+_last_cap_size: tuple[int, int] | None = None
 
 
 def tsum_is_running() -> bool:
@@ -118,16 +124,19 @@ def adb_serial() -> str:
 
 
 def adb(args: list[str], timeout: float = 8) -> subprocess.CompletedProcess[bytes]:
+    global _adb_ok
     if not ADB.exists():
         raise FileNotFoundError("BlueStacks の adb が見つかりませんでした。")
     serial = adb_serial()
-    subprocess.run(
-        [str(ADB), "connect", serial],
-        check=False,
-        capture_output=True,
-        timeout=4,
-        creationflags=_NO_WINDOW,
-    )
+    if not _adb_ok:
+        subprocess.run(
+            [str(ADB), "connect", serial],
+            check=False,
+            capture_output=True,
+            timeout=4,
+            creationflags=_NO_WINDOW,
+        )
+        _adb_ok = True
     return subprocess.run(
         [str(ADB), "-s", serial, *args],
         check=False,
@@ -138,7 +147,108 @@ def adb(args: list[str], timeout: float = 8) -> subprocess.CompletedProcess[byte
 
 
 def capture_screen_path() -> Path:
+    global _capture_how, _last_cap_size
     local = Path(tempfile.gettempdir()) / "tsum_autoplay.png"
+    if _capture_how == "pull":
+        path = _capture_pull(local)
+        _remember_cap_size(path)
+        return path
+    if _capture_how != "png":
+        raw = adb(["exec-out", "screencap"], timeout=5)
+        image = _image_from_screencap(raw.stdout or b"")
+        if image is not None and not image.isNull() and image.save(str(local), "PNG"):
+            _capture_how = "raw"
+            _last_cap_size = (image.width(), image.height())
+            return local
+    if _capture_how != "raw":
+        png = adb(["exec-out", "screencap", "-p"], timeout=5)
+        data = png.stdout or b""
+        if png.returncode == 0 and data.startswith(b"\x89PNG"):
+            _capture_how = "png"
+            local.write_bytes(data)
+            _remember_cap_size(local)
+            return local
+    _capture_how = "pull"
+    path = _capture_pull(local)
+    _remember_cap_size(path)
+    return path
+
+
+def _remember_cap_size(path: Path) -> None:
+    global _last_cap_size
+    image = QImage(str(path))
+    if not image.isNull():
+        _last_cap_size = (image.width(), image.height())
+
+
+def _capture_window() -> QImage | None:
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    rect = _android_view_rect(user32, wintypes, 16, 9)
+    if rect is None:
+        return None
+    left, top, right, bottom = rect
+    width, height = right - left, bottom - top
+    if width < 80 or height < 80:
+        return None
+    hdc = user32.GetDC(0)
+    if not hdc:
+        return None
+    mem = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, width, height)
+    old = gdi32.SelectObject(mem, bmp)
+    ok = gdi32.BitBlt(mem, 0, 0, width, height, hdc, left, top, 0x00CC0020)
+    image = _qimage_from_hbitmap(gdi32, mem, bmp, width, height) if ok else None
+    gdi32.SelectObject(mem, old)
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(0, hdc)
+    return image
+
+
+def _qimage_from_hbitmap(gdi32, hdc, hbmp, width: int, height: int) -> QImage | None:
+    import ctypes
+    from ctypes import wintypes
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", ctypes.c_long),
+            ("biHeight", ctypes.c_long),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", ctypes.c_long),
+            ("biYPelsPerMeter", ctypes.c_long),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    header = BITMAPINFOHEADER()
+    header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    header.biWidth = width
+    header.biHeight = -height
+    header.biPlanes = 1
+    header.biBitCount = 32
+    buf = (ctypes.c_ubyte * (width * height * 4))()
+    got = gdi32.GetDIBits(hdc, hbmp, 0, height, buf, ctypes.byref(header), 0)
+    if not got:
+        return None
+    raw = bytes(buf)
+    return QImage(raw, width, height, width * 4, QImage.Format.Format_ARGB32).copy()
+
+
+def _capture_pull(local: Path) -> Path:
     result = adb(["shell", "screencap", "-p", _REMOTE_CAP], timeout=10)
     if result.returncode != 0:
         err = (result.stderr or result.stdout or b"").decode("utf-8", "ignore").strip()
@@ -150,6 +260,37 @@ def capture_screen_path() -> Path:
     return local
 
 
+def _image_from_screencap(data: bytes) -> QImage | None:
+    if data.startswith(b"\x89PNG"):
+        image = QImage()
+        if image.loadFromData(data, "PNG"):
+            return image
+        return None
+    if len(data) < 12:
+        return None
+    for header in (12, 16):
+        width, height, fmt = struct.unpack_from("<III", data, 0)
+        if width < 2 or height < 2 or width > 4096 or height > 4096:
+            continue
+        pixels = data[header:]
+        if fmt in {1, 2} and len(pixels) >= width * height * 4:
+            qfmt = (
+                QImage.Format.Format_RGBA8888
+                if fmt == 1
+                else QImage.Format.Format_RGBX8888
+            )
+            return QImage(pixels, width, height, width * 4, qfmt).copy()
+        if fmt == 3 and len(pixels) >= width * height * 3:
+            return QImage(
+                pixels, width, height, width * 3, QImage.Format.Format_RGB888
+            ).copy()
+        if fmt == 5 and len(pixels) >= width * height * 4:
+            return QImage(
+                pixels, width, height, width * 4, QImage.Format.Format_ARGB32
+            ).copy()
+    return None
+
+
 def capture_screen() -> QImage:
     local = capture_screen_path()
     image = QImage(str(local))
@@ -158,7 +299,12 @@ def capture_screen() -> QImage:
     return image
 
 
-def tap(x: int, y: int, hold_ms: int = 180) -> None:
+def tap(x: int, y: int, hold_ms: int = 180, screen_w: int = 0, screen_h: int = 0) -> None:
+    width, height = screen_w, screen_h
+    if (width < 2 or height < 2) and _last_cap_size is not None:
+        width, height = _last_cap_size
+    if _tap_mouse(int(x), int(y), width, height, hold_ms):
+        return
     xi, yi = str(int(x)), str(int(y))
     result = adb(["shell", "input", "tap", xi, yi], timeout=6)
     if result.returncode != 0:
@@ -191,16 +337,11 @@ def swipe_path(
 ) -> str:
     if stop is not None and stop.is_set():
         return "停止"
+    points = _spread_points(points, 16)
     if len(points) < 3:
         return "点が3未満"
-    hops = [
-        ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-        for (x0, y0), (x1, y1) in zip(points, points[1:])
-    ]
-    if min(hops) < 32:
-        return "ツムが近すぎる"
-    dense = _dense_points(points, step=12)
-    how = _swipe_mouse(dense, screen_w, screen_h)
+    dense = _dense_points(points, step=14)
+    how = _swipe_mouse(dense, screen_w, screen_h, points)
     if how:
         return how
     if stop is not None and stop.is_set():
@@ -210,7 +351,23 @@ def swipe_path(
     return "なぞり失敗"
 
 
-def _swipe_mouse(dense: list[tuple[int, int]], screen_w: int, screen_h: int) -> str:
+def _spread_points(points: list[tuple[int, int]], min_dist: int) -> list[tuple[int, int]]:
+    if not points:
+        return []
+    kept = [(int(points[0][0]), int(points[0][1]))]
+    for x, y in points[1:]:
+        px, py = kept[-1]
+        if (x - px) ** 2 + (y - py) ** 2 >= min_dist * min_dist:
+            kept.append((int(x), int(y)))
+    return kept
+
+
+def _swipe_mouse(
+    dense: list[tuple[int, int]],
+    screen_w: int,
+    screen_h: int,
+    anchors: list[tuple[int, int]] | None = None,
+) -> str:
     if sys.platform != "win32" or screen_w < 2 or screen_h < 2:
         return ""
     import ctypes
@@ -221,50 +378,117 @@ def _swipe_mouse(dense: list[tuple[int, int]], screen_w: int, screen_h: int) -> 
     except Exception:
         pass
     user32 = ctypes.windll.user32
+    mapped = _map_to_view(dense, screen_w, screen_h, user32, wintypes)
+    if not mapped:
+        return ""
+    hwnd = _player_hwnd(user32, wintypes)
+    if hwnd:
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(0.02)
+    hold = set()
+    if anchors:
+        held = _map_to_view(anchors, screen_w, screen_h, user32, wintypes)
+        hold = {(int(x), int(y)) for x, y in held}
+    if not _send_mouse_path(user32, mapped, hold):
+        return ""
+    return f"マウス {len(dense)}点"
+
+
+def _send_mouse_path(user32, mapped: list[tuple[int, int]], hold: set[tuple[int, int]]) -> bool:
+    import ctypes
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
+
+    class _INPUTunion(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTunion)]
+
+    user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = ctypes.c_uint
+
+    vx = user32.GetSystemMetrics(76)
+    vy = user32.GetSystemMetrics(77)
+    vw = max(1, user32.GetSystemMetrics(78) - 1)
+    vh = max(1, user32.GetSystemMetrics(79) - 1)
+    move = 0x0001 | 0x8000 | 0x4000
+    down = move | 0x0002
+    up = move | 0x0004
+
+    def emit(x: int, y: int, flags: int) -> None:
+        ax = int((x - vx) * 65535 / vw)
+        ay = int((y - vy) * 65535 / vh)
+        inp = INPUT(type=0, union=_INPUTunion(mi=MOUSEINPUT(ax, ay, 0, flags, 0, None)))
+        user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+    x0, y0 = mapped[0]
+    emit(x0, y0, move)
+    time.sleep(0.01)
+    emit(x0, y0, down)
+    time.sleep(0.03)
+    for x, y in mapped[1:]:
+        emit(x, y, move)
+        time.sleep(0.018 if (x, y) in hold else 0.006)
+    time.sleep(0.02)
+    xl, yl = mapped[-1]
+    emit(xl, yl, up)
+    return True
+
+
+def _tap_mouse(x: int, y: int, screen_w: int, screen_h: int, hold_ms: int) -> bool:
+    if sys.platform != "win32" or screen_w < 2 or screen_h < 2:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+    user32 = ctypes.windll.user32
+    mapped = _map_to_view([(x, y)], screen_w, screen_h, user32, wintypes)
+    if not mapped:
+        return False
+    hwnd = _player_hwnd(user32, wintypes)
+    if hwnd:
+        user32.SetForegroundWindow(hwnd)
+    return _send_mouse_path(user32, mapped, set())
+
+
+def _map_to_view(
+    points: list[tuple[int, int]],
+    screen_w: int,
+    screen_h: int,
+    user32,
+    wintypes,
+) -> list[tuple[int, int]]:
     rect = _android_view_rect(user32, wintypes, screen_w, screen_h)
     if rect is None:
-        return ""
+        return []
     left, top, right, bottom = rect
     rw = right - left
     rh = bottom - top
     if rw < 50 or rh < 50:
-        return ""
+        return []
     scale = min(rw / screen_w, rh / screen_h)
     ox = left + (rw - screen_w * scale) / 2
     oy = top + (rh - screen_h * scale) / 2
-    mapped = [
-        (int(ox + x * scale), int(oy + y * scale))
-        for x, y in dense
-    ]
-    hwnd = _player_hwnd(user32, wintypes)
-    HWND_TOPMOST = -1
-    HWND_NOTOPMOST = -2
-    SWP_NOMOVE = 0x0002
-    SWP_NOSIZE = 0x0001
-    SWP_SHOWWINDOW = 0x0040
-    if hwnd:
-        user32.SetWindowPos(
-            hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
-        )
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(0.05)
-    try:
-        x0, y0 = mapped[0]
-        user32.SetCursorPos(x0, y0)
-        time.sleep(0.03)
-        user32.mouse_event(0x0002, 0, 0, 0, 0)
-        time.sleep(0.08)
-        for x, y in mapped[1:]:
-            user32.SetCursorPos(x, y)
-            time.sleep(0.016)
-        time.sleep(0.05)
-        user32.mouse_event(0x0004, 0, 0, 0, 0)
-    finally:
-        if hwnd:
-            user32.SetWindowPos(
-                hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE
-            )
-    return f"マウス {len(dense)}点"
+    return [(int(ox + x * scale), int(oy + y * scale)) for x, y in points]
+
+
+def reset_swipe_mouse() -> None:
+    global _mouse_ready, _view_cache
+    _mouse_ready = False
+    _view_cache = None
 
 
 def _player_hwnd(user32, wintypes):
@@ -302,6 +526,10 @@ def _android_view_rect(
     hwnd = _player_hwnd(user32, wintypes)
     if not hwnd:
         return None
+    global _view_cache
+    now = time.time()
+    if _view_cache is not None and now - _view_cache[0] < 2.0:
+        return _view_cache[1]
     kids: list[tuple[float, int, tuple[int, int, int, int]]] = []
     want = (screen_w / screen_h) if screen_w > 0 and screen_h > 0 else 0.0
 
@@ -324,12 +552,16 @@ def _android_view_rect(
     user32.EnumChildWindows(hwnd, enum_proc(_cb), 0)
     if kids:
         kids.sort()
-        return kids[0][2]
+        rect = kids[0][2]
+        _view_cache = (now, rect)
+        return rect
     rect = wintypes.RECT()
     user32.GetClientRect(hwnd, ctypes.byref(rect))
     pt = wintypes.POINT(0, 0)
     user32.ClientToScreen(hwnd, ctypes.byref(pt))
-    return (pt.x, pt.y, pt.x + rect.right, pt.y + rect.bottom)
+    box = (pt.x, pt.y, pt.x + rect.right, pt.y + rect.bottom)
+    _view_cache = (now, box)
+    return box
 
 
 def _swipe_sendevent(dense: list[tuple[int, int]], screen_w: int, screen_h: int) -> bool:

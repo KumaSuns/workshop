@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, Qt, QTimer, QEvent
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QLabel,
@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from app.bluestacks import halt_input, start_tsum, tsum_is_running
 from app.intro import IntroWorker
 from app.paths import APP_ROOT
-from app.play import PlayWorker
+from app.play import PlayWorker, read_kind_count
 
 APP_NAME = "ツムツム オートプレイ"
 _STOP_HOTKEY = 1
@@ -38,12 +38,31 @@ class DebugWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         layout = QVBoxLayout(self)
+        self._preview = QLabel("なぞる経路")
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview.setMinimumHeight(280)
+        self._preview.setStyleSheet("background:#111; color:#888;")
+        layout.addWidget(self._preview)
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(400)
         layout.addWidget(self._log)
-        self.resize(420, 480)
+        self.resize(420, 720)
         self._on_stop = None
+
+    def set_preview(self, image: QImage) -> None:
+        if image.isNull():
+            return
+        width = max(200, self._preview.width())
+        pix = QPixmap.fromImage(image)
+        self._preview.setPixmap(
+            pix.scaled(
+                width,
+                max(240, self._preview.height()),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     def append(self, text: str) -> None:
         now = datetime.now().strftime("%H:%M:%S")
@@ -123,10 +142,66 @@ class MainWindow(QMainWindow):
         if not tsum_is_running():
             QMessageBox.information(self, "今すぐプレイ", "ツムツムが起動していません。")
             return
+        kinds = self._ask_kind_count()
+        if kinds is None:
+            return
+        charm = self._ask_charm_tsum()
+        if charm is None:
+            return
+        if charm:
+            kinds = max(1, kinds - 1)
         self._stop.clear()
         self._set_running(True)
         self._set_status("今すぐプレイ")
-        self._start_play(start_match=True)
+        self._start_play(start_match=True, kind_count=kinds)
+
+    def _ask_kind_count(self) -> int | None:
+        guess = read_kind_count()
+        box = QMessageBox(self)
+        box.setWindowTitle("今すぐプレイ")
+        if guess in (4, 5):
+            box.setText(f"種類は {guess} ですか？")
+            box.setInformativeText("合っていればそのままスタート。")
+            yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
+            no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+            box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(yes)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is yes:
+                return guess
+            if clicked is no:
+                return 5 if guess == 4 else 4
+            return None
+        box.setText("種類は何種類ですか？")
+        four = box.addButton("4種類", QMessageBox.ButtonRole.AcceptRole)
+        five = box.addButton("5種類", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(five)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is four:
+            return 4
+        if clicked is five:
+            return 5
+        return None
+
+    def _ask_charm_tsum(self) -> bool | None:
+        box = QMessageBox(self)
+        box.setWindowTitle("今すぐプレイ")
+        box.setText("チャームツムですか？")
+        box.setInformativeText("使うと種類が1つ減ります。")
+        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is yes:
+            return True
+        if clicked is no:
+            return False
+        return None
 
     def on_stop(self) -> None:
         if not self._is_busy():
@@ -153,9 +228,17 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(running)
         if running:
             self._front_timer.stop()
+            self._debug.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+            self._debug.show()
+            self.show()
             self._register_stop_hotkey()
         else:
             self._unregister_stop_hotkey()
+            self._debug.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            self._debug.show()
+            self.show()
             self._front_timer.start()
             self._keep_front()
 
@@ -168,13 +251,15 @@ class MainWindow(QMainWindow):
         self._keep_front()
         self._intro.start()
 
-    def _start_play(self, start_match: bool = False) -> None:
-        self._play = PlayWorker(self._stop, self, start_match=start_match)
+    def _start_play(self, start_match: bool = False, kind_count: int | None = None) -> None:
+        self._play = PlayWorker(
+            self._stop, self, start_match=start_match, kind_count=kind_count
+        )
         self._play.status.connect(self._set_status)
+        self._play.preview.connect(self._debug.set_preview)
         self._play.failed.connect(self._on_play_fail)
         self._play.stopped.connect(self._on_stopped)
         self._play.completed.connect(self._on_play_done)
-        self._keep_front()
         self._play.start()
 
     def _set_status(self, text: str) -> None:
