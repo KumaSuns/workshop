@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, Qt, QTimer
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import QLabel, QMainWindow, QMessageBox, QPushButton, QVB
 from app.bluestacks import start_tsum, tsum_is_running
 from app.intro import IntroWorker
 from app.paths import APP_ROOT
+from app.play import PlayWorker
 
 APP_NAME = "ツムツム オートプレイ"
 
@@ -25,9 +27,13 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon)))
         root = QWidget()
         layout = QVBoxLayout(root)
-        self.start_btn = QPushButton("スタート")
-        self.start_btn.clicked.connect(self.on_start)
-        layout.addWidget(self.start_btn)
+        self.play_btn = QPushButton("PLAY")
+        self.play_btn.clicked.connect(self.on_play)
+        layout.addWidget(self.play_btn)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.on_stop)
+        layout.addWidget(self.stop_btn)
         self.shortcut_btn = QPushButton("起動アイコン作成")
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         layout.addWidget(self.shortcut_btn)
@@ -35,33 +41,63 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self.setCentralWidget(root)
+        self._stop = threading.Event()
         self._intro: IntroWorker | None = None
+        self._play: PlayWorker | None = None
         self._front_timer = QTimer(self)
         self._front_timer.setInterval(800)
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
 
-    def on_start(self) -> None:
-        if self._intro is not None and self._intro.isRunning():
+    def on_play(self) -> None:
+        if self._is_busy():
             return
-        if tsum_is_running():
-            QMessageBox.information(self, "スタート", "BlueStacks でツムツムはすでに起動しています。")
+        self._stop.clear()
+        self._set_running(True)
+        if not tsum_is_running():
+            desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+            try:
+                start_tsum(desktop or "")
+            except Exception as exc:  # noqa: BLE001
+                self._set_running(False)
+                QMessageBox.critical(self, "起動できませんでした", str(exc))
+                return
+            self._set_status("起動しています")
+            self._start_intro()
             return
-        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
-        try:
-            start_tsum(desktop or "")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "起動できませんでした", str(exc))
+        self._start_play()
+
+    def on_stop(self) -> None:
+        if not self._is_busy():
             return
-        self.start_btn.setEnabled(False)
-        self.start_btn.setText("起動中…")
-        self._set_status("起動しています")
-        self._intro = IntroWorker(self)
+        self._stop.set()
+        self._set_status("停止しています")
+
+    def _is_busy(self) -> bool:
+        intro_on = self._intro is not None and self._intro.isRunning()
+        play_on = self._play is not None and self._play.isRunning()
+        return intro_on or play_on
+
+    def _set_running(self, running: bool) -> None:
+        self.play_btn.setEnabled(not running)
+        self.stop_btn.setEnabled(running)
+
+    def _start_intro(self) -> None:
+        self._intro = IntroWorker(self._stop, self)
         self._intro.status.connect(self._set_status)
         self._intro.succeeded.connect(self._on_intro_ok)
         self._intro.failed.connect(self._on_intro_fail)
+        self._intro.stopped.connect(self._on_stopped)
         self._keep_front()
         self._intro.start()
+
+    def _start_play(self) -> None:
+        self._play = PlayWorker(self._stop, self)
+        self._play.status.connect(self._set_status)
+        self._play.failed.connect(self._on_play_fail)
+        self._play.stopped.connect(self._on_stopped)
+        self._keep_front()
+        self._play.start()
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -71,18 +107,24 @@ class MainWindow(QMainWindow):
         self.raise_()
 
     def _on_intro_ok(self) -> None:
-        self._restore_start_btn()
-        self._set_status("プレイまで終わりました")
-        QMessageBox.information(self, "スタート", "プレイまで終わりました。")
+        if self._stop.is_set():
+            self._on_stopped()
+            return
+        self._start_play()
 
     def _on_intro_fail(self, message: str) -> None:
-        self._restore_start_btn()
+        self._set_running(False)
         self._set_status(message)
-        QMessageBox.critical(self, "スタート", message)
+        QMessageBox.critical(self, "PLAY", message)
 
-    def _restore_start_btn(self) -> None:
-        self.start_btn.setEnabled(True)
-        self.start_btn.setText("スタート")
+    def _on_play_fail(self, message: str) -> None:
+        self._set_running(False)
+        self._set_status(message)
+        QMessageBox.critical(self, "PLAY", message)
+
+    def _on_stopped(self) -> None:
+        self._set_running(False)
+        self._set_status("停止しました")
 
     def create_launch_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)

@@ -133,7 +133,7 @@ def adb(args: list[str], timeout: float = 8) -> subprocess.CompletedProcess[byte
     )
 
 
-def capture_screen() -> QImage:
+def capture_screen_path() -> Path:
     local = Path(tempfile.gettempdir()) / "tsum_autoplay.png"
     result = adb(["shell", "screencap", "-p", _REMOTE_CAP], timeout=10)
     if result.returncode != 0:
@@ -143,6 +143,11 @@ def capture_screen() -> QImage:
     if pulled.returncode != 0 or not local.exists():
         err = (pulled.stderr or pulled.stdout or b"").decode("utf-8", "ignore").strip()
         raise RuntimeError(err or "画面の保存に失敗しました。")
+    return local
+
+
+def capture_screen() -> QImage:
+    local = capture_screen_path()
     image = QImage(str(local))
     if image.isNull():
         raise RuntimeError("画面画像を読めませんでした。")
@@ -160,3 +165,42 @@ def tap(x: int, y: int, hold_ms: int = 180) -> None:
     if result.returncode != 0:
         err = (result.stderr or result.stdout or b"").decode("utf-8", "ignore").strip()
         raise RuntimeError(err or "タップできませんでした。")
+
+
+def swipe_path(points: list[tuple[int, int]], duration_ms: int = 450) -> None:
+    if len(points) < 2:
+        return
+    dense = _dense_points(points)
+    x0, y0 = dense[0]
+    cmds = [f"input motionevent DOWN {x0} {y0}"]
+    for x, y in dense[1:]:
+        cmds.append(f"input motionevent MOVE {x} {y}")
+    xl, yl = dense[-1]
+    cmds.append(f"input motionevent UP {xl} {yl}")
+    result = adb(["shell", " ; ".join(cmds)], timeout=20)
+    if result.returncode == 0:
+        return
+    x1, y1 = points[0]
+    x2, y2 = points[-1]
+    fallback = adb(
+        ["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(int(duration_ms))],
+        timeout=10,
+    )
+    if fallback.returncode != 0:
+        err = (fallback.stderr or fallback.stdout or b"").decode("utf-8", "ignore").strip()
+        raise RuntimeError(err or "なぞれませんでした。")
+
+
+def _dense_points(points: list[tuple[int, int]], step: int = 14) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for index, (x1, y1) in enumerate(points):
+        if index == 0:
+            out.append((int(x1), int(y1)))
+            continue
+        x0, y0 = out[-1]
+        dist = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+        count = max(1, int(dist / step))
+        for k in range(1, count + 1):
+            t = k / count
+            out.append((int(round(x0 + (x1 - x0) * t)), int(round(y0 + (y1 - y0) * t))))
+    return out

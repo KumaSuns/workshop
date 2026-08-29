@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from threading import Event
 
 from PySide6.QtCore import QRect, QThread, Signal
 from PySide6.QtGui import QImage
@@ -24,21 +25,37 @@ PLAY_STABLE = 3
 StatusFn = Callable[[str], None]
 
 
+class Stopped(Exception):
+    pass
+
+
+def _check_stop(stop: Event | None) -> None:
+    if stop is not None and stop.is_set():
+        raise Stopped()
+
+
 class IntroWorker(QThread):
     succeeded = Signal()
     failed = Signal(str)
+    stopped = Signal()
     status = Signal(str)
+
+    def __init__(self, stop: Event, parent=None) -> None:
+        super().__init__(parent)
+        self._stop = stop
 
     def run(self) -> None:
         try:
-            run_intro_flow(self.status.emit)
+            run_intro_flow(self.status.emit, self._stop)
+        except Stopped:
+            self.stopped.emit()
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
-            return
-        self.succeeded.emit()
+        else:
+            self.succeeded.emit()
 
 
-def run_intro_flow(report: StatusFn | None = None) -> None:
+def run_intro_flow(report: StatusFn | None = None, stop: Event | None = None) -> None:
     def say(text: str) -> None:
         if report is not None:
             report(text)
@@ -52,6 +69,7 @@ def run_intro_flow(report: StatusFn | None = None) -> None:
     clicked_center = False
     clicked_allow = False
     while time.time() < deadline:
+        _check_stop(stop)
         try:
             image = capture_screen()
         except Exception:
@@ -81,7 +99,7 @@ def run_intro_flow(report: StatusFn | None = None) -> None:
                 say("TAP TO STARTをクリックします")
                 _click_start(start_btn, say)
                 deadline = max(deadline, time.time() + 120)
-                _dismiss_popups(say, deadline)
+                _dismiss_popups(say, deadline, stop)
                 return
             previous = image
             time.sleep(0.35)
@@ -142,10 +160,11 @@ def _click_start(button: QRect, say: StatusFn) -> None:
         _slow_tap(still.center().x(), still.center().y())
 
 
-def _dismiss_popups(say: StatusFn, deadline: float) -> None:
+def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -> None:
     play_hits = 0
     popup_hits = 0
     while time.time() < deadline:
+        _check_stop(stop)
         try:
             image = capture_screen()
         except Exception:
