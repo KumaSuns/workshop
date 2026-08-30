@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import math
+
 CANDIDATE_COUNT = 3
-SPACING_NEIGHBOR = 1.7
-RADIUS_NEIGHBOR = 1.12
-BLOCK_FRACTION = 0.4
 MIN_CHAIN = 3
 
 
@@ -21,40 +20,124 @@ def tsum_chain_candidates(
     pieces: list[dict[str, int]],
     limit: int = CANDIDATE_COUNT,
 ) -> list[list[dict[str, int]]]:
-    tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
-    spacing = _typical_spacing(tsums)
-    groups: dict[int, list[dict[str, int]]] = {}
-    for piece in tsums:
-        groups.setdefault(int(piece.get("group") or 1), []).append(piece)
-    found: list[list[dict[str, int]]] = []
-    for nodes in groups.values():
-        found.extend(_paths_in_group(nodes, tsums, spacing))
-    found.sort(key=len, reverse=True)
-    return _pick_diverse(found, limit)
+    return _pick_diverse(_blob_paths(pieces), limit)
 
 
 def tsum_chain_best_per_group(
     pieces: list[dict[str, int]],
     limit: int = 8,
 ) -> list[list[dict[str, int]]]:
+    return _pick_diverse(_blob_paths(pieces), limit)
+
+
+def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
     tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
+    if len(tsums) < MIN_CHAIN:
+        return []
     spacing = _typical_spacing(tsums)
-    groups: dict[int, list[dict[str, int]]] = {}
-    for piece in tsums:
-        groups.setdefault(int(piece.get("group") or 1), []).append(piece)
-    best: list[list[dict[str, int]]] = []
-    for nodes in groups.values():
-        paths = [path for path in _paths_in_group(nodes, tsums, spacing) if len(path) >= MIN_CHAIN]
-        if not paths:
+    phys = _physical_links(tsums, spacing)
+    found = _paths_from_blobs(tsums, phys)
+    found.sort(key=len, reverse=True)
+    return found
+
+
+def _paths_from_blobs(
+    tsums: list[dict[str, int]],
+    phys: list[list[int]],
+) -> list[list[dict[str, int]]]:
+    found: list[list[dict[str, int]]] = []
+    seen: set[frozenset[int]] = set()
+    for index in range(len(tsums)):
+        blob = _type_blob(index, tsums, phys)
+        if len(blob) < MIN_CHAIN:
             continue
-        best.append(max(paths, key=len))
-    best.sort(key=len, reverse=True)
-    return best[:limit]
+        key = frozenset(blob)
+        if key in seen:
+            continue
+        seen.add(key)
+        local = _induced_links(phys, blob)
+        for order in _collect_paths(local):
+            if len(order) >= MIN_CHAIN:
+                found.append([tsums[blob[item]] for item in order])
+    return found
+
+
+def _induced_links(phys: list[list[int]], blob: list[int]) -> list[list[int]]:
+    index = {global_i: local for local, global_i in enumerate(blob)}
+    links: list[list[int]] = [[] for _ in blob]
+    for local, global_i in enumerate(blob):
+        for nxt in phys[global_i]:
+            if nxt in index:
+                links[local].append(index[nxt])
+    return links
+
+
+def _physical_links(tsums: list[dict[str, int]], spacing: float) -> list[list[int]]:
+    count = len(tsums)
+    radii = [max(4, int(piece.get("r") or 12)) for piece in tsums]
+    typical_r = sorted(radii)[len(radii) // 2] if radii else 12
+    reach = typical_r * 2.8
+    if spacing > 0:
+        reach = max(reach, spacing * 1.55)
+    min_dist = typical_r * 0.4
+    xs = [int(piece["x"]) for piece in tsums]
+    ys = [int(piece["y"]) for piece in tsums]
+    links: list[list[int]] = [[] for _ in range(count)]
+    for index in range(count):
+        bins: list[tuple[float, int] | None] = [None] * 6
+        ax, ay = xs[index], ys[index]
+        for other in range(count):
+            if other == index:
+                continue
+            dx = xs[other] - ax
+            dy = ys[other] - ay
+            dist = math.hypot(dx, dy)
+            if dist < min_dist or dist > reach:
+                continue
+            slot = int((math.atan2(dy, dx) + math.pi + 1e-9) / (math.pi / 3)) % 6
+            prev = bins[slot]
+            if prev is None or dist < prev[0]:
+                bins[slot] = (dist, other)
+        for item in bins:
+            if item is None:
+                continue
+            other = item[1]
+            if other not in links[index]:
+                links[index].append(other)
+            if index not in links[other]:
+                links[other].append(index)
+    return links
+
+
+def _type_blob(
+    seed: int,
+    tsums: list[dict[str, int]],
+    phys: list[list[int]],
+) -> list[int]:
+    start = tsums[seed]
+    start_group = int(start.get("group") or 1)
+    seen = {seed}
+    stack = [seed]
+    blob: list[int] = []
+    while stack:
+        current = stack.pop()
+        blob.append(current)
+        for nxt in phys[current]:
+            if nxt in seen:
+                continue
+            if int(tsums[nxt].get("group") or 1) != start_group:
+                continue
+            seen.add(nxt)
+            stack.append(nxt)
+    return blob
 
 
 def _typical_spacing(tsums: list[dict[str, int]]) -> float:
     if len(tsums) < 2:
         return 0.0
+    radii = sorted(max(4, int(piece.get("r") or 12)) for piece in tsums)
+    typical_r = radii[len(radii) // 2]
+    min_real = typical_r * 1.2
     nearest: list[float] = []
     for index, left in enumerate(tsums):
         ax, ay = int(left["x"]), int(left["y"])
@@ -64,15 +147,17 @@ def _typical_spacing(tsums: list[dict[str, int]]) -> float:
                 continue
             dx = ax - int(right["x"])
             dy = ay - int(right["y"])
-            dist2 = dx * dx + dy * dy
-            if dist2 < best:
-                best = dist2
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < min_real:
+                continue
+            if dist < best:
+                best = dist
         if best < 1e18:
-            nearest.append(best ** 0.5)
-    if not nearest:
-        return 0.0
-    nearest.sort()
-    return nearest[len(nearest) // 2]
+            nearest.append(best)
+    if nearest:
+        nearest.sort()
+        return nearest[len(nearest) // 2]
+    return typical_r * 2.0
 
 
 def _paths_in_group(
@@ -105,9 +190,14 @@ def _adjacent(
     dist2 = dx * dx + dy * dy
     radius = max(4, int(left.get("r") or 0))
     other_r = max(4, int(right.get("r") or 0))
-    limit = (radius + other_r) * RADIUS_NEIGHBOR
-    if spacing > 0:
-        limit = max(limit, spacing * SPACING_NEIGHBOR)
+    by_r = (radius + other_r) * RADIUS_NEIGHBOR
+    if spacing <= 0:
+        limit = by_r
+    elif spacing <= by_r * 0.5:
+        limit = by_r
+    else:
+        limit = max(by_r, spacing * SPACING_NEIGHBOR)
+        limit = min(limit, spacing * 1.5)
     if dist2 > limit * limit:
         return False
     if spacing <= 0:
@@ -129,9 +219,9 @@ def _blocked_by_other(
         return False
     thresh = (BLOCK_FRACTION * spacing) ** 2
     for piece in tsums:
-        if piece is left or piece is right:
-            continue
         px, py = int(piece["x"]), int(piece["y"])
+        if (px, py) == (ax, ay) or (px, py) == (bx, by):
+            continue
         t = ((px - ax) * vx + (py - ay) * vy) / length
         if t <= 0.12 or t >= 0.88:
             continue
@@ -144,15 +234,38 @@ def _blocked_by_other(
     return False
 
 
+def _components(links: list[list[int]]) -> list[list[int]]:
+    seen = [False] * len(links)
+    found: list[list[int]] = []
+    for index in range(len(links)):
+        if seen[index]:
+            continue
+        stack = [index]
+        seen[index] = True
+        comp: list[int] = []
+        while stack:
+            node = stack.pop()
+            comp.append(node)
+            for nxt in links[node]:
+                if seen[nxt]:
+                    continue
+                seen[nxt] = True
+                stack.append(nxt)
+        if len(comp) >= MIN_CHAIN:
+            found.append(comp)
+    return found
+
+
 def _collect_paths(links: list[list[int]]) -> list[list[int]]:
-    count = len(links)
-    if count < MIN_CHAIN:
-        return []
-    if count > 16:
-        return _greedy_paths(links)
+    found: list[list[int]] = []
+    for comp in _components(links):
+        found.extend(_paths_in_component(links, comp))
+    found.sort(key=len, reverse=True)
+    return found
+
+
+def _paths_in_component(links: list[list[int]], nodes: list[int]) -> list[list[int]]:
     found: dict[frozenset[int], list[int]] = {}
-    walks = 0
-    walk_limit = 8000
 
     def consider(path: list[int]) -> None:
         if len(path) < MIN_CHAIN:
@@ -162,57 +275,87 @@ def _collect_paths(links: list[list[int]]) -> list[list[int]]:
         if prev is None or len(path) > len(prev):
             found[key] = path[:]
 
-    def walk(current: int, used: int, path: list[int]) -> None:
+    for path in _greedy_on(links, nodes):
+        consider(path)
+    if len(nodes) > 18:
+        return sorted(found.values(), key=len, reverse=True)
+
+    allowed = set(nodes)
+    walks = 0
+    budget = 30000
+    per_start = max(800, budget // max(1, len(nodes)))
+    starts = sorted(
+        nodes,
+        key=lambda node: (sum(1 for nxt in links[node] if nxt in allowed), node),
+    )
+
+    def walk(current: int, used: int, path: list[int], remaining: list[int]) -> None:
         nonlocal walks
         walks += 1
-        if walks > walk_limit:
+        remaining[0] -= 1
+        if remaining[0] <= 0 or walks > budget:
+            consider(path)
             return
         extended = False
         for nxt in links[current]:
+            if nxt not in allowed:
+                continue
             bit = 1 << nxt
             if used & bit:
                 continue
             extended = True
             path.append(nxt)
-            walk(nxt, used | bit, path)
+            walk(nxt, used | bit, path, remaining)
             path.pop()
-            if walks > walk_limit:
+            if remaining[0] <= 0 or walks > budget:
                 return
         if not extended:
             consider(path)
 
-    for start in range(count):
-        walk(start, 1 << start, [start])
-        if walks > walk_limit:
-            break
-    if not found:
-        return _greedy_paths(links)
+    for start in starts:
+        walk(start, 1 << start, [start], [per_start])
     return sorted(found.values(), key=len, reverse=True)
 
 
-def _greedy_paths(links: list[list[int]]) -> list[list[int]]:
+def _greedy_on(links: list[list[int]], nodes: list[int]) -> list[list[int]]:
+    allowed = set(nodes)
     found: dict[frozenset[int], list[int]] = {}
-    for start in range(len(links)):
-        used = {start}
-        path = [start]
-        current = start
-        while True:
-            choices = [nxt for nxt in links[current] if nxt not in used]
-            if not choices:
-                break
-            nxt = max(
-                choices,
-                key=lambda node: sum(1 for other in links[node] if other not in used),
-            )
-            used.add(nxt)
-            path.append(nxt)
-            current = nxt
-        if len(path) < MIN_CHAIN:
-            continue
-        key = frozenset(path)
-        prev = found.get(key)
-        if prev is None or len(path) > len(prev):
-            found[key] = path
+    for start in nodes:
+        for dense in (True, False):
+            used = {start}
+            path = [start]
+            current = start
+            while True:
+                choices = [
+                    nxt for nxt in links[current] if nxt not in used and nxt in allowed
+                ]
+                if not choices:
+                    break
+                nxt = max(
+                    choices,
+                    key=lambda node: (
+                        sum(
+                            1
+                            for other in links[node]
+                            if other not in used and other in allowed
+                        )
+                        if dense
+                        else -sum(
+                            1
+                            for other in links[node]
+                            if other not in used and other in allowed
+                        )
+                    ),
+                )
+                used.add(nxt)
+                path.append(nxt)
+                current = nxt
+            if len(path) < MIN_CHAIN:
+                continue
+            key = frozenset(path)
+            prev = found.get(key)
+            if prev is None or len(path) > len(prev):
+                found[key] = path
     return sorted(found.values(), key=len, reverse=True)
 
 

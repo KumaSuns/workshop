@@ -10,7 +10,7 @@ from threading import Event
 from PySide6.QtCore import QPoint, QRect, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 
-from app.bluestacks import capture_screen_path, reset_swipe_mouse, swipe_path, tap
+from app.bluestacks import capture_play_frame, capture_screen_path, reset_swipe_mouse, swipe_path, tap
 from app.intro import (
     Stopped,
     _check_stop,
@@ -19,7 +19,8 @@ from app.intro import (
     _play_button,
     _slow_tap,
 )
-from app.trainer_bridge import TRAINER_ROOT, load_play_tools
+from app.play_style import rank as style_rank
+from app.trainer_bridge import TRAINER_ROOT, load_play_tools, save_erase_lesson
 
 MIN_CHAIN = 3
 BOARD_TSUMS = 8
@@ -89,8 +90,6 @@ def run_play(
 
     say("プレイを開始します")
     reset_swipe_mouse()
-    used_keys: list[frozenset[tuple[int, int]]] = []
-    last_count = 0
     game = None
     saw_board = False
     kinds = 5
@@ -108,32 +107,36 @@ def run_play(
     while True:
         _check_stop(stop)
         try:
-            path = capture_screen_path()
-            image = QImage(str(path))
+            image = capture_play_frame()
+            rgb = _qimage_rgb(image)
         except Exception:
             say("画面を待っています")
             _sleep_stop(0.25, stop)
             continue
+        if rgb is None or image.isNull():
+            say("画面を待っています")
+            _sleep_stop(0.25, stop)
+            continue
         if game is None:
-            boxes = predictor.predict_all(path)
+            boxes = predictor.predict_all(Path("."), rgb=rgb)
             game = boxes.get("game")
-        timeup = _timeup_score(predictor, path)
+        timeup = _timeup_score(predictor, rgb)
         if timeup >= TIMEUP_SCORE:
             say(f"TIME UP {timeup:.0%}")
             return
         _check_stop(stop)
         if not kinds_locked:
-            used = _five_to_four_used_path(path)
+            used = _five_to_four_used_pil(rgb)
             if used is not None:
                 kinds = 4 if used else 5
                 kinds_locked = True
                 say(f"5＞4 {'使用' if used else '未使用'} / 種類 {kinds}")
-        pieces = predictor.predict_pieces(path, game, kinds=kinds)
+        pieces = predictor.predict_pieces(Path("."), game, kinds=kinds, rgb=rgb)
         tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
         if len(tsums) < BOARD_TSUMS and not saw_board:
-            boxes = predictor.predict_all(path)
+            boxes = predictor.predict_all(Path("."), rgb=rgb)
             game = boxes.get("game")
-            pieces = predictor.predict_pieces(path, None, kinds=kinds)
+            pieces = predictor.predict_pieces(Path("."), None, kinds=kinds, rgb=rgb)
             tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
         _check_stop(stop)
         if len(tsums) >= BOARD_TSUMS:
@@ -151,31 +154,15 @@ def run_play(
                     _sleep_stop(2.0, stop)
                     continue
                 continue
-        if last_count > 0 and (
-            len(tsums) <= last_count - MIN_CHAIN or len(tsums) >= last_count + 5
-        ):
-            used_keys.clear()
-        last_count = len(tsums)
-        bombs = [piece for piece in pieces if str(piece.get("kind") or "") == "bomb"]
-        if bombs and saw_board:
-            bomb = max(bombs, key=lambda piece: int(piece.get("r") or 0))
-            say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
-            tap(int(bomb["x"]), int(bomb["y"]))
-            used_keys.clear()
-            _sleep_stop(0.18, stop)
-            continue
-        _group_by_type(predictor, path, pieces, kinds)
-        chain = _pick_chain(predictor, path, pieces, candidates, used_keys, say)
+        chain, option_lens = _pick_chain(predictor, rgb, pieces, candidates, say)
         if chain:
-            used_keys.append(_chain_key(chain))
             if not _swipe_chain(chain, pieces, image, game, len(tsums), say, stop, preview):
                 _sleep_stop(0.08, stop)
                 continue
-            leftover = [piece for piece in pieces if id(piece) not in {id(item) for item in chain}]
-            nxt = _pick_chain(predictor, path, leftover, candidates, used_keys, say)
-            if nxt:
-                used_keys.append(_chain_key(nxt))
-                _swipe_chain(nxt, leftover, image, game, len(leftover), say, stop, preview)
+            continue
+        if preview is not None:
+            preview(_draw_plan(image, pieces, [], game))
+        if saw_board and _tap_biggest_bomb(pieces, say, stop):
             continue
         say(f"ツム {len(tsums)}体 / なぞれる3体以上なし")
         continue
@@ -208,16 +195,233 @@ def _swipe_chain(
     return True
 
 
-def _timeup_score(predictor, path: Path) -> float:
+def _chain_spots(rgb, chain: list[dict[str, int]]) -> list[tuple[int, int, int, tuple[float, float, float] | None]]:
+    spots: list[tuple[int, int, int, tuple[float, float, float] | None]] = []
+    for piece in chain:
+        x, y = int(piece["x"]), int(piece["y"])
+        radius = max(6, int(piece.get("r") or 12))
+        spots.append((x, y, radius, _spot_mean(rgb, x, y, radius)))
+    return spots
+
+
+def _spots_lingered(
+    after,
+    spots: list[tuple[int, int, int, tuple[float, float, float] | None]],
+) -> bool:
+    hits = 0
+    for x, y, radius, old in spots:
+        if old is None:
+            continue
+        new = _spot_mean(after, x, y, radius)
+        if new is None:
+            continue
+        dist = sum((a - b) ** 2 for a, b in zip(old, new)) ** 0.5
+        if dist < 36:
+            hits += 1
+    return hits >= MIN_CHAIN
+
+
+def _spot_mean(image, x: int, y: int, radius: int) -> tuple[float, float, float] | None:
+    span = max(4, radius // 2)
+    box = (x - span, y - span, x + span + 1, y + span + 1)
+    crop = image.crop(box)
+    pixels = list(crop.getdata())
+    if not pixels:
+        return None
+    count = len(pixels)
+    return (
+        sum(pixel[0] for pixel in pixels) / count,
+        sum(pixel[1] for pixel in pixels) / count,
+        sum(pixel[2] for pixel in pixels) / count,
+    )
+
+
+def _unlike_from_chain(
+    chain: list[dict[str, int]],
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    vecs = [piece.get("_vec") for piece in chain]
+    if any(vec is None for vec in vecs) or len(chain) < 2:
+        return None
+    cut = _weakest_cut(chain)
+    left = [vecs[index] for index in range(cut)]
+    right = [vecs[index] for index in range(cut, len(vecs))]
+    if not left or not right:
+        return None
+    return (_mean_vec(left), _mean_vec(right))
+
+
+def _weakest_cut(chain: list[dict[str, int]]) -> int:
+    vecs = [piece.get("_vec") for piece in chain]
+    cut = 1
+    worst = 2.0
+    for index in range(1, len(chain)):
+        left, right = vecs[index - 1], vecs[index]
+        if left is None or right is None:
+            continue
+        sim = _cosine(left, right)
+        if sim < worst:
+            worst = sim
+            cut = index
+    return cut
+
+
+def _mean_vec(vecs: list[tuple[float, ...]]) -> tuple[float, ...]:
+    dim = len(vecs[0])
+    count = len(vecs)
+    return tuple(sum(vec[index] for vec in vecs) / count for index in range(dim))
+
+
+def _remember_mixed(predictor, image: QImage, game, pieces, chain) -> None:
+    from tempfile import gettempdir
+
+    path = Path(gettempdir()) / "tsum_autoplay_mixed.png"
+    if not image.save(str(path), "PNG"):
+        return
+    cut = _weakest_cut(chain)
+    chain_ids = {id(piece) for piece in chain}
+    labeled: list[dict[str, int]] = []
+    for piece in pieces:
+        item = {
+            key: value
+            for key, value in piece.items()
+            if key in {"x", "y", "r", "kind", "group"}
+        }
+        if id(piece) in chain_ids:
+            index = next(i for i, member in enumerate(chain) if id(member) == id(piece))
+            item["group"] = 1 if index < cut else 2
+        labeled.append(item)
+    try:
+        save_erase_lesson(predictor, path, game, labeled)
+    except Exception:
+        return
+
+
+def _tap_biggest_bomb(pieces: list[dict[str, int]], say: StatusFn, stop: Event | None) -> bool:
+    bombs = [piece for piece in pieces if str(piece.get("kind") or "") == "bomb"]
+    if not bombs:
+        return False
+    bomb = max(bombs, key=lambda piece: int(piece.get("r") or 0))
+    say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+    tap(int(bomb["x"]), int(bomb["y"]))
+    _sleep_stop(0.18, stop)
+    return True
+
+
+def _remaining_after_erase(
+    pieces: list[dict[str, int]],
+    chain: list[dict[str, int]],
+) -> list[dict[str, int]]:
+    gone = {id(piece) for piece in chain}
+    leftover = [dict(piece) for piece in pieces if id(piece) not in gone]
+    _drop_down(leftover, pieces)
+    return leftover
+
+
+def _drop_down(remaining: list[dict[str, int]], before: list[dict[str, int]]) -> None:
+    origins = [
+        piece
+        for piece in before
+        if str(piece.get("kind") or "") in {"tsum", "bomb"}
+    ]
+    movers = [
+        piece
+        for piece in remaining
+        if str(piece.get("kind") or "") in {"tsum", "bomb"}
+    ]
+    tsums = [piece for piece in origins if str(piece.get("kind") or "") == "tsum"]
+    spacing = _median_spacing(tsums or origins)
+    if spacing <= 0 or not movers or not origins:
+        return
+    col_w = spacing * 0.5
+    centers: list[float] = []
+    orig_cols: list[list[dict[str, int]]] = []
+    for piece in origins:
+        x = float(piece["x"])
+        best_i = None
+        best_d = col_w
+        for index, cx in enumerate(centers):
+            dist = abs(x - cx)
+            if dist < best_d:
+                best_d = dist
+                best_i = index
+        if best_i is None:
+            centers.append(x)
+            orig_cols.append([piece])
+            continue
+        orig_cols[best_i].append(piece)
+        count = len(orig_cols[best_i])
+        centers[best_i] += (x - centers[best_i]) / count
+    rest_cols: list[list[dict[str, int]]] = [[] for _ in centers]
+    for piece in movers:
+        x = float(piece["x"])
+        best_i = min(range(len(centers)), key=lambda index: abs(x - centers[index]))
+        rest_cols[best_i].append(piece)
+    for orig, kept in zip(orig_cols, rest_cols):
+        if not kept:
+            continue
+        ys = sorted(int(piece["y"]) for piece in orig)
+        bottom = ys[-1]
+        gaps = [ys[index + 1] - ys[index] for index in range(len(ys) - 1) if ys[index + 1] > ys[index]]
+        step = gaps[len(gaps) // 2] if gaps else int(round(spacing))
+        if step < 1:
+            step = max(1, int(round(spacing)))
+        kept.sort(key=lambda piece: int(piece["y"]))
+        for index, piece in enumerate(reversed(kept)):
+            piece["y"] = int(round(bottom - index * step))
+
+
+def _median_spacing(tsums: list[dict[str, int]]) -> float:
+    if len(tsums) < 2:
+        return 0.0
+    nearest: list[float] = []
+    for index, left in enumerate(tsums):
+        ax, ay = int(left["x"]), int(left["y"])
+        best = 1e18
+        for other, right in enumerate(tsums):
+            if other == index:
+                continue
+            dx = ax - int(right["x"])
+            dy = ay - int(right["y"])
+            dist = dx * dx + dy * dy
+            if dist < best:
+                best = dist
+        if best < 1e18:
+            nearest.append(best ** 0.5)
+    if not nearest:
+        return 0.0
+    nearest.sort()
+    return nearest[len(nearest) // 2]
+
+
+def _qimage_rgb(image: QImage):
+    from PIL import Image as PILImage
+
+    if image.isNull():
+        return None
+    converted = image.convertToFormat(QImage.Format.Format_RGB888)
+    width = converted.width()
+    height = converted.height()
+    stride = converted.bytesPerLine()
+    ptr = converted.constBits()
+    size = converted.sizeInBytes()
+    try:
+        buf = bytes(ptr[:size])
+    except Exception:
+        buf = memoryview(ptr)[:size].tobytes()
+    if stride == width * 3:
+        return PILImage.frombytes("RGB", (width, height), buf)
+    rows = [buf[row * stride : row * stride + width * 3] for row in range(height)]
+    return PILImage.frombytes("RGB", (width, height), b"".join(rows))
+
+
+def _timeup_score(predictor, rgb) -> float:
     model = getattr(predictor, "scene_model", None)
     transform = getattr(predictor, "_scene_transform", None)
     if model is None or transform is None:
         return 0.0
     import torch
-    from PIL import Image
 
-    with Image.open(path) as board:
-        view = _portrait_frame(board.convert("RGB"))
+    view = _portrait_frame(rgb)
     tensor = transform(view).unsqueeze(0).to(predictor.device)
     with torch.no_grad():
         probs = torch.softmax(model(tensor), dim=1)[0]
@@ -427,38 +631,28 @@ def _slot_yellow_blue(image, box: dict[str, int]) -> tuple[float, float]:
 
 def _pick_chain(
     predictor,
-    path: Path,
+    rgb,
     pieces: list[dict[str, int]],
     candidates,
-    used_keys: list[frozenset[tuple[int, int]]],
     say: StatusFn,
-) -> list[dict[str, int]]:
+) -> tuple[list[dict[str, int]], list[int]]:
     found = [chain for chain in candidates(pieces, 8) if len(chain) >= MIN_CHAIN]
     if found:
         say("候補 " + " / ".join(str(len(chain)) for chain in found))
-    for chain in found:
-        same = _keep_same_type(predictor, path, chain)
-        if len(same) < MIN_CHAIN:
-            continue
-        if _chain_too_similar(same, used_keys):
-            continue
-        return same
-    matched = []
-    for chain in found:
-        same = _keep_same_type(predictor, path, chain)
-        if len(same) >= MIN_CHAIN:
-            matched.append(same)
-    if matched:
-        used_keys.clear()
-        return matched[0]
-    return []
+        options = [len(item) for item in found]
+        return max(found, key=lambda item: style_rank(item, options)), options
+    return [], []
 
 
-def _group_by_type(predictor, path: Path, pieces: list[dict[str, int]], kinds: int) -> None:
+def _group_by_type(
+    predictor,
+    rgb,
+    pieces: list[dict[str, int]],
+) -> None:
     tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
     if not tsums:
         return
-    vecs = _type_vectors(predictor, path, tsums)
+    vecs = _type_vectors(predictor, rgb, tsums)
     if vecs is None:
         return
     for piece, vec in zip(tsums, vecs):
@@ -473,7 +667,7 @@ def _split_mixed_groups(tsums: list[dict[str, int]], min_sim: float = 0.75) -> N
     next_id = max(by_group, default=0) + 1
     for members in by_group.values():
         count = len(members)
-        if count < 2:
+        if count < MIN_CHAIN * 2:
             continue
         parent = list(range(count))
 
@@ -484,76 +678,60 @@ def _split_mixed_groups(tsums: list[dict[str, int]], min_sim: float = 0.75) -> N
             return index
 
         for i in range(count):
-            left = members[i].get("_vec")
-            if left is None:
-                continue
             for j in range(i + 1, count):
+                left = members[i].get("_vec")
                 right = members[j].get("_vec")
-                if right is None:
+                if left is None or right is None:
                     continue
                 if _cosine(left, right) < min_sim:
                     continue
                 a, b = find(i), find(j)
                 if a != b:
                     parent[b] = a
-        labels = [find(index) for index in range(count)]
-        unique: list[int] = []
-        for label in labels:
-            if label not in unique:
-                unique.append(label)
-        if len(unique) <= 1:
+        buckets: dict[int, list[int]] = {}
+        for index in range(count):
+            buckets.setdefault(find(index), []).append(index)
+        large = [indexes for indexes in buckets.values() if len(indexes) >= MIN_CHAIN]
+        if len(large) < 2:
             continue
-        remap = {unique[0]: int(members[0].get("group") or 1)}
-        for label in unique[1:]:
-            remap[label] = next_id
+        group_ids: list[int] = [int(members[0].get("group") or 1)]
+        for _ in large[1:]:
+            group_ids.append(next_id)
             next_id += 1
-        for piece, label in zip(members, labels):
-            piece["group"] = remap[label]
+        means: list[tuple[int, tuple[float, ...]]] = []
+        assigned: set[int] = set()
+        for cluster, gid in zip(large, group_ids):
+            vecs = [members[i]["_vec"] for i in cluster if members[i].get("_vec") is not None]
+            if vecs:
+                dim = len(vecs[0])
+                mean = tuple(sum(vec[d] for vec in vecs) / len(vecs) for d in range(dim))
+                means.append((gid, mean))
+            for index in cluster:
+                members[index]["group"] = gid
+                assigned.add(index)
+        for index in range(count):
+            if index in assigned:
+                continue
+            vec = members[index].get("_vec")
+            if vec is None or not means:
+                continue
+            best_g = means[0][0]
+            best = -2.0
+            for gid, mean in means:
+                sim = _cosine(vec, mean)
+                if sim > best:
+                    best = sim
+                    best_g = gid
+            members[index]["group"] = best_g
 
 
-def _keep_same_type(predictor, path: Path, chain: list[dict[str, int]]) -> list[dict[str, int]]:
-    if len(chain) < MIN_CHAIN:
-        return []
-    vecs = [piece.get("_vec") for piece in chain]
-    if any(vec is None for vec in vecs):
-        loaded = _type_vectors(predictor, path, chain)
-        if loaded is None:
-            group = int(chain[0].get("group") or 0)
-            if group and all(int(piece.get("group") or 0) == group for piece in chain):
-                return chain
-            return []
-        vecs = loaded
-    best: list[dict[str, int]] = []
-    start = 0
-    current = [chain[0]]
-    for index in range(1, len(chain)):
-        same_group = int(chain[index].get("group") or 0) == int(chain[start].get("group") or 0)
-        close = (
-            _cosine(vecs[index - 1], vecs[index]) >= 0.75
-            and _cosine(vecs[start], vecs[index]) >= 0.75
-        )
-        if same_group and close:
-            current.append(chain[index])
-            continue
-        if len(current) > len(best):
-            best = current
-        start = index
-        current = [chain[index]]
-    if len(current) > len(best):
-        best = current
-    return best if len(best) >= MIN_CHAIN else []
-
-
-def _type_vectors(predictor, path: Path, pieces: list[dict[str, int]]):
+def _type_vectors(predictor, rgb, pieces: list[dict[str, int]]):
     if not pieces or getattr(predictor, "type_model", None) is None:
         return None
     embed = getattr(predictor, "_tsum_embeddings", None)
-    if embed is None:
+    if embed is None or rgb is None:
         return None
-    from PIL import Image
-
-    with Image.open(path) as board:
-        return embed(board.convert("RGB"), pieces)
+    return embed(rgb, pieces)
 
 
 def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
@@ -626,10 +804,7 @@ def _chain_too_similar(
 ) -> bool:
     key = _chain_key(chain)
     for old in used_keys:
-        overlap = len(key & old)
-        if overlap >= max(1, min(len(key), len(old)) * 0.5):
-            return True
-        if key <= old or old <= key:
+        if key == old or key <= old:
             return True
     return False
 

@@ -9,6 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
 
 PACKAGE = "com.linecorp.LGTMTM"
@@ -172,6 +173,47 @@ def capture_screen_path() -> Path:
     path = _capture_pull(local)
     _remember_cap_size(path)
     return path
+
+
+def capture_play_frame() -> QImage:
+    global _last_cap_size
+    if _last_cap_size is not None:
+        win = _capture_window()
+        if win is not None and not win.isNull() and win.width() >= 80:
+            width, height = _last_cap_size
+            if win.width() != width or win.height() != height:
+                win = win.scaled(
+                    width,
+                    height,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+            return win
+    image = _capture_adb_qimage()
+    if image is None or image.isNull():
+        path = capture_screen_path()
+        image = QImage(str(path))
+    if image.isNull():
+        raise RuntimeError("画面を取れませんでした。")
+    _last_cap_size = (image.width(), image.height())
+    return image
+
+
+def _capture_adb_qimage() -> QImage | None:
+    global _capture_how
+    raw = adb(["exec-out", "screencap"], timeout=5)
+    image = _image_from_screencap(raw.stdout or b"")
+    if image is not None and not image.isNull():
+        _capture_how = "raw"
+        return image
+    png = adb(["exec-out", "screencap", "-p"], timeout=5)
+    data = png.stdout or b""
+    if png.returncode == 0 and data.startswith(b"\x89PNG"):
+        loaded = QImage()
+        if loaded.loadFromData(data, "PNG"):
+            _capture_how = "png"
+            return loaded
+    return None
 
 
 def _remember_cap_size(path: Path) -> None:

@@ -10,13 +10,27 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRectF, QSettings, QStandardPaths, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -30,6 +44,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -65,6 +80,7 @@ from app.regions import (
     is_coin_box_key,
     is_piece_key,
     is_scene_key,
+    tsum_group_color,
 )
 from app.train_effect import TrainEffect
 from app.train_worker import MIN_TRAIN_SAMPLES, TRAIN_EPOCHS, TrainWorker
@@ -272,6 +288,11 @@ QFrame#coords {
     border: 1px solid #2a303b;
     border-radius: 12px;
 }
+QScrollArea#groupStrip {
+    background: #101216;
+    border: 1px solid #2a303b;
+    border-radius: 10px;
+}
 """
 
 
@@ -282,6 +303,261 @@ class FileListDelegate(QStyledItemDelegate):
             option.textElideMode = Qt.TextElideMode.ElideNone
         else:
             option.textElideMode = Qt.TextElideMode.ElideMiddle
+
+
+class _GroupStripBody(QWidget):
+    CELL = 80
+    GAP = 6
+    LABEL = 36
+
+    pieceClicked = Signal(int)
+    pieceRemoveRequested = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._rows: list[tuple[str, QColor, list[tuple[QPixmap, int]]]] = []
+        self._selected: int | None = None
+        self.setMouseTracking(True)
+
+    def set_pieces(
+        self,
+        pixmap: QPixmap | None,
+        pieces: list[dict[str, int]],
+        selected: int | None = None,
+    ) -> None:
+        self._rows = []
+        self._selected = selected
+        if pixmap is None or pixmap.isNull() or not pieces:
+            self.updateGeometry()
+            self.update()
+            self.setMinimumHeight(0)
+            return
+        grouped: dict[str, list[tuple[QPixmap, int]]] = {}
+        for index, piece in enumerate(pieces):
+            key = "B" if piece.get("kind") == "bomb" else str(int(piece.get("group") or 1))
+            grouped.setdefault(key, []).append((self._crop(pixmap, piece), index))
+
+        def sort_key(key: str) -> tuple[int, int]:
+            if key == "B":
+                return (1, 0)
+            return (0, int(key))
+
+        for key in sorted(grouped, key=sort_key):
+            color = QColor("#FF5C5C") if key == "B" else QColor(tsum_group_color(int(key)))
+            self._rows.append((key, color, grouped[key]))
+        self.setMinimumHeight(self.heightForWidth(max(self.width(), 1)))
+        self.updateGeometry()
+        self.update()
+
+    def _crop(self, pixmap: QPixmap, piece: dict[str, int]) -> QPixmap:
+        x, y, radius = int(piece["x"]), int(piece["y"]), max(8, int(piece.get("r") or 16))
+        span = max(12, int(round(radius * 1.05)))
+        tile = pixmap.copy(QRect(x - span, y - span, span * 2, span * 2))
+        return tile.scaled(
+            self.CELL,
+            self.CELL,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._needed_height(width)
+
+    def sizeHint(self) -> QSize:
+        return QSize(480, self._needed_height(max(self.width(), 480)))
+
+    def minimumSizeHint(self) -> QSize:
+        if not self._rows:
+            return QSize(0, 0)
+        return QSize(self.LABEL + self.CELL, self.CELL)
+
+    def _per_row(self, width: int) -> int:
+        inner = max(self.CELL, width - self.LABEL - 8)
+        return max(1, (inner + self.GAP) // (self.CELL + self.GAP))
+
+    def _needed_height(self, width: int) -> int:
+        if not self._rows:
+            return 0
+        per = self._per_row(width)
+        lines = 0
+        for _key, _color, tiles in self._rows:
+            lines += max(1, (len(tiles) + per - 1) // per)
+        return lines * (self.CELL + self.GAP) + self.GAP
+
+    def _hit(self, pos) -> int | None:
+        for rect, index, _key, _color, _tile in self._iter_tiles(max(self.width(), 1)):
+            if rect.contains(pos):
+                return index
+        return None
+
+    def _iter_tiles(self, width: int):
+        per = self._per_row(width)
+        y = self.GAP
+        for key, color, tiles in self._rows:
+            for start in range(0, len(tiles), per):
+                chunk = tiles[start : start + per]
+                x = self.LABEL
+                for tile, index in chunk:
+                    yield QRect(x, y, self.CELL, self.CELL), index, key, color, tile
+                    x += self.CELL + self.GAP
+                y += self.CELL + self.GAP
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.setMinimumHeight(self.heightForWidth(max(self.width(), 1)))
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        hit = self._hit(event.position().toPoint())
+        if hit is None:
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.pieceRemoveRequested.emit(hit)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._selected = hit
+            self.update()
+            self.pieceClicked.emit(hit)
+            event.accept()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101216"))
+        if not self._rows:
+            return
+        painter.setFont(QFont("Yu Gothic UI", 16, QFont.Weight.DemiBold))
+        width = max(self.width(), 1)
+        per = self._per_row(width)
+        y = self.GAP
+        for key, color, tiles in self._rows:
+            for start in range(0, len(tiles), per):
+                chunk = tiles[start : start + per]
+                if start == 0:
+                    painter.setPen(color)
+                    painter.drawText(
+                        QRect(2, y, self.LABEL - 2, self.CELL),
+                        Qt.AlignmentFlag.AlignCenter,
+                        key,
+                    )
+                x = self.LABEL
+                for tile, index in chunk:
+                    painter.drawPixmap(x, y, tile)
+                    selected = index == self._selected
+                    painter.setPen(QPen(QColor(255, 255, 255) if selected else color, 3 if selected else 2))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRect(x, y, self.CELL - 1, self.CELL - 1)
+                    x += self.CELL + self.GAP
+                y += self.CELL + self.GAP
+
+
+class GroupStrip(QScrollArea):
+    pieceClicked = Signal(int)
+    pieceRemoveRequested = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("groupStrip")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._body = _GroupStripBody()
+        self._body.pieceClicked.connect(self.pieceClicked.emit)
+        self._body.pieceRemoveRequested.connect(self.pieceRemoveRequested.emit)
+        self.setWidget(self._body)
+
+    def set_pieces(
+        self,
+        pixmap: QPixmap | None,
+        pieces: list[dict[str, int]],
+        selected: int | None = None,
+    ) -> None:
+        self._body.set_pieces(pixmap, pieces, selected=selected)
+
+    def selected_index(self) -> int | None:
+        return self._body._selected
+
+
+class GroupListWindow(QDialog):
+    pieceClicked = Signal(int)
+    pieceRemoveRequested = Signal(int)
+    groupChanged = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("羅列")
+        self.setModal(False)
+        self.setStyleSheet(STYLESHEET)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self._pieces: list[dict[str, int]] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("ツム種類"))
+        self.spin_group = QSpinBox()
+        self.spin_group.setPrefix("No.  ")
+        self.spin_group.setRange(1, 12)
+        self.spin_group.setValue(1)
+        self.spin_group.setEnabled(False)
+        bar.addWidget(self.spin_group)
+        self.delete_btn = QPushButton("消す")
+        self.delete_btn.setEnabled(False)
+        bar.addWidget(self.delete_btn)
+        bar.addStretch(1)
+        layout.addLayout(bar)
+        self.strip = GroupStrip()
+        layout.addWidget(self.strip, 1)
+        self.strip.pieceClicked.connect(self._on_piece_clicked)
+        self.strip.pieceRemoveRequested.connect(self.pieceRemoveRequested.emit)
+        self.spin_group.valueChanged.connect(self.groupChanged.emit)
+        self.delete_btn.clicked.connect(self._on_delete)
+
+    def set_pieces(
+        self,
+        pixmap: QPixmap | None,
+        pieces: list[dict[str, int]],
+        selected: int | None = None,
+    ) -> None:
+        self._pieces = pieces
+        self.strip.set_pieces(pixmap, pieces, selected=selected)
+        self._sync_bar(selected)
+
+    def _sync_bar(self, selected: int | None) -> None:
+        piece = None
+        if selected is not None and 0 <= selected < len(self._pieces):
+            piece = self._pieces[selected]
+        self.delete_btn.setEnabled(piece is not None)
+        is_tsum = piece is not None and piece.get("kind") == "tsum"
+        self.spin_group.setEnabled(is_tsum)
+        if is_tsum and piece is not None:
+            self.spin_group.blockSignals(True)
+            self.spin_group.setValue(int(piece.get("group") or 1))
+            self.spin_group.blockSignals(False)
+
+    def _on_piece_clicked(self, index: int) -> None:
+        self._sync_bar(index)
+        self.pieceClicked.emit(index)
+
+    def _on_delete(self) -> None:
+        selected = self.strip.selected_index()
+        if selected is None:
+            return
+        self.pieceRemoveRequested.emit(selected)
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        selected = self.strip.selected_index()
+        if selected is not None and key in (Qt.Key.Key_Backspace, Qt.Key.Key_X):
+            self.pieceRemoveRequested.emit(selected)
+            event.accept()
+            return
+        if self.spin_group.isEnabled() and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            self.spin_group.setValue(key - Qt.Key.Key_1 + 1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -312,6 +588,7 @@ class MainWindow(QMainWindow):
         self._list_sort_key: str | None = None
         self._list_sort_asc = True
         self._settings = QSettings("workshop", "TsumTsumScreenTrainer")
+        self._group_window: GroupListWindow | None = None
         self._remember_last_boxes()
 
         self._build_ui()
@@ -567,6 +844,8 @@ class MainWindow(QMainWindow):
             button.setEnabled(False)
             coords_layout.addWidget(button)
             self.trace_chain_btns.append(button)
+        self.list_groups_btn = QPushButton("羅列")
+        coords_layout.addWidget(self.list_groups_btn)
         self.coords_hint = QLabel("上下キーで画像を切替  /  左右キーで枠を1px  /  Shift+矢印で10px  /  Ctrl+矢印でサイズ")
         self.coords_hint.setObjectName("hint")
         coords_layout.addWidget(self.coords_hint, 1)
@@ -614,6 +893,7 @@ class MainWindow(QMainWindow):
         self.spin_group.valueChanged.connect(self.on_group_changed)
         for index, button in enumerate(self.trace_chain_btns):
             button.clicked.connect(lambda _checked=False, i=index: self.trace_chain_candidate(i))
+        self.list_groups_btn.clicked.connect(self.open_group_list)
         QTimer.singleShot(0, self._sync_canvas_3_2)
 
     def _bind_shortcuts(self) -> None:
@@ -1026,6 +1306,7 @@ class MainWindow(QMainWindow):
         self._set_dirty(False)
         self._refresh_region_list()
         self._apply_sample_hint(sample)
+        self._refresh_group_strip()
         self.update_stats()
 
     def _apply_sample_hint(self, sample: Sample | None = None) -> None:
@@ -1430,7 +1711,38 @@ class MainWindow(QMainWindow):
     def on_pieces_changed(self) -> None:
         self._set_dirty(self._active_needs_save())
         self._refresh_region_list()
+        self._refresh_group_strip()
         self.update_stats()
+
+    def _refresh_group_strip(self) -> None:
+        window = getattr(self, "_group_window", None)
+        if window is None or not window.isVisible():
+            return
+        window.set_pieces(
+            self.canvas.source_pixmap(),
+            self.canvas.all_pieces(),
+            selected=self.canvas.selected_piece_index(),
+        )
+
+    def open_group_list(self) -> None:
+        if self._group_window is None:
+            self._group_window = GroupListWindow(self)
+            self._group_window.pieceClicked.connect(self.canvas.select_piece)
+            self._group_window.pieceRemoveRequested.connect(self._remove_listed_piece)
+            self._group_window.groupChanged.connect(self.canvas.set_piece_group)
+            self._group_window.resize(self.width(), self.height())
+        self._group_window.set_pieces(
+            self.canvas.source_pixmap(),
+            self.canvas.all_pieces(),
+            selected=self.canvas.selected_piece_index(),
+        )
+        self._group_window.show()
+        self._group_window.raise_()
+        self._group_window.activateWindow()
+
+    def _remove_listed_piece(self, index: int) -> None:
+        self.canvas.select_piece(index)
+        self.canvas.remove_selected_piece()
 
     def on_group_changed(self, value: int) -> None:
         self.canvas.set_piece_group(value)

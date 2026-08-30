@@ -199,10 +199,43 @@ class ImageCanvas(QGraphicsView):
     def all_pieces(self) -> list[dict[str, int]]:
         return [dict(piece) for piece in self._pieces]
 
+    def source_pixmap(self) -> QPixmap | None:
+        if self._pixmap_item is None:
+            return None
+        pixmap = self._pixmap_item.pixmap()
+        if pixmap.isNull():
+            return None
+        return pixmap
+
+    def selected_piece_index(self) -> int | None:
+        return self._selected_piece
+
+    def select_piece(self, index: int) -> None:
+        if index < 0 or index >= len(self._pieces):
+            return
+        self._selected_piece = index
+        piece = self._pieces[index]
+        if piece.get("kind") == "tsum":
+            group = max(1, min(12, int(piece.get("group") or 1)))
+            if self._piece_group != group:
+                self._piece_group = group
+                self._update_guide()
+                self.pieceGroupChanged.emit(group)
+        self.viewport().update()
+
     def set_piece_group(self, group: int) -> None:
-        self._piece_group = max(1, min(12, int(group)))
+        group = max(1, min(12, int(group)))
+        self._piece_group = group
         self._update_guide()
+        changed = False
+        if self._selected_piece is not None:
+            piece = self._pieces[self._selected_piece]
+            if piece.get("kind") == "tsum" and int(piece.get("group") or 1) != group:
+                piece["group"] = group
+                changed = True
         self.pieceGroupChanged.emit(self._piece_group)
+        if changed:
+            self.piecesChanged.emit()
         self.viewport().update()
 
     def piece_counts(self) -> dict[str, int]:
