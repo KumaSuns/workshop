@@ -46,6 +46,7 @@ BUBBLES = [
 
 class TrainEffect(QWidget):
     cancelRequested = Signal()
+    shutdownToggleRequested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -60,15 +61,25 @@ class TrainEffect(QWidget):
         self._status = "学習中です"
         self._quip = QUIPS[0]
         self._pulse = 0.0
-        self._cancel_btn = QPushButton("中止", self)
-        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._cancel_btn.setStyleSheet(
+        btn_style = (
             "QPushButton { background: #c23b4a; color: #f2f5f8; font-size: 16px; font-weight: 700; "
             "border: none; border-radius: 10px; padding: 8px 22px; min-width: 120px; min-height: 40px; }"
             "QPushButton:hover { background: #e04b5c; }"
             "QPushButton:disabled { background: #5a3a40; color: #c5cad3; }"
         )
+        self._cancel_btn = QPushButton("中止", self)
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.setStyleSheet(btn_style)
         self._cancel_btn.clicked.connect(self.cancelRequested.emit)
+        self._shutdown_btn = QPushButton("やっぱりシャットダウンする", self)
+        self._shutdown_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._shutdown_btn.setStyleSheet(
+            "QPushButton { background: #3a4250; color: #f2f5f8; font-size: 16px; font-weight: 700; "
+            "border: none; border-radius: 10px; padding: 8px 22px; min-width: 260px; min-height: 40px; }"
+            "QPushButton:hover { background: #4a5364; }"
+            "QPushButton:disabled { background: #2a303b; color: #c5cad3; }"
+        )
+        self._shutdown_btn.clicked.connect(self.shutdownToggleRequested.emit)
         self._title = QLabel("学習中です", self)
         self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title.setStyleSheet("color: #ffe066; font-size: 32px; font-weight: 800; background: transparent;")
@@ -102,10 +113,12 @@ class TrainEffect(QWidget):
         self._spawn_blobs()
         self._cancel_btn.setEnabled(True)
         self._cancel_btn.setText("中止")
+        self._shutdown_btn.setEnabled(True)
         self.show()
         self.raise_()
         self._place_hud()
         self._cancel_btn.raise_()
+        self._shutdown_btn.raise_()
         self._title.raise_()
         self._detail.raise_()
         self._bar.raise_()
@@ -122,6 +135,13 @@ class TrainEffect(QWidget):
         self._cancel_btn.setText("中止しています…")
         self._status = "学習を中止しています"
 
+    def set_shutdown_after(self, planned: bool) -> None:
+        if planned:
+            self._shutdown_btn.setText("やっぱりシャットダウンしない")
+        else:
+            self._shutdown_btn.setText("やっぱりシャットダウンする")
+        self._place_hud()
+
     def _place_hud(self) -> None:
         width = max(self.width(), 200)
         self._title.setGeometry(24, 24, width - 48, 48)
@@ -131,15 +151,21 @@ class TrainEffect(QWidget):
         bar_y = self.height() - 28 - 22
         self._bar.setGeometry(bar_x, max(120, bar_y), bar_w, 28)
         self._cancel_btn.adjustSize()
-        btn_w = max(120, self._cancel_btn.width())
-        btn_h = max(40, self._cancel_btn.height())
-        self._cancel_btn.setFixedSize(btn_w, btn_h)
+        self._shutdown_btn.adjustSize()
+        cancel_w = max(120, self._cancel_btn.width())
+        cancel_h = max(40, self._cancel_btn.height())
+        shut_w = max(260, self._shutdown_btn.width())
+        shut_h = max(40, self._shutdown_btn.height())
+        self._cancel_btn.setFixedSize(cancel_w, cancel_h)
+        self._shutdown_btn.setFixedSize(shut_w, shut_h)
         status_h = 24
         gap = 12
-        self._cancel_btn.move(
-            max(12, (self.width() - btn_w) // 2),
-            max(12, self._bar.y() - status_h - gap - btn_h),
-        )
+        row_h = max(cancel_h, shut_h)
+        row_w = cancel_w + gap + shut_w
+        row_x = max(12, (self.width() - row_w) // 2)
+        row_y = max(12, self._bar.y() - status_h - gap - row_h)
+        self._cancel_btn.move(row_x, row_y)
+        self._shutdown_btn.move(row_x + cancel_w + gap, row_y)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

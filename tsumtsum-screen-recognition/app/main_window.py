@@ -280,8 +280,27 @@ QSpinBox {
     color: #e8eaed;
     border: 1px solid #2a303b;
     border-radius: 6px;
-    padding: 4px 8px;
+    padding: 4px 40px 4px 8px;
     min-width: 92px;
+    min-height: 36px;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 36px;
+    background: #2a303b;
+    border: none;
+}
+QSpinBox::up-button {
+    subcontrol-position: top right;
+    border-top-right-radius: 6px;
+}
+QSpinBox::down-button {
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: 6px;
+}
+QSpinBox::up-arrow, QSpinBox::down-arrow {
+    width: 12px;
+    height: 12px;
 }
 QFrame#coords {
     background: #1c2028;
@@ -490,29 +509,41 @@ class GroupListWindow(QDialog):
         self.setWindowTitle("羅列")
         self.setModal(False)
         self.setStyleSheet(STYLESHEET)
-        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         self._pieces: list[dict[str, int]] = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         bar = QHBoxLayout()
         bar.addWidget(QLabel("ツム種類"))
-        self.spin_group = QSpinBox()
-        self.spin_group.setPrefix("No.  ")
-        self.spin_group.setRange(1, 12)
-        self.spin_group.setValue(1)
-        self.spin_group.setEnabled(False)
-        bar.addWidget(self.spin_group)
+        self.group_label = QLabel("No.  1")
+        bar.addWidget(self.group_label)
+        self.group_down_btn = QPushButton("－")
+        self.group_up_btn = QPushButton("＋")
+        self.group_down_btn.setEnabled(False)
+        self.group_up_btn.setEnabled(False)
+        bar.addWidget(self.group_down_btn)
+        bar.addWidget(self.group_up_btn)
         self.delete_btn = QPushButton("消す")
         self.delete_btn.setEnabled(False)
         bar.addWidget(self.delete_btn)
         bar.addStretch(1)
+        self.close_btn = QPushButton("閉じる")
+        bar.addWidget(self.close_btn)
         layout.addLayout(bar)
         self.strip = GroupStrip()
         layout.addWidget(self.strip, 1)
         self.strip.pieceClicked.connect(self._on_piece_clicked)
         self.strip.pieceRemoveRequested.connect(self.pieceRemoveRequested.emit)
-        self.spin_group.valueChanged.connect(self.groupChanged.emit)
+        self.group_down_btn.clicked.connect(self._nudge_group_down)
+        self.group_up_btn.clicked.connect(self._nudge_group_up)
         self.delete_btn.clicked.connect(self._on_delete)
+        self.close_btn.clicked.connect(self.close)
 
     def set_pieces(
         self,
@@ -530,11 +561,33 @@ class GroupListWindow(QDialog):
             piece = self._pieces[selected]
         self.delete_btn.setEnabled(piece is not None)
         is_tsum = piece is not None and piece.get("kind") == "tsum"
-        self.spin_group.setEnabled(is_tsum)
         if is_tsum and piece is not None:
-            self.spin_group.blockSignals(True)
-            self.spin_group.setValue(int(piece.get("group") or 1))
-            self.spin_group.blockSignals(False)
+            group = int(piece.get("group") or 1)
+            self.group_label.setText(f"No.  {group}")
+            self.group_down_btn.setEnabled(group > 1)
+            self.group_up_btn.setEnabled(group < 12)
+        else:
+            self.group_down_btn.setEnabled(False)
+            self.group_up_btn.setEnabled(False)
+
+    def _current_group(self) -> int:
+        selected = self.strip.selected_index()
+        if selected is None or selected >= len(self._pieces):
+            return 1
+        piece = self._pieces[selected]
+        if piece.get("kind") != "tsum":
+            return 1
+        return int(piece.get("group") or 1)
+
+    def _nudge_group_down(self) -> None:
+        group = self._current_group()
+        if group > 1:
+            self.groupChanged.emit(group - 1)
+
+    def _nudge_group_up(self) -> None:
+        group = self._current_group()
+        if group < 12:
+            self.groupChanged.emit(group + 1)
 
     def _on_piece_clicked(self, index: int) -> None:
         self._sync_bar(index)
@@ -553,10 +606,11 @@ class GroupListWindow(QDialog):
             self.pieceRemoveRequested.emit(selected)
             event.accept()
             return
-        if self.spin_group.isEnabled() and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-            self.spin_group.setValue(key - Qt.Key.Key_1 + 1)
-            event.accept()
-            return
+        if self.group_up_btn.isEnabled() or self.group_down_btn.isEnabled():
+            if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+                self.groupChanged.emit(key - Qt.Key.Key_1 + 1)
+                event.accept()
+                return
         super().keyPressEvent(event)
 
 
@@ -580,6 +634,7 @@ class MainWindow(QMainWindow):
         self._train_started_at: float | None = None
         self._cuda_ready: bool | None = None
         self._dirty = False
+        self._shutdown_after_train = False
         self._switching = False
         self._extractor_process = None
         self._ipc_buffers: dict[int, bytes] = {}
@@ -629,6 +684,7 @@ class MainWindow(QMainWindow):
         self.predict_btn = QPushButton("この画像を予測")
         self.train_btn = QPushButton("学習する")
         self.train_btn.setObjectName("primary")
+        self.train_shutdown_btn = QPushButton("学習してシャットダウン")
         for button in (
             self.open_btn,
             self.paste_btn,
@@ -640,6 +696,7 @@ class MainWindow(QMainWindow):
             self.undo_piece_btn,
             self.predict_btn,
             self.train_btn,
+            self.train_shutdown_btn,
         ):
             top_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
         layout.addWidget(top)
@@ -837,17 +894,22 @@ class MainWindow(QMainWindow):
         coords_layout.addWidget(self.spin_group)
         self.piece_count_label = QLabel()
         self.piece_count_label.setObjectName("hint")
+        self.piece_count_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         coords_layout.addWidget(self.piece_count_label, 1)
         self.trace_chain_btns: list[QPushButton] = []
         for index in range(3):
             button = QPushButton("なぞる")
             button.setEnabled(False)
+            button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
             coords_layout.addWidget(button)
             self.trace_chain_btns.append(button)
         self.list_groups_btn = QPushButton("羅列")
+        self.list_groups_btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        self.list_groups_btn.setMinimumWidth(self.trace_chain_btns[0].sizeHint().width())
         coords_layout.addWidget(self.list_groups_btn)
         self.coords_hint = QLabel("上下キーで画像を切替  /  左右キーで枠を1px  /  Shift+矢印で10px  /  Ctrl+矢印でサイズ")
         self.coords_hint.setObjectName("hint")
+        self.coords_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         coords_layout.addWidget(self.coords_hint, 1)
         layout.addWidget(coords)
 
@@ -868,7 +930,9 @@ class MainWindow(QMainWindow):
         self.open_result_train_btn.clicked.connect(self.open_result_train_images)
         self.predict_btn.clicked.connect(self.predict_current)
         self.train_btn.clicked.connect(self.on_train_button)
+        self.train_shutdown_btn.clicked.connect(self.on_train_shutdown_button)
         self._train_fx.cancelRequested.connect(self.cancel_training)
+        self._train_fx.shutdownToggleRequested.connect(self.on_train_shutdown_button)
         self.delete_btn.clicked.connect(self.delete_current)
         self.delete_unused_one_btn.clicked.connect(self.delete_current)
         self.delete_unused_btn.clicked.connect(self.delete_unused_images)
@@ -1158,6 +1222,7 @@ class MainWindow(QMainWindow):
             self._lock_for_training()
             return
         self.train_btn.setText("学習する")
+        self._sync_train_shutdown_btn()
         has_sample = self.current_id is not None
         has_active = any(self._key_has_content(key) for key in self._selected_place_keys())
         self.confirm_btn.setEnabled(has_sample and has_active)
@@ -1730,7 +1795,16 @@ class MainWindow(QMainWindow):
             self._group_window.pieceClicked.connect(self.canvas.select_piece)
             self._group_window.pieceRemoveRequested.connect(self._remove_listed_piece)
             self._group_window.groupChanged.connect(self.canvas.set_piece_group)
-            self._group_window.resize(self.width(), self.height())
+        frame = self.frameGeometry()
+        width = max(1, frame.width() // 2)
+        x = frame.x() + frame.width()
+        screen = self.screen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            if x + width > avail.x() + avail.width():
+                x = avail.x() + avail.width() - width
+            x = max(avail.x(), x)
+        self._group_window.setGeometry(x, frame.y(), width, frame.height())
         self._group_window.set_pieces(
             self.canvas.source_pixmap(),
             self.canvas.all_pieces(),
@@ -2636,13 +2710,28 @@ class MainWindow(QMainWindow):
             widget.setEnabled(False)
         self.train_btn.setEnabled(True)
         self.train_btn.setText("中止")
+        self._sync_train_shutdown_btn()
         self.hint_label.setText("学習中です。中止できます。")
 
     def _unlock_after_training(self) -> None:
         for widget in self._training_lock_widgets():
             widget.setEnabled(True)
         self.train_btn.setText("学習する")
+        self._sync_train_shutdown_btn()
         self.hint_label.setText("色つきの四角が付いています。保存したい種類にチェックを付けて保存してください。")
+
+    def _sync_train_shutdown_btn(self) -> None:
+        if self._is_training():
+            self.train_shutdown_btn.setEnabled(True)
+            if self._shutdown_after_train:
+                self.train_shutdown_btn.setText("やっぱりシャットダウンしない")
+            else:
+                self.train_shutdown_btn.setText("やっぱりシャットダウンする")
+            if hasattr(self, "_train_fx"):
+                self._train_fx.set_shutdown_after(self._shutdown_after_train)
+            return
+        self.train_shutdown_btn.setText("学習してシャットダウン")
+        self.train_shutdown_btn.setEnabled(bool(self._trainable_jobs()) and self.train_worker is None)
 
     def _block_if_training(self) -> bool:
         if not self._is_training():
@@ -2761,7 +2850,7 @@ class MainWindow(QMainWindow):
         rate = 0.55 * self._train_batch_rate(default) + 0.45 * observed
         self._settings.setValue("train_sec_per_batch", rate)
 
-    def start_training(self) -> None:
+    def start_training(self, *, shutdown_after: bool = False) -> None:
         if self._is_training():
             return
         selected = self._selected_place_keys()
@@ -2805,9 +2894,12 @@ class MainWindow(QMainWindow):
         if skipped:
             message += "\n\n枚数が足りないので、今回は学びません。\n" + "\n".join(skipped)
         message += "\n\n" + self._train_eta_line(self._estimate_jobs_seconds(jobs))
+        if shutdown_after:
+            message += "\n終わったら PC をシャットダウンします。"
         answer = QMessageBox.question(self, "学習を開始", message)
         if answer != QMessageBox.StandardButton.Yes:
             return
+        self._shutdown_after_train = shutdown_after
         self.progress.setVisible(True)
         self.progress.setRange(0, 40 * len(jobs))
         self.progress.setValue(0)
@@ -2818,6 +2910,7 @@ class MainWindow(QMainWindow):
         self._lock_for_training()
         self._place_train_fx()
         self._train_fx.start()
+        self._train_fx.set_shutdown_after(self._shutdown_after_train)
         QApplication.processEvents()
         self._train_started_at = time.perf_counter()
         self.statusBar().showMessage("学習中です。中止できます")
@@ -2828,6 +2921,17 @@ class MainWindow(QMainWindow):
             self.cancel_training()
             return
         self.start_training()
+
+    def on_train_shutdown_button(self) -> None:
+        if self._is_training():
+            self._shutdown_after_train = not self._shutdown_after_train
+            self._sync_train_shutdown_btn()
+            if self._shutdown_after_train:
+                self.statusBar().showMessage("終わったらシャットダウンします", 4000)
+            else:
+                self.statusBar().showMessage("終わってもシャットダウンしません", 4000)
+            return
+        self.start_training(shutdown_after=True)
 
     def cancel_training(self) -> None:
         if self.train_worker is None or not self.train_worker.isRunning():
@@ -2868,6 +2972,7 @@ class MainWindow(QMainWindow):
                 names = "、".join(item.get("label", "") for item in done)
                 extra = f"\n終わる前に保存できたもの: {names}"
             self._train_started_at = None
+            self._shutdown_after_train = False
             QMessageBox.information(self, "学習を中止", "学習を中止しました。" + extra)
             self.statusBar().showMessage("学習を中止しました", 4000)
             return
@@ -2881,8 +2986,13 @@ class MainWindow(QMainWindow):
                 lines.append(f"{item['label']}  loss {item.get('loss', 0):.4f}（{item['samples']} 枚）")
             elif item.get("key") in {"coin_digits", "scene"}:
                 lines.append(f"{item['label']}  acc {item.get('iou', 0):.3f}（{item['samples']} 枚）")
-            else:
-                lines.append(f"{item['label']}  IoU {item['iou']:.3f}（{item['samples']} 枚）")
+        else:
+            lines.append(f"{item['label']}  IoU {item['iou']:.3f}（{item['samples']} 枚）")
+        if self._shutdown_after_train:
+            self._shutdown_after_train = False
+            self.statusBar().showMessage("学習が完了しました。シャットダウンします")
+            self._shutdown_pc()
+            return
         QMessageBox.information(
             self,
             "学習完了",
@@ -2898,10 +3008,15 @@ class MainWindow(QMainWindow):
             worker.wait(8000)
         self.train_worker = None
         self._train_started_at = None
+        self._shutdown_after_train = False
         self._unlock_after_training()
         self.update_stats()
         self.hint_label.setText("学習に失敗しました。他の操作が使えます。")
         QMessageBox.critical(self, "学習に失敗", message)
+
+    def _shutdown_pc(self) -> None:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(["shutdown", "/s", "/t", "0"], creationflags=flags)
 
     def _apply_predictions_to_unlabeled(self) -> int:
         if not self.predictor.is_ready():
