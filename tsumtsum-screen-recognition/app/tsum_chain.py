@@ -37,6 +37,9 @@ def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
     spacing = _typical_spacing(tsums)
     phys = _physical_links(tsums, spacing)
     found = _paths_from_blobs(tsums, phys)
+    if not found:
+        phys = _physical_links(tsums, spacing, scale=1.12)
+        found = _paths_from_blobs(tsums, phys)
     found.sort(key=len, reverse=True)
     return found
 
@@ -72,22 +75,41 @@ def _induced_links(phys: list[list[int]], blob: list[int]) -> list[list[int]]:
     return links
 
 
-def _physical_links(tsums: list[dict[str, int]], spacing: float) -> list[list[int]]:
+def _physical_links(
+    tsums: list[dict[str, int]], spacing: float, scale: float = 1.0
+) -> list[list[int]]:
     count = len(tsums)
     radii = [max(4, int(piece.get("r") or 12)) for piece in tsums]
     typical_r = sorted(radii)[len(radii) // 2] if radii else 12
-    reach = typical_r * 2.8
+    reach = typical_r * 2.6 * scale
+    close = typical_r * 2.4 * scale
     if spacing > 0:
-        reach = max(reach, spacing * 1.55)
+        reach = max(reach, spacing * 1.38 * scale)
+        close = max(close, spacing * 1.28 * scale)
+    reach = min(reach, typical_r * 2.9 * scale)
+    close = min(close, typical_r * 2.7 * scale)
     min_dist = typical_r * 0.4
     xs = [int(piece["x"]) for piece in tsums]
     ys = [int(piece["y"]) for piece in tsums]
+    groups = [int(piece.get("group") or 1) for piece in tsums]
+    gap = spacing if spacing > 0 else typical_r * 2.0
     links: list[list[int]] = [[] for _ in range(count)]
+
+    def add(left: int, right: int) -> None:
+        dist = math.hypot(xs[right] - xs[left], ys[right] - ys[left])
+        if dist > close and _segment_blocked(xs, ys, left, right, gap):
+            return
+        if right not in links[left]:
+            links[left].append(right)
+        if left not in links[right]:
+            links[right].append(left)
+
     for index in range(count):
         bins: list[tuple[float, int] | None] = [None] * 6
         ax, ay = xs[index], ys[index]
+        group = groups[index]
         for other in range(count):
-            if other == index:
+            if other == index or groups[other] != group:
                 continue
             dx = xs[other] - ax
             dy = ys[other] - ay
@@ -99,14 +121,48 @@ def _physical_links(tsums: list[dict[str, int]], spacing: float) -> list[list[in
             if prev is None or dist < prev[0]:
                 bins[slot] = (dist, other)
         for item in bins:
-            if item is None:
+            if item is not None:
+                add(index, item[1])
+    for index in range(count):
+        ax, ay = xs[index], ys[index]
+        group = groups[index]
+        for other in range(index + 1, count):
+            if groups[other] != group:
                 continue
-            other = item[1]
-            if other not in links[index]:
-                links[index].append(other)
-            if index not in links[other]:
-                links[other].append(index)
+            dist = math.hypot(xs[other] - ax, ys[other] - ay)
+            if dist < min_dist or dist > close:
+                continue
+            add(index, other)
     return links
+
+
+def _segment_blocked(
+    xs: list[int],
+    ys: list[int],
+    left: int,
+    right: int,
+    spacing: float,
+) -> bool:
+    ax, ay = xs[left], ys[left]
+    bx, by = xs[right], ys[right]
+    vx, vy = bx - ax, by - ay
+    length = vx * vx + vy * vy
+    if length < 1:
+        return False
+    thresh = (0.4 * spacing) ** 2
+    for index, (px, py) in enumerate(zip(xs, ys)):
+        if index == left or index == right:
+            continue
+        t = ((px - ax) * vx + (py - ay) * vy) / length
+        if t <= 0.12 or t >= 0.88:
+            continue
+        qx = ax + t * vx
+        qy = ay + t * vy
+        dx = px - qx
+        dy = py - qy
+        if dx * dx + dy * dy < thresh:
+            return True
+    return False
 
 
 def _type_blob(
@@ -282,8 +338,10 @@ def _paths_in_component(links: list[list[int]], nodes: list[int]) -> list[list[i
 
     allowed = set(nodes)
     walks = 0
-    budget = 30000
+    budget = 200000 if len(nodes) <= 10 else 30000
     per_start = max(800, budget // max(1, len(nodes)))
+    if len(nodes) <= 10:
+        per_start = budget
     starts = sorted(
         nodes,
         key=lambda node: (sum(1 for nxt in links[node] if nxt in allowed), node),

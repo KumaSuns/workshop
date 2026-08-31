@@ -49,10 +49,61 @@ def prepare_tsum_crop(
     fade = ((outer - dist_self) / (outer - inner)).clamp(0.0, 1.0)
     fade = torch.where(dist_self <= inner, torch.ones_like(fade), fade)
     fade = torch.where(dist_self < outer, fade, torch.zeros_like(fade))
+    if others:
+        for other in others:
+            ox, oy = int(other["x"]), int(other["y"])
+            if ox == x and oy == y:
+                continue
+            orad = max(4, int(other.get("r") or r)) * scale * TYPE_DISK_INNER
+            dist_other = torch.hypot(xs - (ox - left) * scale, ys - (oy - top) * scale)
+            fade = torch.where(dist_other < orad, torch.zeros_like(fade), fade)
     fill = torch.tensor(TYPE_FILL, dtype=torch.float32).view(3, 1, 1)
     isolated = rgb * fade.unsqueeze(0) + fill * (1.0 - fade.unsqueeze(0))
     isolated = _suppress_effect_pixels(isolated, fade)
     return to_pil_image(isolated.byte().clamp(0, 255))
+
+
+def piece_lab(image: Image.Image, piece: dict[str, int]) -> tuple[float, ...]:
+    x, y, r = int(piece["x"]), int(piece["y"]), max(4, int(piece["r"]))
+    span = max(8, int(round(r * TYPE_CROP_SCALE)))
+    width, height = image.size
+    box = (
+        max(0, x - span),
+        max(0, y - span),
+        min(width, x + span + 1),
+        min(height, y + span + 1),
+    )
+    crop = image.crop(box).resize((32, 32), Image.Resampling.BILINEAR).convert("LAB")
+    cx = cy = 15.5
+    inner: list[tuple[int, int, int]] = []
+    ring: list[tuple[int, int, int]] = []
+    for index, pixel in enumerate(crop.getdata()):
+        px = index % 32
+        py = index // 32
+        dist = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+        lab = (int(pixel[0]), int(pixel[1]), int(pixel[2]))
+        if dist <= 4.0:
+            inner.append(lab)
+        elif dist <= 9.0:
+            ring.append(lab)
+    if not inner and not ring:
+        return (0.0, 128.0, 128.0, 0.0, 128.0, 128.0)
+    if not inner:
+        inner = ring
+    if not ring:
+        ring = inner
+    luma = sorted(pixel[0] for pixel in ring)
+    median_l = luma[len(luma) // 2]
+    kept = [pixel for pixel in ring if pixel[0] <= median_l + 28]
+    if not kept:
+        kept = ring
+
+    def mean(pixels: list[tuple[int, int, int]]) -> tuple[float, float, float]:
+        count = len(pixels)
+        total = [sum(pixel[i] for pixel in pixels) / count for i in range(3)]
+        return (0.3 * total[0], total[1], total[2])
+
+    return mean(inner) + mean(kept)
 
 
 def _suppress_effect_pixels(rgb: torch.Tensor, fade: torch.Tensor) -> torch.Tensor:
@@ -109,10 +160,22 @@ class TsumTypeNet(nn.Module):
                 parameter.requires_grad = True
 
 
-def supcon_loss(z: torch.Tensor, labels: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+def supcon_loss(
+    z: torch.Tensor,
+    labels: torch.Tensor,
+    colors: torch.Tensor | None = None,
+    temperature: float = 0.07,
+) -> torch.Tensor:
     similar = z @ z.T / temperature
     eye = torch.eye(z.size(0), dtype=torch.bool, device=z.device)
     pos = labels.unsqueeze(0).eq(labels.unsqueeze(1)) & ~eye
+    neg = ~pos & ~eye
+    if colors is not None and colors.size(0) == z.size(0):
+        dist = torch.cdist(colors.float(), colors.float())
+        nz = dist[dist > 1e-6]
+        med = nz.median() if int(nz.numel()) else torch.tensor(1.0, device=z.device)
+        hard = torch.exp(-dist / med.clamp(min=1e-3))
+        similar = similar + 0.8 * hard * neg.float()
     similar = similar - similar.max(dim=1, keepdim=True).values
     exp = similar.exp() * (~eye)
     log_prob = similar - exp.sum(dim=1, keepdim=True).clamp(min=1e-8).log()

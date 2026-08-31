@@ -25,19 +25,20 @@ def scene_name(index: int) -> str:
 
 
 class SceneNet(nn.Module):
-    """画面全体から other / GO / TIME UP を分ける。"""
+    """画面全体の種類を分ける。クラス数は学習済みの checkpoint に合わせる。"""
 
-    def __init__(self, pretrained: bool = True) -> None:
+    def __init__(self, pretrained: bool = True, num_classes: int | None = None) -> None:
         super().__init__()
         weights = ResNet18_Weights.DEFAULT if pretrained else None
         backbone = resnet18(weights=weights)
+        count = len(SCENE_CLASSES) if num_classes is None else int(num_classes)
         self.features = nn.Sequential(*list(backbone.children())[:-1])
         self.head = nn.Sequential(
             nn.Flatten(),
             nn.Linear(512, 128),
             nn.ReLU(inplace=True),
             nn.Dropout(0.25),
-            nn.Linear(128, len(SCENE_CLASSES)),
+            nn.Linear(128, count),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

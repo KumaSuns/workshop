@@ -177,18 +177,6 @@ def capture_screen_path() -> Path:
 
 def capture_play_frame() -> QImage:
     global _last_cap_size
-    if _last_cap_size is not None:
-        win = _capture_window()
-        if win is not None and not win.isNull() and win.width() >= 80:
-            width, height = _last_cap_size
-            if win.width() != width or win.height() != height:
-                win = win.scaled(
-                    width,
-                    height,
-                    Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.FastTransformation,
-                )
-            return win
     image = _capture_adb_qimage()
     if image is None or image.isNull():
         path = capture_screen_path()

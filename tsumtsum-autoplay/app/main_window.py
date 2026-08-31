@@ -108,6 +108,7 @@ class MainWindow(QMainWindow):
         self._play: PlayWorker | None = None
         self._debug = DebugWindow()
         self._debug._on_stop = self.on_stop
+        self._placed = False
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -274,8 +275,13 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._debug.show()
+        if self._placed:
+            return
+        self._placed = True
         geo = self.frameGeometry()
-        self._debug.move(geo.right() + 8, geo.top())
+        self._debug.move(geo.left(), geo.top())
+        dbg = self._debug.frameGeometry()
+        self.move(dbg.right() + 8, dbg.top())
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
@@ -342,7 +348,8 @@ class MainWindow(QMainWindow):
 
     def _on_play_done(self) -> None:
         self._set_running(False)
-        if self.status_label.text() != "TIME UP":
+        text = self.status_label.text()
+        if "コイン" not in text and text != "TIME UP":
             self._set_status("TIME UP")
 
     def _on_stopped(self) -> None:

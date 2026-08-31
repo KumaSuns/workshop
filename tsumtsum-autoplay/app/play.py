@@ -19,12 +19,17 @@ from app.intro import (
     _play_button,
     _slow_tap,
 )
-from app.play_style import rank as style_rank
+from app.play_style import add_unlike, load_unlike, record_pick, unlike_hit
 from app.trainer_bridge import TRAINER_ROOT, load_play_tools, save_erase_lesson
 
 MIN_CHAIN = 3
 BOARD_TSUMS = 8
+SETTLE_WAIT = 2.0
 TIMEUP_SCORE = 0.18
+COIN_SCENE_SCORE = 0.18
+COIN_SCENE_WAIT = 20.0
+COIN_GOAL_4 = 500
+COIN_GOAL_5 = 120
 
 StatusFn = Callable[[str], None]
 
@@ -87,9 +92,24 @@ def run_play(
         raise RuntimeError("ツムの〇モデルがありません。画面認識アプリで学習してください。")
     if getattr(predictor, "scene_model", None) is None:
         raise RuntimeError("TIME UP のモデルがありません。")
+    if getattr(predictor, "coin_scene_model", None) is None:
+        raise RuntimeError("coin 画面のモデルがありません。")
+    if getattr(predictor, "coin_reader", None) is None:
+        raise RuntimeError("コインの読み取りがありません。")
 
     say("プレイを開始します")
     reset_swipe_mouse()
+    unlike = load_unlike()
+    pending_chain: list[dict[str, int]] | None = None
+    pending_spots: list[tuple[int, int, int, tuple[float, float, float] | None]] | None = None
+    pending_image: QImage | None = None
+    pending_pieces: list[dict[str, int]] | None = None
+    pending_game: dict[str, int] | None = None
+    pending_options: list[int] = []
+    pending_n = 0
+    pending_at = 0.0
+    settle_key: tuple[tuple[int, int], ...] | None = None
+    skip_chains: set[tuple[tuple[int, int], ...]] = set()
     game = None
     saw_board = False
     kinds = 5
@@ -117,12 +137,13 @@ def run_play(
             say("画面を待っています")
             _sleep_stop(0.25, stop)
             continue
-        if game is None:
-            boxes = predictor.predict_all(Path("."), rgb=rgb)
-            game = boxes.get("game")
+        boxes = predictor.predict_all(Path("."), rgb=rgb)
+        if boxes.get("game"):
+            game = boxes["game"]
         timeup = _timeup_score(predictor, rgb)
         if timeup >= TIMEUP_SCORE:
             say(f"TIME UP {timeup:.0%}")
+            _read_coin_scene_goal(predictor, kinds, say, stop)
             return
         _check_stop(stop)
         if not kinds_locked:
@@ -134,8 +155,6 @@ def run_play(
         pieces = predictor.predict_pieces(Path("."), game, kinds=kinds, rgb=rgb)
         tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
         if len(tsums) < BOARD_TSUMS and not saw_board:
-            boxes = predictor.predict_all(Path("."), rgb=rgb)
-            game = boxes.get("game")
             pieces = predictor.predict_pieces(Path("."), None, kinds=kinds, rgb=rgb)
             tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
         _check_stop(stop)
@@ -154,11 +173,59 @@ def run_play(
                     _sleep_stop(2.0, stop)
                     continue
                 continue
-        chain, option_lens = _pick_chain(predictor, rgb, pieces, candidates, say)
+        if pending_spots is not None and pending_chain is not None:
+            erased = pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN
+            lingered = _spots_lingered(rgb, pending_spots)
+            waited = time.time() - pending_at
+            if not erased and waited < SETTLE_WAIT and not lingered:
+                say("消えるのを待っています")
+                continue
+            if not erased:
+                say("消えていない")
+                record_pick(pending_options, len(pending_chain), False)
+                skip_chains.add(_chain_key(pending_chain))
+                pair = _unlike_from_chain(pending_chain)
+                if pair is not None and add_unlike(unlike, pair[0], pair[1]):
+                    say("別種類として覚えます")
+                if pending_image is not None and pending_pieces is not None:
+                    _remember_mixed(
+                        predictor, pending_image, pending_game, pending_pieces, pending_chain
+                    )
+                    say("種類の学習に残します")
+            else:
+                key = _board_key(tsums)
+                if waited < SETTLE_WAIT and (settle_key is None or key != settle_key):
+                    settle_key = key
+                    say("落ちるのを待っています")
+                    continue
+                record_pick(pending_options, len(pending_chain), True)
+                skip_chains.clear()
+            pending_chain = None
+            pending_spots = None
+            pending_image = None
+            pending_pieces = None
+            pending_game = None
+            pending_options = []
+            pending_n = 0
+            pending_at = 0.0
+            settle_key = None
+        _attach_type_vecs(predictor, rgb, pieces)
+        chain, option_lens = _pick_chain(
+            predictor, rgb, pieces, candidates, unlike, skip_chains, say
+        )
         if chain:
             if not _swipe_chain(chain, pieces, image, game, len(tsums), say, stop, preview):
                 _sleep_stop(0.08, stop)
                 continue
+            pending_chain = chain
+            pending_spots = _chain_spots(rgb, chain)
+            pending_image = image
+            pending_pieces = pieces
+            pending_game = game
+            pending_options = option_lens
+            pending_n = len(tsums)
+            pending_at = time.time()
+            settle_key = None
             continue
         if preview is not None:
             preview(_draw_plan(image, pieces, [], game))
@@ -243,6 +310,9 @@ def _unlike_from_chain(
     if any(vec is None for vec in vecs) or len(chain) < 2:
         return None
     cut = _weakest_cut(chain)
+    left_v, right_v = vecs[cut - 1], vecs[cut]
+    if left_v is None or right_v is None:
+        return None
     left = [vecs[index] for index in range(cut)]
     right = [vecs[index] for index in range(cut, len(vecs))]
     if not left or not right:
@@ -425,9 +495,156 @@ def _timeup_score(predictor, rgb) -> float:
     tensor = transform(view).unsqueeze(0).to(predictor.device)
     with torch.no_grad():
         probs = torch.softmax(model(tensor), dim=1)[0]
+    classes = getattr(predictor, "scene_classes", None) or ("other", "go", "timeup")
+    if "timeup" in classes:
+        return float(probs[classes.index("timeup")].item())
     if probs.numel() < 3:
         return 0.0
     return float(probs[2].item())
+
+
+def _coin_scene_best(predictor, rgb) -> tuple[str, float]:
+    model = getattr(predictor, "coin_scene_model", None)
+    transform = getattr(predictor, "_scene_transform", None)
+    classes = getattr(predictor, "coin_scene_classes", None) or ()
+    if model is None or transform is None or rgb is None or not classes:
+        return "", 0.0
+    import torch
+
+    view = _portrait_frame(rgb)
+    tensor = transform(view).unsqueeze(0).to(predictor.device)
+    with torch.no_grad():
+        probs = torch.softmax(model(tensor), dim=1)[0]
+    scores: dict[str, float] = {}
+    for index, key in enumerate(classes):
+        if index >= int(probs.numel()):
+            break
+        scores[str(key)] = float(probs[index].item())
+    if not scores:
+        return "", 0.0
+    name = max(scores, key=scores.get)
+    return name, scores[name]
+
+
+def _coin_goal(kinds: int) -> int:
+    return COIN_GOAL_4 if kinds <= 4 else COIN_GOAL_5
+
+
+def _say_coin_goal(coins: int, kinds: int, say: StatusFn) -> None:
+    goal = _coin_goal(kinds)
+    if coins <= 0:
+        say(f"目標 {goal}枚（コインは読めませんでした）")
+        return
+    mark = "達成" if coins >= goal else "未達"
+    say(f"コイン {coins}枚 / 目標 {goal}枚 {mark}")
+
+
+def _parse_coin_text(text: str) -> int | None:
+    digits = "".join(char for char in str(text) if char.isdigit())
+    if not digits:
+        return None
+    value = int(digits)
+    if value <= 0:
+        return None
+    if len(digits) >= 3 and len(set(digits)) == 1:
+        return None
+    return value
+
+
+def _read_coin(predictor) -> int | None:
+    reader = getattr(predictor, "coin_reader", None)
+    if reader is None:
+        return None
+    import tempfile
+
+    from PIL import Image as PILImage
+
+    temp = None
+    try:
+        path = capture_screen_path()
+        with PILImage.open(path) as opened:
+            view = _portrait_frame(opened.convert("RGB"))
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            temp = Path(handle.name)
+        view.save(temp, format="PNG")
+        boxes = reader.candidate_boxes_for_path(temp, "coin")
+        hud = reader._hud
+
+        def predict(crop, key: str = "coin") -> str:
+            raw = reader._predict_digits(crop, key)
+            if _parse_coin_text(raw) is None:
+                return ""
+            return raw
+
+        for box in boxes:
+            _crop, number = hud.read_coin_number(temp, box, predict_fn=predict)
+            value = _parse_coin_text(number)
+            if value is not None:
+                return value
+    except Exception:
+        return None
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+    return None
+
+
+def _read_coin_scene_goal(predictor, kinds: int, say: StatusFn, stop: Event | None) -> None:
+    if getattr(predictor, "coin_scene_model", None) is None:
+        say("coin 画面のモデルがありません")
+        _say_coin_goal(0, kinds, say)
+        return
+    if getattr(predictor, "coin_reader", None) is None:
+        say("coin の読み取りがありません")
+        _say_coin_goal(0, kinds, say)
+        return
+    say("coin 画面を待っています")
+    started = time.time()
+    deadline = started + COIN_SCENE_WAIT
+    last = 0
+    hits = 0
+    tapped = False
+    saw_coin = False
+    coin_at = 0.0
+    while time.time() < deadline:
+        _check_stop(stop)
+        try:
+            image = capture_play_frame()
+            rgb = _qimage_rgb(image)
+        except Exception:
+            _sleep_stop(0.3, stop)
+            continue
+        if rgb is None or image.isNull():
+            _sleep_stop(0.3, stop)
+            continue
+        name, score = _coin_scene_best(predictor, rgb)
+        if name == "coin" and score >= COIN_SCENE_SCORE:
+            if not saw_coin:
+                say(f"coin 画面 {score:.0%}")
+                saw_coin = True
+                coin_at = time.time()
+            if time.time() - coin_at < 1.2:
+                _sleep_stop(0.3, stop)
+                continue
+            coins = _read_coin(predictor)
+            if coins is not None:
+                if coins == last:
+                    hits += 1
+                else:
+                    last = coins
+                    hits = 1
+                if hits >= 3:
+                    break
+        elif (
+            name == "timeup"
+            and not tapped
+            and not saw_coin
+            and time.time() - started >= 1.5
+        ):
+            _slow_tap(image.width() // 2, image.height() // 2)
+            tapped = True
+        _sleep_stop(0.3, stop)
+    _say_coin_goal(last, kinds, say)
 
 
 def _portrait_frame(image: Image.Image) -> Image.Image:
@@ -634,17 +851,55 @@ def _pick_chain(
     rgb,
     pieces: list[dict[str, int]],
     candidates,
+    unlike,
+    skip_chains: set[tuple[tuple[int, int], ...]],
     say: StatusFn,
 ) -> tuple[list[dict[str, int]], list[int]]:
     found = [chain for chain in candidates(pieces, 8) if len(chain) >= MIN_CHAIN]
-    if found:
-        say("候補 " + " / ".join(str(len(chain)) for chain in found))
-        options = [len(item) for item in found]
-        return max(found, key=lambda item: style_rank(item, options)), options
-    return [], []
+    found = [chain for chain in found if _chain_key(chain) not in skip_chains]
+    clean = [chain for chain in found if not _chain_has_unlike(chain, unlike)]
+    if clean:
+        found = clean
+    if not found:
+        return [], []
+    say("候補 " + " / ".join(str(len(chain)) for chain in found))
+    options = [len(item) for item in found]
+    return max(
+        found,
+        key=lambda item: (len(item), _leftover_len(pieces, item, candidates)),
+    ), options
 
 
-def _group_by_type(
+def _chain_key(chain: list[dict[str, int]]) -> tuple[tuple[int, int], ...]:
+    return tuple(sorted((int(piece["x"]) // 8, int(piece["y"]) // 8) for piece in chain))
+
+
+def _chain_has_unlike(chain: list[dict[str, int]], unlike) -> bool:
+    if not unlike:
+        return False
+    for index in range(1, len(chain)):
+        if unlike_hit(chain[index - 1].get("_vec"), chain[index].get("_vec"), unlike):
+            return True
+    return False
+
+
+def _leftover_len(
+    pieces: list[dict[str, int]],
+    chain: list[dict[str, int]],
+    candidates,
+) -> int:
+    leftover = _remaining_after_erase(pieces, chain)
+    found = [item for item in candidates(leftover, 1) if len(item) >= MIN_CHAIN]
+    return max((len(item) for item in found), default=0)
+
+
+def _board_key(tsums: list[dict[str, int]]) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        sorted((int(piece["x"]) // 12, int(piece["y"]) // 12) for piece in tsums)
+    )
+
+
+def _attach_type_vecs(
     predictor,
     rgb,
     pieces: list[dict[str, int]],
@@ -657,72 +912,6 @@ def _group_by_type(
         return
     for piece, vec in zip(tsums, vecs):
         piece["_vec"] = vec
-    _split_mixed_groups(tsums)
-
-
-def _split_mixed_groups(tsums: list[dict[str, int]], min_sim: float = 0.75) -> None:
-    by_group: dict[int, list[dict[str, int]]] = {}
-    for piece in tsums:
-        by_group.setdefault(int(piece.get("group") or 1), []).append(piece)
-    next_id = max(by_group, default=0) + 1
-    for members in by_group.values():
-        count = len(members)
-        if count < MIN_CHAIN * 2:
-            continue
-        parent = list(range(count))
-
-        def find(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
-
-        for i in range(count):
-            for j in range(i + 1, count):
-                left = members[i].get("_vec")
-                right = members[j].get("_vec")
-                if left is None or right is None:
-                    continue
-                if _cosine(left, right) < min_sim:
-                    continue
-                a, b = find(i), find(j)
-                if a != b:
-                    parent[b] = a
-        buckets: dict[int, list[int]] = {}
-        for index in range(count):
-            buckets.setdefault(find(index), []).append(index)
-        large = [indexes for indexes in buckets.values() if len(indexes) >= MIN_CHAIN]
-        if len(large) < 2:
-            continue
-        group_ids: list[int] = [int(members[0].get("group") or 1)]
-        for _ in large[1:]:
-            group_ids.append(next_id)
-            next_id += 1
-        means: list[tuple[int, tuple[float, ...]]] = []
-        assigned: set[int] = set()
-        for cluster, gid in zip(large, group_ids):
-            vecs = [members[i]["_vec"] for i in cluster if members[i].get("_vec") is not None]
-            if vecs:
-                dim = len(vecs[0])
-                mean = tuple(sum(vec[d] for vec in vecs) / len(vecs) for d in range(dim))
-                means.append((gid, mean))
-            for index in cluster:
-                members[index]["group"] = gid
-                assigned.add(index)
-        for index in range(count):
-            if index in assigned:
-                continue
-            vec = members[index].get("_vec")
-            if vec is None or not means:
-                continue
-            best_g = means[0][0]
-            best = -2.0
-            for gid, mean in means:
-                sim = _cosine(vec, mean)
-                if sim > best:
-                    best = sim
-                    best_g = gid
-            members[index]["group"] = best_g
 
 
 def _type_vectors(predictor, rgb, pieces: list[dict[str, int]]):

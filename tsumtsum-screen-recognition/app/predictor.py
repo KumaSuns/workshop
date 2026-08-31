@@ -19,13 +19,13 @@ from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, heat_to_pixel, peaks_from_heat
 from app.paths import WORKSHOP_ROOT
 from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename, piece_radius_from_game
-from app.scene_model import SCENE_INPUT, SceneNet, scene_name
+from app.scene_model import SCENE_CLASSES, SCENE_INPUT, SceneNet
 from app.tsum_type import (
     IMAGENET_MEAN as TYPE_MEAN,
     IMAGENET_STD as TYPE_STD,
     TYPE_INPUT,
     TsumTypeNet,
-    TYPE_CROP_SCALE,
+    piece_lab,
     prepare_tsum_crop,
 )
 
@@ -39,6 +39,7 @@ class Predictor:
         self.type_model: TsumTypeNet | None = None
         self.digit_models: dict[str, CoinDigitNet] = {}
         self.scene_model: SceneNet | None = None
+        self.scene_classes: tuple[str, ...] = SCENE_CLASSES
         self._transform = transforms.Compose(
             [
                 transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
@@ -112,6 +113,7 @@ class Predictor:
         self.type_model = None
         self.digit_models = {}
         self.scene_model = None
+        self.scene_classes = SCENE_CLASSES
         for key in REGION_KEYS:
             path = self.models_dir / model_filename(key)
             if not path.exists():
@@ -183,16 +185,26 @@ class Predictor:
             scene_path = WORKSHOP_ROOT / "video-frame-extractor" / "scene.pt"
         if scene_path.exists():
             checkpoint = torch.load(scene_path, map_location=self.device, weights_only=False)
-            model = SceneNet(pretrained=False)
+            classes = (
+                tuple(checkpoint.get("classes") or SCENE_CLASSES)
+                if isinstance(checkpoint, dict)
+                else SCENE_CLASSES
+            )
+            model = SceneNet(pretrained=False, num_classes=len(classes))
             state = (
                 checkpoint["state_dict"]
                 if isinstance(checkpoint, dict) and "state_dict" in checkpoint
                 else checkpoint
             )
-            model.load_state_dict(state)
-            model.to(self.device)
-            model.eval()
-            self.scene_model = model
+            try:
+                model.load_state_dict(state)
+            except Exception:
+                model = None
+            if model is not None:
+                model.to(self.device)
+                model.eval()
+                self.scene_model = model
+                self.scene_classes = classes
         return self.is_ready()
 
     def predict_scene(self, image_path: Path) -> tuple[str, float]:
@@ -204,7 +216,9 @@ class Predictor:
             logits = self.scene_model(tensor)
             probs = torch.softmax(logits, dim=1)[0]
         index = int(probs.argmax().item())
-        return scene_name(index), float(probs[index].item())
+        classes = self.scene_classes
+        name = classes[index] if 0 <= index < len(classes) else "other"
+        return name, float(probs[index].item())
 
     @property
     def digit_model(self) -> CoinDigitNet | None:
@@ -295,11 +309,16 @@ class Predictor:
             return
         colors = [self._tsum_color(image, piece) for piece in tsums]
         k = min(max(1, kinds), len(tsums))
-        labels = self._kmeans(colors, k, cosine=False)
         if self.type_model is not None:
             embeds = self._tsum_embeddings(image, tsums)
+            labels = self._kmeans(embeds, k, cosine=True)
             for _ in range(2):
-                labels = self._split_mixed_clusters(embeds, labels, cosine=True)
+                labels = self._split_mixed_by_color_and_embed(colors, embeds, labels)
+            labels = self._reassign_by_color(colors, embeds, labels)
+        else:
+            labels = self._kmeans(colors, k, cosine=False)
+            for _ in range(2):
+                labels = self._split_mixed_clusters(colors, labels, cosine=False)
         uniq = sorted(set(labels))
         order = sorted(
             uniq,
@@ -332,16 +351,103 @@ class Predictor:
             right = [members[index] for index, label in enumerate(sub) if label == 1]
             if len(left) < min_size or len(right) < min_size:
                 continue
-            if not cosine:
+            if cosine:
+                center_left = self._mean_point([points[index] for index in left], True)
+                center_right = self._mean_point([points[index] for index in right], True)
+                sim = sum(a * b for a, b in zip(center_left, center_right))
+                if sim >= max_center_sim:
+                    continue
+            else:
+                center_left = self._mean_point([points[index] for index in left], False)
+                center_right = self._mean_point([points[index] for index in right], False)
+                between = self._euclid_dist2(center_left, center_right) ** 0.5
+                within = self._spread(left, points, center_left) + self._spread(
+                    right, points, center_right
+                )
+                if between <= within:
+                    continue
+            for index in right:
+                updated[index] = next_label
+            next_label += 1
+        return updated
+
+    def _split_mixed_by_color_and_embed(
+        self,
+        colors: list[tuple[float, ...]],
+        embeds: list[tuple[float, ...]],
+        labels: list[int],
+        min_size: int = 2,
+        max_center_sim: float = 0.99,
+        min_color_ratio: float = 3.5,
+    ) -> list[int]:
+        next_label = max(labels, default=0) + 1
+        updated = list(labels)
+        for group in sorted(set(labels)):
+            members = [index for index, label in enumerate(labels) if label == group]
+            if len(members) < min_size * 2:
                 continue
-            center_left = self._mean_point([points[index] for index in left], cosine)
-            center_right = self._mean_point([points[index] for index in right], cosine)
-            sim = sum(a * b for a, b in zip(center_left, center_right))
+            sub = self._kmeans([colors[index] for index in members], 2, cosine=False)
+            left = [members[index] for index, label in enumerate(sub) if label == 0]
+            right = [members[index] for index, label in enumerate(sub) if label == 1]
+            if len(left) < min_size or len(right) < min_size:
+                continue
+            center_left = self._mean_point([colors[index] for index in left], False)
+            center_right = self._mean_point([colors[index] for index in right], False)
+            between = self._euclid_dist2(center_left, center_right) ** 0.5
+            within = self._spread(left, colors, center_left) + self._spread(
+                right, colors, center_right
+            )
+            if within <= 0 or between / within < min_color_ratio:
+                continue
+            embed_left = self._mean_point([embeds[index] for index in left], True)
+            embed_right = self._mean_point([embeds[index] for index in right], True)
+            sim = sum(a * b for a, b in zip(embed_left, embed_right))
             if sim >= max_center_sim:
                 continue
             for index in right:
                 updated[index] = next_label
             next_label += 1
+        return updated
+
+    def _reassign_by_color(
+        self,
+        colors: list[tuple[float, ...]],
+        embeds: list[tuple[float, ...]],
+        labels: list[int],
+    ) -> list[int]:
+        groups = sorted(set(labels))
+        if len(groups) < 2:
+            return list(labels)
+        color_c = {
+            group: self._mean_point(
+                [colors[index] for index, label in enumerate(labels) if label == group],
+                False,
+            )
+            for group in groups
+        }
+        embed_c = {
+            group: self._mean_point(
+                [embeds[index] for index, label in enumerate(labels) if label == group],
+                True,
+            )
+            for group in groups
+        }
+        updated = list(labels)
+        for index, label in enumerate(labels):
+            own_color = self._euclid_dist2(colors[index], color_c[label]) ** 0.5
+            best_group = label
+            best_color = own_color
+            for group in groups:
+                dist = self._euclid_dist2(colors[index], color_c[group]) ** 0.5
+                if dist < best_color:
+                    best_color = dist
+                    best_group = group
+            if best_group == label or own_color < best_color * 1.35:
+                continue
+            own_embed = sum(a * b for a, b in zip(embeds[index], embed_c[label]))
+            other_embed = sum(a * b for a, b in zip(embeds[index], embed_c[best_group]))
+            if other_embed >= own_embed - 0.06:
+                updated[index] = best_group
         return updated
 
     def _mean_point(self, points: list[tuple[float, ...]], cosine: bool) -> list[float]:
@@ -355,7 +461,9 @@ class Predictor:
     def _tsum_embeddings(
         self, image: Image.Image, pieces: list[dict[str, int]]
     ) -> list[tuple[float, ...]]:
-        tensors = [self._type_transform(prepare_tsum_crop(image, piece)) for piece in pieces]
+        tensors = [
+            self._type_transform(prepare_tsum_crop(image, piece, pieces)) for piece in pieces
+        ]
         batch = torch.stack(tensors).to(self.device)
         model = self.type_model
         if model is None:
@@ -364,36 +472,19 @@ class Predictor:
             encoded = model(batch).cpu()
         return [tuple(row.tolist()) for row in encoded]
 
-    def _tsum_color(self, image: Image.Image, piece: dict[str, int]) -> tuple[float, float, float]:
-        x, y, r = int(piece["x"]), int(piece["y"]), max(4, int(piece["r"]))
-        span = max(8, int(round(r * TYPE_CROP_SCALE)))
-        width, height = image.size
-        box = (
-            max(0, x - span),
-            max(0, y - span),
-            min(width, x + span + 1),
-            min(height, y + span + 1),
+    def _spread(
+        self,
+        members: list[int],
+        points: list[tuple[float, ...]],
+        center: list[float],
+    ) -> float:
+        return (
+            sum(self._euclid_dist2(points[index], center) ** 0.5 for index in members)
+            / len(members)
         )
-        crop = image.crop(box).resize((32, 32), Image.Resampling.BILINEAR).convert("LAB")
-        cx = cy = 15.5
-        ring: list[tuple[int, int, int]] = []
-        for index, pixel in enumerate(crop.getdata()):
-            px = index % 32
-            py = index // 32
-            dist = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
-            if dist < 4.0 or dist > 9.0:
-                continue
-            ring.append((int(pixel[0]), int(pixel[1]), int(pixel[2])))
-        if not ring:
-            return (0.0, 128.0, 128.0)
-        luma = sorted(pixel[0] for pixel in ring)
-        median_l = luma[len(luma) // 2]
-        kept = [pixel for pixel in ring if pixel[0] <= median_l + 28]
-        if not kept:
-            kept = ring
-        count = len(kept)
-        total = [sum(pixel[i] for pixel in kept) / count for i in range(3)]
-        return (0.3 * total[0], total[1], total[2])
+
+    def _tsum_color(self, image: Image.Image, piece: dict[str, int]) -> tuple[float, ...]:
+        return piece_lab(image, piece)
 
     def _kmeans(self, points: list[tuple[float, ...]], k: int, iters: int = 16, cosine: bool = False) -> list[int]:
         if k <= 1 or len(points) <= 1:

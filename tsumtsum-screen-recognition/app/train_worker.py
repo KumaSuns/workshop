@@ -33,6 +33,7 @@ from app.tsum_type import (
     TYPE_FILL,
     TYPE_INPUT,
     TsumTypeNet,
+    piece_lab,
     prepare_tsum_crop,
     supcon_loss,
 )
@@ -179,9 +180,10 @@ class TsumTypeBoardDataset(Dataset):
         image = Image.open(sample.image_path).convert("RGB")
         crops: list[torch.Tensor] = []
         labels: list[int] = []
+        colors: list[tuple[float, ...]] = []
         tsums = [piece for piece in sample.pieces if piece.get("kind") == "tsum"]
         for piece in tsums:
-            crop = prepare_tsum_crop(image, piece)
+            crop = prepare_tsum_crop(image, piece, tsums)
             if self.augment:
                 crop = self.jitter(crop)
                 if random.random() < 0.5:
@@ -190,7 +192,12 @@ class TsumTypeBoardDataset(Dataset):
                 crop = TF.rotate(crop, angle, fill=TYPE_FILL)
             crops.append(self.normalize(crop))
             labels.append(int(piece.get("group") or 1))
-        return torch.stack(crops), torch.tensor(labels, dtype=torch.long)
+            colors.append(piece_lab(image, piece))
+        return (
+            torch.stack(crops),
+            torch.tensor(labels, dtype=torch.long),
+            torch.tensor(colors, dtype=torch.float32),
+        )
 
 
 class CoinDigitDataset(Dataset):
@@ -547,14 +554,15 @@ class TrainWorker(QThread):
             total_loss = 0.0
             seen = 0
             batches = max(len(loader), 1)
-            for batch_index, (crops, labels) in enumerate(loader, start=1):
+            for batch_index, (crops, labels, colors) in enumerate(loader, start=1):
                 self._raise_if_cancelled()
                 crops = crops[0].to(device)
                 labels = labels[0].to(device)
+                colors = colors[0].to(device)
                 if crops.size(0) < 2:
                     continue
                 optimizer.zero_grad(set_to_none=True)
-                loss = supcon_loss(model(crops), labels)
+                loss = supcon_loss(model(crops), labels, colors)
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
