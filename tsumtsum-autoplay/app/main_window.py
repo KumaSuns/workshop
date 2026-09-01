@@ -293,10 +293,15 @@ class MainWindow(QMainWindow):
         if self._placed:
             return
         self._placed = True
-        geo = self.frameGeometry()
-        self._debug.move(geo.left() + 80, geo.top())
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
         dbg = self._debug.frameGeometry()
-        self.move(dbg.right() + 8, dbg.top())
+        self._debug.move(area.right() - dbg.width() + 1, area.top())
+        dbg = self._debug.frameGeometry()
+        main = self.frameGeometry()
+        self.move(max(area.left(), dbg.left() - main.width() - 8), dbg.top())
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
