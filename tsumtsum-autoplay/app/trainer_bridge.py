@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
+
+from PySide6.QtGui import QImage
 
 from app.paths import APP_ROOT
 
@@ -159,3 +162,28 @@ def save_erase_lesson(
         }
     dataset.set_regions(sample.id, regions, status="labeled", pieces=pieces)
     return True
+
+
+def save_play_board(predictor, image: QImage, game: dict[str, int] | None) -> bool:
+    dataset_cls = getattr(predictor, "_dataset_cls", None)
+    if dataset_cls is None or image is None or image.isNull():
+        return False
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset = dataset_cls(TRAINER_ROOT / "data")
+    before = len(dataset.all())
+    sample = dataset.import_qimage(
+        image,
+        source_name=f"bluestacks_{stamp}.png",
+        name_prefix="bluestacks_",
+    )
+    added = len(dataset.all()) > before
+    if game is not None and not sample.game_region:
+        sample.game_region = {
+            "x": int(game["x"]),
+            "y": int(game["y"]),
+            "w": int(game["w"]),
+            "h": int(game["h"]),
+        }
+        sample.regions["game"] = dict(sample.game_region)
+        dataset.save()
+    return added

@@ -240,7 +240,12 @@ class Dataset:
             ext = ".png"
         return self._import_bytes(data, ext, path.name, save=save)
 
-    def import_qimage(self, image: QImage | QPixmap, source_name: str = "clipboard.png") -> Sample:
+    def import_qimage(
+        self,
+        image: QImage | QPixmap,
+        source_name: str = "clipboard.png",
+        name_prefix: str = "",
+    ) -> Sample:
         if isinstance(image, QPixmap):
             image = image.toImage()
         if image is None or image.isNull():
@@ -249,15 +254,23 @@ class Dataset:
         buffer.open(QIODevice.OpenModeFlag.WriteOnly)
         image.save(buffer, "PNG")
         data = bytes(QByteArray(buffer.data()))
-        return self._import_bytes(data, ".png", source_name)
+        return self._import_bytes(data, ".png", source_name, name_prefix=name_prefix)
 
-    def _import_bytes(self, data: bytes, ext: str, source_name: str, save: bool = True) -> Sample:
+    def _import_bytes(
+        self,
+        data: bytes,
+        ext: str,
+        source_name: str,
+        save: bool = True,
+        name_prefix: str = "",
+    ) -> Sample:
         digest = hashlib.sha256(data).hexdigest()[:12]
         existing = self.get(digest)
         if existing:
             return existing
 
-        filename = f"{digest}{ext}"
+        safe = "".join(ch for ch in name_prefix if ch.isalnum() or ch in "_-")
+        filename = f"{safe}{digest}{ext}" if safe else f"{digest}{ext}"
         dest = self.images_dir / filename
         dest.write_bytes(data)
 

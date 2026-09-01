@@ -20,7 +20,7 @@ from app.intro import (
     _slow_tap,
 )
 from app.play_style import add_unlike, load_unlike, record_pick, unlike_hit
-from app.trainer_bridge import TRAINER_ROOT, load_play_tools, save_erase_lesson
+from app.trainer_bridge import TRAINER_ROOT, load_play_tools, save_erase_lesson, save_play_board
 
 MIN_CHAIN = 3
 BOARD_TSUMS = 8
@@ -47,11 +47,13 @@ class PlayWorker(QThread):
         parent=None,
         start_match: bool = False,
         kind_count: int | None = None,
+        save_boards: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self._stop = stop
         self._start_match = start_match
         self._kind_count = kind_count
+        self._save_boards = save_boards
 
     def run(self) -> None:
         try:
@@ -61,6 +63,7 @@ class PlayWorker(QThread):
                 start_match=self._start_match,
                 preview=self.preview.emit,
                 kind_count=self._kind_count,
+                save_boards=self._save_boards,
             )
         except Stopped:
             self.stopped.emit()
@@ -76,6 +79,7 @@ def run_play(
     start_match: bool = False,
     preview: Callable[[QImage], None] | None = None,
     kind_count: int | None = None,
+    save_boards: Callable[[], bool] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
@@ -110,6 +114,7 @@ def run_play(
     pending_at = 0.0
     settle_key: tuple[tuple[int, int], ...] | None = None
     skip_chains: set[tuple[tuple[int, int], ...]] = set()
+    saved_boards: set[tuple[tuple[int, int], ...]] = set()
     game = None
     saw_board = False
     kinds = 5
@@ -175,9 +180,8 @@ def run_play(
                 continue
         if pending_spots is not None and pending_chain is not None:
             erased = pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN
-            lingered = _spots_lingered(rgb, pending_spots)
             waited = time.time() - pending_at
-            if not erased and waited < SETTLE_WAIT and not lingered:
+            if not erased and waited < SETTLE_WAIT:
                 say("消えるのを待っています")
                 continue
             if not erased:
@@ -187,11 +191,6 @@ def run_play(
                 pair = _unlike_from_chain(pending_chain)
                 if pair is not None and add_unlike(unlike, pair[0], pair[1]):
                     say("別種類として覚えます")
-                if pending_image is not None and pending_pieces is not None:
-                    _remember_mixed(
-                        predictor, pending_image, pending_game, pending_pieces, pending_chain
-                    )
-                    say("種類の学習に残します")
             else:
                 key = _board_key(tsums)
                 if waited < SETTLE_WAIT and (settle_key is None or key != settle_key):
@@ -210,6 +209,16 @@ def run_play(
             pending_at = 0.0
             settle_key = None
         _attach_type_vecs(predictor, rgb, pieces)
+        if save_boards is not None and save_boards() and saw_board:
+            board = _board_key(tsums)
+            if board not in saved_boards:
+                saved_boards.add(board)
+                try:
+                    if save_play_board(predictor, image, game):
+                        say("消す前の盤面を取り込みました")
+                except Exception:
+                    say("盤面を取り込めませんでした")
+        say(_group_counts_line(tsums))
         chain, option_lens = _pick_chain(
             predictor, rgb, pieces, candidates, unlike, skip_chains, say
         )
@@ -846,6 +855,21 @@ def _slot_yellow_blue(image, box: dict[str, int]) -> tuple[float, float]:
     return yellow / total, blue / total
 
 
+def _group_counts_line(tsums: list[dict[str, int]]) -> str:
+    counts: dict[int, int] = {}
+    for piece in tsums:
+        group = int(piece.get("group") or 0)
+        if group <= 0:
+            continue
+        counts[group] = counts.get(group, 0) + 1
+    if not counts:
+        return "この盤面の種類は分かっていません"
+    sizes = [counts[group] for group in sorted(counts)]
+    kinds = len(sizes)
+    bodies = "、".join(f"{n}体" for n in sizes)
+    return f"この盤面は{kinds}種類に分けた（多い順 {bodies}）"
+
+
 def _pick_chain(
     predictor,
     rgb,
@@ -857,16 +881,17 @@ def _pick_chain(
 ) -> tuple[list[dict[str, int]], list[int]]:
     found = [chain for chain in candidates(pieces, 8) if len(chain) >= MIN_CHAIN]
     found = [chain for chain in found if _chain_key(chain) not in skip_chains]
-    clean = [chain for chain in found if not _chain_has_unlike(chain, unlike)]
-    if clean:
-        found = clean
     if not found:
         return [], []
     say("候補 " + " / ".join(str(len(chain)) for chain in found))
     options = [len(item) for item in found]
     return max(
         found,
-        key=lambda item: (len(item), _leftover_len(pieces, item, candidates)),
+        key=lambda item: (
+            len(item),
+            _leftover_len(pieces, item, candidates),
+            0 if _chain_has_unlike(item, unlike) else 1,
+        ),
     ), options
 
 

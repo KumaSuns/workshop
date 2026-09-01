@@ -312,13 +312,8 @@ class Predictor:
         if self.type_model is not None:
             embeds = self._tsum_embeddings(image, tsums)
             labels = self._kmeans(embeds, k, cosine=True)
-            for _ in range(2):
-                labels = self._split_mixed_by_color_and_embed(colors, embeds, labels)
-            labels = self._reassign_by_color(colors, embeds, labels)
         else:
             labels = self._kmeans(colors, k, cosine=False)
-            for _ in range(2):
-                labels = self._split_mixed_clusters(colors, labels, cosine=False)
         uniq = sorted(set(labels))
         order = sorted(
             uniq,

@@ -86,6 +86,10 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon)))
         root = QWidget()
         layout = QVBoxLayout(root)
+        self.capture_btn = QPushButton("消す前の盤面を取り込む")
+        self.capture_btn.setCheckable(True)
+        self.capture_btn.toggled.connect(self._on_capture_toggled)
+        layout.addWidget(self.capture_btn)
         self.play_btn = QPushButton("PLAY")
         self.play_btn.clicked.connect(self.on_play)
         layout.addWidget(self.play_btn)
@@ -104,6 +108,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
         self.setCentralWidget(root)
         self._stop = threading.Event()
+        self._save_boards = threading.Event()
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
         self._debug = DebugWindow()
@@ -117,6 +122,12 @@ class MainWindow(QMainWindow):
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
         self._debug.append("待機中")
+
+    def _on_capture_toggled(self, on: bool) -> None:
+        if on:
+            self._save_boards.set()
+        else:
+            self._save_boards.clear()
 
     def on_play(self) -> None:
         if self._is_busy():
@@ -254,7 +265,11 @@ class MainWindow(QMainWindow):
 
     def _start_play(self, start_match: bool = False, kind_count: int | None = None) -> None:
         self._play = PlayWorker(
-            self._stop, self, start_match=start_match, kind_count=kind_count
+            self._stop,
+            self,
+            start_match=start_match,
+            kind_count=kind_count,
+            save_boards=self._save_boards.is_set,
         )
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
@@ -279,7 +294,7 @@ class MainWindow(QMainWindow):
             return
         self._placed = True
         geo = self.frameGeometry()
-        self._debug.move(geo.left(), geo.top())
+        self._debug.move(geo.left() + 80, geo.top())
         dbg = self._debug.frameGeometry()
         self.move(dbg.right() + 8, dbg.top())
 
