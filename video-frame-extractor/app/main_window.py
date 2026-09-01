@@ -108,6 +108,7 @@ from app.preview_label import ImagePreview
 from app.scene_still_window import SceneStillWindow
 from app.scene_train_images_window import SceneTrainImagesWindow
 from app.coin_train_images_window import CoinTrainImagesWindow
+from app.skill_read import count_skill_uses
 
 RECENT_VIDEO_LIMIT = 10
 SAVED_COIN_COLOR = "#ff9f43"
@@ -243,6 +244,10 @@ class MainWindow(QMainWindow):
         self._video_durations: dict[str, float] = {}
         self._batch_extract = False
         self._batch_results: list[str] = []
+        self._fever_count: int | None = None
+        self._skill_count: int | None = None
+        self._read_busy_depth = 0
+        self._skill_progress_at = 0.0
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(100)
         self._elapsed_timer.timeout.connect(self._tick_extract_elapsed)
@@ -452,6 +457,8 @@ class MainWindow(QMainWindow):
         scene_row.addWidget(self.result_btn, 1)
         scene_row.addWidget(self.scene_btn, 1)
         info_layout.addLayout(scene_row)
+        self.play_video_btn = QPushButton("動画を再生")
+        info_layout.addWidget(self.play_video_btn)
 
         icon_row = QHBoxLayout()
         icon_row.setContentsMargins(0, 0, 0, 0)
@@ -514,6 +521,8 @@ class MainWindow(QMainWindow):
 
         self.video_time_value = self._add_info_block(info_layout, "動画の時間")
         self.go_timeup_value = self._add_info_block(info_layout, "GO → TIME UP")
+        self.fever_value = self._add_info_block(info_layout, "FEVER")
+        self.skill_value = self._add_info_block(info_layout, "スキル")
         self.play_coin_value = self._add_info_block(info_layout, "coin のコイン")
         self.result_coin_value = self._add_info_block(info_layout, "result のコイン")
         self.play_coin_value.setObjectName("infoCoinValue")
@@ -594,6 +603,7 @@ class MainWindow(QMainWindow):
         self.extract_btn.clicked.connect(self.start_extract)
         self.scene_btn.clicked.connect(self.start_scene_extract)
         self.result_btn.clicked.connect(self.start_result_extract)
+        self.play_video_btn.clicked.connect(self.play_current_video)
         self.scene_still_btn.clicked.connect(self.open_scene_still)
         self.wrong_btn.clicked.connect(self.reject_current_scene)
         self.teach_btn.clicked.connect(self.teach_current_kind)
@@ -653,7 +663,7 @@ class MainWindow(QMainWindow):
         return value
 
     def _update_buttons(self) -> None:
-        busy = self.worker is not None
+        busy = self.worker is not None or self._read_busy_depth > 0
         ready = self.info is not None and not busy
         extracting = isinstance(self.worker, SceneExtractWorker)
         self.extract_btn.setEnabled(ready)
@@ -661,6 +671,7 @@ class MainWindow(QMainWindow):
         self.scene_btn.setEnabled(not busy or extracting)
         self.scene_btn.setText("中止" if extracting else "解析")
         self.result_btn.setEnabled(ready and bool(self.scene_labels.keys_named("result")))
+        self.play_video_btn.setEnabled(self.info is not None)
         self.scene_still_btn.setEnabled(self.info is not None)
         self.open_btn.setEnabled(not busy)
         self.count_spin.setEnabled(not busy)
@@ -1003,6 +1014,8 @@ class MainWindow(QMainWindow):
         self._item_tsum_cache = {}
         self._item_box_cache = {}
         self._preview_coin_box = None
+        self._fever_count = None
+        self._skill_count = None
         extra = ""
         if len(self._video_queue) > 1:
             extra = f"\nまとめて {len(self._video_queue)} 本（いま {self._video_index + 1} 本目）"
@@ -1036,6 +1049,8 @@ class MainWindow(QMainWindow):
         self._preview_point = None
         self._full_pixmap = None
         self._preview_coin_box = None
+        self._fever_count = None
+        self._skill_count = None
         if hasattr(self, "preview"):
             self.preview.editable = False
             self._set_coin_fix_visible(False)
@@ -1534,6 +1549,7 @@ class MainWindow(QMainWindow):
         self._item_tsum_cache[self._item_cache_key(point)] = name
         self.tsum_edit.setText(name)
         self._reload_tsum_reader()
+        self._count_video_skills()
         self._refresh_info_pane()
         extra = (
             "「使用ツムを学習する」が使えます。"
@@ -1583,6 +1599,7 @@ class MainWindow(QMainWindow):
             return
         self._item_tsum_cache[self._item_cache_key(point)] = saved_name
         self._reload_tsum_reader()
+        self._count_video_skills()
         self._refresh_info_pane()
         self.statusBar().showMessage(f"使用ツムを {saved_name} にしました。いま {count} 枚。", 6000)
 
@@ -2271,6 +2288,10 @@ class MainWindow(QMainWindow):
         if self.info is None:
             self.video_time_value.setText("—")
             self.go_timeup_value.setText("—")
+            if hasattr(self, "fever_value"):
+                self.fever_value.setText("—")
+            if hasattr(self, "skill_value"):
+                self.skill_value.setText("—")
             self.play_coin_value.setText("—")
             self.result_coin_value.setText("—")
             if hasattr(self, "play_net_value"):
@@ -2288,6 +2309,17 @@ class MainWindow(QMainWindow):
                 self.item_cost_value.setText("—")
             self._set_item_icons(set())
             return
+        own = False
+        if read_coins:
+            self._begin_busy_read("解析中です", "結果を読んでいます")
+            own = True
+        try:
+            self._refresh_info_pane_body(read_coins)
+        finally:
+            if own:
+                self._end_busy_read()
+
+    def _refresh_info_pane_body(self, read_coins: bool) -> None:
         self.video_time_value.setText(self.info.format_duration())
         points = self._list_points()
         pairs = self._go_timeup_pairs(points)
@@ -2304,6 +2336,16 @@ class MainWindow(QMainWindow):
                 )
         else:
             self.go_timeup_value.setText("—")
+        if hasattr(self, "fever_value"):
+            if self._fever_count is None:
+                self.fever_value.setText("—")
+            else:
+                self.fever_value.setText(f"{self._fever_count}回")
+        if hasattr(self, "skill_value"):
+            if self._skill_count is None:
+                self.skill_value.setText("—")
+            else:
+                self.skill_value.setText(f"{self._skill_count}回")
 
         coin_points = [point for point in points if self._coin_box_key_for_point(point) == "coin"]
         result_points = [point for point in points if self._coin_box_key_for_point(point) == "result_coin"]
@@ -2315,38 +2357,35 @@ class MainWindow(QMainWindow):
                 self.play_net_value.setText("—")
             if hasattr(self, "result_net_value"):
                 self.result_net_value.setText("—")
-            QApplication.processEvents()
             self.coin_ratio_value.setText("—")
             self.play_per_min_value.setText("—")
             self.result_per_min_value.setText("—")
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 for index, point in enumerate(pending, start=1):
                     key = self._coin_box_key_for_point(point)
                     if key:
                         self._read_point_coin(point, key)
-                    self.statusBar().showMessage(f"コインを読んでいます {index}/{len(pending)}")
-                    QApplication.processEvents()
+                    self._set_busy_read(
+                        index, len(pending), f"コインを読んでいます  {index}/{len(pending)}"
+                    )
             except Exception:
                 pass
-            finally:
-                QApplication.restoreOverrideCursor()
 
         self._set_coin_value_text(self.play_coin_value, coin_points, "coin")
         self._set_coin_value_text(self.result_coin_value, result_points, "result_coin")
         self.coin_ratio_value.setText(self._ratio_text(coin_points, result_points))
         item_points = [point for point in points if self._is_item_point(point)]
         if read_coins and item_points:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 for index, point in enumerate(item_points, start=1):
                     self._read_point_items(point, force=True)
-                    self.statusBar().showMessage(f"アイテムを読んでいます {index}/{len(item_points)}")
-                    QApplication.processEvents()
+                    self._set_busy_read(
+                        index,
+                        len(item_points),
+                        f"アイテムを読んでいます  {index}/{len(item_points)}",
+                    )
             except Exception:
                 pass
-            finally:
-                QApplication.restoreOverrideCursor()
         used: set[str] = set()
         tsum_names: list[str] = []
         cost_parts: list[str] = []
@@ -2382,6 +2421,44 @@ class MainWindow(QMainWindow):
         self.result_per_min_value.setText(result_rate)
         if read_coins:
             self._relabel_item_points()
+            self._count_video_skills()
+            if hasattr(self, "skill_value"):
+                if self._skill_count is None:
+                    self.skill_value.setText("—")
+                else:
+                    self.skill_value.setText(f"{self._skill_count}回")
+
+    def _begin_busy_read(self, title: str, detail: str) -> None:
+        self._read_busy_depth += 1
+        if self._read_busy_depth == 1:
+            self.progress.setVisible(True)
+            self._train_fx.start(title, detail, cancel=False, devices=False)
+            self._update_buttons()
+        else:
+            self._train_fx.set_progress(
+                self._train_fx.bar.value(),
+                max(self._train_fx.bar.maximum(), 1),
+                detail,
+            )
+        QApplication.processEvents()
+
+    def _set_busy_read(self, current: int, total: int, message: str) -> None:
+        if self._read_busy_depth <= 0:
+            self._begin_busy_read("解析中です", message)
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(current)
+        self._train_fx.set_progress(current, total, message)
+        QApplication.processEvents()
+
+    def _end_busy_read(self) -> None:
+        if self._read_busy_depth <= 0:
+            return
+        self._read_busy_depth -= 1
+        if self._read_busy_depth > 0:
+            return
+        self.progress.setVisible(False)
+        self._train_fx.stop()
+        self._update_buttons()
 
     def _item_point_extra(self, point) -> str:
         extra = f"{self.scene_labels.name_of(point.kind)} {point.score:.0%}"
@@ -2522,6 +2599,59 @@ class MainWindow(QMainWindow):
             return 0
         used = set(self._item_used_cache.get(self._item_cache_key(items[-1])) or [])
         return item_coin_cost(used)
+
+    def _tsum_id_before_go(self, points: list, prev_end: float, go: float) -> str:
+        items = [
+            point
+            for point in points
+            if self._is_item_point(point) and prev_end < point.seconds <= go
+        ]
+        if not items:
+            items = [point for point in points if self._is_item_point(point)]
+            if len(items) != 1:
+                return ""
+        name = self._item_tsum_cache.get(self._item_cache_key(items[-1]), "")
+        return tsum_id_for_name(name) or ""
+
+    def _count_video_skills(self) -> None:
+        if self.info is None:
+            self._skill_count = None
+            return
+        points = self._list_points()
+        pairs = self._go_timeup_pairs(points)
+        if not pairs:
+            self._skill_count = None
+            return
+        windows: list[tuple[float, float, str]] = []
+        prev_end = 0.0
+        for go, timeup in pairs:
+            tsum_id = self._tsum_id_before_go(points, prev_end, go)
+            if tsum_id:
+                windows.append((go, timeup, tsum_id))
+            prev_end = timeup
+        if not windows:
+            self._skill_count = None
+            return
+        own = self._read_busy_depth <= 0
+        if own:
+            self._begin_busy_read("解析中です", "スキルを数えています")
+        try:
+            self._set_busy_read(0, 1, "スキルを数えています")
+            self._skill_count = count_skill_uses(
+                self.info, windows, progress=self._on_skill_count_progress
+            )
+        except Exception:
+            self._skill_count = None
+        finally:
+            if own:
+                self._end_busy_read()
+
+    def _on_skill_count_progress(self, current: int, total: int, _name: str) -> None:
+        now = time.perf_counter()
+        if current < total and now - self._skill_progress_at < 0.15:
+            return
+        self._skill_progress_at = now
+        self._set_busy_read(current, max(total, 1), "スキルを数えています")
 
     def _game_net_amounts(
         self, coin_points: list, result_points: list
@@ -3389,40 +3519,49 @@ class MainWindow(QMainWindow):
     def on_scene_finished(self, paths: list[str]) -> None:
         points = getattr(self.worker, "found_points", []) if self.worker is not None else []
         names = getattr(self.worker, "search_names", "") if self.worker is not None else ""
-        self.progress.setVisible(False)
         self._clear_worker()
         batch = self._batch_extract
-        if batch:
-            self._remember_current_video_rate()
-        else:
-            self._finish_extract_elapsed(remember=True)
         names = names or self.scene_labels.extract_names()
         show = set(self.scene_labels.extract_keys())
         hidden = set(self.scene_labels.hidden_keys())
         hidden_hits = [point for point in points if getattr(point, "kind", "") in hidden]
+        fever_keys = set(self.scene_labels.keys_named("fever"))
+        self._fever_count = sum(1 for point in points if getattr(point, "kind", "") in fever_keys)
         points = [point for point in points if getattr(point, "kind", "") in show]
-        self._saved_by_index = {}
-        for point, path in zip(points, paths):
-            self._saved_by_index[point.index] = Path(path)
         if points:
-            self.point_list.blockSignals(True)
-            self.point_list.clear()
-            for point in points:
-                name = self.scene_labels.name_of(point.kind)
-                self.point_list.addItem(self._point_item(point, f"{name} {point.score:.0%}"))
-            self.point_list.blockSignals(False)
-            if self.point_list.count():
-                self.point_list.setCurrentRow(0)
-            self._mark_incomplete_items()
-            self._fit_point_list()
-            QTimer.singleShot(0, self._fit_point_list)
+            self._begin_busy_read("解析中です", "結果を読んでいます")
         else:
-            self.point_list.blockSignals(True)
-            self.point_list.clear()
-            self.point_list.blockSignals(False)
-            self._preview_opened_video()
-        self._update_buttons()
-        self._refresh_info_pane(read_coins=bool(points))
+            self.progress.setVisible(False)
+        try:
+            self._saved_by_index = {}
+            for point, path in zip(points, paths):
+                self._saved_by_index[point.index] = Path(path)
+            if points:
+                self.point_list.blockSignals(True)
+                self.point_list.clear()
+                for point in points:
+                    name = self.scene_labels.name_of(point.kind)
+                    self.point_list.addItem(self._point_item(point, f"{name} {point.score:.0%}"))
+                self.point_list.blockSignals(False)
+                if self.point_list.count():
+                    self.point_list.setCurrentRow(0)
+                self._mark_incomplete_items()
+                self._fit_point_list()
+                QTimer.singleShot(0, self._fit_point_list)
+            else:
+                self.point_list.blockSignals(True)
+                self.point_list.clear()
+                self.point_list.blockSignals(False)
+                self._preview_opened_video()
+            self._update_buttons()
+            self._refresh_info_pane(read_coins=bool(points))
+        finally:
+            if points:
+                self._end_busy_read()
+        if batch:
+            self._remember_current_video_rate()
+        else:
+            self._finish_extract_elapsed(remember=True)
         if batch:
             self._batch_results.append(self._batch_result_line(len(points), hidden_hits))
             if self._video_index + 1 < len(self._video_queue):
@@ -3476,6 +3615,8 @@ class MainWindow(QMainWindow):
         return (
             f"{name}  {found}枚\n"
             f"  GO→TIME UP  {self.go_timeup_value.text()}\n"
+            f"  FEVER  {self.fever_value.text()}\n"
+            f"  スキル  {self.skill_value.text()}\n"
             f"  使用ツム  {self._plain_tsum_join()}\n"
             f"  アイテム消費  {self._plain_item_cost_join()}\n"
             f"  coin  {self._plain_coin_join('coin')}\n"
@@ -3760,6 +3901,7 @@ class MainWindow(QMainWindow):
     def on_failed(self, message: str) -> None:
         self.progress.setVisible(False)
         self._finish_extract_elapsed()
+        self._read_busy_depth = 0
         self._train_fx.stop()
         self._fit_preview()
         self._clear_worker()
@@ -3775,6 +3917,22 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("中止しました", 4000)
             return
         QMessageBox.critical(self, "失敗しました", message)
+
+    def play_current_video(self) -> None:
+        if self.info is None:
+            QMessageBox.information(self, "動画を再生", "先に動画を開いてください。")
+            return
+        path = self.info.path
+        if not path.is_file():
+            QMessageBox.warning(self, "動画を再生", f"{path.name} が見つかりません。")
+            return
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.warning(self, "動画を再生", "再生アプリを開けませんでした。")
+            return
+        self.statusBar().showMessage(f"{path.name} を再生しています", 4000)
 
     def _open_folder(self, folder: Path) -> None:
         folder.mkdir(parents=True, exist_ok=True)

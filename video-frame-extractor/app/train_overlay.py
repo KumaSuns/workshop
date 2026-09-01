@@ -179,11 +179,21 @@ class TrainOverlay(QFrame):
         layout.addStretch(1)
         self.hide()
 
-    def start(self) -> None:
-        self.title.setText("学習中です")
-        self.detail.setText("画像を読んでいます…")
+    def start(
+        self,
+        title: str = "学習中です",
+        detail: str = "画像を読んでいます…",
+        *,
+        cancel: bool = True,
+        devices: bool = True,
+    ) -> None:
+        self.title.setText(title)
+        self.detail.setText(detail)
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
+        self.cpu_badge.setVisible(devices)
+        self.gpu_badge.setVisible(devices)
+        self.cancel_btn.setVisible(cancel)
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.setText("中止")
         self._place()

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -82,6 +83,7 @@ from app.regions import (
     is_scene_key,
     tsum_group_color,
 )
+from app.skill_export import registered_skills_by_sample, save_skill_image, skill_tsum_choices
 from app.train_effect import TrainEffect
 from app.train_worker import MIN_TRAIN_SAMPLES, TRAIN_EPOCHS, TrainWorker
 
@@ -643,6 +645,7 @@ class MainWindow(QMainWindow):
         self._last_piece_radius: dict[str, int] = {}
         self._list_sort_key: str | None = None
         self._list_sort_asc = True
+        self._skill_registered: dict[str, str] = {}
         self._settings = QSettings("workshop", "TsumTsumScreenTrainer")
         self._group_window: GroupListWindow | None = None
         self._remember_last_boxes()
@@ -860,11 +863,13 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.list_widget, 1)
         self.delete_btn = QPushButton("選択を削除")
         self.delete_btn.setObjectName("danger")
+        self.skill_register_btn = QPushButton("SKILL画像として登録")
         self.video_app_btn = QPushButton("動画編集・生成")
         self.video_app_btn.setObjectName("video")
         stay_row = QHBoxLayout()
         stay_row.setContentsMargins(0, 0, 0, 0)
         stay_row.addWidget(self.delete_btn)
+        stay_row.addWidget(self.skill_register_btn)
         stay_row.addWidget(self.video_app_btn)
         right_layout.addLayout(stay_row)
         right.setMinimumWidth(480)
@@ -935,6 +940,7 @@ class MainWindow(QMainWindow):
         self._train_fx.cancelRequested.connect(self.cancel_training)
         self._train_fx.shutdownToggleRequested.connect(self.on_train_shutdown_button)
         self.delete_btn.clicked.connect(self.delete_current)
+        self.skill_register_btn.clicked.connect(self.register_skill_image)
         self.delete_unused_one_btn.clicked.connect(self.delete_current)
         self.delete_unused_btn.clicked.connect(self.delete_unused_images)
         self.show_unused_chk.toggled.connect(self.on_show_unused_toggled)
@@ -1083,6 +1089,7 @@ class MainWindow(QMainWindow):
         self.refresh_list(self.current_id)
 
     def refresh_list(self, select_id: str | None = None) -> None:
+        self._skill_registered = registered_skills_by_sample()
         self._sync_list_columns()
         selected = select_id or self.current_id
         samples = self._ordered_visible_samples()
@@ -1167,10 +1174,18 @@ class MainWindow(QMainWindow):
             name_item = QTableWidgetItem()
             self.list_widget.setItem(row, name_col, name_item)
         name = sample.source_name
-        if skipped:
+        skill_name = self._skill_registered.get(sample.id, "")
+        if skill_name:
+            name = f"SKILL  {skill_name}  {name}"
+        elif skipped:
             name = f"使わない  {name}"
         name_item.setText(name)
-        name_item.setForeground(QColor("#7a8190") if skipped else QColor("#c5cad3"))
+        if skipped and not skill_name:
+            name_item.setForeground(QColor("#7a8190"))
+        elif skill_name:
+            name_item.setForeground(QColor("#3DDC97"))
+        else:
+            name_item.setForeground(QColor("#c5cad3"))
         name_item.setData(Qt.ItemDataRole.UserRole, sample.id)
         name_item.setFlags(
             (name_item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
@@ -1269,6 +1284,13 @@ class MainWindow(QMainWindow):
         )
         self.open_result_train_btn.setEnabled(True)
         self.delete_btn.setEnabled(has_sample)
+        if hasattr(self, "skill_register_btn"):
+            self.skill_register_btn.setEnabled(has_sample)
+            skill_name = self._skill_registered.get(self.current_id or "", "")
+            if skill_name:
+                self.skill_register_btn.setText(f"SKILL登録済み（{skill_name}）")
+            else:
+                self.skill_register_btn.setText("SKILL画像として登録")
         self._update_unused_delete_buttons()
 
     def on_list_cell_changed(
@@ -1384,27 +1406,29 @@ class MainWindow(QMainWindow):
             name = PLACE_LABELS.get(self._active_key, "画面")
             if self._active_key in sample.confirmed:
                 self.hint_label.setText(f"この画像は「{name}」として保存済みです。")
-                return
-            if self.predictor.scene_model is None:
+            elif self.predictor.scene_model is None:
                 self.hint_label.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
-                return
-            try:
-                kind, score = self.predictor.predict_scene(sample.image_path)
-            except Exception:
-                self.hint_label.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
-                return
-            if kind == self._active_key:
-                self.hint_label.setText(
-                    f"予測は「{PLACE_LABELS.get(kind, kind)}」({score:.0%}) です。合っていれば保存してください。"
-                )
-            elif kind != "other":
-                self.hint_label.setText(
-                    f"予測は「{PLACE_LABELS.get(kind, kind)}」({score:.0%}) です。違うなら「{name}」を保存してください。"
-                )
             else:
-                self.hint_label.setText(
-                    f"予測では GO / TIME UP ではありません。この画像が「{name}」なら保存してください。"
-                )
+                try:
+                    kind, score = self.predictor.predict_scene(sample.image_path)
+                except Exception:
+                    kind, score = "other", 0.0
+                    self.hint_label.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
+                    kind = None
+                if kind is not None:
+                    if kind == self._active_key:
+                        self.hint_label.setText(
+                            f"予測は「{PLACE_LABELS.get(kind, kind)}」({score:.0%}) です。合っていれば保存してください。"
+                        )
+                    elif kind != "other":
+                        self.hint_label.setText(
+                            f"予測は「{PLACE_LABELS.get(kind, kind)}」({score:.0%}) です。違うなら「{name}」を保存してください。"
+                        )
+                    else:
+                        self.hint_label.setText(
+                            f"予測では GO / TIME UP ではありません。この画像が「{name}」なら保存してください。"
+                        )
+            self._append_skill_registered_hint(sample)
             return
         if sample.status == "unlabeled":
             self.hint_label.setText("左のチェックを付けた種類だけ保存します。名前をクリックすると、その枠を直せます。")
@@ -1414,6 +1438,17 @@ class MainWindow(QMainWindow):
             self.hint_label.setText("この画像は使わない設定です。囲んで保存すれば学習に使えます。")
         else:
             self.hint_label.setText("色つきの四角が付いています。保存したい種類にチェックを付けて保存してください。")
+        self._append_skill_registered_hint(sample)
+
+    def _append_skill_registered_hint(self, sample: Sample) -> None:
+        skill_name = self._skill_registered.get(sample.id, "")
+        if not skill_name:
+            return
+        extra = f"この画像は {skill_name} のスキル画像として登録済みです。"
+        current = self.hint_label.text()
+        if extra in current:
+            return
+        self.hint_label.setText(f"{current}\n{extra}" if current else extra)
 
     def _remember_last_boxes(self) -> None:
         self._last_boxes = {}
@@ -2024,6 +2059,70 @@ class MainWindow(QMainWindow):
         if next_id:
             self.show_sample(next_id)
         self.statusBar().showMessage(f"{name} を削除しました", 4000)
+
+    def register_skill_image(self) -> None:
+        try:
+            self._register_skill_image()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "登録できませんでした", str(exc))
+
+    def _register_skill_image(self) -> None:
+        if self._block_if_training():
+            return
+        sample_id = self.current_id or self._list_id_at(self.list_widget.currentRow())
+        sample = self.dataset.get(sample_id) if sample_id else None
+        if sample is None or not sample.image_path.is_file():
+            QMessageBox.information(self, "SKILL画像として登録", "画像を選んでから使ってください。")
+            return
+        choices = skill_tsum_choices()
+        if not choices:
+            QMessageBox.information(
+                self,
+                "SKILL画像として登録",
+                "登録できるスキルがありません。",
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SKILL画像として登録")
+        dialog.setModal(True)
+        dialog.setMinimumSize(360, 280)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("どのスキルですか？"))
+        name_list = QListWidget()
+        for tsum_id, display in choices:
+            item = QListWidgetItem(display)
+            item.setData(Qt.ItemDataRole.UserRole, tsum_id)
+            name_list.addItem(item)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        buttons = QDialogButtonBox()
+        ok_btn = buttons.addButton("登録する", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        dialog.raise_()
+        dialog.activateWindow()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        row = name_list.currentItem()
+        if row is None:
+            QMessageBox.information(self, "SKILL画像として登録", "スキルを選んでください。")
+            return
+        tsum_id = str(row.data(Qt.ItemDataRole.UserRole) or "")
+        display = row.text()
+        if not tsum_id:
+            return
+        dest = save_skill_image(sample.image_path, tsum_id, sample.id)
+        self.refresh_list(select_id=sample.id)
+        self._apply_sample_hint(sample)
+        QMessageBox.information(
+            self,
+            "SKILL画像として登録",
+            f"{display} のスキル画像に登録しました。\n{dest.name}",
+        )
+        self.statusBar().showMessage(f"{display} のスキル画像に登録しました。{dest.name}", 5000)
 
     def on_show_unused_toggled(self) -> None:
         select = self.current_id
@@ -2692,6 +2791,7 @@ class MainWindow(QMainWindow):
             self.read_coin_btn,
             self.open_result_train_btn,
             self.delete_btn,
+            self.skill_register_btn,
             self.delete_unused_one_btn,
             self.delete_unused_btn,
             self.copy_data_btn,

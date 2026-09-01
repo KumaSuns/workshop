@@ -15,6 +15,11 @@ tsumtsum-screen-recognition/data/extractor/
 
 # 動画から抜き出した画像はリポジトリに入れない
 video-frame-extractor/output/
+tsumtsum-analyzer/output/
+tsumtsum-analyzer/data/models/
+tsumtsum-analyzer/data/extractor/
+tsumtsum-analyzer/data/index.json
+tsumtsum-analyzer/data/assets/
 
 # 使用ツムの種類フォルダは残し、中の画像は入れない
 video-frame-extractor/app/assets/images/use_tsums/**
