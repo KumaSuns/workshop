@@ -635,6 +635,7 @@ class MainWindow(QMainWindow):
         self._cuda_ready: bool | None = None
         self._dirty = False
         self._shutdown_after_train = False
+        self._awake_timer: QTimer | None = None
         self._switching = False
         self._extractor_process = None
         self._ipc_buffers: dict[int, bytes] = {}
@@ -2705,6 +2706,38 @@ class MainWindow(QMainWindow):
             self.spin_group,
         )
 
+    def _keep_display_awake(self, on: bool) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetThreadExecutionState.argtypes = [ctypes.c_uint]
+        kernel32.SetThreadExecutionState.restype = ctypes.c_uint
+        continuous = 0x80000000
+        system = 0x00000001
+        display = 0x00000002
+        if on:
+            kernel32.SetThreadExecutionState(ctypes.c_uint(continuous | system | display))
+            if self._awake_timer is None:
+                self._awake_timer = QTimer(self)
+                self._awake_timer.timeout.connect(self._ping_display_awake)
+            self._awake_timer.start(30000)
+            return
+        if self._awake_timer is not None:
+            self._awake_timer.stop()
+        kernel32.SetThreadExecutionState(ctypes.c_uint(continuous))
+
+    def _ping_display_awake(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetThreadExecutionState.argtypes = [ctypes.c_uint]
+        kernel32.SetThreadExecutionState.restype = ctypes.c_uint
+        kernel32.SetThreadExecutionState(ctypes.c_uint(0x80000000 | 0x00000001 | 0x00000002))
+
     def _lock_for_training(self) -> None:
         for widget in self._training_lock_widgets():
             widget.setEnabled(False)
@@ -2714,6 +2747,7 @@ class MainWindow(QMainWindow):
         self.hint_label.setText("学習中です。中止できます。")
 
     def _unlock_after_training(self) -> None:
+        self._keep_display_awake(False)
         for widget in self._training_lock_widgets():
             widget.setEnabled(True)
         self.train_btn.setText("学習する")
@@ -2908,6 +2942,7 @@ class MainWindow(QMainWindow):
         self.train_worker.finished_ok.connect(self.on_train_finished)
         self.train_worker.failed.connect(self.on_train_failed)
         self._lock_for_training()
+        self._keep_display_awake(True)
         self._place_train_fx()
         self._train_fx.start()
         self._train_fx.set_shutdown_after(self._shutdown_after_train)
@@ -3138,6 +3173,7 @@ class MainWindow(QMainWindow):
             self.train_worker.requestInterruption()
             self.train_worker.wait(15000)
             self._train_fx.stop()
+        self._keep_display_awake(False)
         event.accept()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
