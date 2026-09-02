@@ -369,6 +369,55 @@ def _play_button(image: QImage) -> QRect | None:
     return play
 
 
+def _retry_button(image: QImage) -> QRect | None:
+    low = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() > image.height() * 0.72
+        and pill.width() >= image.width() * 0.28
+        and pill.width() <= image.width() * 0.45
+    ]
+    left = [pill for pill in low if pill.center().x() < image.width() * 0.45]
+    right = [pill for pill in low if pill.center().x() > image.width() * 0.55]
+    if not left or not right:
+        return None
+    close = max(left, key=lambda rect: rect.width() * rect.height())
+    retry = max(right, key=lambda rect: rect.width() * rect.height())
+    if abs(close.center().y() - retry.center().y()) > image.height() * 0.05:
+        return None
+    if retry.x() < close.right() - close.width() * 0.1:
+        return None
+    if not _retry_is_orange(image, retry):
+        return None
+    return retry
+
+
+def _retry_is_orange(image: QImage, rect: QRect) -> bool:
+    inset = max(2, min(rect.width(), rect.height()) // 5)
+    left = rect.x() + inset
+    top = rect.y() + inset
+    right = rect.x() + rect.width() - inset
+    bottom = rect.y() + rect.height() - inset
+    if right - left < 4 or bottom - top < 4:
+        return False
+    step_x = max(1, (right - left) // 8)
+    step_y = max(1, (bottom - top) // 8)
+    reds = 0
+    greens = 0
+    count = 0
+    for y in range(top, bottom, step_y):
+        for x in range(left, right, step_x):
+            color = image.pixelColor(x, y)
+            reds += color.red()
+            greens += color.green()
+            count += 1
+    if count <= 0:
+        return False
+    red = reds / count
+    green = greens / count
+    return red > 200 and green < red * 0.72
+
+
 def _continue_button(image: QImage) -> QRect | None:
     low = [
         pill

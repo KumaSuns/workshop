@@ -86,8 +86,9 @@ def _physical_links(
     if spacing > 0:
         reach = max(reach, spacing * 1.38 * scale)
         close = max(close, spacing * 1.28 * scale)
-    reach = min(reach, typical_r * 2.9 * scale)
-    close = min(close, typical_r * 2.7 * scale)
+    else:
+        reach = min(reach, typical_r * 2.9 * scale)
+        close = min(close, typical_r * 2.7 * scale)
     min_dist = typical_r * 0.4
     xs = [int(piece["x"]) for piece in tsums]
     ys = [int(piece["y"]) for piece in tsums]

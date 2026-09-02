@@ -369,6 +369,8 @@ class MainWindow(QMainWindow):
     def _on_play_done(self) -> None:
         self._set_running(False)
         text = self.status_label.text()
+        if "リトライ" in text:
+            return
         if "コイン" not in text and text != "TIME UP":
             self._set_status("TIME UP")
 

@@ -163,7 +163,7 @@ class TsumTypeBoardDataset(Dataset):
             >= 2
         ]
         self.augment = augment
-        self.jitter = transforms.ColorJitter(0.25, 0.25, 0.25, 0.12)
+        self.jitter = transforms.ColorJitter(0.12, 0.12, 0.12, 0.03)
         self.normalize = transforms.Compose(
             [
                 transforms.Resize((TYPE_INPUT, TYPE_INPUT)),
@@ -277,6 +277,48 @@ def box_iou(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     area_tgt = target[:, 2] * target[:, 3]
     union = area_pred + area_tgt - inter
     return inter / union.clamp(min=1e-6)
+
+
+def _group_match_acc(pred_g: list[int], gt_g: list[int]) -> float:
+    from itertools import permutations
+
+    pred_ids = sorted(set(pred_g))
+    gt_ids = sorted(set(gt_g))
+    if not pred_g:
+        return 0.0
+    best = 0
+    src, dst = pred_ids, gt_ids
+    if len(src) <= len(dst):
+        for perm in permutations(dst, len(src)):
+            mapping = dict(zip(src, perm))
+            best = max(best, sum(1 for p, g in zip(pred_g, gt_g) if mapping.get(p) == g))
+    else:
+        for perm in permutations(src, len(dst)):
+            mapping = dict(zip(perm, dst))
+            best = max(best, sum(1 for p, g in zip(pred_g, gt_g) if mapping.get(p) == g))
+    return best / len(gt_g)
+
+
+def _eval_tsum_type_acc(model: TsumTypeNet, eval_set: TsumTypeBoardDataset, device: torch.device) -> float:
+    from app.predictor import Predictor
+
+    helper = Predictor.__new__(Predictor)
+    model.eval()
+    total = 0.0
+    seen = 0
+    with torch.no_grad():
+        for index in range(len(eval_set)):
+            crops, labels, _colors = eval_set[index]
+            if crops.size(0) < 4:
+                continue
+            encoded = model(crops.to(device)).cpu()
+            embeds = [tuple(row.tolist()) for row in encoded]
+            truth = [int(value) for value in labels.tolist()]
+            k = len(set(truth))
+            pred = helper._kmeans(embeds, k, cosine=True)
+            total += _group_match_acc(pred, truth)
+            seen += 1
+    return total / max(seen, 1)
 
 
 class TrainWorker(QThread):
@@ -523,28 +565,18 @@ class TrainWorker(QThread):
         label: str,
     ) -> dict:
         dataset = TsumTypeBoardDataset(samples, augment=True)
+        eval_set = TsumTypeBoardDataset(samples, augment=False)
         if len(dataset) < MIN_TRAIN_SAMPLES:
             raise ValueError(f"「{label}」の学習には {MIN_TRAIN_SAMPLES} 枚以上必要です")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
-        previous = _checkpoint(model_path)
-        prev_state = previous.get("state_dict")
-        model = TsumTypeNet(pretrained=not bool(prev_state))
-        if prev_state:
-            try:
-                model.load_state_dict(prev_state)
-            except Exception:
-                stem = {key: value for key, value in prev_state.items() if key.startswith("stem.")}
-                if stem:
-                    model.load_state_dict(stem, strict=False)
-                else:
-                    prev_state = None
-                    model = TsumTypeNet()
+        model = TsumTypeNet(pretrained=True)
         model.freeze_backbone()
         model.to(device)
         trainable = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=3e-4 if prev_state else 1e-3, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(trainable, lr=1e-3, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
+        best_acc = -1.0
         best_loss = 10**9
         best_state = None
         model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -576,27 +608,41 @@ class TrainWorker(QThread):
                 )
             scheduler.step()
             mean_loss = total_loss / max(seen, 1)
-            if mean_loss < best_loss:
+            acc = -1.0
+            if epoch == 1 or epoch % 5 == 0 or epoch == self.epochs:
+                acc = _eval_tsum_type_acc(model, eval_set, device)
+            improved = False
+            if acc >= 0:
+                if acc > best_acc or (acc == best_acc and mean_loss < best_loss):
+                    best_acc = acc
+                    best_loss = mean_loss
+                    improved = True
+            elif best_acc < 0 and mean_loss < best_loss:
                 best_loss = mean_loss
+                improved = True
+            if improved:
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            self._emit_job_progress(
-                job_index,
-                epoch,
-                batches,
-                batches,
-                f"学習中です  {label}  {epoch}/{self.epochs}  loss {mean_loss:.4f}",
-            )
+            status = f"学習中です  {label}  {epoch}/{self.epochs}  loss {mean_loss:.4f}"
+            if acc >= 0:
+                status += f"  acc {acc:.3f}"
+            self._emit_job_progress(job_index, epoch, batches, batches, status)
             self._raise_if_cancelled()
         if best_state is None:
             raise RuntimeError(f"「{label}」の学習結果を保存できませんでした")
         torch.save(
-            {"state_dict": best_state, "loss": best_loss, "key": "tsum_types", "samples": len(dataset)},
+            {
+                "state_dict": best_state,
+                "loss": best_loss,
+                "acc": max(0.0, best_acc),
+                "key": "tsum_types",
+                "samples": len(dataset),
+            },
             model_path,
         )
         return {
             "key": "tsum_types",
             "label": label,
-            "iou": max(0.0, 1.0 - float(best_loss)),
+            "iou": float(best_acc) if best_acc >= 0 else max(0.0, 1.0 - float(best_loss)),
             "loss": float(best_loss),
             "samples": len(dataset),
         }

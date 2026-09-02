@@ -12,7 +12,7 @@ UNLIKE_MAX = 40
 
 
 def _empty() -> dict:
-    return {"wins": {}, "losses": {}, "follow_max": 3}
+    return {"wins": {}, "losses": {}, "follow_max": 3, "plays": [], "hud": {}}
 
 
 def _load() -> dict:
@@ -27,16 +27,74 @@ def _load() -> dict:
     wins = payload.get("wins") if isinstance(payload.get("wins"), dict) else {}
     losses = payload.get("losses") if isinstance(payload.get("losses"), dict) else {}
     follow = int(payload.get("follow_max") or 3)
+    plays = payload.get("plays") if isinstance(payload.get("plays"), list) else []
+    cleaned = []
+    for item in plays[-40:]:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append(
+            {
+                "clears": int(item.get("clears") or 0),
+                "swipes": int(item.get("swipes") or 0),
+                "skills": int(item.get("skills") or 0),
+                "bombs": int(item.get("bombs") or 0),
+                "fans": int(item.get("fans") or 0),
+            }
+        )
+    hud_raw = payload.get("hud") if isinstance(payload.get("hud"), dict) else {}
+    hud: dict[str, dict[str, int]] = {}
+    for key, item in hud_raw.items():
+        if not isinstance(item, dict):
+            continue
+        hud[str(key)] = {
+            "w": int(item.get("w") or 0),
+            "l": int(item.get("l") or 0),
+        }
     return {
         "wins": {str(key): int(value) for key, value in wins.items()},
         "losses": {str(key): int(value) for key, value in losses.items()},
         "follow_max": max(1, min(6, follow)),
+        "plays": cleaned,
+        "hud": hud,
     }
 
 
 def _save(data: dict) -> None:
     PATH.parent.mkdir(parents=True, exist_ok=True)
-    PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    PATH.write_text(
+        json.dumps(
+            {
+                "wins": data.get("wins") or {},
+                "losses": data.get("losses") or {},
+                "follow_max": int(data.get("follow_max") or 3),
+                "plays": data.get("plays") or [],
+                "hud": data.get("hud") or {},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def style_now() -> dict:
+    return _load()
+
+
+def record_play(clears: int, swipes: int, skills: int, bombs: int, fans: int) -> None:
+    data = _load()
+    plays = list(data.get("plays") or [])
+    plays.append(
+        {
+            "clears": int(clears),
+            "swipes": int(swipes),
+            "skills": int(skills),
+            "bombs": int(bombs),
+            "fans": int(fans),
+        }
+    )
+    data["plays"] = plays[-40:]
+    _save(data)
 
 
 def record_pick(options: list[int], picked: int, ok: bool) -> None:
@@ -66,12 +124,62 @@ def rank(
     leftover: int = 0,
     options: list[int] | None = None,
     jump: float = 0.0,
+    data: dict | None = None,
 ) -> tuple[int, int, float, int]:
     length = len(chain)
-    data = _load()
+    data = data if data is not None else _load()
     key = f"{max(options or [length])}:{length}"
     learned = int(data["wins"].get(key, 0)) - int(data["losses"].get(key, 0))
     return (length, leftover, -jump, learned)
+
+
+def hud_situation(fever_on: bool, fever_fill: float, has_chain: bool, has_bomb: bool, full: bool) -> str:
+    if fever_on:
+        gauge = "on"
+    elif fever_fill >= 0.12:
+        gauge = "up"
+    else:
+        gauge = "off"
+    chain = "c" if has_chain else "n"
+    bomb = "b" if has_bomb else "x"
+    board = "f" if full else "s"
+    return f"{gauge}_{chain}_{bomb}_{board}"
+
+
+def hud_net(kind: str, sit: str, data: dict | None = None) -> int:
+    data = data if data is not None else _load()
+    hud = data.get("hud") or {}
+    item = hud.get(f"{sit}:{kind}") if isinstance(hud.get(f"{sit}:{kind}"), dict) else {}
+    return int(item.get("w") or 0) - int(item.get("l") or 0)
+
+
+def should_hud(kind: str, sit: str, default: bool, data: dict | None = None) -> bool:
+    data = data if data is not None else _load()
+    hud = data.get("hud") or {}
+
+    def pair(key: str) -> tuple[int, int]:
+        item = hud.get(key) if isinstance(hud.get(key), dict) else {}
+        return int(item.get("w") or 0), int(item.get("l") or 0)
+
+    go_w, go_l = pair(f"{sit}:{kind}")
+    skip_w, skip_l = pair(f"{sit}:skip_{kind}")
+    if go_w + go_l + skip_w + skip_l < 4:
+        return default
+    return (go_w - go_l) >= (skip_w - skip_l)
+
+
+def record_hud(sit: str, kind: str, pressed: bool, ok: bool) -> None:
+    if not sit or not kind:
+        return
+    data = _load()
+    hud = dict(data.get("hud") or {})
+    key = f"{sit}:{kind}" if pressed else f"{sit}:skip_{kind}"
+    item = dict(hud.get(key) or {}) if isinstance(hud.get(key), dict) else {}
+    bucket = "w" if ok else "l"
+    item[bucket] = int(item.get(bucket) or 0) + 1
+    hud[key] = {"w": int(item.get("w") or 0), "l": int(item.get("l") or 0)}
+    data["hud"] = hud
+    _save(data)
 
 
 def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:

@@ -7,11 +7,12 @@ from torch.nn import functional as F
 from torchvision.models import ResNet18_Weights, resnet18
 from torchvision.transforms.functional import pil_to_tensor, to_pil_image
 
-TYPE_INPUT = 64
+TYPE_INPUT = 96
 TYPE_EMBED = 64
-TYPE_CROP_SCALE = 0.70
-TYPE_DISK_INNER = 0.72
-TYPE_DISK_OUTER = 0.96
+TYPE_CROP_SCALE = 1.1
+TYPE_CROP_INNER = 0.9
+TYPE_DISK_INNER = 0.78
+TYPE_DISK_OUTER = 0.98
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 TYPE_FILL = tuple(int(round(value * 255)) for value in IMAGENET_MEAN)
@@ -27,9 +28,10 @@ def prepare_tsum_crop(
     image: Image.Image,
     piece: dict[str, int],
     others: list[dict[str, int]] | None = None,
+    crop_scale: float | None = None,
 ) -> Image.Image:
     x, y, r = int(piece["x"]), int(piece["y"]), max(4, int(piece["r"]))
-    span = max(8, int(round(r * TYPE_CROP_SCALE)))
+    span = max(8, int(round(r * (TYPE_CROP_SCALE if crop_scale is None else crop_scale))))
     left = x - span
     top = y - span
     size = TYPE_INPUT
@@ -154,10 +156,7 @@ class TsumTypeNet(nn.Module):
 
     def freeze_backbone(self) -> None:
         for parameter in self.stem.parameters():
-            parameter.requires_grad = False
-        for block in self.stem[-2:]:
-            for parameter in block.parameters():
-                parameter.requires_grad = True
+            parameter.requires_grad = True
 
 
 def supcon_loss(

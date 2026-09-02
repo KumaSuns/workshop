@@ -23,6 +23,7 @@ from app.scene_model import SCENE_CLASSES, SCENE_INPUT, SceneNet
 from app.tsum_type import (
     IMAGENET_MEAN as TYPE_MEAN,
     IMAGENET_STD as TYPE_STD,
+    TYPE_CROP_INNER,
     TYPE_INPUT,
     TsumTypeNet,
     piece_lab,
@@ -253,8 +254,9 @@ class Predictor:
         self,
         image_path: Path,
         game: dict[str, int] | None,
-        kinds: int = 5,
+        kinds: int = 0,
         rgb: Image.Image | None = None,
+        inner: bool = True,
     ) -> list[dict[str, int]]:
         if self.piece_model is None:
             return []
@@ -290,14 +292,15 @@ class Predictor:
                 pieces.append(
                     {"x": int(round(x)), "y": int(round(y)), "r": r, "kind": kind, "group": 1}
                 )
-        self._assign_groups(rgb, pieces, kinds=kinds)
+        self._assign_groups(rgb, pieces, kinds=kinds, inner=inner)
         return pieces
 
     def _assign_groups(
         self,
         image: Image.Image,
         pieces: list[dict[str, int]],
-        kinds: int = 5,
+        kinds: int = 0,
+        inner: bool = True,
     ) -> None:
         tsums: list[dict[str, int]] = []
         for piece in pieces:
@@ -308,12 +311,32 @@ class Predictor:
         if not tsums:
             return
         colors = [self._tsum_color(image, piece) for piece in tsums]
-        k = min(max(1, kinds), len(tsums))
+        cosine = False
+        points: list[tuple[float, ...]] = colors
+        inner_points: list[tuple[float, ...]] | None = None
         if self.type_model is not None:
-            embeds = self._tsum_embeddings(image, tsums)
-            labels = self._kmeans(embeds, k, cosine=True)
+            points = self._tsum_embeddings(image, tsums)
+            cosine = True
+            if inner:
+                inner_points = self._tsum_embeddings(image, tsums, crop_scale=TYPE_CROP_INNER)
+        if kinds > 0:
+            k = min(max(1, kinds), len(tsums))
+            labels = self._kmeans(points, k, cosine=cosine)
+            if inner_points is not None:
+                other = self._kmeans(inner_points, k, cosine=True)
+                if self._prefer_clusters(other, labels, inner_points, points):
+                    labels = other
         else:
-            labels = self._kmeans(colors, k, cosine=False)
+            k = min(5, len(tsums))
+            labels = self._kmeans(points, k, cosine=cosine)
+            if cosine and k > 4:
+                labels = self._merge_same_type_clusters(points, labels)
+            if inner_points is not None:
+                other = self._kmeans(inner_points, k, cosine=True)
+                if cosine and k > 4:
+                    other = self._merge_same_type_clusters(inner_points, other)
+                if self._prefer_clusters(other, labels, inner_points, points):
+                    labels = other
         uniq = sorted(set(labels))
         order = sorted(
             uniq,
@@ -325,6 +348,87 @@ class Predictor:
         remap = {old: new for new, old in enumerate(order, start=1)}
         for piece, label in zip(tsums, labels):
             piece["group"] = remap[label]
+
+    def _cluster_sizes(self, labels: list[int]) -> list[int]:
+        counts: dict[int, int] = {}
+        for label in labels:
+            counts[label] = counts.get(label, 0) + 1
+        return sorted(counts.values())
+
+    def _prefer_clusters(
+        self,
+        left: list[int],
+        right: list[int],
+        left_points: list[tuple[float, ...]],
+        right_points: list[tuple[float, ...]],
+    ) -> bool:
+        left_sizes = self._cluster_sizes(left)
+        right_sizes = self._cluster_sizes(right)
+        left_min = left_sizes[0] if left_sizes else 0
+        right_min = right_sizes[0] if right_sizes else 0
+        if right_min <= 2 and left_min > right_min:
+            return True
+        if left_min <= 2 and right_min > left_min:
+            return False
+        return self._cluster_score(left_points, left) > self._cluster_score(right_points, right)
+
+    def _cluster_score(self, points: list[tuple[float, ...]], labels: list[int]) -> float:
+        groups = sorted(set(labels))
+        if len(groups) < 2 or len(points) < 3:
+            return 0.0
+        scores: list[float] = []
+        for index, label in enumerate(labels):
+            own = [points[j] for j, other in enumerate(labels) if other == label and j != index]
+            if not own:
+                continue
+            a = sum(self._cosine_dist2(points[index], point) for point in own) / len(own)
+            nearest = None
+            for group in groups:
+                if group == label:
+                    continue
+                other = [points[j] for j, item in enumerate(labels) if item == group]
+                if not other:
+                    continue
+                b = sum(self._cosine_dist2(points[index], point) for point in other) / len(other)
+                if nearest is None or b < nearest:
+                    nearest = b
+            if nearest is None:
+                continue
+            scores.append((nearest - a) / max(a, nearest, 1e-6))
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def _merge_same_type_clusters(
+        self,
+        points: list[tuple[float, ...]],
+        labels: list[int],
+        min_k: int = 4,
+        min_sim: float = 0.94,
+    ) -> list[int]:
+        updated = list(labels)
+        while True:
+            groups = sorted(set(updated))
+            if len(groups) <= min_k:
+                return updated
+            centers = {
+                group: self._mean_point(
+                    [points[index] for index, label in enumerate(updated) if label == group],
+                    True,
+                )
+                for group in groups
+            }
+            best_pair: tuple[int, int] | None = None
+            best_sim = -1.0
+            group_list = list(groups)
+            for i, left in enumerate(group_list):
+                for right in group_list[i + 1 :]:
+                    sim = sum(a * b for a, b in zip(centers[left], centers[right]))
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_pair = (left, right)
+            if best_pair is None or best_sim < min_sim:
+                return updated
+            keep, drop = best_pair
+            updated = [keep if label == drop else label for label in updated]
 
     def _split_mixed_clusters(
         self,
@@ -454,10 +558,14 @@ class Predictor:
         return center
 
     def _tsum_embeddings(
-        self, image: Image.Image, pieces: list[dict[str, int]]
+        self,
+        image: Image.Image,
+        pieces: list[dict[str, int]],
+        crop_scale: float | None = None,
     ) -> list[tuple[float, ...]]:
         tensors = [
-            self._type_transform(prepare_tsum_crop(image, piece, pieces)) for piece in pieces
+            self._type_transform(prepare_tsum_crop(image, piece, pieces, crop_scale=crop_scale))
+            for piece in pieces
         ]
         batch = torch.stack(tensors).to(self.device)
         model = self.type_model

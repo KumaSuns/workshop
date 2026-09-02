@@ -1069,7 +1069,7 @@ class MainWindow(QMainWindow):
         samples = self._visible_samples()
         key = self._list_sort_key
         if not key:
-            return samples
+            return list(reversed(samples))
         return sorted(
             samples,
             key=lambda sample: self._sample_sort_value(sample, key),
@@ -1110,9 +1110,8 @@ class MainWindow(QMainWindow):
                     moved_row = row
                     break
         elif selected is None and self.list_widget.rowCount() and prev_current is None:
-            last = self.list_widget.rowCount() - 1
-            self.list_widget.setCurrentCell(last, 0)
-            moved_row = last
+            self.list_widget.setCurrentCell(0, 0)
+            moved_row = 0
         elif selected and selected == prev_current:
             for row in range(self.list_widget.rowCount()):
                 if self._list_id_at(row) == selected:
@@ -1316,7 +1315,6 @@ class MainWindow(QMainWindow):
     def on_place_item_changed(self, _item: QListWidgetItem) -> None:
         if self.region_list.signalsBlocked():
             return
-        self._sync_piece_game_checks()
         self._apply_visible_keys()
         self.refresh_list(select_id=self.current_id)
         self.update_stats()
@@ -1333,7 +1331,6 @@ class MainWindow(QMainWindow):
             self.region_list.blockSignals(True)
             current.setCheckState(Qt.CheckState.Checked)
             self.region_list.blockSignals(False)
-        self._sync_piece_game_checks()
         self._apply_visible_keys()
         self._refresh_region_list()
         self.refresh_list(select_id=self.current_id)
@@ -1372,6 +1369,12 @@ class MainWindow(QMainWindow):
             if any(key in selected and key not in sample.confirmed for key in PIECE_KEYS):
                 try:
                     self._predict_into_sample(sample, overwrite=True)
+                except Exception:
+                    pass
+                sample = self.dataset.get(sample_id) or sample
+            elif "tsum" in selected and any(piece.get("kind") == "tsum" for piece in sample.pieces):
+                try:
+                    self._relabel_tsum_groups(sample)
                 except Exception:
                     pass
                 sample = self.dataset.get(sample_id) or sample
@@ -1748,7 +1751,6 @@ class MainWindow(QMainWindow):
             self.region_list.blockSignals(True)
             item.setCheckState(Qt.CheckState.Checked)
             self.region_list.blockSignals(False)
-            self._sync_piece_game_checks()
             self._apply_visible_keys()
 
     def import_paths(self, paths: list[str]) -> None:
@@ -1916,6 +1918,9 @@ class MainWindow(QMainWindow):
         if not ready:
             names = "、".join(PLACE_LABELS.get(key, key) for key in keys)
             QMessageBox.information(self, "まだありません", f"選んだ「{names}」に、まだ枠や〇がありません。")
+            return False
+        if any(is_piece_key(key) for key in ready) and "game" not in self.canvas.all_region_boxes():
+            QMessageBox.information(self, "ゲーム範囲がありません", "ツムとボムにはゲーム範囲が必要です。先にゲーム範囲を囲んでください。")
             return False
         if not any(self._key_needs_save(key) for key in ready):
             names = "、".join(PLACE_LABELS.get(key, key) for key in ready)
@@ -2691,21 +2696,6 @@ class MainWindow(QMainWindow):
                 return item
         return None
 
-    def _sync_piece_game_checks(self) -> None:
-        piece_on = False
-        for key in PIECE_KEYS:
-            item = self._place_item(key)
-            if item is not None and item.checkState() == Qt.CheckState.Checked:
-                piece_on = True
-                break
-        game_item = self._place_item("game")
-        if not piece_on or game_item is None or game_item.checkState() == Qt.CheckState.Checked:
-            return
-        self.region_list.blockSignals(True)
-        game_item.setCheckState(Qt.CheckState.Checked)
-        self.region_list.blockSignals(False)
-        self.statusBar().showMessage("ツムとボムにはゲーム範囲が必要です", 4000)
-
     def _list_status_keys(self) -> list[str]:
         keys = [key for key, _label, _color in PLACE_SPECS]
         coin_index = next((index for index, key in enumerate(keys) if is_coin_box_key(key)), -1)
@@ -3167,6 +3157,31 @@ class MainWindow(QMainWindow):
             applied += len(added)
         return applied
 
+    def _relabel_tsum_groups(self, sample: Sample) -> bool:
+        if self.predictor.type_model is None:
+            return False
+        if not any(piece.get("kind") == "tsum" for piece in sample.pieces):
+            return False
+        from PIL import Image
+
+        pieces = [dict(piece) for piece in sample.pieces]
+        before = [
+            (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
+            for piece in pieces
+            if piece.get("kind") == "tsum"
+        ]
+        with Image.open(sample.image_path) as image:
+            self.predictor._assign_groups(image.convert("RGB"), pieces)
+        after = [
+            (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
+            for piece in pieces
+            if piece.get("kind") == "tsum"
+        ]
+        if before == after:
+            return False
+        self.dataset.set_pieces(sample.id, pieces)
+        return True
+
     def _predict_into_sample(self, sample: Sample, *, overwrite: bool = True) -> list[str]:
         added: list[str] = []
         boxes = self.predictor.predict_all(sample.image_path)
@@ -3174,7 +3189,15 @@ class MainWindow(QMainWindow):
             added.extend(self.dataset.apply_predictions(sample.id, boxes))
         sample = self.dataset.get(sample.id) or sample
         game = sample.regions.get("game") or sample.game_region
+        existing_tsums = [piece for piece in sample.pieces if piece.get("kind") == "tsum"]
+        tsum_locked = (not overwrite) and "tsum" in sample.confirmed
+        if existing_tsums and not tsum_locked:
+            if self._relabel_tsum_groups(sample):
+                added.append("tsum")
+            sample = self.dataset.get(sample.id) or sample
         pieces = self.predictor.predict_pieces(sample.image_path, game)
+        if existing_tsums:
+            pieces = [piece for piece in pieces if piece.get("kind") != "tsum"]
         if pieces:
             if not overwrite:
                 existing = {str(piece.get("kind")) for piece in sample.pieces}

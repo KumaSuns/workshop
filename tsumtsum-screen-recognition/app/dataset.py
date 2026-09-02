@@ -467,6 +467,24 @@ class Dataset:
             self._save()
         return added
 
+    def set_pieces(self, sample_id: str, pieces: list[dict[str, int]]) -> Sample:
+        sample = self.get(sample_id)
+        if sample is None:
+            raise KeyError(sample_id)
+        sample.pieces = [
+            {
+                "x": int(piece["x"]),
+                "y": int(piece["y"]),
+                "r": int(piece["r"]),
+                "kind": str(piece["kind"]),
+                "group": int(piece.get("group") or 1),
+            }
+            for piece in pieces
+            if int(piece.get("r") or 0) >= 4
+        ]
+        self._save()
+        return sample
+
     def clear_named_region(self, sample_id: str, key: str) -> Sample:
         sample = self.get(sample_id)
         if sample is None:

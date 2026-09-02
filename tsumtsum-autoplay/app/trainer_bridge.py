@@ -10,7 +10,6 @@ from PySide6.QtGui import QImage
 from app.paths import APP_ROOT
 
 TRAINER_ROOT = APP_ROOT.parent / "tsumtsum-screen-recognition"
-EXTRACTOR_ROOT = APP_ROOT.parent / "video-frame-extractor"
 
 
 def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dict[str, int]]]]:
@@ -50,8 +49,6 @@ def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dic
             raise RuntimeError(
                 "TIME UP のモデルがありません。動画フレーム抜き出しで GO / TIME UP を学習してください。"
             )
-        if "coin" not in getattr(predictor, "digit_models", {}):
-            raise RuntimeError("コインの数字モデルがありません。画面認識アプリで学習してください。")
         return predictor, chain_fn
     finally:
         if added:
@@ -65,70 +62,62 @@ def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dic
         sys.modules.update(hidden)
         if predictor is not None:
             predictor._trainer_modules = keep
-            _attach_coin_scene(predictor)
-            _attach_coin_reader(predictor)
 
 
-def _attach_coin_scene(predictor) -> None:
-    predictor.coin_scene_model = None
-    predictor.coin_scene_classes = ()
-    path = TRAINER_ROOT / "data" / "extractor" / "scene.pt"
-    if not path.is_file():
-        return
-    mods = getattr(predictor, "_trainer_modules", {}) or {}
-    scene_mod = mods.get("app.scene_model")
-    if scene_mod is None:
-        return
-    import torch
-
-    checkpoint = torch.load(path, map_location=predictor.device, weights_only=False)
-    classes = (
-        tuple(checkpoint.get("classes") or ())
-        if isinstance(checkpoint, dict)
-        else ()
-    )
-    if "coin" not in classes:
-        return
-    model = scene_mod.SceneNet(pretrained=False, num_classes=len(classes))
-    state = (
-        checkpoint["state_dict"]
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint
-        else checkpoint
-    )
-    try:
-        model.load_state_dict(state)
-    except Exception:
-        return
-    model.to(predictor.device)
-    model.eval()
-    predictor.coin_scene_model = model
-    predictor.coin_scene_classes = classes
+PLAY_TRAIN_EPOCHS = 8
 
 
-def _attach_coin_reader(predictor) -> None:
-    predictor.coin_reader = None
+def train_play_models(predictor, stop=None) -> list[str]:
     hidden = {
         key: sys.modules.pop(key)
         for key in list(sys.modules)
         if key == "app" or key.startswith("app.")
     }
-    root = str(EXTRACTOR_ROOT)
+    root = str(TRAINER_ROOT)
     added = root not in sys.path
     if added:
         sys.path.insert(0, root)
+    keep = dict(getattr(predictor, "_trainer_modules", None) or {})
+    sys.modules.update(keep)
+    ran: list[str] = []
     try:
-        from app.coin_read import CoinReader
+        from app.dataset import Dataset
+        from app.regions import COIN_BOX_KEYS, PIECE_KEYS, REGION_KEYS, SCENE_KEYS
+        from app.train_worker import MIN_TRAIN_SAMPLES, TrainingCancelled, TrainWorker
 
-        predictor.coin_reader = CoinReader()
+        dataset = Dataset(TRAINER_ROOT / "data")
+        jobs = _play_train_jobs(dataset, MIN_TRAIN_SAMPLES, REGION_KEYS, PIECE_KEYS, SCENE_KEYS, COIN_BOX_KEYS)
+        if not jobs:
+            return []
+        if getattr(predictor, "release", None) is not None:
+            predictor.release()
+        worker = TrainWorker(jobs, epochs=PLAY_TRAIN_EPOCHS)
+        inner = worker._raise_if_cancelled
+
+        def _raise() -> None:
+            if stop is not None and stop.is_set():
+                raise TrainingCancelled()
+            inner()
+
+        worker._raise_if_cancelled = _raise
+        try:
+            worker._train()
+            ran = [str(item[3] if len(item) > 3 else item[0]) for item in jobs]
+        except TrainingCancelled:
+            ran = []
+        finally:
+            worker._release_cuda()
+            if getattr(predictor, "reload", None) is not None:
+                predictor.reload()
+        return ran
+    finally:
         keep = {
             key: sys.modules[key]
             for key in list(sys.modules)
             if key == "app" or key.startswith("app.")
         }
-        predictor.coin_reader._extractor_modules = keep
-    except Exception:
-        predictor.coin_reader = None
-    finally:
+        if predictor is not None:
+            predictor._trainer_modules = keep
         if added:
             try:
                 sys.path.remove(root)
@@ -138,6 +127,51 @@ def _attach_coin_reader(predictor) -> None:
             if key == "app" or key.startswith("app."):
                 del sys.modules[key]
         sys.modules.update(hidden)
+
+
+def _play_train_jobs(dataset, min_n, region_keys, piece_keys, scene_keys, coin_box_keys) -> list[tuple]:
+    jobs: list[tuple] = []
+    for key in region_keys:
+        samples = dataset.labeled_for(key)
+        if len(samples) >= min_n:
+            jobs.append((key, samples, dataset.model_path_for(key), key))
+    piece_map = {
+        sample.id: sample
+        for key in piece_keys
+        for sample in dataset.labeled_for(key)
+    }
+    piece_samples = list(piece_map.values())
+    if len(piece_samples) >= min_n:
+        type_samples = [
+            sample
+            for sample in piece_samples
+            if len(
+                {
+                    int(piece.get("group") or 1)
+                    for piece in sample.pieces
+                    if piece.get("kind") == "tsum"
+                }
+            )
+            >= 2
+        ]
+        if len(type_samples) >= min_n:
+            jobs.append(("tsum_types", type_samples, dataset.model_path_for("tsum_types"), "ツムの種類"))
+        jobs.append(("pieces", piece_samples, dataset.model_path_for("pieces"), "ツム・ボム"))
+    digit_samples = dataset.labeled_digit_samples()
+    if len(digit_samples) >= min_n:
+        jobs.append(("coin_digits", digit_samples, dataset.model_path_for("coin_digits"), "コインの数字"))
+    playable = [sample for sample in dataset.all() if sample.status != "skipped"]
+    others = sum(
+        1
+        for sample in playable
+        if not any(key in sample.confirmed for key in scene_keys)
+    )
+    if (
+        all(len(dataset.labeled_for(key)) >= min_n for key in scene_keys)
+        and others >= min_n
+    ):
+        jobs.append(("scene", playable, dataset.model_path_for("scene"), "GO・TIME UP"))
+    return jobs
 
 
 def save_erase_lesson(
@@ -164,7 +198,115 @@ def save_erase_lesson(
     return True
 
 
-def save_play_board(predictor, image: QImage, game: dict[str, int] | None) -> bool:
+HUD_KEYS = (
+    "game",
+    "score",
+    "coin",
+    "result_coin",
+    "timer",
+    "skill",
+    "fan",
+    "pause",
+    "fever",
+)
+DIGIT_KEYS = ("coin", "result_coin")
+RESULT_KEYS = ("result_coin", "score")
+
+
+def save_play_board(
+    predictor,
+    image: QImage,
+    game: dict[str, int] | None,
+    boxes: dict[str, dict[str, int]] | None = None,
+    pieces: list[dict[str, int]] | None = None,
+    rgb=None,
+) -> bool:
+    hud = _hud_boxes(boxes, HUD_KEYS)
+    if game is not None and "game" not in hud:
+        hud["game"] = {
+            "x": int(game["x"]),
+            "y": int(game["y"]),
+            "w": int(game["w"]),
+            "h": int(game["h"]),
+        }
+    return _save_labeled(
+        predictor,
+        image,
+        hud,
+        pieces=pieces or [],
+        readings=_digit_readings(predictor, rgb, hud),
+    )
+
+
+def save_play_scene(predictor, image: QImage, key: str) -> bool:
+    return _save_labeled(predictor, image, {}, pieces=[], scene=key)
+
+
+def save_play_result(predictor, image: QImage, boxes: dict[str, dict[str, int]] | None, rgb=None) -> bool:
+    hud = _hud_boxes(boxes, RESULT_KEYS)
+    if not hud:
+        return False
+    return _save_labeled(
+        predictor,
+        image,
+        hud,
+        pieces=[],
+        readings=_digit_readings(predictor, rgb, hud),
+    )
+
+
+def _hud_boxes(boxes: dict[str, dict[str, int]] | None, keys: tuple[str, ...]) -> dict[str, dict[str, int]]:
+    hud: dict[str, dict[str, int]] = {}
+    if not boxes:
+        return hud
+    for key in keys:
+        box = boxes.get(key)
+        if not box:
+            continue
+        hud[key] = {
+            "x": int(box["x"]),
+            "y": int(box["y"]),
+            "w": int(box["w"]),
+            "h": int(box["h"]),
+        }
+    return hud
+
+
+def _digit_readings(predictor, rgb, boxes: dict[str, dict[str, int]]) -> dict[str, str]:
+    readings: dict[str, str] = {}
+    if rgb is None or not boxes:
+        return readings
+    for key in DIGIT_KEYS:
+        box = boxes.get(key)
+        if not box:
+            continue
+        try:
+            crop = rgb.crop(
+                (
+                    int(box["x"]),
+                    int(box["y"]),
+                    int(box["x"]) + int(box["w"]),
+                    int(box["y"]) + int(box["h"]),
+                )
+            )
+            digits = "".join(
+                char for char in str(predictor.predict_coin_digits(crop, key) or "") if char.isdigit()
+            )
+        except Exception:
+            continue
+        if digits:
+            readings[key] = digits
+    return readings
+
+
+def _save_labeled(
+    predictor,
+    image: QImage,
+    regions: dict[str, dict[str, int]],
+    pieces: list[dict[str, int]] | None = None,
+    readings: dict[str, str] | None = None,
+    scene: str | None = None,
+) -> bool:
     dataset_cls = getattr(predictor, "_dataset_cls", None)
     if dataset_cls is None or image is None or image.isNull():
         return False
@@ -176,14 +318,15 @@ def save_play_board(predictor, image: QImage, game: dict[str, int] | None) -> bo
         source_name=f"bluestacks_{stamp}.png",
         name_prefix="bluestacks_",
     )
-    added = len(dataset.all()) > before
-    if game is not None and not sample.game_region:
-        sample.game_region = {
-            "x": int(game["x"]),
-            "y": int(game["y"]),
-            "w": int(game["w"]),
-            "h": int(game["h"]),
-        }
-        sample.regions["game"] = dict(sample.game_region)
-        dataset.save()
-    return added
+    if len(dataset.all()) <= before:
+        return False
+    dataset.set_regions(sample.id, regions, status="labeled", pieces=pieces or [])
+    if readings:
+        for key, digits in readings.items():
+            try:
+                dataset.set_reading(sample.id, key, digits)
+            except Exception:
+                continue
+    if scene:
+        dataset.confirm_key(sample.id, scene)
+    return True
