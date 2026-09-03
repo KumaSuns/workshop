@@ -28,8 +28,6 @@ from app.play_style import (
     record_hud,
     record_pick,
     record_play,
-    should_hud,
-    style_now,
     unlike_hit,
 )
 from app.trainer_bridge import (
@@ -308,8 +306,11 @@ def run_play(
         fever_fill = _fever_fill(rgb, fever)
         fever_on = fever_fill >= 0.25
         say(_group_counts_line(tsums))
-        found = [item for item in candidates(pieces, 8) if len(item) >= MIN_CHAIN]
-        found = [item for item in found if not _chain_too_similar(item, skip_chains)]
+        raw = [item for item in candidates(pieces, 8) if len(item) >= MIN_CHAIN]
+        found = [item for item in raw if not _chain_too_similar(item, skip_chains)]
+        while raw and not found and skip_chains:
+            skip_chains.pop(0)
+            found = [item for item in raw if not _chain_too_similar(item, skip_chains)]
         found.sort(key=len, reverse=True)
         if found:
             say("候補 " + " / ".join(str(len(item)) for item in found))
@@ -348,40 +349,34 @@ def run_play(
             continue
         if preview is not None:
             preview(_draw_plan(image, pieces, [], game))
-        if _press_skill(skill, image, say, stop, last_skill_at, pending_hud, sit):
-            last_skill_at = time.time()
-            skill_taps += 1
-        style = style_now()
-        bomb_want = has_bomb
-        fan_want = (
+        if saw_board and fan is None:
+            boxes = predictor.predict_all(Path("."), rgb=rgb)
+            last_boxes = boxes
+            game, skill, fever, timer, fan = _merge_hud(
+                boxes, game, skill, fever, timer, fan, meters=True
+            )
+        if (
             saw_board
             and fan is not None
             and len(tsums) >= BOARD_TSUMS
-            and should_hud("fan", sit, not fever_on, style)
             and time.time() - last_fan_at >= 1.5
-        )
-        if bomb_want and fan_want:
-            fan_want = False
+        ):
+            _tap_fan(fan, image, say, stop)
+            last_fan_at = time.time()
+            fan_taps += 1
+            skip_chains = []
+            pending_hud.append((sit, "fan", True))
+            continue
         if has_bomb:
-            did = False
-            if bomb_want:
-                did = _tap_biggest_bomb(pieces, image, say, stop)
-                if did:
-                    bomb_taps += 1
-                    last_bomb_at = time.time()
-            pending_hud.append((sit, "bomb", bomb_want and did))
+            did = _tap_biggest_bomb(pieces, image, say, stop)
             if did:
+                bomb_taps += 1
+                last_bomb_at = time.time()
+                pending_hud.append((sit, "bomb", True))
                 continue
-        if saw_board and fan is not None and len(tsums) >= BOARD_TSUMS:
-            did = False
-            if fan_want:
-                _tap_fan(fan, image, say, stop)
-                last_fan_at = time.time()
-                fan_taps += 1
-                did = True
-            pending_hud.append((sit, "fan", did))
-            if did:
-                continue
+        if _press_skill(skill, image, say, stop, last_skill_at, pending_hud, sit):
+            last_skill_at = time.time()
+            skill_taps += 1
         last_save_at = _learn_board(
             predictor,
             image,
@@ -1309,9 +1304,6 @@ def _chain_too_similar(
     key = _chain_key(chain)
     for old in used_keys:
         if key == old or key <= old or old <= key:
-            return True
-        overlap = len(key & old)
-        if overlap >= 2 and overlap * 2 >= min(len(key), len(old)):
             return True
     return False
 
