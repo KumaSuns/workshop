@@ -27,6 +27,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
+    QAbstractItemDelegate,
     QAbstractItemView,
     QApplication,
     QCheckBox,
@@ -324,6 +325,13 @@ class FileListDelegate(QStyledItemDelegate):
             option.textElideMode = Qt.TextElideMode.ElideNone
         else:
             option.textElideMode = Qt.TextElideMode.ElideMiddle
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        window = parent.window() if parent is not None else None
+        if editor is not None and window is not None:
+            editor.installEventFilter(window)
+        return editor
 
 
 class _GroupStripBody(QWidget):
@@ -841,7 +849,9 @@ class MainWindow(QMainWindow):
         self.list_widget = QTableWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.list_widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.list_widget.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_widget.setWordWrap(False)
         self.list_widget.setTextElideMode(Qt.TextElideMode.ElideNone)
@@ -952,6 +962,7 @@ class MainWindow(QMainWindow):
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
         self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
+        self.list_widget.itemChanged.connect(self.on_list_item_changed)
         self.region_list.currentItemChanged.connect(self.on_region_type_changed)
         self.region_list.itemChanged.connect(self.on_place_item_changed)
         self.canvas.regionCommitted.connect(self.on_region_committed)
@@ -961,6 +972,7 @@ class MainWindow(QMainWindow):
         self.canvas.filesDropped.connect(self.import_paths)
         self.canvas.imageDropped.connect(self.import_qimage)
         self.canvas.installEventFilter(self)
+        self.list_widget.installEventFilter(self)
         self.spin_group.valueChanged.connect(self.on_group_changed)
         for index, button in enumerate(self.trace_chain_btns):
             button.clicked.connect(lambda _checked=False, i=index: self.trace_chain_candidate(i))
@@ -1052,6 +1064,43 @@ class MainWindow(QMainWindow):
             if digits:
                 return digits
         return ""
+
+    def _coin_write_key(self, sample: Sample) -> str:
+        for box_key in COIN_BOX_KEYS:
+            digits = "".join(char for char in (sample.readings or {}).get(box_key, "") if char.isdigit())
+            if digits:
+                return box_key
+        for box_key in COIN_BOX_KEYS:
+            if (sample.regions or {}).get(box_key):
+                return box_key
+        return "coin"
+
+    def on_list_item_changed(self, item: QTableWidgetItem) -> None:
+        if item is None or self._block_if_training():
+            return
+        keys = self._list_status_keys()
+        col = item.column()
+        if col < 0 or col >= len(keys) or keys[col] != "coin_digits":
+            return
+        sample = self.dataset.get(item.data(Qt.ItemDataRole.UserRole) or self._list_id_at(item.row()))
+        if sample is None:
+            return
+        digits = "".join(char for char in item.text() if char.isdigit())
+        self.list_widget.blockSignals(True)
+        try:
+            if not digits:
+                self._style_list_row(item.row(), sample)
+                return
+            key = self._coin_write_key(sample)
+            self.dataset.set_reading(sample.id, key, digits)
+            item.setText(format_coin_number(digits))
+            item.setForeground(QColor("#3DDC97"))
+            self.statusBar().showMessage(f"コイン {format_coin_number(digits)} を直しました", 4000)
+        except Exception as exc:  # noqa: BLE001
+            self._style_list_row(item.row(), sample)
+            QMessageBox.warning(self, "数字を保存できませんでした", str(exc))
+        finally:
+            self.list_widget.blockSignals(False)
 
     def _sample_sort_value(self, sample: Sample, key: str):
         if key == "file":
@@ -1159,6 +1208,21 @@ class MainWindow(QMainWindow):
                     text, color = format_coin_number(digits), QColor("#3DDC97")
                 else:
                     text, color = "未", QColor("#8b93a0")
+                item = self.list_widget.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.list_widget.setItem(row, col, item)
+                item.setText(text)
+                item.setForeground(color)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setData(Qt.ItemDataRole.UserRole, sample.id)
+                item.setFlags(
+                    item.flags()
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsEditable
+                )
+                continue
             else:
                 state = self._key_list_state(sample, key)
                 if state == "confirmed":
@@ -1376,19 +1440,20 @@ class MainWindow(QMainWindow):
         if sample is None:
             return
         selected = set(self._selected_place_keys())
-        if self.predictor.piece_model is not None and any(key in selected for key in PIECE_KEYS):
-            if any(key in selected and key not in sample.confirmed for key in PIECE_KEYS):
-                try:
-                    self._predict_into_sample(sample, overwrite=True)
-                except Exception:
-                    pass
-                sample = self.dataset.get(sample_id) or sample
-            elif "tsum" in selected and any(piece.get("kind") == "tsum" for piece in sample.pieces):
-                try:
-                    self._relabel_tsum_groups(sample)
-                except Exception:
-                    pass
-                sample = self.dataset.get(sample_id) or sample
+        if not getattr(self, "_skip_auto_predict", False):
+            if self.predictor.piece_model is not None and any(key in selected for key in PIECE_KEYS):
+                if any(key in selected and key not in sample.confirmed for key in PIECE_KEYS):
+                    try:
+                        self._predict_into_sample(sample, overwrite=True)
+                    except Exception:
+                        pass
+                    sample = self.dataset.get(sample_id) or sample
+                elif "tsum" in selected and any(piece.get("kind") == "tsum" for piece in sample.pieces):
+                    try:
+                        self._relabel_tsum_groups(sample)
+                    except Exception:
+                        pass
+                    sample = self.dataset.get(sample_id) or sample
         self.current_id = sample.id
         pixmap = QPixmap(str(sample.image_path))
         regions = {
@@ -1403,7 +1468,8 @@ class MainWindow(QMainWindow):
             active_key=self._active_key,
             pieces=sample.pieces,
         )
-        self.canvas.setFocus()
+        if not getattr(self, "_keep_list_focus", False):
+            self.canvas.setFocus()
         self._apply_visible_keys()
         self._set_dirty(False)
         self._refresh_region_list()
@@ -1421,6 +1487,8 @@ class MainWindow(QMainWindow):
             if self._active_key in sample.confirmed:
                 self.hint_label.setText(f"この画像は「{name}」として保存済みです。")
             elif self.predictor.scene_model is None:
+                self.hint_label.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
+            elif getattr(self, "_skip_auto_predict", False):
                 self.hint_label.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
             else:
                 try:
@@ -3227,28 +3295,59 @@ class MainWindow(QMainWindow):
         if self._is_training() and watched is self.canvas and event.type() == QEvent.Type.KeyPress:
             return True
         if (
-            watched is self.canvas
-            and event.type() == QEvent.Type.KeyPress
+            event.type() == QEvent.Type.KeyPress
             and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
             and event.modifiers()
             in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.KeypadModifier)
+            and (
+                watched is self.canvas
+                or watched is self.list_widget
+                or self.list_widget.isAncestorOf(watched)
+            )
         ):
-            self._select_image_by_delta(-1 if event.key() == Qt.Key.Key_Up else 1)
+            if getattr(self, "_arrow_nav", False):
+                return True
+            self._arrow_nav = True
+            try:
+                from_list = watched is self.list_widget or self.list_widget.isAncestorOf(watched)
+                self._skip_auto_predict = True
+                if from_list:
+                    self._commit_list_edit()
+                    self._keep_list_focus = True
+                if event.isAutoRepeat():
+                    return True
+                self._select_image_by_delta(-1 if event.key() == Qt.Key.Key_Up else 1)
+            finally:
+                self._keep_list_focus = False
+                self._skip_auto_predict = False
+                self._arrow_nav = False
             return True
         return super().eventFilter(watched, event)
+
+    def _commit_list_edit(self) -> None:
+        if self.list_widget.state() != QAbstractItemView.State.EditingState:
+            return
+        editor = QApplication.focusWidget()
+        if editor is None or not self.list_widget.isAncestorOf(editor):
+            return
+        self.list_widget.commitData(editor)
+        self.list_widget.closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
 
     def _select_image_by_delta(self, delta: int) -> None:
         count = self.list_widget.rowCount()
         if count <= 0:
             return
         row = self.list_widget.currentRow()
+        col = self.list_widget.currentColumn()
         if row < 0:
             next_row = 0 if delta > 0 else count - 1
         else:
             next_row = row + delta
         if next_row < 0 or next_row >= count:
             return
-        self.list_widget.setCurrentRow(next_row)
+        if col < 0:
+            col = 0
+        self.list_widget.setCurrentCell(next_row, col)
 
     def _unlabeled_id(self, after_id: str | None, *, backward: bool = False) -> str | None:
         samples = self.dataset.all()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import subprocess
 import tempfile
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -57,12 +58,27 @@ def crop_box(image_path: Path, box: dict[str, int]) -> Image.Image:
 
 
 def _tight_ink(crop: Image.Image) -> Image.Image:
-    gray = crop.convert("L")
-    width, height = gray.size
-    limit = max(48, int(gray.getextrema()[1] * 0.55))
-    pixels = gray.load()
-    xs = [x for x in range(width) if any(pixels[x, y] >= limit for y in range(height))]
-    ys = [y for y in range(height) if any(pixels[x, y] >= limit for x in range(width))]
+    rgb = crop.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+    col_min = 3
+    row_min = 2
+    xs = [
+        x
+        for x in range(width)
+        if sum(1 for y in range(height) if _is_digit_pixel(*pixels[x, y][:3])) >= col_min
+    ]
+    ys = [
+        y
+        for y in range(height)
+        if sum(1 for x in range(width) if _is_digit_pixel(*pixels[x, y][:3])) >= row_min
+    ]
+    if not xs or not ys:
+        gray = crop.convert("L")
+        limit = max(48, int(gray.getextrema()[1] * 0.55))
+        gp = gray.load()
+        xs = [x for x in range(width) if any(gp[x, y] >= limit for y in range(height))]
+        ys = [y for y in range(height) if any(gp[x, y] >= limit for x in range(width))]
     if not xs or not ys:
         return crop
     pad = 2
@@ -113,6 +129,10 @@ _SLOT_COUNT = 8
 _SLOT_WIDTH_RATIO = 0.72
 
 
+def _is_digit_pixel(red: int, green: int, blue: int) -> bool:
+    return red > 200 and green > 200 and blue > 180
+
+
 def _is_gold_pixel(red: int, green: int, blue: int) -> bool:
     return red > 160 and green > 110 and blue < 180 and red >= green - 20 and red > blue + 25
 
@@ -136,6 +156,84 @@ def _gold_icon_width(crop: Image.Image) -> int:
     if last < 8:
         return 0
     return min(width - 8, last + max(2, height // 12))
+
+
+def _white_topology(crop: Image.Image) -> tuple[int, int]:
+    rgb = crop.convert("RGB")
+    width, height = rgb.size
+    if width < 2 or height < 2:
+        return 0, 0
+    pixels = rgb.load()
+    ink = [
+        [_is_digit_pixel(*pixels[x, y][:3]) for x in range(width)]
+        for y in range(height)
+    ]
+    seen = [[False] * width for _ in range(height)]
+    components = 0
+    for y in range(height):
+        for x in range(width):
+            if not ink[y][x] or seen[y][x]:
+                continue
+            components += 1
+            queue = deque([(y, x)])
+            seen[y][x] = True
+            while queue:
+                cy, cx = queue.popleft()
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < height and 0 <= nx < width and ink[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        queue.append((ny, nx))
+    outside = [[False] * width for _ in range(height)]
+    border = deque()
+    for x in range(width):
+        for y in (0, height - 1):
+            if not ink[y][x] and not outside[y][x]:
+                outside[y][x] = True
+                border.append((y, x))
+    for y in range(height):
+        for x in (0, width - 1):
+            if not ink[y][x] and not outside[y][x]:
+                outside[y][x] = True
+                border.append((y, x))
+    while border:
+        cy, cx = border.popleft()
+        for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+            if 0 <= ny < height and 0 <= nx < width and not ink[ny][nx] and not outside[ny][nx]:
+                outside[ny][nx] = True
+                border.append((ny, nx))
+    holes = 0
+    hole_seen = [[False] * width for _ in range(height)]
+    for y in range(height):
+        for x in range(width):
+            if ink[y][x] or outside[y][x] or hole_seen[y][x]:
+                continue
+            holes += 1
+            queue = deque([(y, x)])
+            hole_seen[y][x] = True
+            while queue:
+                cy, cx = queue.popleft()
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if (
+                        0 <= ny < height
+                        and 0 <= nx < width
+                        and not ink[ny][nx]
+                        and not outside[ny][nx]
+                        and not hole_seen[ny][nx]
+                    ):
+                        hole_seen[ny][nx] = True
+                        queue.append((ny, nx))
+    return components, holes
+
+
+_HOLE_DIGITS = frozenset({"0", "4", "6", "8", "9"})
+
+
+def adjust_coin_digits(crop: Image.Image, digits: str) -> str:
+    ink = _tight_ink(crop.convert("RGB"))
+    components, holes = _white_topology(ink)
+    if components == 1 and holes == 1 and digits not in _HOLE_DIGITS:
+        return "0"
+    return digits
 
 
 def _pad_to_slots(crop: Image.Image) -> Image.Image:

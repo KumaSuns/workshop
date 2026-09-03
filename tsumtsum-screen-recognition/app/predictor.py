@@ -14,7 +14,7 @@ from app.digit_model import (
     CoinDigitNet,
     decode_logits,
 )
-from app.hud_number import prepare_digit_crop
+from app.hud_number import adjust_coin_digits, prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, heat_to_pixel, peaks_from_heat
 from app.paths import WORKSHOP_ROOT
@@ -229,11 +229,14 @@ class Predictor:
         model = self.digit_models.get(key) or self.digit_model
         if model is None:
             return ""
-        crop = prepare_digit_crop(crop, key)
-        tensor = self._digit_transform(crop.convert("RGB")).unsqueeze(0).to(self.device)
+        prepared = prepare_digit_crop(crop, key)
+        tensor = self._digit_transform(prepared.convert("RGB")).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = model(tensor)
-        return decode_logits(logits.cpu())
+        digits = decode_logits(logits.cpu())
+        if key == "coin":
+            return adjust_coin_digits(prepared, digits)
+        return digits
 
     def predict_all(self, image_path: Path, rgb: Image.Image | None = None) -> dict[str, dict[str, int]]:
         if not self.models:

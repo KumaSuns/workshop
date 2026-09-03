@@ -19,7 +19,6 @@ PLAYER = Path(r"C:\Program Files\BlueStacks_nxt\HD-Player.exe")
 ADB = Path(r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe")
 CONF = Path(r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf")
 _REMOTE_CAP = "/data/local/tmp/tsum_autoplay.png"
-
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _REMOTE_DRAG = "/data/local/tmp/tsum_drag.sh"
 _touch_dev: tuple[str, int, int] | None | bool = None

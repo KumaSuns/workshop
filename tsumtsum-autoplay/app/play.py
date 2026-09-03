@@ -25,6 +25,7 @@ from app.play_style import (
     hud_situation,
     load_unlike,
     rank,
+    follow_max,
     record_hud,
     record_pick,
     record_play,
@@ -143,7 +144,9 @@ def run_play(
     pending_key: frozenset[tuple[int, int]] | None = None
     pending_n = 0
     pending_at = 0.0
+    pending_burst = 1
     pieces: list[dict[str, int]] = []
+    board_n = 0
 
     def fresh_match() -> None:
         nonlocal game, skill, fever, timer, fan, hud_ready
@@ -151,7 +154,7 @@ def run_play(
         nonlocal ignore_start_until, saw_board
         nonlocal clears, swipes, skill_taps, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
-        nonlocal pending_n, pending_at, skip_chains, saved_boards
+        nonlocal pending_n, pending_at, pending_burst, skip_chains, saved_boards, board_n
         game = None
         skill = None
         fever = None
@@ -177,8 +180,10 @@ def run_play(
         pending_key = None
         pending_n = 0
         pending_at = 0.0
+        pending_burst = 1
         skip_chains = []
         saved_boards = set()
+        board_n = 0
 
     kinds = 5
     kinds_locked = False
@@ -211,15 +216,19 @@ def run_play(
             game, _, fever, timer, fan = _merge_hud(
                 boxes, game, None, fever, timer, fan
             )
-        elif saw_board and skill is None:
-            boxes = predictor.predict_all(Path("."), rgb=rgb)
-            last_boxes = boxes
-            game, skill, fever, timer, fan = _merge_hud(
-                boxes, game, skill, fever, timer, fan
-            )
-            last_skill_look = time.time()
         if _end_on_timeup(
-            predictor, image, rgb, pending_spots, clears, swipes, pieces if saw_board else None, game, say, stop
+            predictor,
+            image,
+            rgb,
+            pending_spots,
+            clears,
+            swipes,
+            pieces if saw_board else None,
+            game,
+            say,
+            stop,
+            timer,
+            saw_board,
         ):
             record_play(clears, swipes, skill_taps, bomb_taps, fan_taps)
             if not loop:
@@ -233,9 +242,12 @@ def run_play(
         if (
             saw_board
             and pending_spots is not None
-            and _spots_lingered(rgb, pending_spots)
             and (time.time() - pending_at if pending_at else 0.0) < 0.6
+            and _spots_lingered(rgb, pending_spots)
         ):
+            if _press_skill(skill, image, say, stop, last_skill_at, pending_hud, ""):
+                last_skill_at = time.time()
+                skill_taps += 1
             continue
         if not kinds_locked:
             used = _five_to_four_used_pil(rgb)
@@ -252,6 +264,9 @@ def run_play(
         if len(tsums) >= BOARD_TSUMS:
             saw_board = True
             kinds_locked = True
+        if board_n and len(tsums) != board_n:
+            skip_chains = []
+        board_n = len(tsums)
         if saw_board and not hud_ready:
             boxes = predictor.predict_all(Path("."), rgb=rgb)
             last_boxes = boxes
@@ -283,9 +298,9 @@ def run_play(
                 if pending_lesson is not None:
                     record_pick(pending_lesson[0], pending_lesson[1], True)
                     pending_lesson = None
-                clears += 1
-                if pending_key is not None:
-                    skip_chains = [key for key in skip_chains if key != pending_key][-8:]
+                clears += max(1, pending_burst)
+                pending_burst = 1
+                skip_chains = []
                 pending_spots = None
                 pending_key = None
                 pending_n = 0
@@ -300,6 +315,7 @@ def run_play(
                 pending_key = None
                 pending_n = 0
                 pending_at = 0.0
+                pending_burst = 1
                 say(f"消し {clears}回 / なぞり {swipes}回")
             else:
                 continue
@@ -308,10 +324,16 @@ def run_play(
         say(_group_counts_line(tsums))
         raw = [item for item in candidates(pieces, 8) if len(item) >= MIN_CHAIN]
         found = [item for item in raw if not _chain_too_similar(item, skip_chains)]
-        while raw and not found and skip_chains:
-            skip_chains.pop(0)
-            found = [item for item in raw if not _chain_too_similar(item, skip_chains)]
         found.sort(key=len, reverse=True)
+        my_group = _mytsum_group(predictor, rgb, tsums, skill)
+        if my_group > 0:
+            found.sort(
+                key=lambda chain: (
+                    len(chain),
+                    int(chain[0].get("group") or 0) == my_group,
+                ),
+                reverse=True,
+            )
         if found:
             say("候補 " + " / ".join(str(len(item)) for item in found))
         has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
@@ -328,16 +350,68 @@ def run_play(
                 record_hud(old_sit, kind, pressed, ok)
             pending_hud = []
         if found:
-            chain = found[0]
-            if _swipe_chain(chain, pieces, image, game, len(tsums), say, stop, preview):
+            used: set[tuple[int, int]] = set()
+            last_chain: list[dict[str, int]] | None = None
+            burst = 0
+            cap = follow_max()
+            timeup = False
+            for chain in found:
+                cells = _chain_cells(chain)
+                if cells & used:
+                    continue
+                if not _swipe_chain(chain, pieces, image, game, len(tsums), say, stop, preview):
+                    continue
                 swipes += 1
-                pending_spots = _chain_spots(rgb, chain)
-                pending_key = _chain_key(chain)
+                burst += 1
+                used |= cells
+                last_chain = chain
+                skip_chains.append(_chain_key(chain))
+                try:
+                    check = capture_play_frame()
+                    check_rgb = _qimage_rgb(check)
+                except Exception:
+                    check = None
+                    check_rgb = None
+                if (
+                    check is not None
+                    and not check.isNull()
+                    and check_rgb is not None
+                    and _end_on_timeup(
+                        predictor,
+                        check,
+                        check_rgb,
+                        pending_spots,
+                        clears,
+                        swipes,
+                        pieces,
+                        game,
+                        say,
+                        stop,
+                        timer,
+                        True,
+                    )
+                ):
+                    timeup = True
+                    break
+                if burst >= cap:
+                    break
+            if timeup:
+                record_play(clears, swipes, skill_taps, bomb_taps, fan_taps)
+                if not loop:
+                    return
+                if not _replay_after_timeup(predictor, say, stop):
+                    return
+                fresh_match()
+                say("次のプレイを開始します")
+                continue
+            if last_chain is not None:
+                pending_spots = _chain_spots(rgb, last_chain)
+                pending_key = _chain_key(last_chain)
                 pending_n = len(tsums)
-                pending_lesson = ([len(item) for item in found], len(chain))
+                pending_burst = burst
+                pending_lesson = ([len(item) for item in found], len(last_chain))
                 pending_at = time.time()
-                skip_chains.append(pending_key)
-            if has_bomb and time.time() - last_bomb_at >= 0.4:
+            if has_bomb:
                 if _tap_biggest_bomb(pieces, image, say, stop):
                     bomb_taps += 1
                     last_bomb_at = time.time()
@@ -349,24 +423,12 @@ def run_play(
             continue
         if preview is not None:
             preview(_draw_plan(image, pieces, [], game))
-        if saw_board and fan is None:
+        if saw_board and (skill is None or fan is None):
             boxes = predictor.predict_all(Path("."), rgb=rgb)
             last_boxes = boxes
             game, skill, fever, timer, fan = _merge_hud(
                 boxes, game, skill, fever, timer, fan, meters=True
             )
-        if (
-            saw_board
-            and fan is not None
-            and len(tsums) >= BOARD_TSUMS
-            and time.time() - last_fan_at >= 1.5
-        ):
-            _tap_fan(fan, image, say, stop)
-            last_fan_at = time.time()
-            fan_taps += 1
-            skip_chains = []
-            pending_hud.append((sit, "fan", True))
-            continue
         if has_bomb:
             did = _tap_biggest_bomb(pieces, image, say, stop)
             if did:
@@ -374,6 +436,11 @@ def run_play(
                 last_bomb_at = time.time()
                 pending_hud.append((sit, "bomb", True))
                 continue
+        if _press_fan(fan, image, say, stop, last_fan_at, len(tsums), pending_hud, sit):
+            last_fan_at = time.time()
+            fan_taps += 1
+            skip_chains = []
+            continue
         if _press_skill(skill, image, say, stop, last_skill_at, pending_hud, sit):
             last_skill_at = time.time()
             skill_taps += 1
@@ -615,6 +682,28 @@ def _press_skill(
     return True
 
 
+def _press_fan(
+    fan: dict[str, int] | None,
+    image: QImage,
+    say: StatusFn,
+    stop: Event | None,
+    last_fan_at: float,
+    tsum_count: int,
+    pending_hud: list[tuple[str, str, bool]],
+    sit: str,
+) -> bool:
+    if fan is None:
+        say("扇風機の枠がありません")
+        return False
+    if tsum_count < BOARD_TSUMS:
+        return False
+    if time.time() - last_fan_at < 1.5:
+        return False
+    pending_hud.append((sit, "fan", True))
+    _tap_fan(fan, image, say, stop)
+    return True
+
+
 def _tap_skill(
     skill: dict[str, int],
     image: QImage,
@@ -624,7 +713,7 @@ def _tap_skill(
     x = int(skill["x"] + max(1, int(skill["w"])) / 2)
     y = int(skill["y"] + max(1, int(skill["h"])) / 2)
     say(f"スキルをタップ {x},{y}")
-    tap(x, y, screen_w=image.width(), screen_h=image.height())
+    _tap_point(image, x, y)
 
 
 def _tap_fan(
@@ -636,7 +725,7 @@ def _tap_fan(
     x = int(fan["x"] + max(1, int(fan["w"])) / 2)
     y = int(fan["y"] + max(1, int(fan["h"])) / 2)
     say(f"扇風機をタップ {x},{y}")
-    tap(x, y, screen_w=image.width(), screen_h=image.height())
+    _tap_point(image, x, y)
     _sleep_stop(0.12, stop)
 
 
@@ -801,15 +890,45 @@ def _end_on_timeup(
     game: dict[str, int] | None,
     say: StatusFn,
     stop: Event | None,
+    timer: dict[str, int] | None = None,
+    saw_board: bool = False,
 ) -> bool:
     hit, score = _timeup_hit(predictor, rgb)
-    if not hit:
+    timer_zero = saw_board and _timer_is_zero(predictor, rgb, timer)
+    if not hit and not timer_zero:
         return False
     extra = 0
     if pending_spots is not None and not _spots_lingered(rgb, pending_spots):
         extra = 1
-    say(f"TIME UP {score:.0%} / 消し {clears + extra}回 / なぞり {swipes}回")
+    if timer_zero and not hit:
+        say(f"TIME UP タイマー0 / 消し {clears + extra}回 / なぞり {swipes}回")
+    else:
+        say(f"TIME UP {score:.0%} / 消し {clears + extra}回 / なぞり {swipes}回")
     return True
+
+
+def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
+    if timer is None or rgb is None:
+        return False
+    predict = getattr(predictor, "predict_coin_digits", None)
+    if predict is None:
+        return False
+    width, height = rgb.size
+    left = max(0, int(timer["x"]))
+    top = max(0, int(timer["y"]))
+    right = min(width, left + max(1, int(timer["w"])))
+    bottom = min(height, top + max(1, int(timer["h"])))
+    if right - left < 4 or bottom - top < 4:
+        return False
+    crop = rgb.crop((left, top, right, bottom))
+    try:
+        raw = str(predict(crop, "timer") or "")
+    except Exception:
+        return False
+    digits = "".join(char for char in raw if char.isdigit())
+    if not digits:
+        return False
+    return int(digits) == 0
 
 
 def _replay_after_timeup(predictor, say: StatusFn, stop: Event | None) -> bool:
@@ -1207,6 +1326,46 @@ def _board_key(tsums: list[dict[str, int]]) -> tuple[tuple[int, int], ...]:
     return tuple(
         sorted((int(piece["x"]) // 12, int(piece["y"]) // 12) for piece in tsums)
     )
+
+
+def _skill_face(skill: dict[str, int]) -> dict[str, int]:
+    width = max(1, int(skill["w"]))
+    height = max(1, int(skill["h"]))
+    return {
+        "x": int(skill["x"] + width / 2),
+        "y": int(skill["y"] + height / 2),
+        "r": max(4, min(width, height) // 2),
+        "kind": "tsum",
+        "group": 0,
+    }
+
+
+def _mytsum_group(predictor, rgb, tsums: list[dict[str, int]], skill) -> int:
+    if skill is None or not tsums:
+        return 0
+    if any(piece.get("_vec") is None for piece in tsums):
+        _attach_type_vecs(predictor, rgb, tsums)
+    skill_vecs = _type_vectors(predictor, rgb, [_skill_face(skill)])
+    if not skill_vecs:
+        return 0
+    skill_vec = skill_vecs[0]
+    buckets: dict[int, list[tuple[float, ...]]] = {}
+    for piece in tsums:
+        vec = piece.get("_vec")
+        group = int(piece.get("group") or 0)
+        if vec is None or group <= 0:
+            continue
+        buckets.setdefault(group, []).append(vec)
+    if not buckets:
+        return 0
+    best_group = 0
+    best_sim: float | None = None
+    for group, members in buckets.items():
+        sim = _cosine(skill_vec, _mean_vec(members))
+        if best_sim is None or sim > best_sim:
+            best_sim = sim
+            best_group = group
+    return best_group
 
 
 def _attach_type_vecs(
