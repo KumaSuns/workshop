@@ -1076,6 +1076,17 @@ class MainWindow(QMainWindow):
             reverse=not self._list_sort_asc,
         )
 
+    def _neighbor_list_id(self, removed_id: str) -> str | None:
+        ids = [sample.id for sample in self._ordered_visible_samples()]
+        if removed_id not in ids:
+            return ids[0] if ids else None
+        index = ids.index(removed_id)
+        if index + 1 < len(ids):
+            return ids[index + 1]
+        if index > 0:
+            return ids[index - 1]
+        return None
+
     def on_list_header_clicked(self, section: int) -> None:
         keys = self._list_status_keys() + ["file"]
         if section < 0 or section >= len(keys):
@@ -2052,11 +2063,8 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         removed_id = self.current_id
-        next_id = self.dataset.next_pending(removed_id)
+        next_id = self._neighbor_list_id(removed_id)
         self.dataset.remove(removed_id)
-        if next_id is None:
-            visible = [item for item in self._visible_samples() if item.id != removed_id]
-            next_id = visible[0].id if visible else None
         self.current_id = None
         self.canvas.clear_image()
         self._set_dirty(False)

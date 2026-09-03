@@ -83,12 +83,11 @@ def _physical_links(
     typical_r = sorted(radii)[len(radii) // 2] if radii else 12
     reach = typical_r * 2.6 * scale
     close = typical_r * 2.4 * scale
-    if spacing > 0:
-        reach = max(reach, spacing * 1.38 * scale)
-        close = max(close, spacing * 1.28 * scale)
-    else:
-        reach = min(reach, typical_r * 2.9 * scale)
-        close = min(close, typical_r * 2.7 * scale)
+    if 0 < spacing <= typical_r * 3.0:
+        reach = max(reach, spacing * 1.32 * scale)
+        close = max(close, spacing * 1.22 * scale)
+    reach = min(reach, typical_r * 2.9 * scale)
+    close = min(close, typical_r * 2.7 * scale)
     min_dist = typical_r * 0.4
     xs = [int(piece["x"]) for piece in tsums]
     ys = [int(piece["y"]) for piece in tsums]
@@ -97,8 +96,7 @@ def _physical_links(
     links: list[list[int]] = [[] for _ in range(count)]
 
     def add(left: int, right: int) -> None:
-        dist = math.hypot(xs[right] - xs[left], ys[right] - ys[left])
-        if dist > close and _segment_blocked(xs, ys, left, right, gap):
+        if _segment_blocked(xs, ys, left, right, gap):
             return
         if right not in links[left]:
             links[left].append(right)

@@ -82,11 +82,11 @@ def train_play_models(predictor, stop=None) -> list[str]:
     ran: list[str] = []
     try:
         from app.dataset import Dataset
-        from app.regions import COIN_BOX_KEYS, PIECE_KEYS, REGION_KEYS, SCENE_KEYS
+        from app.regions import PIECE_KEYS, SCENE_KEYS
         from app.train_worker import MIN_TRAIN_SAMPLES, TrainingCancelled, TrainWorker
 
         dataset = Dataset(TRAINER_ROOT / "data")
-        jobs = _play_train_jobs(dataset, MIN_TRAIN_SAMPLES, REGION_KEYS, PIECE_KEYS, SCENE_KEYS, COIN_BOX_KEYS)
+        jobs = _play_train_jobs(dataset, MIN_TRAIN_SAMPLES, PIECE_KEYS, SCENE_KEYS)
         if not jobs:
             return []
         if getattr(predictor, "release", None) is not None:
@@ -129,12 +129,8 @@ def train_play_models(predictor, stop=None) -> list[str]:
         sys.modules.update(hidden)
 
 
-def _play_train_jobs(dataset, min_n, region_keys, piece_keys, scene_keys, coin_box_keys) -> list[tuple]:
+def _play_train_jobs(dataset, min_n, piece_keys, scene_keys) -> list[tuple]:
     jobs: list[tuple] = []
-    for key in region_keys:
-        samples = dataset.labeled_for(key)
-        if len(samples) >= min_n:
-            jobs.append((key, samples, dataset.model_path_for(key), key))
     piece_map = {
         sample.id: sample
         for key in piece_keys
@@ -235,6 +231,7 @@ def save_play_board(
         hud,
         pieces=pieces or [],
         readings=_digit_readings(predictor, rgb, hud),
+        confirm_regions=False,
     )
 
 
@@ -252,6 +249,7 @@ def save_play_result(predictor, image: QImage, boxes: dict[str, dict[str, int]] 
         hud,
         pieces=[],
         readings=_digit_readings(predictor, rgb, hud),
+        confirm_regions=False,
     )
 
 
@@ -306,6 +304,7 @@ def _save_labeled(
     pieces: list[dict[str, int]] | None = None,
     readings: dict[str, str] | None = None,
     scene: str | None = None,
+    confirm_regions: bool = True,
 ) -> bool:
     dataset_cls = getattr(predictor, "_dataset_cls", None)
     if dataset_cls is None or image is None or image.isNull():
@@ -320,7 +319,14 @@ def _save_labeled(
     )
     if len(dataset.all()) <= before:
         return False
-    dataset.set_regions(sample.id, regions, status="labeled", pieces=pieces or [])
+    status = "labeled" if confirm_regions or scene else "predicted"
+    dataset.set_regions(sample.id, regions, status=status, pieces=pieces or [])
+    if not confirm_regions and regions:
+        sample = dataset.get(sample.id)
+        if sample is not None:
+            sample.confirmed = [key for key in sample.confirmed if key not in regions]
+            sample.status = "predicted" if not scene else sample.status
+            dataset.save()
     if readings:
         for key, digits in readings.items():
             try:

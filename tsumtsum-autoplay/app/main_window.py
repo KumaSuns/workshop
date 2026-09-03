@@ -96,6 +96,9 @@ class MainWindow(QMainWindow):
         self.now_btn = QPushButton("今すぐプレイ")
         self.now_btn.clicked.connect(self.on_play_now)
         layout.addWidget(self.now_btn)
+        self.loop_btn = QPushButton("連続プレイ")
+        self.loop_btn.clicked.connect(self.on_loop_play)
+        layout.addWidget(self.loop_btn)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop)
@@ -109,6 +112,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self._stop = threading.Event()
         self._save_boards = threading.Event()
+        self._loop_play = False
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
         self._debug = DebugWindow()
@@ -130,11 +134,18 @@ class MainWindow(QMainWindow):
             self._save_boards.clear()
 
     def on_play(self) -> None:
+        self._begin_play(loop=False)
+
+    def on_loop_play(self) -> None:
+        self._begin_play(loop=True)
+
+    def _begin_play(self, *, loop: bool) -> None:
         if self._is_busy():
             return
+        self._loop_play = loop
         self._stop.clear()
         self._set_running(True)
-        self._set_status("PLAY")
+        self._set_status("連続プレイ" if loop else "PLAY")
         if not tsum_is_running():
             desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
             try:
@@ -146,7 +157,7 @@ class MainWindow(QMainWindow):
             self._set_status("起動しています")
             self._start_intro()
             return
-        self._start_play()
+        self._start_play(loop=loop)
 
     def on_play_now(self) -> None:
         if self._is_busy():
@@ -165,7 +176,7 @@ class MainWindow(QMainWindow):
         self._stop.clear()
         self._set_running(True)
         self._set_status("今すぐプレイ")
-        self._start_play(start_match=True, kind_count=kinds)
+        self._start_play(start_match=True, kind_count=kinds, loop=False)
 
     def _ask_kind_count(self) -> int | None:
         guess = read_kind_count()
@@ -237,6 +248,7 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool) -> None:
         self.play_btn.setEnabled(not running)
         self.now_btn.setEnabled(not running)
+        self.loop_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         if running:
             self._front_timer.stop()
@@ -263,13 +275,21 @@ class MainWindow(QMainWindow):
         self._keep_front()
         self._intro.start()
 
-    def _start_play(self, start_match: bool = False, kind_count: int | None = None) -> None:
+    def _start_play(
+        self,
+        start_match: bool = False,
+        kind_count: int | None = None,
+        loop: bool | None = None,
+    ) -> None:
+        if loop is None:
+            loop = self._loop_play
         self._play = PlayWorker(
             self._stop,
             self,
             start_match=start_match,
             kind_count=kind_count,
             save_boards=self._save_boards.is_set,
+            loop=loop,
         )
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
@@ -354,7 +374,7 @@ class MainWindow(QMainWindow):
         if self._stop.is_set():
             self._on_stopped()
             return
-        self._start_play()
+        self._start_play(loop=self._loop_play)
 
     def _on_intro_fail(self, message: str) -> None:
         self._set_running(False)
