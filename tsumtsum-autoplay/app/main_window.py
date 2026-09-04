@@ -106,6 +106,18 @@ class MainWindow(QMainWindow):
         self.shortcut_btn = QPushButton("起動アイコン作成")
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         layout.addWidget(self.shortcut_btn)
+        self.remote_btn = QPushButton("新アプリを起動")
+        self.remote_btn.clicked.connect(self._start_remote_app)
+        layout.addWidget(self.remote_btn)
+        self.tsum_btn = QPushButton("ツムツムを起動")
+        self.tsum_btn.clicked.connect(self._start_tsum_app)
+        layout.addWidget(self.tsum_btn)
+        self.shutdown_btn = QPushButton("PCをシャットダウン")
+        self.shutdown_btn.clicked.connect(self._confirm_shutdown)
+        layout.addWidget(self.shutdown_btn)
+        self.reboot_btn = QPushButton("PCを再起動")
+        self.reboot_btn.clicked.connect(self._confirm_reboot)
+        layout.addWidget(self.reboot_btn)
         self.status_label = QLabel("待機中")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -397,6 +409,76 @@ class MainWindow(QMainWindow):
     def _on_stopped(self) -> None:
         self._set_running(False)
         self._set_status("停止しました")
+
+    def _start_remote_app(self) -> None:
+        script = APP_ROOT.parent / "pc-web-remote" / "main.py"
+        if not script.is_file():
+            QMessageBox.critical(self, "新アプリを起動", "新アプリが見つかりませんでした。")
+            return
+        python = Path(sys.executable)
+        pythonw = python.with_name("pythonw.exe")
+        target = pythonw if pythonw.exists() else python
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.Popen(
+                [str(target), str(script)],
+                cwd=str(script.parent),
+                creationflags=flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "新アプリを起動", str(exc))
+            return
+        self._set_status("新アプリを起動しました")
+
+    def _start_tsum_app(self) -> None:
+        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+        try:
+            start_tsum(desktop or "")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "ツムツムを起動", str(exc))
+            return
+        self._set_status("ツムツムを起動しました")
+
+    def _confirm_shutdown(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("PCをシャットダウン")
+        box.setText("この PC をシャットダウンしますか？")
+        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
+        box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        self._run_shutdown("/s")
+
+    def _confirm_reboot(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("PCを再起動")
+        box.setText("この PC を再起動しますか？")
+        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
+        box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        self._run_shutdown("/r")
+
+    def _run_shutdown(self, flag: str) -> None:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            result = subprocess.run(
+                ["shutdown", flag, "/t", "0"],
+                check=False,
+                capture_output=True,
+                text=True,
+                creationflags=flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "PC", str(exc))
+            return
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "実行できませんでした").strip()
+            QMessageBox.critical(self, "PC", err)
 
     def create_launch_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)

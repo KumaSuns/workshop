@@ -24,12 +24,12 @@ def crop_tsum(image: Image.Image, piece: dict[str, int], scale: float = TYPE_CRO
     return image.crop((x - span, y - span, x + span, y + span))
 
 
-def prepare_tsum_crop(
+def isolated_tsum_rgb(
     image: Image.Image,
     piece: dict[str, int],
     others: list[dict[str, int]] | None = None,
     crop_scale: float | None = None,
-) -> Image.Image:
+) -> torch.Tensor:
     x, y, r = int(piece["x"]), int(piece["y"]), max(4, int(piece["r"]))
     span = max(8, int(round(r * (TYPE_CROP_SCALE if crop_scale is None else crop_scale))))
     left = x - span
@@ -61,7 +61,16 @@ def prepare_tsum_crop(
             fade = torch.where(dist_other < orad, torch.zeros_like(fade), fade)
     fill = torch.tensor(TYPE_FILL, dtype=torch.float32).view(3, 1, 1)
     isolated = rgb * fade.unsqueeze(0) + fill * (1.0 - fade.unsqueeze(0))
-    isolated = _suppress_effect_pixels(isolated, fade)
+    return _suppress_effect_pixels(isolated, fade)
+
+
+def prepare_tsum_crop(
+    image: Image.Image,
+    piece: dict[str, int],
+    others: list[dict[str, int]] | None = None,
+    crop_scale: float | None = None,
+) -> Image.Image:
+    isolated = isolated_tsum_rgb(image, piece, others, crop_scale)
     return to_pil_image(isolated.byte().clamp(0, 255))
 
 

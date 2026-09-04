@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PC 遠隔操作</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <form id="form" class="card">
+    <h1>PC 遠隔操作</h1>
+    <label>パスワード<input id="password" type="password" autocomplete="current-password"></label>
+    <p id="err" class="err" hidden>パスワードが違います。</p>
+    <button type="submit">入る</button>
+  </form>
+  <script>
+    document.getElementById("form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const err = document.getElementById("err");
+      err.hidden = true;
+      const password = document.getElementById("password").value;
+      const response = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      if (!response.ok) {
+        err.hidden = false;
+        return;
+      }
+      location.href = "/";
+    });
+  </script>
+</body>
+</html>

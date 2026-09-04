@@ -186,6 +186,13 @@ def capture_play_frame() -> QImage:
     return image
 
 
+def capture_window_frame() -> QImage | None:
+    image = _capture_window()
+    if image is None or image.isNull():
+        return None
+    return image
+
+
 def _capture_adb_qimage() -> QImage | None:
     global _capture_how
     raw = adb(["exec-out", "screencap"], timeout=5)
@@ -363,6 +370,7 @@ def swipe_path(
     screen_w: int = 0,
     screen_h: int = 0,
     stop=None,
+    abort=None,
 ) -> str:
     if stop is not None and stop.is_set():
         return "停止"
@@ -370,7 +378,7 @@ def swipe_path(
     if len(points) < 3:
         return "点が3未満"
     dense = _dense_points(points, step=14)
-    how = _swipe_mouse(dense, screen_w, screen_h, points)
+    how = _swipe_mouse(dense, screen_w, screen_h, points, abort=abort)
     if how:
         return how
     if stop is not None and stop.is_set():
@@ -396,6 +404,7 @@ def _swipe_mouse(
     screen_w: int,
     screen_h: int,
     anchors: list[tuple[int, int]] | None = None,
+    abort=None,
 ) -> str:
     if sys.platform != "win32" or screen_w < 2 or screen_h < 2:
         return ""
@@ -418,12 +427,17 @@ def _swipe_mouse(
     if anchors:
         held = _map_to_view(anchors, screen_w, screen_h, user32, wintypes)
         hold = {(int(x), int(y)) for x, y in held}
-    if not _send_mouse_path(user32, mapped, hold):
+    if not _send_mouse_path(user32, mapped, hold, abort):
         return ""
     return f"マウス {len(dense)}点"
 
 
-def _send_mouse_path(user32, mapped: list[tuple[int, int]], hold: set[tuple[int, int]]) -> bool:
+def _send_mouse_path(
+    user32,
+    mapped: list[tuple[int, int]],
+    hold: set[tuple[int, int]],
+    abort=None,
+) -> bool:
     import ctypes
 
     class MOUSEINPUT(ctypes.Structure):
@@ -464,7 +478,13 @@ def _send_mouse_path(user32, mapped: list[tuple[int, int]], hold: set[tuple[int,
     time.sleep(0.01)
     emit(x0, y0, down)
     time.sleep(0.03)
+    if abort is not None and abort.is_set():
+        emit(x0, y0, up)
+        return True
     for x, y in mapped[1:]:
+        if abort is not None and abort.is_set():
+            emit(x, y, up)
+            return True
         emit(x, y, move)
         time.sleep(0.018 if (x, y) in hold else 0.006)
     time.sleep(0.02)

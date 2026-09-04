@@ -27,7 +27,7 @@ from app.tsum_type import (
     TYPE_INPUT,
     TsumTypeNet,
     piece_lab,
-    prepare_tsum_crop,
+    isolated_tsum_rgb,
 )
 
 
@@ -266,7 +266,7 @@ class Predictor:
         if rgb is None:
             with Image.open(image_path) as image:
                 rgb = image.convert("RGB")
-        else:
+        elif rgb.mode != "RGB":
             rgb = rgb.convert("RGB")
         width, height = rgb.size
         if game is None:
@@ -567,10 +567,13 @@ class Predictor:
         crop_scale: float | None = None,
     ) -> list[tuple[float, ...]]:
         tensors = [
-            self._type_transform(prepare_tsum_crop(image, piece, pieces, crop_scale=crop_scale))
+            isolated_tsum_rgb(image, piece, pieces, crop_scale)
             for piece in pieces
         ]
-        batch = torch.stack(tensors).to(self.device)
+        batch = torch.stack(tensors).clamp(0, 255).byte().float().div_(255.0)
+        mean = batch.new_tensor(TYPE_MEAN).view(1, 3, 1, 1)
+        std = batch.new_tensor(TYPE_STD).view(1, 3, 1, 1)
+        batch = ((batch - mean) / std).to(self.device)
         model = self.type_model
         if model is None:
             return [self._tsum_color(image, piece) for piece in pieces]

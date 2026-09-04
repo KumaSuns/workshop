@@ -26,3 +26,6 @@ video-frame-extractor/app/assets/images/use_tsums/**
 !video-frame-extractor/app/assets/images/use_tsums/**/
 !video-frame-extractor/app/assets/images/use_tsums/**/.gitkeep
 
+pc-web-remote/data/
+pc-web-remote/cloudflared.exe
+
