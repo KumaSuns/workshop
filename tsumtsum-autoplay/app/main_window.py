@@ -107,12 +107,11 @@ class DebugWindow(QWidget):
             )
         )
 
-    def set_gauges(self, skill, fever) -> None:
+    def set_gauges(self, skill, fever, fever_on=False) -> None:
         skill_s = "—" if skill is None else f"{float(skill):.2f}"
         fever_s = "—" if fever is None else f"{float(fever):.2f}"
         self._gauges.setText(f"スキル  {skill_s}    フィーバー  {fever_s}")
-        on = fever is not None and float(fever) >= 0.25
-        self._set_fever_mark(on)
+        self._set_fever_mark(bool(fever_on))
 
     def _set_fever_mark(self, on: bool) -> None:
         if on:
@@ -196,6 +195,7 @@ class MainWindow(QMainWindow):
         self._debug = DebugWindow()
         self._debug._on_stop = self.on_stop
         self._placed = False
+        self._enter_yes = None
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -401,58 +401,62 @@ class MainWindow(QMainWindow):
     ) -> str | None:
         if pick_only:
             return self._choose_used_tsum(path)
-        box = QMessageBox(self)
-        box.setWindowTitle("今すぐプレイ")
-        box.setWindowModality(Qt.WindowModality.ApplicationModal)
-        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        dialog = QDialog()
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        layout = QVBoxLayout(dialog)
         if guess:
-            box.setText(f"使用ツムは {guess} ですか？")
-            yes = box.addButton("はい", QMessageBox.ButtonRole.AcceptRole)
+            layout.addWidget(QLabel(f"使用ツムは {guess} ですか？"))
         else:
-            box.setText("使用ツムが分かっていません。")
-            yes = None
-        no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
-        new = box.addButton("新規", QMessageBox.ButtonRole.ActionRole)
-        cancel = box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+            layout.addWidget(QLabel("使用ツムが分かっていません。"))
+        buttons = QDialogButtonBox()
+        yes = None
+        if guess:
+            yes = buttons.addButton("はい", QDialogButtonBox.ButtonRole.AcceptRole)
+        no = buttons.addButton("いいえ", QDialogButtonBox.ButtonRole.NoRole)
+        new = buttons.addButton("新規", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel = buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
         no.setAutoDefault(False)
         new.setAutoDefault(False)
         cancel.setAutoDefault(False)
         if yes is not None:
             yes.setAutoDefault(True)
             yes.setDefault(True)
-            box.setDefaultButton(yes)
-
-        class _EnterYes(QObject):
-            def eventFilter(self, watched, event) -> bool:
-                if event.type() != QEvent.Type.KeyPress or event.isAutoRepeat():
-                    return False
-                if event.key() not in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                    return False
-                if yes is None:
-                    return False
-                yes.click()
-                return True
-
-        filt = _EnterYes(box)
-        app = QApplication.instance()
-        box.installEventFilter(filt)
-        if app is not None:
-            app.installEventFilter(filt)
-        box.raise_()
-        box.activateWindow()
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        no.clicked.connect(lambda: dialog.done(2))
+        new.clicked.connect(lambda: dialog.done(3))
         if yes is not None:
             yes.setFocus()
+            self._enter_yes = dialog.accept
+        self._front_timer.stop()
+        self._debug.setEnabled(False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if sys.platform == "win32":
+            import ctypes
+
+            hwnd = int(dialog.winId())
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040
+            )
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        dialog.grabKeyboard()
         try:
-            box.exec()
+            result = dialog.exec()
         finally:
-            if app is not None:
-                app.removeEventFilter(filt)
-        clicked = box.clickedButton()
-        if yes is not None and clicked is yes:
+            dialog.releaseKeyboard()
+            self._enter_yes = None
+            self._debug.setEnabled(True)
+            self._front_timer.start()
+        if yes is not None and result == QDialog.DialogCode.Accepted:
             return guess
-        if clicked is no:
+        if result == 2:
             return self._pick_used_tsum(guess, path)
-        if clicked is new:
+        if result == 3:
             return self._register_used_tsum(path)
         return None
 
@@ -609,6 +613,8 @@ class MainWindow(QMainWindow):
         self._debug.append(text)
 
     def _keep_front(self) -> None:
+        if QApplication.activeModalWidget() is not None:
+            return
         self.raise_()
         if self._debug.isVisible():
             self._debug.raise_()
@@ -636,6 +642,19 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def eventFilter(self, watched, event) -> bool:
+        if (
+            self._enter_yes is not None
+            and event.type()
+            in (QEvent.Type.KeyPress, QEvent.Type.ShortcutOverride)
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        ):
+            if event.isAutoRepeat():
+                return True
+            event.accept()
+            fn = self._enter_yes
+            self._enter_yes = None
+            fn()
+            return True
         if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Q:
             if not event.isAutoRepeat() and self._is_busy():
                 self.on_stop()

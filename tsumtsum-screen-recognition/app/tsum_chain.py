@@ -37,9 +37,19 @@ def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
     spacing = _typical_spacing(tsums)
     phys = _physical_links(tsums, spacing)
     found = _paths_from_blobs(tsums, phys)
-    if not found:
+    longest = max((len(path) for path in found), default=0)
+    biggest = 0
+    counts: dict[int, int] = {}
+    for piece in tsums:
+        group = int(piece.get("group") or 1)
+        counts[group] = counts.get(group, 0) + 1
+        if counts[group] > biggest:
+            biggest = counts[group]
+    if not found or (longest <= MIN_CHAIN and biggest > MIN_CHAIN):
         phys = _physical_links(tsums, spacing, scale=1.12)
-        found = _paths_from_blobs(tsums, phys)
+        extra = _paths_from_blobs(tsums, phys)
+        if extra and (not found or max(len(path) for path in extra) > longest):
+            found = extra
     found.sort(key=len, reverse=True)
     return found
 
@@ -59,10 +69,47 @@ def _paths_from_blobs(
             continue
         seen.add(key)
         local = _induced_links(phys, blob)
-        for order in _collect_paths(local):
-            if len(order) >= MIN_CHAIN:
-                found.append([tsums[blob[item]] for item in order])
+        xs = [int(tsums[i]["x"]) for i in blob]
+        ys = [int(tsums[i]["y"]) for i in blob]
+        orders = [
+            order
+            for order in _collect_paths(local, xs, ys)
+            if len(order) >= MIN_CHAIN
+        ]
+        for order in orders:
+            found.append([tsums[blob[item]] for item in order])
+        covered = set(orders[0]) if orders else set()
+        while True:
+            rest = [item for item in range(len(blob)) if item not in covered]
+            if len(rest) < MIN_CHAIN:
+                break
+            sub = _induced_sub(local, rest)
+            rest_orders = [
+                order
+                for order in _collect_paths(
+                    sub,
+                    [xs[item] for item in rest],
+                    [ys[item] for item in rest],
+                )
+                if len(order) >= MIN_CHAIN
+            ]
+            if not rest_orders:
+                break
+            for order in rest_orders:
+                found.append([tsums[blob[rest[item]]] for item in order])
+            covered.update(rest[item] for item in rest_orders[0])
     return found
+
+
+def _induced_sub(links: list[list[int]], nodes: list[int]) -> list[list[int]]:
+    index = {old: new for new, old in enumerate(nodes)}
+    out: list[list[int]] = [[] for _ in nodes]
+    for new, old in enumerate(nodes):
+        for nxt in links[old]:
+            mapped = index.get(nxt)
+            if mapped is not None:
+                out[new].append(mapped)
+    return out
 
 
 def _induced_links(phys: list[list[int]], blob: list[int]) -> list[list[int]]:
@@ -311,15 +358,24 @@ def _components(links: list[list[int]]) -> list[list[int]]:
     return found
 
 
-def _collect_paths(links: list[list[int]]) -> list[list[int]]:
+def _collect_paths(
+    links: list[list[int]],
+    xs: list[int] | None = None,
+    ys: list[int] | None = None,
+) -> list[list[int]]:
     found: list[list[int]] = []
     for comp in _components(links):
-        found.extend(_paths_in_component(links, comp))
+        found.extend(_paths_in_component(links, comp, xs, ys))
     found.sort(key=len, reverse=True)
     return found
 
 
-def _paths_in_component(links: list[list[int]], nodes: list[int]) -> list[list[int]]:
+def _paths_in_component(
+    links: list[list[int]],
+    nodes: list[int],
+    xs: list[int] | None = None,
+    ys: list[int] | None = None,
+) -> list[list[int]]:
     found: dict[frozenset[int], list[int]] = {}
 
     def consider(path: list[int]) -> None:
@@ -330,7 +386,7 @@ def _paths_in_component(links: list[list[int]], nodes: list[int]) -> list[list[i
         if prev is None or len(path) > len(prev):
             found[key] = path[:]
 
-    for path in _greedy_on(links, nodes):
+    for path in _greedy_on(links, nodes, xs, ys):
         consider(path)
     if len(nodes) > 18:
         return sorted(found.values(), key=len, reverse=True)
@@ -374,7 +430,12 @@ def _paths_in_component(links: list[list[int]], nodes: list[int]) -> list[list[i
     return sorted(found.values(), key=len, reverse=True)
 
 
-def _greedy_on(links: list[list[int]], nodes: list[int]) -> list[list[int]]:
+def _greedy_on(
+    links: list[list[int]],
+    nodes: list[int],
+    xs: list[int] | None = None,
+    ys: list[int] | None = None,
+) -> list[list[int]]:
     allowed = set(nodes)
     found: dict[frozenset[int], list[int]] = {}
     for start in nodes:
@@ -388,22 +449,42 @@ def _greedy_on(links: list[list[int]], nodes: list[int]) -> list[list[int]]:
                 ]
                 if not choices:
                     break
-                nxt = max(
-                    choices,
-                    key=lambda node: (
-                        sum(
-                            1
-                            for other in links[node]
-                            if other not in used and other in allowed
-                        )
-                        if dense
-                        else -sum(
-                            1
-                            for other in links[node]
-                            if other not in used and other in allowed
-                        )
-                    ),
-                )
+                if xs is not None and ys is not None and len(path) >= 2:
+                    px = xs[current] - xs[path[-2]]
+                    py = ys[current] - ys[path[-2]]
+                    ahead = [
+                        nxt
+                        for nxt in choices
+                        if (xs[nxt] - xs[current]) * px + (ys[nxt] - ys[current]) * py
+                        >= 0
+                    ]
+                    if ahead:
+                        choices = ahead
+                    else:
+                        break
+                if xs is not None and ys is not None:
+                    cx, cy = xs[current], ys[current]
+                    nxt = min(
+                        choices,
+                        key=lambda node: (xs[node] - cx) ** 2 + (ys[node] - cy) ** 2,
+                    )
+                else:
+                    nxt = max(
+                        choices,
+                        key=lambda node: (
+                            sum(
+                                1
+                                for other in links[node]
+                                if other not in used and other in allowed
+                            )
+                            if dense
+                            else -sum(
+                                1
+                                for other in links[node]
+                                if other not in used and other in allowed
+                            )
+                        ),
+                    )
                 used.add(nxt)
                 path.append(nxt)
                 current = nxt
