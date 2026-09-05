@@ -3,6 +3,8 @@ from __future__ import annotations
 import colorsys
 import json
 import math
+import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -23,8 +25,11 @@ from app.bluestacks import (
 from app.intro import (
     Stopped,
     _check_stop,
+    _close_button,
     _continue_button,
+    _in_play_hud,
     _match_start_button,
+    _pause_continue_button,
     _play_button,
     _retry_button,
     _slow_tap,
@@ -48,8 +53,11 @@ from app.trainer_bridge import (
 
 MIN_CHAIN = 3
 BOARD_TSUMS = 8
+BOARD_READY = 40
 TIMEUP_SCORE = 0.18
 SKILL_GAP = 2.2
+SKILL_FILL_READY = 0.90
+SKILL_FILL_SPENT = 0.40
 SKIP_TTL = 0.6
 FAN_GAP = 8.0
 _gpu_lock = Lock()
@@ -63,6 +71,9 @@ class PlayWorker(QThread):
     completed = Signal()
     status = Signal(str)
     preview = Signal(QImage)
+    gauges = Signal(object, object)
+    need_kinds = Signal()
+    need_used_tsum = Signal(str, str, bool)
 
     def __init__(
         self,
@@ -72,6 +83,7 @@ class PlayWorker(QThread):
         kind_count: int | None = None,
         save_boards: Callable[[], bool] | None = None,
         loop: bool = False,
+        ask_kinds: bool = False,
     ) -> None:
         super().__init__(parent)
         self._stop = stop
@@ -79,6 +91,37 @@ class PlayWorker(QThread):
         self._kind_count = kind_count
         self._save_boards = save_boards
         self._loop = loop
+        self._ask_kinds = ask_kinds
+        self._kinds_gate = Event()
+        self._kinds_answer: int | None = None
+        self._used_gate = Event()
+        self._used_answer: str | None = None
+
+    def provide_kinds(self, kinds: int | None) -> None:
+        self._kinds_answer = kinds
+        self._kinds_gate.set()
+
+    def provide_used_tsum(self, name: str | None) -> None:
+        self._used_answer = name
+        self._used_gate.set()
+
+    def _request_kinds(self) -> int | None:
+        self._kinds_gate.clear()
+        self._kinds_answer = None
+        self.need_kinds.emit()
+        while not self._kinds_gate.wait(timeout=0.2):
+            _check_stop(self._stop)
+        return self._kinds_answer
+
+    def _request_used_tsum(
+        self, guess: str, path: Path | None, pick_only: bool
+    ) -> str | None:
+        self._used_gate.clear()
+        self._used_answer = None
+        self.need_used_tsum.emit(guess, str(path) if path is not None else "", pick_only)
+        while not self._used_gate.wait(timeout=0.2):
+            _check_stop(self._stop)
+        return self._used_answer
 
     def run(self) -> None:
         try:
@@ -87,9 +130,12 @@ class PlayWorker(QThread):
                 self._stop,
                 start_match=self._start_match,
                 preview=self.preview.emit,
+                gauges=self.gauges.emit,
                 kind_count=self._kind_count,
                 save_boards=self._save_boards,
                 loop=self._loop,
+                request_kinds=self._request_kinds if self._ask_kinds else None,
+                request_used_tsum=self._request_used_tsum if self._ask_kinds else None,
             )
         except Stopped:
             self.stopped.emit()
@@ -104,13 +150,41 @@ def run_play(
     stop: Event | None,
     start_match: bool = False,
     preview: Callable[[QImage], None] | None = None,
+    gauges: Callable[[float | None, float], None] | None = None,
     kind_count: int | None = None,
     save_boards: Callable[[], bool] | None = None,
     loop: bool = False,
+    request_kinds: Callable[[], int | None] | None = None,
+    request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
             report(text)
+
+    arrived = ""
+    if start_match:
+        _seen, _locked, arrived = _click_start_or_continue(say, stop, tap_start=False)
+        if arrived in ("start", "continue") and request_used_tsum is not None:
+            if arrived == "start":
+                try:
+                    path = capture_screen_path()
+                except Exception:
+                    path = None
+                guess = _read_used_tsum(path) if path is not None else ""
+                if guess:
+                    say(f"使用ツム {guess}")
+                confirmed = request_used_tsum(guess, path, False)
+            else:
+                confirmed = request_used_tsum("", None, True)
+            if confirmed is None:
+                raise Stopped()
+            if confirmed:
+                say(f"使用ツム {confirmed}")
+        if arrived in ("start", "continue") and request_kinds is not None:
+            asked = request_kinds()
+            if asked is None:
+                raise Stopped()
+            kind_count = asked
 
     say("モデルを読み込み中")
     try:
@@ -139,6 +213,7 @@ def run_play(
     fan = None
     hud_ready = False
     last_skill_at = 0.0
+    skill_wait_empty = False
     last_fan_at = 0.0
     last_bomb_at = 0.0
     skip_bomb_cells: set[tuple[int, int]] = set()
@@ -164,7 +239,7 @@ def run_play(
 
     def fresh_match() -> None:
         nonlocal game, skill, fever, timer, fan, hud_ready
-        nonlocal last_skill_at, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
+        nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
         nonlocal ignore_start_until, saw_board
         nonlocal clears, swipes, skill_taps, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
@@ -177,6 +252,7 @@ def run_play(
         fan = None
         hud_ready = False
         last_skill_at = 0.0
+        skill_wait_empty = False
         last_fan_at = 0.0
         last_bomb_at = 0.0
         skip_bomb_cells = set()
@@ -210,12 +286,10 @@ def run_play(
         kinds = int(kind_count)
         kinds_locked = True
         say(f"種類 {kinds}")
-    if start_match:
-        seen, locked = _click_start_or_continue(say, stop)
-        if not kinds_locked and locked:
-            kinds = seen
-            kinds_locked = True
-            say(f"5＞4 {'使用' if kinds == 4 else '未使用'} / 種類 {kinds}")
+    if start_match and arrived == "start":
+        _tap_start_now(say, stop)
+    elif start_match and arrived == "continue":
+        _tap_continue_now(say, stop)
     watching = Event()
     watch_hit = Event()
     stop_watch = Event()
@@ -273,6 +347,13 @@ def run_play(
             say("次のプレイを開始します")
             continue
         _check_stop(stop)
+        if time.time() >= ignore_start_until:
+            start = _match_start_button(image)
+            if start is not None:
+                say("スタートをクリックします")
+                _slow_tap(start.center().x(), start.center().y())
+                _sleep_stop(1.2, stop)
+                continue
         if not kinds_locked:
             used = _five_to_four_used_pil(rgb)
             if used is not None:
@@ -287,7 +368,7 @@ def run_play(
                 pieces = predictor.predict_pieces(Path("."), None, rgb=rgb, inner=False)
             tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
         _check_stop(stop)
-        if len(tsums) >= BOARD_TSUMS:
+        if len(tsums) >= BOARD_READY:
             saw_board = True
             kinds_locked = True
         if saw_board and not hud_ready:
@@ -300,18 +381,18 @@ def run_play(
             )
             hud_ready = True
             last_skill_at = 0.0
+            skill_wait_empty = False
         if not saw_board:
-            if len(tsums) < BOARD_TSUMS:
-                say(f"ツム {len(tsums)}体（盤面が少ない）")
-                if time.time() >= ignore_start_until and _tap_start_or_continue(image, say, stop):
-                    continue
-                play = None if image.isNull() else _play_button(image)
-                if play is not None:
-                    say("プレイをクリックします")
-                    _slow_tap(play.center().x(), play.center().y())
-                    _sleep_stop(2.0, stop)
-                    continue
+            say(f"ツム {len(tsums)}体（盤面が少ない）")
+            if time.time() >= ignore_start_until and _tap_start_or_continue(image, say, stop):
                 continue
+            play = None if image.isNull() else _play_button(image)
+            if play is not None:
+                say("プレイをクリックします")
+                _slow_tap(play.center().x(), play.center().y())
+                _sleep_stop(2.0, stop)
+                continue
+            continue
         erased_now = False
         if pending_spots is not None:
             erased = not _spots_lingered(rgb, pending_spots)
@@ -363,19 +444,33 @@ def run_play(
         ]
         found = [item for item in raw if not _chain_too_similar(item, skip_chains)]
         found.sort(key=len, reverse=True)
-        if my_group <= 0 and skill is not None:
+        if my_group <= 0 and skill is not None and now - last_skill_look >= 2.0:
+            last_skill_look = now
             with _gpu_lock:
-                my_group = _mytsum_group(predictor, rgb, tsums, skill)
-            if my_group <= 0:
-                my_group = -1
+                looked = _mytsum_group(predictor, rgb, tsums, skill)
+            if looked > 0:
+                my_group = looked
         if my_group > 0:
-            found.sort(
-                key=lambda chain: (
-                    len(chain) + (1 if int(chain[0].get("group") or 0) == my_group else 0),
-                    int(chain[0].get("group") or 0) == my_group,
-                ),
-                reverse=True,
-            )
+            charging = True
+            fill_now = _skill_fill(rgb, skill)
+            if fill_now is not None and fill_now >= SKILL_FILL_READY:
+                charging = False
+            if charging:
+                found.sort(
+                    key=lambda chain: (
+                        int(chain[0].get("group") or 0) == my_group,
+                        len(chain),
+                    ),
+                    reverse=True,
+                )
+            else:
+                found.sort(
+                    key=lambda chain: (
+                        len(chain),
+                        int(chain[0].get("group") or 0) == my_group,
+                    ),
+                    reverse=True,
+                )
         if found:
             say("候補 " + " / ".join(str(len(item)) for item in found))
         has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
@@ -391,10 +486,15 @@ def run_play(
                 ok = erased_now or fever_on or (kind == "fan" and bool(found))
                 record_hud(old_sit, kind, pressed, ok)
             pending_hud = []
-        if _press_skill(skill, image, rgb, say, stop, last_skill_at, pending_hud, sit):
+        tapped, skill_wait_empty = _press_skill(
+            skill, image, rgb, say, stop, last_skill_at, skill_wait_empty, pending_hud, sit
+        )
+        if tapped:
             last_skill_at = time.time()
             skill_taps += 1
         skill_fill = _skill_fill(rgb, skill)
+        if gauges is not None:
+            gauges(skill_fill, fever_fill)
         if found:
             used: set[tuple[int, int]] = set()
             last_chain: list[dict[str, int]] | None = None
@@ -432,9 +532,7 @@ def run_play(
                     skip_chains.append(key)
                     skip_born[key] = time.time()
                     burst_skip.append(key)
-                    if watch_hit.is_set():
-                        timeup = True
-                        break
+                    break
             finally:
                 watching.clear()
             if timeup or watch_hit.is_set():
@@ -492,15 +590,6 @@ def run_play(
                 pending_lesson = ([len(item) for item in found], len(last_chain))
                 pending_at = time.time()
                 pending_skip = pending_skip + burst_skip
-            did, cell = _tap_biggest_bomb(
-                pieces, image, say, stop, game, skip_bomb_cells
-            )
-            if did:
-                bomb_taps += 1
-                last_bomb_at = time.time()
-                if cell is not None:
-                    skip_bomb_cells.add(cell)
-                pending_hud.append((sit, "bomb", True))
             continue
         if preview is not None:
             preview(_draw_plan(image, pieces, [], game, skill_fill))
@@ -760,24 +849,34 @@ def _press_skill(
     say: StatusFn,
     stop: Event | None,
     last_skill_at: float,
+    wait_empty: bool,
     pending_hud: list[tuple[str, str, bool]],
     sit: str,
-) -> bool:
+) -> tuple[bool, bool]:
     if skill is None:
         say("スキル枠がありません")
-        return False
+        return False, wait_empty
+    fill = _skill_fill(rgb, skill)
+    if wait_empty:
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            wait_empty = False
+        else:
+            return False, wait_empty
     if time.time() - last_skill_at < SKILL_GAP:
-        return False
+        return False, wait_empty
     if not _skill_ready(rgb, skill):
-        return False
+        return False, wait_empty
     pending_hud.append((sit, "skill", True))
     _tap_skill(skill, image, say, stop)
-    return True
+    return True, True
 
 
 def _skill_ready(rgb, skill: dict[str, int]) -> bool:
     if rgb is None:
         return False
+    fill = _skill_fill(rgb, skill)
+    if fill is not None and fill >= SKILL_FILL_READY:
+        return True
     yellow, blue = _skill_ring_yellow_blue(rgb, skill)
     if yellow + blue < SLOT_ON:
         return False
@@ -845,55 +944,34 @@ def _skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
     crop = rgb.crop((left, top, right, bottom))
     width, height = crop.size
     pixels = crop.load()
-    xs: list[int] = []
-    ys: list[int] = []
-    for yy in range(height):
-        for xx in range(width):
-            red, green, blue_v = pixels[xx, yy][:3]
-            if max(red, green, blue_v) >= 89:
-                xs.append(xx)
-                ys.append(yy)
-    if not xs:
-        return 0.0
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
-    edges: list[int] = []
-    for index in range(72):
-        ang = -math.pi / 2.0 + (2.0 * math.pi * index / 72.0)
-        cos_a = math.cos(ang)
-        sin_a = math.sin(ang)
-        for dist in range(8, max(width, height)):
-            xx = int(round(cx + cos_a * dist))
-            yy = int(round(cy + sin_a * dist))
-            if xx < 0 or yy < 0 or xx >= width or yy >= height:
-                break
-            red, green, blue_v = pixels[xx, yy][:3]
-            if max(red, green, blue_v) < 56:
-                edges.append(dist)
-                break
-    if len(edges) >= 36:
-        radius = float(sorted(edges)[len(edges) // 2])
-    else:
-        radius = min(width, height) / 2.0
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    radius = min(width, height) / 2.0
     filled = 0
-    total = 0
-    ring = radius * 0.92
-    for index in range(72):
-        ang = -math.pi / 2.0 + (2.0 * math.pi * index / 72.0)
-        xx = int(round(cx + math.cos(ang) * ring))
-        yy = int(round(cy + math.sin(ang) * ring))
-        if xx < 0 or yy < 0 or xx >= width or yy >= height:
-            continue
-        red, green, blue_v = pixels[xx, yy][:3]
-        hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
-        total += 1
-        if 0.05 <= hue <= 0.20 and sat >= 0.20 and val >= 0.45:
-            filled += 1
-        elif 0.48 <= hue <= 0.58 and sat >= 0.45 and val >= 0.75:
-            filled += 1
-    if total <= 0:
+    empty = 0
+    for frac in (0.60, 0.70):
+        ring = radius * frac
+        for index in range(72):
+            ang = -math.pi / 2.0 + (2.0 * math.pi * index / 72.0)
+            xx = int(round(cx + math.cos(ang) * ring))
+            yy = int(round(cy + math.sin(ang) * ring))
+            if xx < 0 or yy < 0 or xx >= width or yy >= height:
+                continue
+            red, green, blue_v = pixels[xx, yy][:3]
+            hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
+            if 0.05 <= hue <= 0.20 and sat >= 0.22 and val >= 0.50:
+                filled += 1
+            elif 0.48 <= hue <= 0.58 and sat >= 0.45 and val >= 0.75:
+                filled += 1
+            elif val < 0.42:
+                empty += 1
+            elif 0.55 <= hue <= 0.72 and sat >= 0.22 and val < 0.75:
+                empty += 1
+            elif sat < 0.25 and val < 0.60:
+                empty += 1
+    if filled + empty <= 0:
         return 0.0
-    return filled / total
+    return filled / (filled + empty)
 
 
 def _press_fan(
@@ -1271,7 +1349,11 @@ def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
 def _replay_after_timeup(predictor, say: StatusFn, stop: Event | None) -> bool:
     if not _wait_and_tap_retry(predictor, say, stop):
         return False
-    return _wait_and_tap_start(say, stop)
+    _sleep_stop(1.0, stop)
+    _seen, _locked, arrived = _click_start_or_continue(
+        say, stop, tap_start=True, skip_retry=True
+    )
+    return arrived in ("start", "continue")
 
 
 def _tap_point(image: QImage, x: int, y: int) -> None:
@@ -1372,7 +1454,118 @@ def _sleep_stop(seconds: float, stop: Event | None) -> None:
         time.sleep(min(0.2, max(0.0, end - time.time())))
 
 
-def _click_start_or_continue(say: StatusFn, stop: Event | None) -> tuple[int, bool]:
+_ANALYZE_ROOT = TRAINER_ROOT.parent / "tsumtsum-analyze"
+_TSUM_READER = None
+
+
+def _used_tsum_reader():
+    global _TSUM_READER
+    if _TSUM_READER is not None:
+        return _TSUM_READER
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import TsumReader
+
+    _TSUM_READER = TsumReader()
+    return _TSUM_READER
+
+
+def _read_used_tsum(path: Path) -> str:
+    from PIL import Image
+
+    try:
+        reader = _used_tsum_reader()
+        from tsumtsum_analyze.item_teach import (
+            _crop_screen_tsum,
+            _image_to_feature,
+            _l1_distance,
+            shown_tsum_name,
+        )
+
+        with Image.open(path) as opened:
+            view = _portrait_frame(opened.convert("RGB"))
+            target = _image_to_feature(_crop_screen_tsum(view))
+        best_id = ""
+        best_dist = math.inf
+        for tsum_id, proto_list in reader._prototypes.items():
+            dist = min(_l1_distance(target, proto) for proto in proto_list)
+            if dist < best_dist:
+                best_dist = dist
+                best_id = tsum_id
+        if not best_id or best_dist > 0.12:
+            return ""
+        return shown_tsum_name(reader._display.get(best_id, best_id))
+    except Exception:
+        return ""
+
+
+def used_tsum_names() -> list[str]:
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import tsum_class_names
+
+    return tsum_class_names()
+
+
+def save_used_tsum_teach(path: Path, name: str, folder_id: str | None = None) -> str:
+    from PIL import Image
+
+    global _TSUM_READER
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import save_tsum_screen
+
+    with Image.open(path) as opened:
+        view = _portrait_frame(opened.convert("RGB"))
+    dest = Path(tempfile.gettempdir()) / "tsum_used_teach.png"
+    view.save(str(dest), format="PNG")
+    _count, saved = save_tsum_screen(dest, name, folder_id=folder_id)
+    _TSUM_READER = None
+    return saved
+
+
+def register_used_tsum_id(name: str, folder_id: str) -> str:
+    global _TSUM_READER
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import (
+        _dir_name,
+        _ensure_gitkeep,
+        _load_registry,
+        _name_only,
+        _rebuild_tsum_model,
+        _save_registry,
+        tsum_display_name,
+        use_tsums_root,
+    )
+
+    cleaned = _name_only(name)
+    if not cleaned:
+        raise ValueError("ツムの名前を入力してください")
+    tsum_id = _dir_name(folder_id)
+    if not tsum_id:
+        raise ValueError("フォルダ名を入力してください")
+    folder = use_tsums_root() / tsum_id
+    folder.mkdir(parents=True, exist_ok=True)
+    _ensure_gitkeep(folder)
+    registry = _load_registry()
+    registry[tsum_id] = cleaned
+    _save_registry(registry)
+    _rebuild_tsum_model(tsum_id)
+    _TSUM_READER = None
+    return tsum_display_name(tsum_id)
+
+
+def _click_start_or_continue(
+    say: StatusFn,
+    stop: Event | None,
+    tap_start: bool = True,
+    skip_retry: bool = False,
+) -> tuple[int, bool, str]:
     deadline = time.time() + 12
     kinds = 5
     locked = False
@@ -1392,11 +1585,98 @@ def _click_start_or_continue(say: StatusFn, stop: Event | None) -> tuple[int, bo
         if used is not None:
             kinds = 4 if used else 5
             locked = True
-        if _tap_start_or_continue(image, say, stop):
-            return kinds, locked
-        say("スタートまたは続けるを待っています")
-        _sleep_stop(0.35, stop)
-    return kinds, locked
+        start = _match_start_button(image)
+        if start is not None:
+            name = _read_used_tsum(path)
+            if name:
+                say(f"使用ツム {name}")
+            if tap_start:
+                say("スタートをクリックします")
+                _slow_tap(start.center().x(), start.center().y())
+                _sleep_stop(1.2, stop)
+            else:
+                say("スタートを検出しました")
+            return kinds, locked, "start"
+        pause = _pause_continue_button(image)
+        if pause is not None:
+            if tap_start:
+                say("続けるをクリックします")
+                _slow_tap(pause.center().x(), pause.center().y())
+                _sleep_stop(1.2, stop)
+            else:
+                say("続けるを検出しました")
+            return kinds, locked, "continue"
+        if _in_play_hud(image):
+            return kinds, locked, ""
+        retry = None if skip_retry else _retry_button(image)
+        if retry is not None:
+            say("リトライをクリックします")
+            _slow_tap(retry.center().x(), retry.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        play = _play_button(image)
+        if play is not None:
+            say("プレイをクリックします")
+            _slow_tap(play.center().x(), play.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        close = _close_button(image)
+        if close is not None:
+            say("とじるをクリックします")
+            _slow_tap(close.center().x(), close.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        resume = _continue_button(image)
+        if resume is not None:
+            if tap_start:
+                say("続けるをクリックします")
+                _slow_tap(resume.center().x(), resume.center().y())
+                _sleep_stop(1.2, stop)
+            else:
+                say("続けるを検出しました")
+            return kinds, locked, "continue"
+        say("画面の最上部をタップします")
+        _slow_tap(image.width() // 2, 1)
+        _sleep_stop(1.2, stop)
+        deadline = max(deadline, time.time() + 12)
+    return kinds, locked, ""
+
+
+def _tap_start_now(say: StatusFn, stop: Event | None) -> bool:
+    try:
+        path = capture_screen_path()
+        image = QImage(str(path))
+    except Exception:
+        return False
+    if image.isNull():
+        return False
+    start = _match_start_button(image)
+    if start is None:
+        return False
+    say("スタートをクリックします")
+    _slow_tap(start.center().x(), start.center().y())
+    _sleep_stop(1.2, stop)
+    return True
+
+
+def _tap_continue_now(say: StatusFn, stop: Event | None) -> bool:
+    try:
+        path = capture_screen_path()
+        image = QImage(str(path))
+    except Exception:
+        return False
+    if image.isNull():
+        return False
+    resume = _pause_continue_button(image) or _continue_button(image)
+    if resume is None:
+        return False
+    say("続けるをクリックします")
+    _slow_tap(resume.center().x(), resume.center().y())
+    _sleep_stop(1.2, stop)
+    return True
 
 
 def _tap_start_or_continue(image: QImage, say: StatusFn, stop: Event | None) -> bool:

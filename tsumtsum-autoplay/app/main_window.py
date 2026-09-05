@@ -6,11 +6,16 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt, QTimer, QEvent
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import QObject, QStandardPaths, Qt, QTimer, QEvent
+from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -19,16 +24,42 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.bluestacks import halt_input, start_tsum, tsum_is_running
+from app.bluestacks import capture_play_frame, halt_input, start_tsum, tsum_is_running
 from app.intro import IntroWorker
 from app.paths import APP_ROOT
-from app.play import PlayWorker, read_kind_count
+from app.play import (
+    PlayWorker,
+    read_kind_count,
+    register_used_tsum_id,
+    save_used_tsum_teach,
+    used_tsum_names,
+)
 
 APP_NAME = "ツムツム オートプレイ"
 _STOP_HOTKEY = 1
 _WM_HOTKEY = 0x0312
 _VK_Q = 0x51
 _MOD_NOREPEAT = 0x4000
+_NOT_CHARM_TSUMS = frozenset(
+    {
+        "ナミネ",
+        "namine",
+        "ガジェット",
+        "gadget",
+        "cバズ",
+        "c_bazu",
+        "キャプテンライトイヤー",
+        "戴冠式エルサ",
+        "coronation_elsa",
+    }
+)
+
+
+def _is_not_charm_tsum(name: str) -> bool:
+    raw = " ".join((name or "").split())
+    if not raw:
+        return False
+    return raw in _NOT_CHARM_TSUMS or raw.casefold() in _NOT_CHARM_TSUMS
 
 
 class DebugWindow(QWidget):
@@ -38,11 +69,23 @@ class DebugWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         layout = QVBoxLayout(self)
+        row = QHBoxLayout()
+        self._gauges = QLabel("スキル  —    フィーバー  —")
+        self._gauges.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._fever_mark = QLabel("FEVER")
+        self._fever_mark.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._set_fever_mark(False)
+        row.addWidget(self._gauges, 1)
+        row.addWidget(self._fever_mark, 0)
+        layout.addLayout(row)
         self._preview = QLabel("なぞる経路")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumHeight(280)
         self._preview.setStyleSheet("background:#111; color:#888;")
         layout.addWidget(self._preview)
+        self._used_tsum = QLabel("使用ツム  —")
+        self._used_tsum.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self._used_tsum)
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(400)
@@ -64,10 +107,29 @@ class DebugWindow(QWidget):
             )
         )
 
+    def set_gauges(self, skill, fever) -> None:
+        skill_s = "—" if skill is None else f"{float(skill):.2f}"
+        fever_s = "—" if fever is None else f"{float(fever):.2f}"
+        self._gauges.setText(f"スキル  {skill_s}    フィーバー  {fever_s}")
+        on = fever is not None and float(fever) >= 0.25
+        self._set_fever_mark(on)
+
+    def _set_fever_mark(self, on: bool) -> None:
+        if on:
+            self._fever_mark.setStyleSheet("color:#FF2A2A; font-weight:700;")
+        else:
+            self._fever_mark.setStyleSheet("color:#888888; font-weight:400;")
+
+    def set_used_tsum(self, name: str) -> None:
+        shown = " ".join((name or "").split()) or "—"
+        self._used_tsum.setText(f"使用ツム  {shown}")
+
     def append(self, text: str) -> None:
         now = datetime.now().strftime("%H:%M:%S")
         self._log.appendPlainText(f"{now}  {text}")
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+        if text.startswith("使用ツム "):
+            self.set_used_tsum(text[len("使用ツム ") :])
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat() and self._on_stop:
@@ -90,6 +152,9 @@ class MainWindow(QMainWindow):
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
         layout.addWidget(self.capture_btn)
+        self.shot_btn = QPushButton("キャプチャー")
+        self.shot_btn.clicked.connect(self.on_capture_screen)
+        layout.addWidget(self.shot_btn)
         self.play_btn = QPushButton("PLAY")
         self.play_btn.clicked.connect(self.on_play)
         layout.addWidget(self.play_btn)
@@ -127,6 +192,7 @@ class MainWindow(QMainWindow):
         self._loop_play = False
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
+        self._selected_used_tsum = ""
         self._debug = DebugWindow()
         self._debug._on_stop = self.on_stop
         self._placed = False
@@ -144,6 +210,23 @@ class MainWindow(QMainWindow):
             self._save_boards.set()
         else:
             self._save_boards.clear()
+
+    def on_capture_screen(self) -> None:
+        try:
+            image = capture_play_frame()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "キャプチャー", str(exc))
+            return
+        if image is None or image.isNull():
+            QMessageBox.warning(self, "キャプチャー", "画面を取れませんでした。")
+            return
+        clip = QApplication.clipboard()
+        if clip is None:
+            QMessageBox.warning(self, "キャプチャー", "クリップボードにコピーできませんでした。")
+            return
+        clip.setImage(image)
+        self._debug.set_preview(image)
+        self._set_status("キャプチャーしました。貼り付けできます")
 
     def on_play(self) -> None:
         self._begin_play(loop=False)
@@ -169,7 +252,10 @@ class MainWindow(QMainWindow):
             self._set_status("起動しています")
             self._start_intro()
             return
-        self._start_play(loop=loop)
+        if loop:
+            self._start_play(start_match=True, ask_kinds=True, loop=True)
+            return
+        self._start_play(loop=False)
 
     def on_play_now(self) -> None:
         if self._is_busy():
@@ -177,37 +263,17 @@ class MainWindow(QMainWindow):
         if not tsum_is_running():
             QMessageBox.information(self, "今すぐプレイ", "ツムツムが起動していません。")
             return
-        kinds = self._ask_kind_count()
-        if kinds is None:
-            return
-        charm = self._ask_charm_tsum()
-        if charm is None:
-            return
-        if charm:
-            kinds = max(1, kinds - 1)
         self._stop.clear()
         self._set_running(True)
         self._set_status("今すぐプレイ")
-        self._start_play(start_match=True, kind_count=kinds, loop=False)
+        self._start_play(start_match=True, ask_kinds=True, loop=False)
 
     def _ask_kind_count(self) -> int | None:
         guess = read_kind_count()
+        if guess in (4, 5):
+            return guess
         box = QMessageBox(self)
         box.setWindowTitle("今すぐプレイ")
-        if guess in (4, 5):
-            box.setText(f"種類は {guess} ですか？")
-            box.setInformativeText("合っていればそのままスタート。")
-            yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
-            no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
-            box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(yes)
-            box.exec()
-            clicked = box.clickedButton()
-            if clicked is yes:
-                return guess
-            if clicked is no:
-                return 5 if guess == 4 else 4
-            return None
         box.setText("種類は何種類ですか？")
         four = box.addButton("4種類", QMessageBox.ButtonRole.AcceptRole)
         five = box.addButton("5種類", QMessageBox.ButtonRole.AcceptRole)
@@ -292,9 +358,11 @@ class MainWindow(QMainWindow):
         start_match: bool = False,
         kind_count: int | None = None,
         loop: bool | None = None,
+        ask_kinds: bool = False,
     ) -> None:
         if loop is None:
             loop = self._loop_play
+        self._selected_used_tsum = ""
         self._play = PlayWorker(
             self._stop,
             self,
@@ -302,13 +370,239 @@ class MainWindow(QMainWindow):
             kind_count=kind_count,
             save_boards=self._save_boards.is_set,
             loop=loop,
+            ask_kinds=ask_kinds,
         )
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
+        self._play.gauges.connect(self._debug.set_gauges)
         self._play.failed.connect(self._on_play_fail)
         self._play.stopped.connect(self._on_stopped)
         self._play.completed.connect(self._on_play_done)
+        if ask_kinds:
+            self._play.need_kinds.connect(self._on_need_kinds)
+            self._play.need_used_tsum.connect(self._on_need_used_tsum)
         self._play.start()
+
+    def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
+        play = self._play
+        if play is None:
+            return
+        screen = Path(path) if path else None
+        name = self._confirm_used_tsum(guess, screen, pick_only)
+        if name is None:
+            play.provide_used_tsum(None)
+            self.on_stop()
+            return
+        self._selected_used_tsum = name
+        play.provide_used_tsum(name)
+
+    def _confirm_used_tsum(
+        self, guess: str, path: Path | None, pick_only: bool = False
+    ) -> str | None:
+        if pick_only:
+            return self._choose_used_tsum(path)
+        box = QMessageBox(self)
+        box.setWindowTitle("今すぐプレイ")
+        box.setWindowModality(Qt.WindowModality.ApplicationModal)
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        if guess:
+            box.setText(f"使用ツムは {guess} ですか？")
+            yes = box.addButton("はい", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            box.setText("使用ツムが分かっていません。")
+            yes = None
+        no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+        new = box.addButton("新規", QMessageBox.ButtonRole.ActionRole)
+        cancel = box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        no.setAutoDefault(False)
+        new.setAutoDefault(False)
+        cancel.setAutoDefault(False)
+        if yes is not None:
+            yes.setAutoDefault(True)
+            yes.setDefault(True)
+            box.setDefaultButton(yes)
+
+        class _EnterYes(QObject):
+            def eventFilter(self, watched, event) -> bool:
+                if event.type() != QEvent.Type.KeyPress or event.isAutoRepeat():
+                    return False
+                if event.key() not in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    return False
+                if yes is None:
+                    return False
+                yes.click()
+                return True
+
+        filt = _EnterYes(box)
+        app = QApplication.instance()
+        box.installEventFilter(filt)
+        if app is not None:
+            app.installEventFilter(filt)
+        box.raise_()
+        box.activateWindow()
+        if yes is not None:
+            yes.setFocus()
+        try:
+            box.exec()
+        finally:
+            if app is not None:
+                app.removeEventFilter(filt)
+        clicked = box.clickedButton()
+        if yes is not None and clicked is yes:
+            return guess
+        if clicked is no:
+            return self._pick_used_tsum(guess, path)
+        if clicked is new:
+            return self._register_used_tsum(path)
+        return None
+
+    def _choose_used_tsum(self, path: Path | None) -> str | None:
+        names = used_tsum_names()
+        if not names:
+            return self._register_used_tsum(path)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("使用ツムはどれですか？"))
+        name_list = QListWidget()
+        for name in names:
+            name_list.addItem(name)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        buttons = QDialogButtonBox()
+        ok_btn = buttons.addButton("これにします", QDialogButtonBox.ButtonRole.AcceptRole)
+        new_btn = buttons.addButton("新規", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        layout.addWidget(buttons)
+        name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        new_btn.clicked.connect(lambda: dialog.done(2))
+        result = dialog.exec()
+        if result == 2:
+            return self._register_used_tsum(path)
+        if result != QDialog.DialogCode.Accepted:
+            return None
+        row = name_list.currentItem()
+        if row is None:
+            return None
+        if path is not None and path.is_file():
+            return self._save_used_tsum_choice(path, row.text(), None)
+        return row.text()
+
+    def _pick_used_tsum(self, guess: str, path: Path | None) -> str | None:
+        names = [name for name in used_tsum_names() if name != guess]
+        if not names:
+            QMessageBox.information(
+                self,
+                "今すぐプレイ",
+                "まだ種類がありません。「新規」で名前を付けてください。",
+            )
+            return self._register_used_tsum(path)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("どれですか？"))
+        name_list = QListWidget()
+        for name in names:
+            name_list.addItem(name)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn.setText("これに直す")
+        cancel_btn.setText("やめる")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        row = name_list.currentItem()
+        if row is None:
+            return None
+        return self._save_used_tsum_choice(path, row.text(), None)
+
+    def _register_used_tsum(self, path: Path | None) -> str | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("ツム名"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("ガジェット")
+        layout.addWidget(name_edit)
+        layout.addWidget(QLabel("フォルダ名"))
+        dir_edit = QLineEdit()
+        dir_edit.setPlaceholderText("Gadget")
+        layout.addWidget(dir_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn.setText("保存する")
+        cancel_btn.setText("やめる")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_edit.returnPressed.connect(dialog.accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        name = " ".join(name_edit.text().split())
+        folder_id = "".join(dir_edit.text().split())
+        if not name:
+            QMessageBox.information(self, "今すぐプレイ", "ツム名を入力してください。")
+            return None
+        if not folder_id:
+            QMessageBox.information(self, "今すぐプレイ", "フォルダ名を入力してください。")
+            return None
+        return self._save_used_tsum_choice(path, name, folder_id)
+
+    def _save_used_tsum_choice(
+        self, path: Path | None, name: str, folder_id: str | None
+    ) -> str | None:
+        try:
+            if path is not None and path.is_file():
+                saved = save_used_tsum_teach(path, name, folder_id)
+            elif folder_id:
+                saved = register_used_tsum_id(name, folder_id)
+            else:
+                return name
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存できませんでした", str(exc))
+            return None
+        self._set_status(f"使用ツム {saved}")
+        return saved
+
+    def _on_need_kinds(self) -> None:
+        play = self._play
+        if play is None:
+            return
+        kinds = self._ask_kind_count()
+        if kinds is None:
+            play.provide_kinds(None)
+            self.on_stop()
+            return
+        charm = False
+        if not _is_not_charm_tsum(self._selected_used_tsum):
+            asked = self._ask_charm_tsum()
+            if asked is None:
+                play.provide_kinds(None)
+                self.on_stop()
+                return
+            charm = asked
+        if charm:
+            kinds = max(1, kinds - 1)
+        play.provide_kinds(kinds)
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -386,7 +680,10 @@ class MainWindow(QMainWindow):
         if self._stop.is_set():
             self._on_stopped()
             return
-        self._start_play(loop=self._loop_play)
+        if self._loop_play:
+            self._start_play(start_match=True, ask_kinds=True, loop=True)
+            return
+        self._start_play(loop=False)
 
     def _on_intro_fail(self, message: str) -> None:
         self._set_running(False)

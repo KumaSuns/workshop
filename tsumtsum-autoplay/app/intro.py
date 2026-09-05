@@ -354,6 +354,8 @@ def _color_pills(image: QImage, match, max_w_frac: float) -> list[QRect]:
 
 
 def _play_button(image: QImage) -> QRect | None:
+    if _retry_button(image) is not None or _pause_continue_button(image) is not None:
+        return None
     bottom = [
         pill
         for pill in _yellow_pills(image)
@@ -364,7 +366,7 @@ def _play_button(image: QImage) -> QRect | None:
     play = max(bottom, key=lambda rect: rect.width() * rect.height())
     if play.width() < image.width() * 0.18:
         return None
-    if abs(play.center().x() - image.width() / 2) > image.width() * 0.22:
+    if abs(play.center().x() - image.width() / 2) > image.width() * 0.15:
         return None
     return play
 
@@ -419,6 +421,8 @@ def _retry_is_orange(image: QImage, rect: QRect) -> bool:
 
 
 def _continue_button(image: QImage) -> QRect | None:
+    if _retry_button(image) is not None:
+        return None
     low = [
         pill
         for pill in _yellow_pills(image, max_w_frac=0.85)
@@ -433,12 +437,54 @@ def _continue_button(image: QImage) -> QRect | None:
     return button
 
 
+def _pause_continue_button(image: QImage) -> QRect | None:
+    resume = _continue_button(image)
+    if resume is None:
+        return None
+    above = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() < resume.y()
+        and pill.center().y() > image.height() * 0.55
+        and pill.width() >= image.width() * 0.22
+    ]
+    left = [pill for pill in above if pill.center().x() < image.width() * 0.45]
+    right = [pill for pill in above if pill.center().x() > image.width() * 0.55]
+    if not left or not right:
+        return None
+    redo = max(left, key=lambda rect: rect.width() * rect.height())
+    home = max(right, key=lambda rect: rect.width() * rect.height())
+    if abs(redo.center().y() - home.center().y()) > image.height() * 0.04:
+        return None
+    if resume.y() < max(redo.bottom(), home.bottom()) + image.height() * 0.03:
+        return None
+    return resume
+
+
+def _in_play_hud(image: QImage) -> bool:
+    yellows = _yellow_pills(image)
+    top_right = any(
+        pill.center().y() < image.height() * 0.22
+        and pill.center().x() > image.width() * 0.70
+        and pill.width() < image.width() * 0.22
+        for pill in yellows
+    )
+    bot_right = any(
+        pill.center().y() > image.height() * 0.75
+        and pill.center().x() > image.width() * 0.70
+        and pill.width() < image.width() * 0.22
+        for pill in yellows
+    )
+    return top_right and bot_right
+
+
 def _match_start_button(image: QImage) -> QRect | None:
     low = [
         pill
-        for pill in _pink_pills(image)
-        if pill.center().y() > image.height() * 0.55
-        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.22
+        for pill in _pink_pills(image, max_w_frac=0.62)
+        if pill.center().y() > image.height() * 0.70
+        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.18
+        and pill.width() <= max(1, pill.height()) * 5
     ]
     if not low:
         return None
@@ -468,9 +514,19 @@ def _cancel_button(image: QImage) -> QRect | None:
 
 
 def _close_button(image: QImage) -> QRect | None:
-    if _play_button(image) is not None or _cancel_button(image) is not None:
+    if (
+        _play_button(image) is not None
+        or _cancel_button(image) is not None
+        or _pause_continue_button(image) is not None
+        or _in_play_hud(image)
+    ):
         return None
-    pills = _yellow_pills(image)
+    pills = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() > image.height() * 0.55
+        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.28
+    ]
     if not pills:
         return None
     if len(pills) >= 3:
