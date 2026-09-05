@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import colorsys
 import json
+import math
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -316,7 +317,6 @@ def run_play(
             erased = not _spots_lingered(rgb, pending_spots)
             if pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN:
                 erased = True
-            waited = time.time() - pending_at if pending_at else 0.0
             if erased:
                 if pending_lesson is not None:
                     record_pick(pending_lesson[0], pending_lesson[1], True)
@@ -332,10 +332,13 @@ def run_play(
                 with _gpu_lock:
                     coin = _read_coin(predictor, rgb, last_boxes)
                 say(_counts_line(clears, swipes, coin))
-            elif waited >= 0.6:
+            else:
                 if pending_lesson is not None:
                     record_pick(pending_lesson[0], pending_lesson[1], False)
                     pending_lesson = None
+                miss_at = time.time()
+                for key in pending_skip:
+                    skip_born[key] = miss_at
                 pending_spots = None
                 pending_key = None
                 pending_n = 0
@@ -391,6 +394,7 @@ def run_play(
         if _press_skill(skill, image, rgb, say, stop, last_skill_at, pending_hud, sit):
             last_skill_at = time.time()
             skill_taps += 1
+        skill_fill = _skill_fill(rgb, skill)
         if found:
             used: set[tuple[int, int]] = set()
             last_chain: list[dict[str, int]] | None = None
@@ -417,6 +421,7 @@ def run_play(
                         stop,
                         preview,
                         watch_hit,
+                        skill_fill,
                     ):
                         continue
                     swipes += 1
@@ -497,10 +502,8 @@ def run_play(
                     skip_bomb_cells.add(cell)
                 pending_hud.append((sit, "bomb", True))
             continue
-        if pending_spots is not None:
-            continue
         if preview is not None:
-            preview(_draw_plan(image, pieces, [], game))
+            preview(_draw_plan(image, pieces, [], game, skill_fill))
         if saw_board and (skill is None or fan is None):
             with _gpu_lock:
                 boxes = predictor.predict_all(Path("."), rgb=rgb)
@@ -554,6 +557,7 @@ def _swipe_chain(
     stop: Event | None,
     preview: Callable[[QImage], None] | None,
     abort: Event | None = None,
+    skill_fill: float | None = None,
 ) -> bool:
     points = [(int(piece["x"]), int(piece["y"])) for piece in chain]
     cells = {(x // 24, y // 24) for x, y in points}
@@ -564,7 +568,7 @@ def _swipe_chain(
     say(f"ツム {tsum_count}体 / チェーン {len(chain)}体")
     say(f"経路 {route}")
     if preview is not None:
-        preview(_draw_plan(image, pieces, chain, game))
+        preview(_draw_plan(image, pieces, chain, game, skill_fill))
     say("なぞっています")
     _check_stop(stop)
     how = swipe_path(
@@ -814,6 +818,82 @@ def _skill_ring_yellow_blue(image, box: dict[str, int]) -> tuple[float, float]:
     if total <= 0:
         return 0.0, 0.0
     return yellow / total, blue / total
+
+
+def _skill_button_square(box: dict[str, int]) -> dict[str, int]:
+    x = int(box["x"])
+    y = int(box["y"])
+    width = max(1, int(box["w"]))
+    height = max(1, int(box["h"]))
+    if height > width:
+        return {"x": x, "y": y, "w": width, "h": width}
+    if width > height:
+        return {"x": x, "y": y, "w": height, "h": height}
+    return {"x": x, "y": y, "w": width, "h": height}
+
+
+def _skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
+    if rgb is None or skill is None:
+        return None
+    box = _skill_button_square(skill)
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(rgb.width, left + max(1, int(box["w"])))
+    bottom = min(rgb.height, top + max(1, int(box["h"])))
+    if right - left < 8 or bottom - top < 8:
+        return 0.0
+    crop = rgb.crop((left, top, right, bottom))
+    width, height = crop.size
+    pixels = crop.load()
+    xs: list[int] = []
+    ys: list[int] = []
+    for yy in range(height):
+        for xx in range(width):
+            red, green, blue_v = pixels[xx, yy][:3]
+            if max(red, green, blue_v) >= 89:
+                xs.append(xx)
+                ys.append(yy)
+    if not xs:
+        return 0.0
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    edges: list[int] = []
+    for index in range(72):
+        ang = -math.pi / 2.0 + (2.0 * math.pi * index / 72.0)
+        cos_a = math.cos(ang)
+        sin_a = math.sin(ang)
+        for dist in range(8, max(width, height)):
+            xx = int(round(cx + cos_a * dist))
+            yy = int(round(cy + sin_a * dist))
+            if xx < 0 or yy < 0 or xx >= width or yy >= height:
+                break
+            red, green, blue_v = pixels[xx, yy][:3]
+            if max(red, green, blue_v) < 56:
+                edges.append(dist)
+                break
+    if len(edges) >= 36:
+        radius = float(sorted(edges)[len(edges) // 2])
+    else:
+        radius = min(width, height) / 2.0
+    filled = 0
+    total = 0
+    ring = radius * 0.92
+    for index in range(72):
+        ang = -math.pi / 2.0 + (2.0 * math.pi * index / 72.0)
+        xx = int(round(cx + math.cos(ang) * ring))
+        yy = int(round(cy + math.sin(ang) * ring))
+        if xx < 0 or yy < 0 or xx >= width or yy >= height:
+            continue
+        red, green, blue_v = pixels[xx, yy][:3]
+        hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
+        total += 1
+        if 0.05 <= hue <= 0.20 and sat >= 0.20 and val >= 0.45:
+            filled += 1
+        elif 0.48 <= hue <= 0.58 and sat >= 0.45 and val >= 0.75:
+            filled += 1
+    if total <= 0:
+        return 0.0
+    return filled / total
 
 
 def _press_fan(
@@ -1660,6 +1740,7 @@ def _draw_plan(
     pieces: list[dict[str, int]],
     chain: list[dict[str, int]],
     game: dict[str, int] | None,
+    skill_fill: float | None = None,
 ) -> QImage:
     if image.isNull():
         return image
@@ -1703,6 +1784,18 @@ def _draw_plan(
         painter.drawEllipse(QPoint(x, y), radius, radius)
         painter.setPen(QColor("#1A1A1A"))
         painter.drawText(QRect(x - radius, y - radius, radius * 2, radius * 2), Qt.AlignmentFlag.AlignCenter, str(index))
+    if skill_fill is not None:
+        label = f"{skill_fill:.2f}"
+        fill_font = QFont()
+        fill_font.setBold(True)
+        fill_font.setPixelSize(max(64, painted.width() // 6))
+        painter.setFont(fill_font)
+        box = QRect(8, 8, max(1, painted.width() - 16), fill_font.pixelSize() + 24)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 180))
+        painter.drawRect(box)
+        painter.setPen(QColor("#FFE066"))
+        painter.drawText(box, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
     painter.end()
     return painted
 

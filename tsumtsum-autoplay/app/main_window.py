@@ -333,7 +333,7 @@ class MainWindow(QMainWindow):
         self._debug.move(area.right() - dbg.width() + 1, area.top())
         dbg = self._debug.frameGeometry()
         main = self.frameGeometry()
-        self.move(max(area.left(), dbg.left() - main.width() - 8), dbg.top())
+        self.move(max(area.left(), dbg.left() - main.width() - 40), dbg.top())
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
