@@ -38,10 +38,12 @@ from app.play_style import (
     hud_net,
     hud_situation,
     load_unlike,
+    order_found,
     rank,
     record_hud,
     record_pick,
     record_play,
+    record_rl_match,
     unlike_hit,
 )
 from app.trainer_bridge import (
@@ -238,6 +240,7 @@ def run_play(
     pending_burst = 1
     pending_group = 0
     pending_skip: list[frozenset[tuple[int, int]]] = []
+    match_picks: list[tuple[list[int], int]] = []
     pieces: list[dict[str, int]] = []
 
     def fresh_match() -> None:
@@ -247,7 +250,7 @@ def run_play(
         nonlocal clears, swipes, coin, skill_taps, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_skip, skip_chains, skip_born, saved_boards
-        nonlocal my_group
+        nonlocal my_group, match_picks
         game = None
         skill = None
         fever = None
@@ -279,6 +282,7 @@ def run_play(
         pending_burst = 1
         pending_group = 0
         pending_skip = []
+        match_picks = []
         skip_chains = []
         skip_born = {}
         saved_boards = set()
@@ -371,7 +375,18 @@ def run_play(
             say("TIME UP / " + _counts_line(clears, swipes, coin))
             ended = True
         if ended:
-            record_play(clears, swipes, skill_taps, bomb_taps, fan_taps)
+            _note_match_end(
+                predictor,
+                rgb,
+                last_boxes,
+                clears,
+                swipes,
+                skill_taps,
+                bomb_taps,
+                fan_taps,
+                match_picks,
+                coin,
+            )
             watch_hit.clear()
             if not loop:
                 stop_watch.set()
@@ -524,6 +539,8 @@ def run_play(
             key for key in skip_chains if now - skip_born.get(key, 0) < SKIP_TTL
         ]
         skip_chains = _prune_skip(skip_chains, tsums)
+        pick_opts: list[int] = []
+        pick_n = 0
         found = list_found(pieces, tsums)
         if my_group <= 0 and skill is not None and now - last_skill_look >= 2.0:
             last_skill_look = now
@@ -533,6 +550,7 @@ def run_play(
                 my_group = looked
                 found = list_found(pieces, tsums)
         if found:
+            found, pick_opts, pick_n = order_found(found)
             say("候補 " + " / ".join(str(len(item)) for item in found))
         has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
         sit = hud_situation(
@@ -593,6 +611,8 @@ def run_play(
                     used |= spots
                     last_chain = chain
                     burst_skip.append(_chain_key(chain))
+                    if chain is found[0] and pick_n >= MIN_CHAIN:
+                        match_picks.append((pick_opts, pick_n))
             finally:
                 watching.clear()
             if timeup or watch_hit.is_set():
@@ -627,7 +647,18 @@ def run_play(
                         coin = _read_coin(predictor, check_rgb, last_boxes)
                     say("TIME UP / " + _counts_line(clears, swipes, coin))
             if timeup:
-                record_play(clears, swipes, skill_taps, bomb_taps, fan_taps)
+                _note_match_end(
+                    predictor,
+                    check_rgb,
+                    last_boxes,
+                    clears,
+                    swipes,
+                    skill_taps,
+                    bomb_taps,
+                    fan_taps,
+                    match_picks,
+                    coin,
+                )
                 if not loop:
                     stop_watch.set()
                     watching.clear()
@@ -1395,6 +1426,33 @@ def _end_on_timeup(
     else:
         say(f"TIME UP / {counts}")
     return True
+
+
+def _coin_int(value) -> int:
+    digits = "".join(char for char in str(value or "") if char.isdigit())
+    if not digits:
+        return 0
+    return int(digits)
+
+
+def _note_match_end(
+    predictor,
+    rgb,
+    boxes: dict[str, dict[str, int]] | None,
+    clears: int,
+    swipes: int,
+    skill_taps: int,
+    bomb_taps: int,
+    fan_taps: int,
+    match_picks: list[tuple[list[int], int]],
+    coin,
+) -> None:
+    record_play(clears, swipes, skill_taps, bomb_taps, fan_taps)
+    value = _coin_int(coin)
+    if value <= 0 and rgb is not None:
+        with _gpu_lock:
+            value = _coin_int(_read_coin(predictor, rgb, boxes))
+    record_rl_match(match_picks, value)
 
 
 def _counts_line(clears: int, swipes: int, coin: str = "") -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 from app.paths import APP_ROOT
@@ -9,10 +10,22 @@ PATH = APP_ROOT / "data" / "play_style.json"
 UNLIKE_PATH = APP_ROOT / "data" / "unlike.json"
 UNLIKE_SIM = 0.75
 UNLIKE_MAX = 40
+GOAL_COIN = 1200
+
+
+def _empty_rl() -> dict:
+    return {"n": 0, "baseline": 0.0, "goal_coin": GOAL_COIN, "choices": {}}
 
 
 def _empty() -> dict:
-    return {"wins": {}, "losses": {}, "follow_max": 3, "plays": [], "hud": {}}
+    return {
+        "wins": {},
+        "losses": {},
+        "follow_max": 3,
+        "plays": [],
+        "hud": {},
+        "rl": _empty_rl(),
+    }
 
 
 def _load() -> dict:
@@ -56,6 +69,7 @@ def _load() -> dict:
         "follow_max": max(1, min(6, follow)),
         "plays": cleaned,
         "hud": hud,
+        "rl": _rl_from(payload.get("rl")),
     }
 
 
@@ -69,6 +83,7 @@ def _save(data: dict) -> None:
                 "follow_max": int(data.get("follow_max") or 3),
                 "plays": data.get("plays") or [],
                 "hud": data.get("hud") or {},
+                "rl": data.get("rl") or _empty_rl(),
             },
             ensure_ascii=False,
             indent=2,
@@ -79,6 +94,89 @@ def _save(data: dict) -> None:
 
 def style_now() -> dict:
     return _load()
+
+
+def _rl_from(raw) -> dict:
+    empty = _empty_rl()
+    if not isinstance(raw, dict):
+        return empty
+    choices_raw = raw.get("choices") if isinstance(raw.get("choices"), dict) else {}
+    choices: dict[str, dict[str, float | int]] = {}
+    for key, item in choices_raw.items():
+        if not isinstance(item, dict):
+            continue
+        choices[str(key)] = {
+            "sum": float(item.get("sum") or 0),
+            "n": int(item.get("n") or 0),
+        }
+    return {
+        "n": int(raw.get("n") or 0),
+        "baseline": float(raw.get("baseline") or 0),
+        "goal_coin": GOAL_COIN,
+        "choices": choices,
+    }
+
+
+def _rl_key(options: list[int], picked: int) -> str:
+    return ",".join(str(n) for n in options) + f":{picked}"
+
+
+def order_found(
+    found: list[list[dict[str, int]]],
+) -> tuple[list[list[dict[str, int]]], list[int], int]:
+    if not found:
+        return found, [], 0
+    options = [len(item) for item in found]
+    if len(found) == 1:
+        return found, options, options[0]
+    data = _load()
+    rl = data.get("rl") if isinstance(data.get("rl"), dict) else _empty_rl()
+    choices = rl.get("choices") if isinstance(rl.get("choices"), dict) else {}
+    matches = int(rl.get("n") or 0)
+    baseline = float(rl.get("baseline") or 0)
+    scores: list[float] = []
+    for item in found:
+        key = _rl_key(options, len(item))
+        entry = choices.get(key) if isinstance(choices.get(key), dict) else None
+        n = int(entry.get("n") or 0) if entry else 0
+        if n > 0:
+            scores.append(float(entry.get("sum") or 0) / n)
+        elif matches > 0:
+            scores.append(baseline)
+        else:
+            scores.append(float(len(item)))
+    if random.randrange(matches + 2) == 0:
+        index = random.randrange(len(found))
+    else:
+        best = max(scores)
+        index = scores.index(best)
+    picked = found[index]
+    rest = [item for i, item in enumerate(found) if i != index]
+    return [picked] + rest, options, len(picked)
+
+
+def record_rl_match(picks: list[tuple[list[int], int]], coin: int) -> None:
+    if coin <= 0 or not picks:
+        return
+    data = _load()
+    rl = _rl_from(data.get("rl"))
+    choices = dict(rl.get("choices") or {})
+    for options, picked in picks:
+        if picked < 3:
+            continue
+        key = _rl_key(options, picked)
+        item = dict(choices.get(key) or {}) if isinstance(choices.get(key), dict) else {}
+        item["sum"] = float(item.get("sum") or 0) + coin
+        item["n"] = int(item.get("n") or 0) + 1
+        choices[key] = item
+    prev_n = int(rl.get("n") or 0)
+    n = prev_n + 1
+    prev_base = float(rl.get("baseline") or 0)
+    rl["choices"] = choices
+    rl["n"] = n
+    rl["baseline"] = (prev_base * prev_n + coin) / n
+    data["rl"] = rl
+    _save(data)
 
 
 def record_play(clears: int, swipes: int, skills: int, bombs: int, fans: int) -> None:
