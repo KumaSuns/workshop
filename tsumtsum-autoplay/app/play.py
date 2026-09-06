@@ -43,7 +43,7 @@ from app.play_style import (
     record_hud,
     record_pick,
     record_play,
-    record_rl_match,
+    record_rl_length,
     unlike_hit,
 )
 from app.trainer_bridge import (
@@ -421,6 +421,56 @@ def run_play(
         if len(tsums) >= BOARD_READY:
             saw_board = True
             kinds_locked = True
+        if saw_board:
+            try:
+                look = capture_play_frame()
+                look_rgb = _qimage_rgb(look)
+            except Exception:
+                look = None
+                look_rgb = None
+            if look is not None and not look.isNull() and look_rgb is not None:
+                image = look
+                rgb = look_rgb
+                ended = _end_on_timeup(
+                    predictor,
+                    image,
+                    rgb,
+                    pending_spots,
+                    clears,
+                    swipes,
+                    pieces,
+                    game,
+                    say,
+                    stop,
+                    timer,
+                    True,
+                    last_boxes,
+                )
+                if not ended and watch_hit.is_set():
+                    say("TIME UP / " + _counts_line(clears, swipes, coin))
+                    ended = True
+                if ended:
+                    _note_match_end(
+                        predictor,
+                        rgb,
+                        last_boxes,
+                        clears,
+                        swipes,
+                        skill_taps,
+                        bomb_taps,
+                        fan_taps,
+                        match_picks,
+                        coin,
+                    )
+                    watch_hit.clear()
+                    if not loop:
+                        stop_watch.set()
+                        watching.clear()
+                        return
+                    _replay_after_timeup(say, stop)
+                    fresh_match()
+                    say("プレイを開始します")
+                    continue
         if saw_board and not hud_ready:
             with _gpu_lock:
                 boxes = predictor.predict_all(Path("."), rgb=rgb)
@@ -580,6 +630,7 @@ def run_play(
             burst = 0
             burst_skip: list[frozenset[tuple[int, int]]] = []
             timeup = watch_hit.is_set()
+            length_pick = False
             watching.set()
             try:
                 used: set[tuple[int, int]] = set()
@@ -612,9 +663,11 @@ def run_play(
                     last_chain = chain
                     burst_skip.append(_chain_key(chain))
                     if chain is found[0] and pick_n >= MIN_CHAIN:
-                        match_picks.append((pick_opts, pick_n))
+                        length_pick = True
             finally:
                 watching.clear()
+            if length_pick:
+                record_rl_length(pick_opts, pick_n)
             if timeup or watch_hit.is_set():
                 timeup = True
                 try:
@@ -1428,13 +1481,6 @@ def _end_on_timeup(
     return True
 
 
-def _coin_int(value) -> int:
-    digits = "".join(char for char in str(value or "") if char.isdigit())
-    if not digits:
-        return 0
-    return int(digits)
-
-
 def _note_match_end(
     predictor,
     rgb,
@@ -1448,11 +1494,6 @@ def _note_match_end(
     coin,
 ) -> None:
     record_play(clears, swipes, skill_taps, bomb_taps, fan_taps)
-    value = _coin_int(coin)
-    if value <= 0 and rgb is not None:
-        with _gpu_lock:
-            value = _coin_int(_read_coin(predictor, rgb, boxes))
-    record_rl_match(match_picks, value)
 
 
 def _counts_line(clears: int, swipes: int, coin: str = "") -> str:

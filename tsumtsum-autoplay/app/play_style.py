@@ -17,6 +17,10 @@ def _empty_rl() -> dict:
     return {"n": 0, "baseline": 0.0, "goal_coin": GOAL_COIN, "choices": {}}
 
 
+def _empty_rl_length() -> dict:
+    return {"n": 0, "baseline": 0.0, "choices": {}}
+
+
 def _empty() -> dict:
     return {
         "wins": {},
@@ -25,6 +29,7 @@ def _empty() -> dict:
         "plays": [],
         "hud": {},
         "rl": _empty_rl(),
+        "rl_length": _empty_rl_length(),
     }
 
 
@@ -70,6 +75,7 @@ def _load() -> dict:
         "plays": cleaned,
         "hud": hud,
         "rl": _rl_from(payload.get("rl")),
+        "rl_length": _rl_length_from(payload.get("rl_length")),
     }
 
 
@@ -84,6 +90,7 @@ def _save(data: dict) -> None:
                 "plays": data.get("plays") or [],
                 "hud": data.get("hud") or {},
                 "rl": data.get("rl") or _empty_rl(),
+                "rl_length": data.get("rl_length") or _empty_rl_length(),
             },
             ensure_ascii=False,
             indent=2,
@@ -112,7 +119,27 @@ def _rl_from(raw) -> dict:
     return {
         "n": int(raw.get("n") or 0),
         "baseline": float(raw.get("baseline") or 0),
-        "goal_coin": GOAL_COIN,
+        "goal_coin": int(raw.get("goal_coin") or GOAL_COIN),
+        "choices": choices,
+    }
+
+
+def _rl_length_from(raw) -> dict:
+    empty = _empty_rl_length()
+    if not isinstance(raw, dict):
+        return empty
+    choices_raw = raw.get("choices") if isinstance(raw.get("choices"), dict) else {}
+    choices: dict[str, dict[str, float | int]] = {}
+    for key, item in choices_raw.items():
+        if not isinstance(item, dict):
+            continue
+        choices[str(key)] = {
+            "sum": float(item.get("sum") or 0),
+            "n": int(item.get("n") or 0),
+        }
+    return {
+        "n": int(raw.get("n") or 0),
+        "baseline": float(raw.get("baseline") or 0),
         "choices": choices,
     }
 
@@ -130,10 +157,9 @@ def order_found(
     if len(found) == 1:
         return found, options, options[0]
     data = _load()
-    rl = data.get("rl") if isinstance(data.get("rl"), dict) else _empty_rl()
+    rl = data.get("rl_length") if isinstance(data.get("rl_length"), dict) else _empty_rl_length()
     choices = rl.get("choices") if isinstance(rl.get("choices"), dict) else {}
     matches = int(rl.get("n") or 0)
-    baseline = float(rl.get("baseline") or 0)
     scores: list[float] = []
     for item in found:
         key = _rl_key(options, len(item))
@@ -141,8 +167,6 @@ def order_found(
         n = int(entry.get("n") or 0) if entry else 0
         if n > 0:
             scores.append(float(entry.get("sum") or 0) / n)
-        elif matches > 0:
-            scores.append(baseline)
         else:
             scores.append(float(len(item)))
     if random.randrange(matches + 2) == 0:
@@ -176,6 +200,27 @@ def record_rl_match(picks: list[tuple[list[int], int]], coin: int) -> None:
     rl["n"] = n
     rl["baseline"] = (prev_base * prev_n + coin) / n
     data["rl"] = rl
+    _save(data)
+
+
+def record_rl_length(options: list[int], picked: int) -> None:
+    if picked < 3:
+        return
+    data = _load()
+    rl = _rl_length_from(data.get("rl_length"))
+    choices = dict(rl.get("choices") or {})
+    key = _rl_key(options, picked)
+    item = dict(choices.get(key) or {}) if isinstance(choices.get(key), dict) else {}
+    item["sum"] = float(item.get("sum") or 0) + picked
+    item["n"] = int(item.get("n") or 0) + 1
+    choices[key] = item
+    prev_n = int(rl.get("n") or 0)
+    n = prev_n + 1
+    prev_base = float(rl.get("baseline") or 0)
+    rl["choices"] = choices
+    rl["n"] = n
+    rl["baseline"] = (prev_base * prev_n + picked) / n
+    data["rl_length"] = rl
     _save(data)
 
 
