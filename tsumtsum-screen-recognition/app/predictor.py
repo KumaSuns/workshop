@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import torch
@@ -16,7 +17,15 @@ from app.digit_model import (
 )
 from app.hud_number import adjust_coin_digits, prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
-from app.piece_model import HEATMAP_SIZE, PIECE_INPUT, PieceNet, heat_to_pixel, peaks_from_heat
+from app.piece_model import (
+    HEATMAP_SIZE,
+    PIECE_INPUT,
+    PieceNet,
+    heat_peaks,
+    heat_to_pixel,
+    nms_peaks,
+    peaks_from_heat,
+)
 from app.paths import WORKSHOP_ROOT
 from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename, piece_radius_from_game
 from app.scene_model import SCENE_CLASSES, SCENE_INPUT, SceneNet
@@ -288,15 +297,71 @@ class Predictor:
         radius = radius[0, 0].cpu()
         pieces: list[dict[str, int]] = []
         board_w = int(game["w"]) if game is not None else crop_w
-        for channel, kind in enumerate(("tsum", "bomb")):
-            for _score, hx, hy, _r_norm in peaks_from_heat(heat[channel], radius):
-                x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
-                r = piece_radius_from_game(board_w, kind)
-                pieces.append(
-                    {"x": int(round(x)), "y": int(round(y)), "r": r, "kind": kind, "group": 1}
-                )
+        pieces.extend(self._tsums_from_heat(heat[0], radius, left, top, crop_w, crop_h, board_w))
+        base_bomb = piece_radius_from_game(board_w, "bomb")
+        for _score, hx, hy, _r_norm in peaks_from_heat(heat[1], radius):
+            x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
+            pieces.append(
+                {
+                    "x": int(round(x)),
+                    "y": int(round(y)),
+                    "r": base_bomb,
+                    "kind": "bomb",
+                    "group": 0,
+                }
+            )
         self._assign_groups(rgb, pieces, kinds=kinds, inner=inner)
         return pieces
+
+    def _tsums_from_heat(
+        self,
+        heat: torch.Tensor,
+        radius_map: torch.Tensor,
+        left: int,
+        top: int,
+        crop_w: int,
+        crop_h: int,
+        board_w: int,
+    ) -> list[dict[str, int]]:
+        base_r = piece_radius_from_game(board_w, "tsum")
+        scale = min(crop_w, crop_h)
+        raw = heat_peaks(heat, radius_map)
+        min_sep = max(2.0, HEATMAP_SIZE / 18.0)
+        kept = nms_peaks(raw, min_sep)
+        found: list[dict[str, int]] = []
+        for score, hx, hy, r_norm in kept:
+            pred_r = max(1, int(round(float(r_norm) * scale)))
+            x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
+            big = False
+            if pred_r >= int(round(base_r * 1.8)):
+                heat_r = pred_r / max(1.0, float(crop_w)) * HEATMAP_SIZE
+                strong = 0
+                for other_score, ox, oy, _or in raw:
+                    if math.hypot(ox - hx, oy - hy) > heat_r:
+                        continue
+                    if other_score >= max(0.22, 0.6 * score):
+                        strong += 1
+                nearby_kept = 0
+                for _s, ox, oy, _or in kept:
+                    if (ox, oy) == (hx, hy):
+                        continue
+                    if math.hypot(ox - hx, oy - hy) <= heat_r:
+                        nearby_kept += 1
+                if strong >= 3 or nearby_kept >= 2:
+                    pred_r = base_r
+                else:
+                    big = True
+            item = {
+                "x": int(round(x)),
+                "y": int(round(y)),
+                "r": int(pred_r if big else base_r),
+                "kind": "tsum",
+                "group": 1,
+            }
+            if big:
+                item["big"] = 1
+            found.append(item)
+        return found
 
     def _assign_groups(
         self,
@@ -351,6 +416,9 @@ class Predictor:
         remap = {old: new for new, old in enumerate(order, start=1)}
         for piece, label in zip(tsums, labels):
             piece["group"] = remap[label]
+        if cosine:
+            for piece, point in zip(tsums, points):
+                piece["_vec"] = tuple(point)
 
     def _cluster_sizes(self, labels: list[int]) -> list[int]:
         counts: dict[int, int] = {}

@@ -100,7 +100,7 @@ def refine_peak(heat: torch.Tensor, x: int, y: int) -> tuple[float, float]:
     return x + dx, y + dy
 
 
-def peaks_from_heat(
+def heat_peaks(
     heat: torch.Tensor,
     radius_map: torch.Tensor,
     threshold: float = 0.22,
@@ -123,8 +123,14 @@ def peaks_from_heat(
             )
         )
     points.sort(reverse=True)
+    return points
+
+
+def nms_peaks(
+    points: list[tuple[float, float, float, float]],
+    min_sep: float,
+) -> list[tuple[float, float, float, float]]:
     kept: list[tuple[float, float, float, float]] = []
-    min_sep = max(2.0, HEATMAP_SIZE / 18.0)
     for score, x, y, radius in points:
         too_close = False
         for _s, ox, oy, _other_r in kept:
@@ -134,3 +140,13 @@ def peaks_from_heat(
         if not too_close:
             kept.append((score, x, y, radius))
     return kept
+
+
+def peaks_from_heat(
+    heat: torch.Tensor,
+    radius_map: torch.Tensor,
+    threshold: float = 0.22,
+) -> list[tuple[float, float, float, float]]:
+    points = heat_peaks(heat, radius_map, threshold)
+    min_sep = max(2.0, HEATMAP_SIZE / 18.0)
+    return nms_peaks(points, min_sep)

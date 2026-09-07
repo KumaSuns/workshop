@@ -11,6 +11,22 @@ UNLIKE_PATH = APP_ROOT / "data" / "unlike.json"
 UNLIKE_SIM = 0.75
 UNLIKE_MAX = 40
 GOAL_COIN = 1200
+_cache: dict | None = None
+_dirty = False
+
+
+def play_coin(value) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    if n >= 3000:
+        return None
+    return n
 
 
 def _empty_rl() -> dict:
@@ -30,18 +46,28 @@ def _empty() -> dict:
         "hud": {},
         "rl": _empty_rl(),
         "rl_length": _empty_rl_length(),
+        "rl_wait": _empty_rl_length(),
+        "rl_bomb": _empty_rl_length(),
+        "rl_skill": _empty_rl_length(),
+        "rl_skill_coin": _empty_rl_length(),
     }
 
 
 def _load() -> dict:
+    global _cache
+    if _cache is not None:
+        return _cache
     if not PATH.is_file():
-        return _empty()
+        _cache = _empty()
+        return _cache
     try:
         payload = json.loads(PATH.read_text(encoding="utf-8"))
     except Exception:
-        return _empty()
+        _cache = _empty()
+        return _cache
     if not isinstance(payload, dict):
-        return _empty()
+        _cache = _empty()
+        return _cache
     wins = payload.get("wins") if isinstance(payload.get("wins"), dict) else {}
     losses = payload.get("losses") if isinstance(payload.get("losses"), dict) else {}
     follow = int(payload.get("follow_max") or 3)
@@ -59,6 +85,12 @@ def _load() -> dict:
                 "fans": int(item.get("fans") or 0),
             }
         )
+        if "skill_ok" in item:
+            cleaned[-1]["skill_ok"] = int(item.get("skill_ok") or 0)
+        if "coin" in item:
+            kept = play_coin(item.get("coin"))
+            if kept is not None:
+                cleaned[-1]["coin"] = kept
     hud_raw = payload.get("hud") if isinstance(payload.get("hud"), dict) else {}
     hud: dict[str, dict[str, int]] = {}
     for key, item in hud_raw.items():
@@ -68,7 +100,7 @@ def _load() -> dict:
             "w": int(item.get("w") or 0),
             "l": int(item.get("l") or 0),
         }
-    return {
+    _cache = {
         "wins": {str(key): int(value) for key, value in wins.items()},
         "losses": {str(key): int(value) for key, value in losses.items()},
         "follow_max": max(1, min(6, follow)),
@@ -76,10 +108,20 @@ def _load() -> dict:
         "hud": hud,
         "rl": _rl_from(payload.get("rl")),
         "rl_length": _rl_length_from(payload.get("rl_length")),
+        "rl_wait": _rl_length_from(payload.get("rl_wait")),
+        "rl_bomb": _rl_length_from(payload.get("rl_bomb")),
+        "rl_skill": _rl_length_from(payload.get("rl_skill")),
+        "rl_skill_coin": _rl_length_from(payload.get("rl_skill_coin")),
     }
+    return _cache
 
 
-def _save(data: dict) -> None:
+def _save(data: dict, disk: bool = False) -> None:
+    global _cache, _dirty
+    _cache = data
+    if not disk:
+        _dirty = True
+        return
     PATH.parent.mkdir(parents=True, exist_ok=True)
     PATH.write_text(
         json.dumps(
@@ -91,16 +133,100 @@ def _save(data: dict) -> None:
                 "hud": data.get("hud") or {},
                 "rl": data.get("rl") or _empty_rl(),
                 "rl_length": data.get("rl_length") or _empty_rl_length(),
+                "rl_wait": data.get("rl_wait") or _empty_rl_length(),
+                "rl_bomb": data.get("rl_bomb") or _empty_rl_length(),
+                "rl_skill": data.get("rl_skill") or _empty_rl_length(),
+                "rl_skill_coin": data.get("rl_skill_coin") or _empty_rl_length(),
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
+    _dirty = False
+
+
+def flush_style() -> None:
+    if _cache is not None and _dirty:
+        _save(_cache, True)
 
 
 def style_now() -> dict:
     return _load()
+
+
+def history_text() -> str:
+    data = _load()
+    length = data.get("rl_length") if isinstance(data.get("rl_length"), dict) else {}
+    coin = data.get("rl") if isinstance(data.get("rl"), dict) else {}
+    wait = data.get("rl_wait") if isinstance(data.get("rl_wait"), dict) else {}
+    bomb = data.get("rl_bomb") if isinstance(data.get("rl_bomb"), dict) else {}
+    plays = list(data.get("plays") or [])
+    length_n = int(length.get("n") or 0)
+    wait_n = int(wait.get("n") or 0)
+    bomb_n = int(bomb.get("n") or 0)
+    coin_n = int(coin.get("n") or 0)
+    length_avg = float(length.get("baseline") or 0)
+    wait_avg = float(wait.get("baseline") or 0)
+    bomb_avg = float(bomb.get("baseline") or 0)
+    coin_avg = float(coin.get("baseline") or 0)
+    goal = int(coin.get("goal_coin") or GOAL_COIN)
+    nw = _num_width(length_n, wait_n, bomb_n, coin_n)
+    aw = max(
+        _num_width(int(length_avg), int(wait_avg), int(bomb_avg), int(coin_avg), goal),
+        len(f"{length_avg:.1f}"),
+        len(f"{wait_avg:.1f}"),
+        len(f"{bomb_avg:.1f}"),
+        len(f"{coin_avg:.1f}"),
+    )
+    lines = [
+        f"長さ   回数 {length_n:>{nw}} / 平均 {length_avg:>{aw}.1f}",
+        f"待ち   回数 {wait_n:>{nw}} / 平均 {wait_avg:>{aw}.1f}秒",
+        f"ボム   回数 {bomb_n:>{nw}} / 平均 {bomb_avg:>{aw}.1f}秒",
+        f"コイン 試合 {coin_n:>{nw}} / 平均 {coin_avg:>{aw}.1f} / 目標 {goal:>{aw}}",
+        "",
+    ]
+    if not plays:
+        return "\n".join(lines)
+    clears = [int(item.get("clears") or 0) for item in plays]
+    swipes = [int(item.get("swipes") or 0) for item in plays]
+    cw = _num_width(*clears)
+    sw = _num_width(*swipes)
+    has_skill = any("skill_ok" in item for item in plays)
+    has_coin = any("coin" in item for item in plays)
+    ok_w = 1
+    tap_w = 1
+    coin_w = 1
+    if has_skill:
+        oks = [int(item.get("skill_ok") or 0) for item in plays if "skill_ok" in item]
+        taps = [int(item.get("skills") or 0) for item in plays if "skill_ok" in item]
+        ok_w = _num_width(*oks)
+        tap_w = _num_width(*taps)
+    if has_coin:
+        coins = [int(item.get("coin") or 0) for item in plays if "coin" in item]
+        coin_w = _num_width(*coins)
+    for item in reversed(plays):
+        line = f"消し {int(item.get('clears') or 0):>{cw}} / なぞり {int(item.get('swipes') or 0):>{sw}}"
+        if has_skill:
+            if "skill_ok" in item:
+                skill = (
+                    f"{int(item.get('skill_ok') or 0):>{ok_w}}/"
+                    f"{int(item.get('skills') or 0):>{tap_w}}"
+                )
+                line += f" / スキル {skill}"
+            elif has_coin:
+                line += f" / スキル {' ' * (ok_w + 1 + tap_w)}"
+        if has_coin:
+            if "coin" in item:
+                line += f" / コイン {int(item.get('coin') or 0):>{coin_w}}"
+            else:
+                line += f" / コイン {'':>{coin_w}}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _num_width(*nums: int) -> int:
+    return max((len(str(int(n))) for n in nums), default=1)
 
 
 def _rl_from(raw) -> dict:
@@ -150,12 +276,19 @@ def _rl_key(options: list[int], picked: int) -> str:
 
 def order_found(
     found: list[list[dict[str, int]]],
+    leftovers: list[int] | None = None,
 ) -> tuple[list[list[dict[str, int]]], list[int], int]:
     if not found:
         return found, [], 0
     options = [len(item) for item in found]
     if len(found) == 1:
         return found, options, options[0]
+    if leftovers is None or len(leftovers) != len(found):
+        leftovers = [0] * len(found)
+    bigs = [
+        1 if any(int(piece.get("big") or 0) for piece in item) else 0
+        for item in found
+    ]
     data = _load()
     rl = data.get("rl_length") if isinstance(data.get("rl_length"), dict) else _empty_rl_length()
     choices = rl.get("choices") if isinstance(rl.get("choices"), dict) else {}
@@ -169,18 +302,44 @@ def order_found(
             scores.append(float(entry.get("sum") or 0) / n)
         else:
             scores.append(float(len(item)))
-    if random.randrange(matches + 2) == 0:
+    wait_rl = data.get("rl_wait") if isinstance(data.get("rl_wait"), dict) else _empty_rl_length()
+    wait_choices = wait_rl.get("choices") if isinstance(wait_rl.get("choices"), dict) else {}
+    wait_n = int(wait_rl.get("n") or 0)
+    wait_base = float(wait_rl.get("baseline") or 0)
+    waits: list[float] = []
+    for item in found:
+        key = _rl_key(options, len(item))
+        entry = wait_choices.get(key) if isinstance(wait_choices.get(key), dict) else None
+        n = int(entry.get("n") or 0) if entry else 0
+        if n > 0:
+            waits.append(round(float(entry.get("sum") or 0) / n, 1))
+        else:
+            waits.append(round(wait_base, 1))
+
+    def pick_among(indices: list[int]) -> int:
+        best_left = max(leftovers[i] for i in indices)
+        tied = [i for i in indices if leftovers[i] == best_left]
+        best_big = max(bigs[i] for i in tied)
+        tied = [i for i in tied if bigs[i] == best_big]
+        best_len = max(scores[i] for i in tied)
+        return next(i for i in tied if scores[i] == best_len)
+
+    explore_n = wait_n if wait_n > 0 else matches
+    if random.randrange(explore_n + 2) == 0:
         index = random.randrange(len(found))
+    elif wait_n > 0:
+        best_wait = min(waits)
+        index = pick_among([i for i, wait in enumerate(waits) if wait == best_wait])
     else:
-        best = max(scores)
-        index = scores.index(best)
+        index = pick_among(list(range(len(found))))
     picked = found[index]
     rest = [item for i, item in enumerate(found) if i != index]
     return [picked] + rest, options, len(picked)
 
 
 def record_rl_match(picks: list[tuple[list[int], int]], coin: int) -> None:
-    if coin <= 0 or not picks:
+    kept = play_coin(coin)
+    if kept is None or kept <= 0 or not picks:
         return
     data = _load()
     rl = _rl_from(data.get("rl"))
@@ -190,7 +349,7 @@ def record_rl_match(picks: list[tuple[list[int], int]], coin: int) -> None:
             continue
         key = _rl_key(options, picked)
         item = dict(choices.get(key) or {}) if isinstance(choices.get(key), dict) else {}
-        item["sum"] = float(item.get("sum") or 0) + coin
+        item["sum"] = float(item.get("sum") or 0) + kept
         item["n"] = int(item.get("n") or 0) + 1
         choices[key] = item
     prev_n = int(rl.get("n") or 0)
@@ -198,7 +357,7 @@ def record_rl_match(picks: list[tuple[list[int], int]], coin: int) -> None:
     prev_base = float(rl.get("baseline") or 0)
     rl["choices"] = choices
     rl["n"] = n
-    rl["baseline"] = (prev_base * prev_n + coin) / n
+    rl["baseline"] = (prev_base * prev_n + kept) / n
     data["rl"] = rl
     _save(data)
 
@@ -224,20 +383,233 @@ def record_rl_length(options: list[int], picked: int) -> None:
     _save(data)
 
 
-def record_play(clears: int, swipes: int, skills: int, bombs: int, fans: int) -> None:
+def record_rl_wait(options: list[int], picked: int, seconds: float) -> None:
+    if picked < 3:
+        return
+    wait = max(0.0, float(seconds))
+    data = _load()
+    rl = _rl_length_from(data.get("rl_wait"))
+    choices = dict(rl.get("choices") or {})
+    key = _rl_key(options, picked)
+    item = dict(choices.get(key) or {}) if isinstance(choices.get(key), dict) else {}
+    item["sum"] = float(item.get("sum") or 0) + wait
+    item["n"] = int(item.get("n") or 0) + 1
+    choices[key] = item
+    prev_n = int(rl.get("n") or 0)
+    n = prev_n + 1
+    prev_base = float(rl.get("baseline") or 0)
+    rl["choices"] = choices
+    rl["n"] = n
+    rl["baseline"] = (prev_base * prev_n + wait) / n
+    data["rl_wait"] = rl
+    _save(data)
+
+
+def should_bomb(sit: str, default: bool) -> bool:
+    if not sit:
+        return default
+    data = _load()
+    rl = _rl_length_from(data.get("rl_bomb"))
+    n = int(rl.get("n") or 0)
+    if n <= 0:
+        return default
+    if random.randrange(n + 2) == 0:
+        return random.randrange(2) == 0
+    choices = rl.get("choices") if isinstance(rl.get("choices"), dict) else {}
+    base = float(rl.get("baseline") or 0)
+
+    def stats(action: str) -> tuple[int, float]:
+        key = f"{sit}:{action}"
+        entry = choices.get(key) if isinstance(choices.get(key), dict) else None
+        count = int(entry.get("n") or 0) if entry else 0
+        if count <= 0:
+            return 0, base
+        return count, float(entry.get("sum") or 0) / count
+
+    tap_n, tap = stats("tap")
+    skip_n, skip = stats("skip")
+    if skip_n <= 0:
+        return True
+    if tap_n <= 0:
+        return skip >= base
+    if tap < skip:
+        return True
+    if skip < tap:
+        return False
+    return default
+
+
+def record_rl_bomb(sit: str, pressed: bool, seconds: float) -> None:
+    if not sit:
+        return
+    wait = max(0.0, float(seconds))
+    data = _load()
+    rl = _rl_length_from(data.get("rl_bomb"))
+    choices = dict(rl.get("choices") or {})
+    key = f"{sit}:{'tap' if pressed else 'skip'}"
+    item = dict(choices.get(key) or {}) if isinstance(choices.get(key), dict) else {}
+    item["sum"] = float(item.get("sum") or 0) + wait
+    item["n"] = int(item.get("n") or 0) + 1
+    choices[key] = item
+    prev_n = int(rl.get("n") or 0)
+    n = prev_n + 1
+    prev_base = float(rl.get("baseline") or 0)
+    rl["choices"] = choices
+    rl["n"] = n
+    rl["baseline"] = (prev_base * prev_n + wait) / n
+    data["rl_bomb"] = rl
+    _save(data)
+
+
+def should_skill(sit: str, default: bool, skill_n: int = 0) -> bool:
+    data = _load()
+    coins = _rl_length_from(data.get("rl_skill_coin"))
+    coin_n = int(coins.get("n") or 0)
+    wait_rl = _rl_length_from(data.get("rl_skill"))
+    wait_n = int(wait_rl.get("n") or 0)
+    total = coin_n + wait_n
+    if total > 0 and random.randrange(total + 2) == 0:
+        return random.randrange(2) == 0
+    if coin_n > 0:
+        choices = coins.get("choices") if isinstance(coins.get("choices"), dict) else {}
+        base = float(coins.get("baseline") or 0)
+
+        def coin_at(count: int) -> tuple[int, float]:
+            key = str(max(0, int(count)))
+            entry = choices.get(key) if isinstance(choices.get(key), dict) else None
+            n = int(entry.get("n") or 0) if entry else 0
+            if n <= 0:
+                return 0, base
+            return n, float(entry.get("sum") or 0) / n
+
+        now_n, now_avg = coin_at(skill_n)
+        next_n, next_avg = coin_at(skill_n + 1)
+        if now_n > 0 and next_n > 0:
+            if next_avg > now_avg:
+                return True
+            if now_avg > next_avg:
+                return False
+        elif next_n > 0 and now_n <= 0 and next_avg > base:
+            return True
+    if not sit:
+        return default
+    if wait_n <= 0:
+        return default
+    choices = wait_rl.get("choices") if isinstance(wait_rl.get("choices"), dict) else {}
+    base = float(wait_rl.get("baseline") or 0)
+
+    def stats(action: str) -> tuple[int, float]:
+        key = f"{sit}:{action}"
+        entry = choices.get(key) if isinstance(choices.get(key), dict) else None
+        count = int(entry.get("n") or 0) if entry else 0
+        if count <= 0:
+            return 0, base
+        return count, float(entry.get("sum") or 0) / count
+
+    tap_n, tap = stats("tap")
+    skip_n, skip = stats("skip")
+    if skip_n <= 0:
+        return True
+    if tap_n <= 0:
+        return skip >= base
+    if tap < skip:
+        return True
+    if skip < tap:
+        return False
+    return default
+
+
+def record_rl_skill(sit: str, pressed: bool, seconds: float) -> None:
+    if not sit:
+        return
+    wait = max(0.0, float(seconds))
+    data = _load()
+    rl = _rl_length_from(data.get("rl_skill"))
+    choices = dict(rl.get("choices") or {})
+    key = f"{sit}:{'tap' if pressed else 'skip'}"
+    item = dict(choices.get(key) or {}) if isinstance(choices.get(key), dict) else {}
+    item["sum"] = float(item.get("sum") or 0) + wait
+    item["n"] = int(item.get("n") or 0) + 1
+    choices[key] = item
+    prev_n = int(rl.get("n") or 0)
+    n = prev_n + 1
+    prev_base = float(rl.get("baseline") or 0)
+    rl["choices"] = choices
+    rl["n"] = n
+    rl["baseline"] = (prev_base * prev_n + wait) / n
+    data["rl_skill"] = rl
+    _save(data)
+
+
+def record_rl_skill_coin(skill_n: int, coin: int) -> None:
+    kept = play_coin(coin)
+    if kept is None:
+        return
+    data = _load()
+    rl = _rl_length_from(data.get("rl_skill_coin"))
+
+    def add(count: int, value: int) -> None:
+        nonlocal rl
+        choices = dict(rl.get("choices") or {})
+        key = str(max(0, int(count)))
+        item = dict(choices.get(key) or {}) if isinstance(choices.get(key), dict) else {}
+        item["sum"] = float(item.get("sum") or 0) + value
+        item["n"] = int(item.get("n") or 0) + 1
+        choices[key] = item
+        prev_n = int(rl.get("n") or 0)
+        n = prev_n + 1
+        prev_base = float(rl.get("baseline") or 0)
+        rl = {
+            "choices": choices,
+            "n": n,
+            "baseline": (prev_base * prev_n + value) / n,
+        }
+
+    if int(rl.get("n") or 0) <= 0:
+        for item in data.get("plays") or []:
+            if not isinstance(item, dict) or "coin" not in item:
+                continue
+            value = play_coin(item.get("coin"))
+            if value is None:
+                continue
+            add(int(item.get("skill_ok") or 0), value)
+        data["rl_skill_coin"] = rl
+        _save(data)
+        return
+    add(skill_n, kept)
+    data["rl_skill_coin"] = rl
+    _save(data)
+
+
+def record_play(
+    clears: int,
+    swipes: int,
+    skills: int,
+    skill_ok: int,
+    bombs: int,
+    fans: int,
+    coin: int | None = None,
+) -> None:
     data = _load()
     plays = list(data.get("plays") or [])
-    plays.append(
-        {
-            "clears": int(clears),
-            "swipes": int(swipes),
-            "skills": int(skills),
-            "bombs": int(bombs),
-            "fans": int(fans),
-        }
-    )
+    item = {
+        "clears": int(clears),
+        "swipes": int(swipes),
+        "skills": int(skills),
+        "skill_ok": int(skill_ok),
+        "bombs": int(bombs),
+        "fans": int(fans),
+    }
+    if coin is not None:
+        kept = play_coin(coin)
+        if kept is not None:
+            item["coin"] = kept
+    plays.append(item)
     data["plays"] = plays[-40:]
     _save(data)
+    if item.get("coin") is not None:
+        record_rl_skill_coin(int(item.get("skill_ok") or 0), int(item["coin"]))
+    flush_style()
 
 
 def record_pick(options: list[int], picked: int, ok: bool) -> None:
@@ -287,6 +659,10 @@ def hud_situation(fever_on: bool, fever_fill: float, has_chain: bool, has_bomb: 
     bomb = "b" if has_bomb else "x"
     board = "f" if full else "s"
     return f"{gauge}_{chain}_{bomb}_{board}"
+
+
+def bomb_situation(sit: str, n: int) -> str:
+    return f"{sit}_{max(0, int(n))}"
 
 
 def hud_net(kind: str, sit: str, data: dict | None = None) -> int:

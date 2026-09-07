@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QStandardPaths, Qt, QTimer, QEvent
-from PySide6.QtGui import QIcon, QImage, QPixmap
+from PySide6.QtGui import QFont, QIcon, QImage, QPixmap
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -26,7 +27,9 @@ from PySide6.QtWidgets import (
 
 from app.bluestacks import capture_play_frame, halt_input, start_tsum, tsum_is_running
 from app.intro import IntroWorker
-from app.paths import APP_ROOT
+from app.paths import APP_ROOT, IPC_NAME
+from app.play_style import history_text
+from app.record_play import RecordWorker, play_video_path
 from app.play import (
     PlayWorker,
     read_kind_count,
@@ -144,7 +147,16 @@ class MainWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         icon = self._ensure_app_icon()
         if icon is not None:
-            self.setWindowIcon(QIcon(str(icon)))
+            window_icon = QIcon()
+            window_icon.addFile(str(icon))
+            pix = QPixmap(str(icon))
+            if not pix.isNull():
+                window_icon.addPixmap(pix)
+            self.setWindowIcon(window_icon)
+            app_inst = QApplication.instance()
+            if app_inst is not None:
+                app_inst.setWindowIcon(window_icon)
+        self._refresh_desktop_shortcut()
         root = QWidget()
         layout = QVBoxLayout(root)
         self.capture_btn = QPushButton("消す前の盤面を取り込む")
@@ -163,6 +175,9 @@ class MainWindow(QMainWindow):
         self.loop_btn = QPushButton("連続プレイ")
         self.loop_btn.clicked.connect(self.on_loop_play)
         layout.addWidget(self.loop_btn)
+        self.record_btn = QPushButton("1プレイを録画")
+        self.record_btn.clicked.connect(self.on_record_one)
+        layout.addWidget(self.record_btn)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop)
@@ -185,12 +200,22 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("待機中")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+        self._history = QPlainTextEdit()
+        self._history.setReadOnly(True)
+        font = QFont("MS Gothic")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self._history.setFont(font)
+        layout.addWidget(self._history, 1)
         self.setCentralWidget(root)
+        self.setMinimumWidth(max(1, self.sizeHint().width() * 2))
+        self._fill_history()
         self._stop = threading.Event()
         self._save_boards = threading.Event()
         self._loop_play = False
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
+        self._record: RecordWorker | None = None
+        self._want_record = False
         self._selected_used_tsum = ""
         self._debug = DebugWindow()
         self._debug._on_stop = self.on_stop
@@ -204,6 +229,7 @@ class MainWindow(QMainWindow):
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
         self._debug.append("待機中")
+        self._start_ipc()
 
     def _on_capture_toggled(self, on: bool) -> None:
         if on:
@@ -233,6 +259,17 @@ class MainWindow(QMainWindow):
 
     def on_loop_play(self) -> None:
         self._begin_play(loop=True)
+
+    def on_record_one(self) -> None:
+        if self._is_busy():
+            return
+        self._want_record = True
+        if tsum_is_running():
+            self.on_play_now()
+        else:
+            self._begin_play(loop=False)
+        if not self._is_busy():
+            self._want_record = False
 
     def _begin_play(self, *, loop: bool) -> None:
         if self._is_busy():
@@ -315,6 +352,8 @@ class MainWindow(QMainWindow):
             self._intro.requestInterruption()
         if self._play is not None:
             self._play.requestInterruption()
+        if self._record is not None:
+            self._record.requestInterruption()
         halt_input()
         self._set_status("停止しています")
 
@@ -327,6 +366,7 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(not running)
         self.now_btn.setEnabled(not running)
         self.loop_btn.setEnabled(not running)
+        self.record_btn.setEnabled(not running)
         self.stop_btn.setEnabled(running)
         if running:
             self._front_timer.stop()
@@ -382,6 +422,33 @@ class MainWindow(QMainWindow):
             self._play.need_kinds.connect(self._on_need_kinds)
             self._play.need_used_tsum.connect(self._on_need_used_tsum)
         self._play.start()
+        if self._want_record:
+            self._start_record()
+
+    def _start_record(self) -> None:
+        self._stop_record()
+        dest = play_video_path()
+        self._want_record = True
+        self._record = RecordWorker(self._stop, dest, self)
+        self._record.failed.connect(self._on_record_fail)
+        self._record.saved.connect(self._on_record_saved)
+        self._record.start()
+        self._set_status("1プレイを録画しています")
+
+    def _stop_record(self) -> None:
+        rec = self._record
+        self._record = None
+        self._want_record = False
+        if rec is None:
+            return
+        rec.requestInterruption()
+        rec.wait(8000)
+
+    def _on_record_fail(self, message: str) -> None:
+        self._set_status(message)
+
+    def _on_record_saved(self, path: str) -> None:
+        self._set_status(f"録画しました {path}")
 
     def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
         play = self._play
@@ -611,6 +678,29 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
         self._debug.append(text)
+        self._fill_history()
+
+    def _fill_history(self) -> None:
+        self._history.setPlainText(history_text())
+
+    def _start_ipc(self) -> None:
+        self._ipc_server = QLocalServer(self)
+        self._ipc_server.newConnection.connect(self._on_ipc_connection)
+        if self._ipc_server.listen(IPC_NAME):
+            return
+        QLocalServer.removeServer(IPC_NAME)
+        self._ipc_server.listen(IPC_NAME)
+
+    def _on_ipc_connection(self) -> None:
+        sock = self._ipc_server.nextPendingConnection()
+        if sock is not None:
+            sock.disconnectFromServer()
+            sock.deleteLater()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._debug.show()
+        self._debug.raise_()
 
     def _keep_front(self) -> None:
         if QApplication.activeModalWidget() is not None:
@@ -691,6 +781,7 @@ class MainWindow(QMainWindow):
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
 
     def closeEvent(self, event) -> None:
+        self._stop_record()
         self._unregister_stop_hotkey()
         self._debug.close()
         super().closeEvent(event)
@@ -705,24 +796,28 @@ class MainWindow(QMainWindow):
         self._start_play(loop=False)
 
     def _on_intro_fail(self, message: str) -> None:
+        self._want_record = False
         self._set_running(False)
         self._set_status(message)
         QMessageBox.critical(self, "PLAY", message)
 
     def _on_play_fail(self, message: str) -> None:
+        self._stop_record()
         self._set_running(False)
         self._set_status(message)
         QMessageBox.critical(self, "PLAY", message)
 
     def _on_play_done(self) -> None:
+        self._stop_record()
         self._set_running(False)
         text = self.status_label.text()
         if "リトライ" in text:
             return
-        if "コイン" not in text and text != "TIME UP":
+        if "コイン" not in text and text != "TIME UP" and not text.startswith("録画しました"):
             self._set_status("TIME UP")
 
     def _on_stopped(self) -> None:
+        self._stop_record()
         self._set_running(False)
         self._set_status("停止しました")
 
@@ -806,6 +901,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{dest}")
             return
         lnk = Path(desktop) / f"{APP_NAME}.lnk"
+        err = self._write_launch_shortcut(lnk)
+        if err:
+            QMessageBox.critical(self, "アイコンを作れませんでした", err)
+            return
+        QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
+
+    def _refresh_desktop_shortcut(self) -> None:
+        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+        if not desktop or sys.platform == "darwin":
+            return
+        lnk = Path(desktop) / f"{APP_NAME}.lnk"
+        if lnk.is_file():
+            self._write_launch_shortcut(lnk)
+
+    def _write_launch_shortcut(self, lnk: Path) -> str:
         python = Path(sys.executable)
         pythonw = python.with_name("pythonw.exe")
         target = pythonw if pythonw.exists() else python
@@ -837,13 +947,10 @@ class MainWindow(QMainWindow):
                 creationflags=flags,
             )
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "アイコンを作れませんでした", str(exc))
-            return
+            return str(exc)
         if result.returncode != 0 or not lnk.exists():
-            err = (result.stderr or result.stdout or "ショートカットを作れませんでした").strip()
-            QMessageBox.critical(self, "アイコンを作れませんでした", err)
-            return
-        QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
+            return (result.stderr or result.stdout or "ショートカットを作れませんでした").strip()
+        return ""
 
     def _create_macos_launch_shortcut(self, desktop: Path) -> Path:
         app_path = desktop / f"{APP_NAME}.app"
@@ -881,5 +988,8 @@ class MainWindow(QMainWindow):
         return app_path
 
     def _ensure_app_icon(self) -> Path | None:
-        path = APP_ROOT / "app.ico"
-        return path if path.exists() else None
+        for name in ("launch.ico", "app.ico"):
+            path = APP_ROOT / name
+            if path.is_file():
+                return path
+        return None

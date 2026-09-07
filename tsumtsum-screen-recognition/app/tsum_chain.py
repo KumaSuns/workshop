@@ -4,6 +4,14 @@ import math
 
 CANDIDATE_COUNT = 3
 MIN_CHAIN = 3
+TURN_DOT = -0.5
+
+
+def _turn_ok(px: float, py: float, dx: float, dy: float) -> bool:
+    denom = math.hypot(px, py) * math.hypot(dx, dy)
+    if denom < 1e-9:
+        return True
+    return (px * dx + py * dy) / denom >= TURN_DOT
 
 
 def max_tsum_chain(pieces: list[dict[str, int]]) -> int:
@@ -45,7 +53,7 @@ def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
         counts[group] = counts.get(group, 0) + 1
         if counts[group] > biggest:
             biggest = counts[group]
-    if not found or (longest <= MIN_CHAIN and biggest > MIN_CHAIN):
+    if not found or longest < biggest:
         phys = _physical_links(tsums, spacing, scale=1.12)
         extra = _paths_from_blobs(tsums, phys)
         if extra and (not found or max(len(path) for path in extra) > longest):
@@ -139,6 +147,7 @@ def _physical_links(
     xs = [int(piece["x"]) for piece in tsums]
     ys = [int(piece["y"]) for piece in tsums]
     groups = [int(piece.get("group") or 1) for piece in tsums]
+    bigs = [bool(int(piece.get("big") or 0)) for piece in tsums]
     gap = spacing if spacing > 0 else typical_r * 2.0
     links: list[list[int]] = [[] for _ in range(count)]
 
@@ -160,7 +169,10 @@ def _physical_links(
             dx = xs[other] - ax
             dy = ys[other] - ay
             dist = math.hypot(dx, dy)
-            if dist < min_dist or dist > reach:
+            lim = reach
+            if bigs[index] or bigs[other]:
+                lim = (radii[index] + radii[other]) * 1.32 * scale
+            if dist < min_dist or dist > lim:
                 continue
             slot = int((math.atan2(dy, dx) + math.pi + 1e-9) / (math.pi / 3)) % 6
             prev = bins[slot]
@@ -176,7 +188,10 @@ def _physical_links(
             if groups[other] != group:
                 continue
             dist = math.hypot(xs[other] - ax, ys[other] - ay)
-            if dist < min_dist or dist > close:
+            lim = close
+            if bigs[index] or bigs[other]:
+                lim = (radii[index] + radii[other]) * 1.22 * scale
+            if dist < min_dist or dist > lim:
                 continue
             add(index, other)
     return links
@@ -416,6 +431,18 @@ def _paths_in_component(
             bit = 1 << nxt
             if used & bit:
                 continue
+            if (
+                xs is not None
+                and ys is not None
+                and len(path) >= 2
+                and not _turn_ok(
+                    xs[current] - xs[path[-2]],
+                    ys[current] - ys[path[-2]],
+                    xs[nxt] - xs[current],
+                    ys[nxt] - ys[current],
+                )
+            ):
+                continue
             extended = True
             path.append(nxt)
             walk(nxt, used | bit, path, remaining)
@@ -455,8 +482,12 @@ def _greedy_on(
                     ahead = [
                         nxt
                         for nxt in choices
-                        if (xs[nxt] - xs[current]) * px + (ys[nxt] - ys[current]) * py
-                        >= 0
+                        if _turn_ok(
+                            px,
+                            py,
+                            xs[nxt] - xs[current],
+                            ys[nxt] - ys[current],
+                        )
                     ]
                     if ahead:
                         choices = ahead
@@ -510,7 +541,7 @@ def _pick_diverse(
             (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
             for piece in path
         )
-        if any(key <= old or old <= key for old in keys):
+        if any(key <= old or old <= key or len(key & old) >= 2 for old in keys):
             continue
         selected.append(path)
         keys.append(key)
