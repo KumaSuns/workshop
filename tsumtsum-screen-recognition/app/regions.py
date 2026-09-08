@@ -18,6 +18,7 @@ REGION_KEYS = [key for key, _label, _color in REGION_SPECS]
 
 PIECE_SPECS: list[tuple[str, str, str]] = [
     ("tsum", "ツム", "#FFE066"),
+    ("big", "デカツム", "#FFB020"),
     ("bomb", "ボム", "#FF5C5C"),
 ]
 PIECE_LABELS = {key: label for key, label, _color in PIECE_SPECS}
@@ -65,14 +66,22 @@ def is_piece_key(key: str) -> bool:
     return key in PIECE_KEYS
 
 
+def is_tsum_kind(kind: str | None) -> bool:
+    return str(kind or "") in {"tsum", "big"}
+
+
 def is_scene_key(key: str) -> bool:
     return key in SCENE_KEYS
 
 
 def piece_radius_from_game(width: float, kind: str = "tsum") -> int:
     span = max(1.0, float(width))
-    divisor = 12.0 if kind == "bomb" else 15.0
-    return max(8, int(round(span / divisor)))
+    if kind == "bomb":
+        return max(8, int(round(span / 12.0)))
+    radius = max(8, int(round(span / 15.0)))
+    if kind == "big":
+        return max(8, int(round(radius * 1.8)))
+    return radius
 
 
 def model_filename(key: str) -> str:

@@ -82,10 +82,12 @@ from app.regions import (
     is_coin_box_key,
     is_piece_key,
     is_scene_key,
+    is_tsum_kind,
     tsum_group_color,
 )
 from app.skill_export import registered_skills_by_sample, save_skill_image, skill_tsum_choices
 from app.train_effect import TrainEffect
+from app.tsum_chain import CANDIDATE_COUNT
 from app.train_worker import MIN_TRAIN_SAMPLES, TRAIN_EPOCHS, TrainWorker
 
 LIST_STATUS_WIDTHS = {
@@ -100,6 +102,7 @@ LIST_STATUS_WIDTHS = {
     "pause": 36,
     "fever": 52,
     "tsum": 32,
+    "big": 40,
     "bomb": 32,
     "go": 32,
     "timeup": 40,
@@ -116,6 +119,7 @@ LIST_STATUS_HEADERS = {
     "pause": "一時\n停止",
     "fever": "フィーバー\nゲージ",
     "tsum": "ツム",
+    "big": "デカ\nツム",
     "bomb": "ボム",
     "go": "GO",
     "timeup": "TIME\nUP",
@@ -570,7 +574,7 @@ class GroupListWindow(QDialog):
         if selected is not None and 0 <= selected < len(self._pieces):
             piece = self._pieces[selected]
         self.delete_btn.setEnabled(piece is not None)
-        is_tsum = piece is not None and piece.get("kind") == "tsum"
+        is_tsum = piece is not None and is_tsum_kind(str(piece.get("kind") or ""))
         if is_tsum and piece is not None:
             group = int(piece.get("group") or 1)
             self.group_label.setText(f"No.  {group}")
@@ -585,7 +589,7 @@ class GroupListWindow(QDialog):
         if selected is None or selected >= len(self._pieces):
             return 1
         piece = self._pieces[selected]
-        if piece.get("kind") != "tsum":
+        if not is_tsum_kind(str(piece.get("kind") or "")):
             return 1
         return int(piece.get("group") or 1)
 
@@ -636,8 +640,9 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.setStyleSheet(STYLESHEET)
 
-        self.dataset = Dataset(DATA_DIR)
-        self.predictor = Predictor(self.dataset.models_dir)
+        self.dataset = Dataset(DATA_DIR, load=False)
+        self.predictor = Predictor(self.dataset.models_dir, load=False)
+        self._data_loaded = False
         self.current_id: str | None = None
         self._active_key = "game"
         self.train_worker: TrainWorker | None = None
@@ -661,7 +666,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._bind_shortcuts()
         self._start_ipc()
-        self.refresh_list()
         self.update_stats()
 
     def _build_ui(self) -> None:
@@ -846,6 +850,8 @@ class MainWindow(QMainWindow):
         unused_row.addWidget(self.delete_unused_one_btn)
         unused_row.addWidget(self.delete_unused_btn)
         right_layout.addLayout(unused_row)
+        self.delete_unsaved_btn = QPushButton("保存していない画像を全部消す")
+        right_layout.addWidget(self.delete_unsaved_btn)
         self.list_widget = QTableWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -913,7 +919,7 @@ class MainWindow(QMainWindow):
         self.piece_count_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         coords_layout.addWidget(self.piece_count_label, 1)
         self.trace_chain_btns: list[QPushButton] = []
-        for index in range(3):
+        for index in range(CANDIDATE_COUNT):
             button = QPushButton("なぞる")
             button.setEnabled(False)
             button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
@@ -953,6 +959,7 @@ class MainWindow(QMainWindow):
         self.skill_register_btn.clicked.connect(self.register_skill_image)
         self.delete_unused_one_btn.clicked.connect(self.delete_current)
         self.delete_unused_btn.clicked.connect(self.delete_unused_images)
+        self.delete_unsaved_btn.clicked.connect(self.delete_unsaved_images)
         self.show_unused_chk.toggled.connect(self.on_show_unused_toggled)
         self.copy_data_btn.clicked.connect(self.copy_data_folder)
         self.import_data_btn.clicked.connect(self.import_data_folder)
@@ -1162,6 +1169,8 @@ class MainWindow(QMainWindow):
             self.list_widget.setRowCount(len(samples))
         for row, sample in enumerate(samples):
             self._style_list_row(row, sample)
+            if row % 40 == 0:
+                QApplication.processEvents()
         moved_row = None
         if selected and selected != prev_current:
             for row in range(self.list_widget.rowCount()):
@@ -1327,7 +1336,7 @@ class MainWindow(QMainWindow):
         self.undo_piece_btn.setEnabled(
             has_sample and piece_mode and self.canvas.has_piece_of_kind(self._active_key)
         )
-        self.spin_group.setEnabled(self._active_key == "tsum")
+        self.spin_group.setEnabled(is_tsum_kind(self._active_key))
         has_last = (
             self._active_key in self._last_piece_radius
             if piece_mode
@@ -1352,7 +1361,7 @@ class MainWindow(QMainWindow):
             else:
                 button.setText("なぞる")
                 button.setEnabled(False)
-        self.predict_btn.setEnabled(has_sample and self.predictor.is_ready())
+        self.predict_btn.setEnabled(has_sample)
         self.read_coin_btn.setEnabled(
             has_sample and any(key in self.canvas.all_region_boxes() for key in COIN_BOX_KEYS)
         )
@@ -1439,21 +1448,6 @@ class MainWindow(QMainWindow):
         sample = self.dataset.get(sample_id)
         if sample is None:
             return
-        selected = set(self._selected_place_keys())
-        if not getattr(self, "_skip_auto_predict", False):
-            if self.predictor.piece_model is not None and any(key in selected for key in PIECE_KEYS):
-                if any(key in selected and key not in sample.confirmed for key in PIECE_KEYS):
-                    try:
-                        self._predict_into_sample(sample, overwrite=True)
-                    except Exception:
-                        pass
-                    sample = self.dataset.get(sample_id) or sample
-                elif "tsum" in selected and any(piece.get("kind") == "tsum" for piece in sample.pieces):
-                    try:
-                        self._relabel_tsum_groups(sample)
-                    except Exception:
-                        pass
-                    sample = self.dataset.get(sample_id) or sample
         self.current_id = sample.id
         pixmap = QPixmap(str(sample.image_path))
         regions = {
@@ -2121,6 +2115,8 @@ class MainWindow(QMainWindow):
             showing and current is not None and current.status == "skipped"
         )
         self.delete_unused_btn.setEnabled(showing and bool(unused))
+        if hasattr(self, "delete_unsaved_btn"):
+            self.delete_unsaved_btn.setEnabled(bool(self._unsaved_samples()))
 
     def delete_current(self) -> None:
         if self._block_if_training() or not self.current_id:
@@ -2246,6 +2242,44 @@ class MainWindow(QMainWindow):
         if next_id and next_id != self.current_id:
             self.show_sample(next_id)
         self.statusBar().showMessage(f"使わない画像を {len(unused)} 枚消しました", 4000)
+
+    def _unsaved_samples(self) -> list[Sample]:
+        registered = self._skill_registered or registered_skills_by_sample()
+        found: list[Sample] = []
+        for sample in self.dataset.all():
+            if sample.confirmed:
+                continue
+            if registered.get(sample.id):
+                continue
+            found.append(sample)
+        return found
+
+    def delete_unsaved_images(self) -> None:
+        if self._block_if_training():
+            return
+        self._skill_registered = registered_skills_by_sample()
+        unsaved = self._unsaved_samples()
+        if not unsaved:
+            QMessageBox.information(self, "保存していない画像", "保存していない画像はありません。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "保存していない画像を消す",
+            f"予測だけ・未設定の {len(unsaved)} 枚をデータセットから削除しますか？\n保存済みとSKILL登録済みは残します。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        current_gone = self.current_id in {sample.id for sample in unsaved} if self.current_id else False
+        self.dataset.remove_many([sample.id for sample in unsaved])
+        if current_gone:
+            self.current_id = None
+            self.canvas.clear_image()
+            self._set_dirty(False)
+        next_id = self.current_id or (self._visible_samples()[0].id if self._visible_samples() else None)
+        self.refresh_list(select_id=next_id)
+        if next_id and next_id != self.current_id:
+            self.show_sample(next_id)
+        self.statusBar().showMessage(f"保存していない画像を {len(unsaved)} 枚消しました", 4000)
 
     def _resolved_path(self, path: Path) -> Path:
         try:
@@ -2531,7 +2565,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.dataset.reload()
-        self.predictor.reload()
+        self.predictor.reload(pump=QApplication.processEvents, device="cpu")
         self._remember_last_boxes()
         self.refresh_list()
         self.statusBar().showMessage("dataを取り込みました", 5000)
@@ -2597,6 +2631,7 @@ class MainWindow(QMainWindow):
         if sample is None or key is None or box is None:
             QMessageBox.information(self, "コインの枠がありません", "先にコインの枠を囲んでください。")
             return
+        self._ensure_predictor()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             crop, number = ocr_coin_number(
@@ -2630,7 +2665,10 @@ class MainWindow(QMainWindow):
         return None
 
     def predict_current(self) -> None:
-        if not self.current_id or not self.predictor.is_ready():
+        if not self.current_id:
+            return
+        if not self._ensure_predictor():
+            QMessageBox.information(self, "予測", "モデルがありません。範囲を教えてから学習してください。")
             return
         sample = self.dataset.get(self.current_id)
         if sample is None:
@@ -2665,7 +2703,7 @@ class MainWindow(QMainWindow):
             }
             piece_samples = list(piece_map.values())
             if len(piece_samples) >= MIN_TRAIN_SAMPLES:
-                if "tsum" in piece_keys:
+                if "tsum" in piece_keys or "big" in piece_keys:
                     type_samples = [
                         sample
                         for sample in piece_samples
@@ -2673,7 +2711,7 @@ class MainWindow(QMainWindow):
                             {
                                 int(piece.get("group") or 1)
                                 for piece in sample.pieces
-                                if piece.get("kind") == "tsum"
+                                if is_tsum_kind(str(piece.get("kind") or ""))
                             }
                         )
                         >= 2
@@ -2860,6 +2898,7 @@ class MainWindow(QMainWindow):
             self.skill_register_btn,
             self.delete_unused_one_btn,
             self.delete_unused_btn,
+            self.delete_unsaved_btn,
             self.copy_data_btn,
             self.import_data_btn,
             self.shortcut_btn,
@@ -2971,6 +3010,30 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._sync_canvas_3_2()
+        if self._data_loaded:
+            return
+        self._data_loaded = True
+        QTimer.singleShot(0, self._load_dataset)
+
+    def _load_dataset(self) -> None:
+        self.statusBar().showMessage("画像一覧を読み込み中")
+        QApplication.processEvents()
+        self.dataset.reload()
+        self._remember_last_boxes()
+        self.refresh_list()
+        self.statusBar().clearMessage()
+
+    def _ensure_predictor(self) -> bool:
+        if self.predictor.is_ready():
+            return True
+        self.statusBar().showMessage("モデルを読み込み中")
+        QApplication.processEvents()
+        try:
+            self.predictor.reload(pump=QApplication.processEvents, device="cpu")
+        except Exception:
+            return False
+        self.update_stats()
+        return self.predictor.is_ready()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -3088,9 +3151,8 @@ class MainWindow(QMainWindow):
                 skipped.append(f"GO/TIME UP以外: {others} 枚")
         message = "チェックした種類だけ学習します。\n" + "\n".join(ready_lines)
         piece_selected = [key for key in PIECE_KEYS if key in selected]
-        if len(piece_selected) == 1 and "pieces" in trained_keys:
-            other = "ボム" if piece_selected[0] == "tsum" else "ツム"
-            message += f"\n（ツムとボムは同じモデルです。{PLACE_LABELS[piece_selected[0]]}だけ学ぶと、{other}の予測も更新されます。）"
+        if piece_selected and "pieces" in trained_keys and set(piece_selected) != set(PIECE_KEYS):
+            message += "\n（ツム・ボム・デカツムは同じ〇モデルです。選んだ〇の学習で、〇の予測はまとめて更新されます。）"
         if skipped:
             message += "\n\n枚数が足りないので、今回は学びません。\n" + "\n".join(skipped)
         message += "\n\n" + self._train_eta_line(self._estimate_jobs_seconds(jobs))
@@ -3159,7 +3221,7 @@ class MainWindow(QMainWindow):
         self.train_worker = None
         self._unlock_after_training()
         try:
-            self.predictor.reload()
+            self.predictor.reload(pump=QApplication.processEvents, device="cpu")
         except Exception:
             pass
         self.update_stats()
@@ -3236,7 +3298,7 @@ class MainWindow(QMainWindow):
     def _relabel_tsum_groups(self, sample: Sample) -> bool:
         if self.predictor.type_model is None:
             return False
-        if not any(piece.get("kind") == "tsum" for piece in sample.pieces):
+        if not any(is_tsum_kind(str(piece.get("kind") or "")) for piece in sample.pieces):
             return False
         from PIL import Image
 
@@ -3244,14 +3306,14 @@ class MainWindow(QMainWindow):
         before = [
             (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
             for piece in pieces
-            if piece.get("kind") == "tsum"
+            if is_tsum_kind(str(piece.get("kind") or ""))
         ]
         with Image.open(sample.image_path) as image:
             self.predictor._assign_groups(image.convert("RGB"), pieces)
         after = [
             (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
             for piece in pieces
-            if piece.get("kind") == "tsum"
+            if is_tsum_kind(str(piece.get("kind") or ""))
         ]
         if before == after:
             return False
@@ -3265,15 +3327,23 @@ class MainWindow(QMainWindow):
             added.extend(self.dataset.apply_predictions(sample.id, boxes))
         sample = self.dataset.get(sample.id) or sample
         game = sample.regions.get("game") or sample.game_region
-        existing_tsums = [piece for piece in sample.pieces if piece.get("kind") == "tsum"]
-        tsum_locked = (not overwrite) and "tsum" in sample.confirmed
+        existing_tsums = [
+            piece for piece in sample.pieces if is_tsum_kind(str(piece.get("kind") or ""))
+        ]
+        tsum_locked = (not overwrite) and (
+            "tsum" in sample.confirmed or "big" in sample.confirmed
+        )
         if existing_tsums and not tsum_locked:
             if self._relabel_tsum_groups(sample):
                 added.append("tsum")
             sample = self.dataset.get(sample.id) or sample
         pieces = self.predictor.predict_pieces(sample.image_path, game)
         if existing_tsums:
-            pieces = [piece for piece in pieces if piece.get("kind") != "tsum"]
+            pieces = [
+                piece
+                for piece in pieces
+                if not is_tsum_kind(str(piece.get("kind") or ""))
+            ]
         if pieces:
             if not overwrite:
                 existing = {str(piece.get("kind")) for piece in sample.pieces}

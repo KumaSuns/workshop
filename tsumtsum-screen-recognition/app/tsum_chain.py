@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 
-CANDIDATE_COUNT = 3
+from app.regions import is_tsum_kind
+
+CANDIDATE_COUNT = 5
 MIN_CHAIN = 3
 TURN_DOT = -0.5
 
@@ -39,11 +41,23 @@ def tsum_chain_best_per_group(
 
 
 def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
-    tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
+    tsums: list[dict[str, int]] = []
+    for piece in pieces:
+        if not is_tsum_kind(str(piece.get("kind") or "")):
+            continue
+        item = dict(piece)
+        if str(item.get("kind") or "") == "big":
+            item["big"] = 1
+        tsums.append(item)
     if len(tsums) < MIN_CHAIN:
         return []
     spacing = _typical_spacing(tsums)
-    phys = _physical_links(tsums, spacing)
+    bombs = [
+        piece
+        for piece in pieces
+        if str(piece.get("kind") or "") == "bomb"
+    ]
+    phys = _physical_links(tsums, spacing, blockers=bombs)
     found = _paths_from_blobs(tsums, phys)
     longest = max((len(path) for path in found), default=0)
     biggest = 0
@@ -54,7 +68,7 @@ def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
         if counts[group] > biggest:
             biggest = counts[group]
     if not found or longest < biggest:
-        phys = _physical_links(tsums, spacing, scale=1.12)
+        phys = _physical_links(tsums, spacing, scale=1.12, blockers=bombs)
         extra = _paths_from_blobs(tsums, phys)
         if extra and (not found or max(len(path) for path in extra) > longest):
             found = extra
@@ -131,7 +145,10 @@ def _induced_links(phys: list[list[int]], blob: list[int]) -> list[list[int]]:
 
 
 def _physical_links(
-    tsums: list[dict[str, int]], spacing: float, scale: float = 1.0
+    tsums: list[dict[str, int]],
+    spacing: float,
+    scale: float = 1.0,
+    blockers: list[dict[str, int]] | None = None,
 ) -> list[list[int]]:
     count = len(tsums)
     radii = [max(4, int(piece.get("r") or 12)) for piece in tsums]
@@ -149,10 +166,12 @@ def _physical_links(
     groups = [int(piece.get("group") or 1) for piece in tsums]
     bigs = [bool(int(piece.get("big") or 0)) for piece in tsums]
     gap = spacing if spacing > 0 else typical_r * 2.0
+    extra_x = [int(piece["x"]) for piece in (blockers or [])]
+    extra_y = [int(piece["y"]) for piece in (blockers or [])]
     links: list[list[int]] = [[] for _ in range(count)]
 
     def add(left: int, right: int) -> None:
-        if _segment_blocked(xs, ys, left, right, gap):
+        if _segment_blocked(xs, ys, left, right, gap, extra_x, extra_y):
             return
         if right not in links[left]:
             links[left].append(right)
@@ -203,6 +222,8 @@ def _segment_blocked(
     left: int,
     right: int,
     spacing: float,
+    extra_x: list[int] | None = None,
+    extra_y: list[int] | None = None,
 ) -> bool:
     ax, ay = xs[left], ys[left]
     bx, by = xs[right], ys[right]
@@ -211,9 +232,14 @@ def _segment_blocked(
     if length < 1:
         return False
     thresh = (0.4 * spacing) ** 2
+    points: list[tuple[int, int]] = []
     for index, (px, py) in enumerate(zip(xs, ys)):
         if index == left or index == right:
             continue
+        points.append((px, py))
+    if extra_x and extra_y:
+        points.extend(zip(extra_x, extra_y))
+    for px, py in points:
         t = ((px - ax) * vx + (py - ay) * vy) / length
         if t <= 0.12 or t >= 0.88:
             continue
@@ -541,7 +567,7 @@ def _pick_diverse(
             (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
             for piece in path
         )
-        if any(key <= old or old <= key or len(key & old) >= 2 for old in keys):
+        if any(key & old for old in keys):
             continue
         selected.append(path)
         keys.append(key)

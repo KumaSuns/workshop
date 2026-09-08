@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Callable
 from pathlib import Path
 
 from app.paths import APP_ROOT
@@ -22,7 +23,7 @@ def play_coin(value) -> int | None:
         n = int(value)
     except (TypeError, ValueError):
         return None
-    if n < 0:
+    if n <= 0:
         return None
     if n >= 3000:
         return None
@@ -35,6 +36,32 @@ def _empty_rl() -> dict:
 
 def _empty_rl_length() -> dict:
     return {"n": 0, "baseline": 0.0, "choices": {}}
+
+
+def _skill_coin_from_plays(plays: list) -> dict:
+    choices: dict[str, dict[str, float | int]] = {}
+    total_n = 0
+    total_sum = 0.0
+    for item in plays:
+        if not isinstance(item, dict) or "coin" not in item:
+            continue
+        value = play_coin(item.get("coin"))
+        if value is None:
+            continue
+        key = str(max(0, int(item.get("skill_ok") or 0)))
+        entry = dict(choices.get(key) or {})
+        entry["sum"] = float(entry.get("sum") or 0) + value
+        entry["n"] = int(entry.get("n") or 0) + 1
+        choices[key] = entry
+        total_n += 1
+        total_sum += value
+    if total_n <= 0:
+        return _empty_rl_length()
+    return {
+        "choices": choices,
+        "n": total_n,
+        "baseline": total_sum / total_n,
+    }
 
 
 def _empty() -> dict:
@@ -111,7 +138,7 @@ def _load() -> dict:
         "rl_wait": _rl_length_from(payload.get("rl_wait")),
         "rl_bomb": _rl_length_from(payload.get("rl_bomb")),
         "rl_skill": _rl_length_from(payload.get("rl_skill")),
-        "rl_skill_coin": _rl_length_from(payload.get("rl_skill_coin")),
+        "rl_skill_coin": _skill_coin_from_plays(cleaned),
     }
     return _cache
 
@@ -277,6 +304,7 @@ def _rl_key(options: list[int], picked: int) -> str:
 def order_found(
     found: list[list[dict[str, int]]],
     leftovers: list[int] | None = None,
+    leftover_fn: Callable[[list[dict[str, int]]], int] | None = None,
 ) -> tuple[list[list[dict[str, int]]], list[int], int]:
     if not found:
         return found, [], 0
@@ -285,6 +313,9 @@ def order_found(
         return found, options, options[0]
     if leftovers is None or len(leftovers) != len(found):
         leftovers = [0] * len(found)
+        cached = [False] * len(found)
+    else:
+        cached = [True] * len(found)
     bigs = [
         1 if any(int(piece.get("big") or 0) for piece in item) else 0
         for item in found
@@ -316,20 +347,31 @@ def order_found(
         else:
             waits.append(round(wait_base, 1))
 
+    def leftover_at(index: int) -> int:
+        if cached[index]:
+            return leftovers[index]
+        if leftover_fn is None:
+            return 0
+        leftovers[index] = int(leftover_fn(found[index]))
+        cached[index] = True
+        return leftovers[index]
+
     def pick_among(indices: list[int]) -> int:
-        best_left = max(leftovers[i] for i in indices)
-        tied = [i for i in indices if leftovers[i] == best_left]
+        best_len = max(scores[i] for i in indices)
+        tied = [i for i in indices if scores[i] == best_len]
+        lefts = [leftover_at(i) for i in tied]
+        best_left = max(lefts)
+        tied = [i for i in tied if leftover_at(i) == best_left]
         best_big = max(bigs[i] for i in tied)
         tied = [i for i in tied if bigs[i] == best_big]
-        best_len = max(scores[i] for i in tied)
-        return next(i for i in tied if scores[i] == best_len)
+        if wait_n > 0:
+            best_wait = min(waits[i] for i in tied)
+            tied = [i for i in tied if waits[i] == best_wait]
+        return tied[0]
 
     explore_n = wait_n if wait_n > 0 else matches
     if random.randrange(explore_n + 2) == 0:
         index = random.randrange(len(found))
-    elif wait_n > 0:
-        best_wait = min(waits)
-        index = pick_among([i for i, wait in enumerate(waits) if wait == best_wait])
     else:
         index = pick_among(list(range(len(found))))
     picked = found[index]
@@ -411,31 +453,8 @@ def should_bomb(sit: str, default: bool) -> bool:
     data = _load()
     rl = _rl_length_from(data.get("rl_bomb"))
     n = int(rl.get("n") or 0)
-    if n <= 0:
-        return default
-    if random.randrange(n + 2) == 0:
+    if n > 0 and random.randrange(n + 2) == 0:
         return random.randrange(2) == 0
-    choices = rl.get("choices") if isinstance(rl.get("choices"), dict) else {}
-    base = float(rl.get("baseline") or 0)
-
-    def stats(action: str) -> tuple[int, float]:
-        key = f"{sit}:{action}"
-        entry = choices.get(key) if isinstance(choices.get(key), dict) else None
-        count = int(entry.get("n") or 0) if entry else 0
-        if count <= 0:
-            return 0, base
-        return count, float(entry.get("sum") or 0) / count
-
-    tap_n, tap = stats("tap")
-    skip_n, skip = stats("skip")
-    if skip_n <= 0:
-        return True
-    if tap_n <= 0:
-        return skip >= base
-    if tap < skip:
-        return True
-    if skip < tap:
-        return False
     return default
 
 
@@ -465,57 +484,30 @@ def should_skill(sit: str, default: bool, skill_n: int = 0) -> bool:
     data = _load()
     coins = _rl_length_from(data.get("rl_skill_coin"))
     coin_n = int(coins.get("n") or 0)
-    wait_rl = _rl_length_from(data.get("rl_skill"))
-    wait_n = int(wait_rl.get("n") or 0)
-    total = coin_n + wait_n
-    if total > 0 and random.randrange(total + 2) == 0:
+    if coin_n > 0 and random.randrange(coin_n + 2) == 0:
         return random.randrange(2) == 0
-    if coin_n > 0:
-        choices = coins.get("choices") if isinstance(coins.get("choices"), dict) else {}
-        base = float(coins.get("baseline") or 0)
-
-        def coin_at(count: int) -> tuple[int, float]:
-            key = str(max(0, int(count)))
-            entry = choices.get(key) if isinstance(choices.get(key), dict) else None
-            n = int(entry.get("n") or 0) if entry else 0
-            if n <= 0:
-                return 0, base
-            return n, float(entry.get("sum") or 0) / n
-
-        now_n, now_avg = coin_at(skill_n)
-        next_n, next_avg = coin_at(skill_n + 1)
-        if now_n > 0 and next_n > 0:
-            if next_avg > now_avg:
-                return True
-            if now_avg > next_avg:
-                return False
-        elif next_n > 0 and now_n <= 0 and next_avg > base:
-            return True
-    if not sit:
+    if coin_n <= 0:
         return default
-    if wait_n <= 0:
-        return default
-    choices = wait_rl.get("choices") if isinstance(wait_rl.get("choices"), dict) else {}
-    base = float(wait_rl.get("baseline") or 0)
+    choices = coins.get("choices") if isinstance(coins.get("choices"), dict) else {}
+    base = float(coins.get("baseline") or 0)
 
-    def stats(action: str) -> tuple[int, float]:
-        key = f"{sit}:{action}"
+    def coin_at(count: int) -> tuple[int, float]:
+        key = str(max(0, int(count)))
         entry = choices.get(key) if isinstance(choices.get(key), dict) else None
-        count = int(entry.get("n") or 0) if entry else 0
-        if count <= 0:
+        n = int(entry.get("n") or 0) if entry else 0
+        if n <= 0:
             return 0, base
-        return count, float(entry.get("sum") or 0) / count
+        return n, float(entry.get("sum") or 0) / n
 
-    tap_n, tap = stats("tap")
-    skip_n, skip = stats("skip")
-    if skip_n <= 0:
+    now_n, now_avg = coin_at(skill_n)
+    next_n, next_avg = coin_at(skill_n + 1)
+    if now_n > 0 and next_n > 0:
+        if next_avg > now_avg:
+            return True
+        if now_avg > next_avg:
+            return False
+    elif next_n > 0 and now_n <= 0 and next_avg > base:
         return True
-    if tap_n <= 0:
-        return skip >= base
-    if tap < skip:
-        return True
-    if skip < tap:
-        return False
     return default
 
 

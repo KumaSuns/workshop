@@ -11,7 +11,7 @@ PIECE_INPUT = 512
 HEATMAP_SIZE = 128
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-KIND_CHANNELS = {"tsum": 0, "bomb": 1}
+KIND_CHANNELS = {"tsum": 0, "big": 0, "bomb": 1}
 
 
 def pixel_to_heat(

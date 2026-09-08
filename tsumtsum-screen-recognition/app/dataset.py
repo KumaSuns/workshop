@@ -83,7 +83,7 @@ class Sample:
 
 
 class Dataset:
-    def __init__(self, root: Path = DATA_DIR) -> None:
+    def __init__(self, root: Path = DATA_DIR, load: bool = True) -> None:
         self.root = root
         self.images_dir = root / "images"
         self.labels_dir = root / "labels"
@@ -94,7 +94,8 @@ class Dataset:
         self.labels_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self._samples: list[Sample] = []
-        self._load()
+        if load:
+            self._load()
 
     def reload(self) -> None:
         self._load()

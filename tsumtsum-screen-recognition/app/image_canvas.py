@@ -22,6 +22,7 @@ from app.regions import (
     SCENE_LABELS,
     is_piece_key,
     is_scene_key,
+    is_tsum_kind,
     piece_radius_from_game,
     tsum_group_color,
 )
@@ -215,7 +216,7 @@ class ImageCanvas(QGraphicsView):
             return
         self._selected_piece = index
         piece = self._pieces[index]
-        if piece.get("kind") == "tsum":
+        if piece.get("kind") and is_tsum_kind(str(piece.get("kind"))):
             group = max(1, min(12, int(piece.get("group") or 1)))
             if self._piece_group != group:
                 self._piece_group = group
@@ -230,7 +231,7 @@ class ImageCanvas(QGraphicsView):
         changed = False
         if self._selected_piece is not None:
             piece = self._pieces[self._selected_piece]
-            if piece.get("kind") == "tsum" and int(piece.get("group") or 1) != group:
+            if is_tsum_kind(str(piece.get("kind") or "")) and int(piece.get("group") or 1) != group:
                 piece["group"] = group
                 changed = True
         self.pieceGroupChanged.emit(self._piece_group)
@@ -424,7 +425,7 @@ class ImageCanvas(QGraphicsView):
             self._guide.setText(f"この画像が「{name}」なら保存してください。枠は不要です。")
         elif is_piece_key(self._active_key):
             name = PIECE_LABELS.get(self._active_key, "ツム")
-            extra = f"  種類 {self._piece_group}" if self._active_key == "tsum" else ""
+            extra = f"  種類 {self._piece_group}" if is_tsum_kind(self._active_key) else ""
             if self._game_rect() is None:
                 self._guide.setText(f"「{name}」の前に、ゲーム範囲を保存してください")
             else:
@@ -526,7 +527,7 @@ class ImageCanvas(QGraphicsView):
                 continue
             center = self.mapFromScene(QPointF(piece["x"], piece["y"]))
             radius = self._piece_view_radius(piece)
-            if kind == "tsum":
+            if is_tsum_kind(kind):
                 accent = QColor(tsum_group_color(int(piece.get("group") or 1)))
             else:
                 accent = QColor(PIECE_COLORS.get(kind, "#FFE066"))
@@ -611,7 +612,7 @@ class ImageCanvas(QGraphicsView):
             return
         kind = self._active_key
         radius = self._piece_radius.get(kind, DEFAULT_RADIUS)
-        if kind == "tsum":
+        if is_tsum_kind(kind):
             color = QColor(tsum_group_color(self._piece_group))
         else:
             color = QColor(PIECE_COLORS.get(kind, "#FFE066"))
@@ -659,7 +660,7 @@ class ImageCanvas(QGraphicsView):
             "y": int(round(scene_pos.y())),
             "r": int(radius),
             "kind": kind,
-            "group": self._piece_group if kind == "tsum" else 0,
+            "group": self._piece_group if is_tsum_kind(kind) else 0,
         }
         self._clamp_piece(piece)
         self._pieces.append(piece)
@@ -761,7 +762,6 @@ class ImageCanvas(QGraphicsView):
                 piece = self._pieces[hover_hit]
                 piece["r"] = max(MIN_RADIUS, piece["r"] + step)
                 self._clamp_piece(piece)
-                self._piece_radius[piece["kind"]] = piece["r"]
                 self._selected_piece = hover_hit
                 self.piecesChanged.emit()
             else:
@@ -980,7 +980,7 @@ class ImageCanvas(QGraphicsView):
             ):
                 event.accept()
                 return
-            if self._active_key == "tsum" and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            if is_tsum_kind(self._active_key) and Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
                 self.set_piece_group(key - Qt.Key.Key_1 + 1)
                 event.accept()
                 return

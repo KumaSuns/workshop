@@ -25,7 +25,7 @@ from app.digit_model import (
 from app.hud_number import crop_box, prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import HEATMAP_SIZE, KIND_CHANNELS, PIECE_INPUT, PieceNet, draw_gaussian, pixel_to_heat
-from app.regions import REGION_LABELS
+from app.regions import REGION_LABELS, is_tsum_kind
 from app.scene_model import SCENE_INPUT, SceneNet, scene_index
 from app.tsum_type import (
     IMAGENET_MEAN as TYPE_MEAN,
@@ -157,7 +157,7 @@ class TsumTypeBoardDataset(Dataset):
                 {
                     int(piece.get("group") or 1)
                     for piece in sample.pieces
-                    if piece.get("kind") == "tsum"
+                    if is_tsum_kind(str(piece.get("kind") or ""))
                 }
             )
             >= 2
@@ -181,7 +181,7 @@ class TsumTypeBoardDataset(Dataset):
         crops: list[torch.Tensor] = []
         labels: list[int] = []
         colors: list[tuple[float, ...]] = []
-        tsums = [piece for piece in sample.pieces if piece.get("kind") == "tsum"]
+        tsums = [piece for piece in sample.pieces if is_tsum_kind(str(piece.get("kind") or ""))]
         for piece in tsums:
             crop = prepare_tsum_crop(image, piece, tsums)
             if self.augment:

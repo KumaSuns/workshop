@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 from PySide6.QtGui import QImage
 
@@ -145,14 +149,14 @@ def _play_train_jobs(dataset, min_n, piece_keys, scene_keys) -> list[tuple]:
                 {
                     int(piece.get("group") or 1)
                     for piece in sample.pieces
-                    if piece.get("kind") == "tsum"
+                    if str(piece.get("kind") or "") in {"tsum", "big"}
                 }
             )
             >= 2
         ]
         if len(type_samples) >= min_n:
             jobs.append(("tsum_types", type_samples, dataset.model_path_for("tsum_types"), "ツムの種類"))
-        jobs.append(("pieces", piece_samples, dataset.model_path_for("pieces"), "ツム・ボム"))
+        jobs.append(("pieces", piece_samples, dataset.model_path_for("pieces"), "ツム・ボム・デカツム"))
     digit_samples = dataset.labeled_digit_samples()
     if len(digit_samples) >= min_n:
         jobs.append(("coin_digits", digit_samples, dataset.model_path_for("coin_digits"), "コインの数字"))
@@ -207,6 +211,9 @@ HUD_KEYS = (
 )
 DIGIT_KEYS = ("coin", "result_coin")
 RESULT_KEYS = ("result_coin", "score")
+_board_queue: Queue | None = None
+_board_thread: Thread | None = None
+_board_dataset_cls = None
 
 
 def save_play_board(
@@ -225,14 +232,83 @@ def save_play_board(
             "w": int(game["w"]),
             "h": int(game["h"]),
         }
-    return _save_labeled(
-        predictor,
-        image,
-        hud,
-        pieces=pieces or [],
-        readings=_digit_readings(predictor, rgb, hud),
-        confirm_regions=False,
+    dataset_cls = getattr(predictor, "_dataset_cls", None)
+    if dataset_cls is None:
+        return False
+    if rgb is None:
+        return False
+    kept = [
+        {
+            "x": int(piece["x"]),
+            "y": int(piece["y"]),
+            "r": int(piece["r"]),
+            "kind": str(piece["kind"]),
+            "group": int(piece.get("group") or 1),
+        }
+        for piece in (pieces or [])
+        if int(piece.get("r") or 0) >= 4
+    ]
+    _ensure_board_saver(dataset_cls)
+    _board_queue.put(
+        {
+            "rgb": rgb.copy(),
+            "hud": hud,
+            "pieces": kept,
+        }
     )
+    return True
+
+
+def _ensure_board_saver(dataset_cls) -> None:
+    global _board_queue, _board_thread, _board_dataset_cls
+    _board_dataset_cls = dataset_cls
+    if _board_queue is None:
+        _board_queue = Queue()
+    if _board_thread is not None and _board_thread.is_alive():
+        return
+    _board_thread = Thread(target=_board_save_loop, daemon=True)
+    _board_thread.start()
+
+
+def _board_save_loop() -> None:
+    while True:
+        job = _board_queue.get()
+        try:
+            _write_play_board(job)
+        except Exception:
+            pass
+
+
+def _write_play_board(job: dict) -> None:
+    dataset_cls = _board_dataset_cls
+    if dataset_cls is None:
+        return
+    dataset = dataset_cls(TRAINER_ROOT / "data")
+    before = len(dataset.all())
+    rgb = job.get("rgb")
+    if rgb is None:
+        return
+    fd, raw = tempfile.mkstemp(suffix=".png", prefix="bluestacks_")
+    os.close(fd)
+    tmp = Path(raw)
+    sample = None
+    try:
+        rgb.save(tmp, format="PNG")
+        sample = dataset.import_file(tmp, save=False)
+    except Exception:
+        sample = None
+    finally:
+        tmp.unlink(missing_ok=True)
+    if sample is None or len(dataset.all()) <= before:
+        return
+    hud = job.get("hud") or {}
+    dataset.apply_predictions(sample.id, hud)
+    dataset.apply_piece_predictions(sample.id, job.get("pieces") or [])
+    sample = dataset.get(sample.id)
+    if sample is not None:
+        sample.status = "predicted"
+        sample.confirmed = []
+        dataset.save()
 
 
 def save_play_scene(predictor, image: QImage, key: str) -> bool:
@@ -305,6 +381,7 @@ def _save_labeled(
     readings: dict[str, str] | None = None,
     scene: str | None = None,
     confirm_regions: bool = True,
+    rgb=None,
 ) -> bool:
     dataset_cls = getattr(predictor, "_dataset_cls", None)
     if dataset_cls is None or image is None or image.isNull():
@@ -312,11 +389,24 @@ def _save_labeled(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset = dataset_cls(TRAINER_ROOT / "data")
     before = len(dataset.all())
-    sample = dataset.import_qimage(
-        image,
-        source_name=f"bluestacks_{stamp}.png",
-        name_prefix="bluestacks_",
-    )
+    sample = None
+    if rgb is not None:
+        fd, raw = tempfile.mkstemp(suffix=".png", prefix="bluestacks_")
+        os.close(fd)
+        tmp = Path(raw)
+        try:
+            rgb.save(tmp, format="PNG")
+            sample = dataset.import_file(tmp, save=False)
+        except Exception:
+            sample = None
+        finally:
+            tmp.unlink(missing_ok=True)
+    if sample is None:
+        sample = dataset.import_qimage(
+            image,
+            source_name=f"bluestacks_{stamp}.png",
+            name_prefix="bluestacks_",
+        )
     if len(dataset.all()) <= before:
         return False
     status = "labeled" if confirm_regions or scene else "predicted"

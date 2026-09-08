@@ -32,6 +32,7 @@ class ServerThread(QThread):
     def __init__(self) -> None:
         super().__init__()
         self._server: uvicorn.Server | None = None
+        self.error = ""
 
     def run(self) -> None:
         config = uvicorn.Config(
@@ -39,12 +40,14 @@ class ServerThread(QThread):
             host=BIND_HOST,
             port=PORT,
             log_level="warning",
+            loop="asyncio",
             ws_max_size=16 * 1024 * 1024,
         )
         self._server = uvicorn.Server(config)
         try:
             self._server.run()
         except Exception as exc:
+            self.error = str(exc)
             self.failed.emit(str(exc))
 
     def stop(self) -> None:
@@ -117,7 +120,10 @@ class MainWindow(QMainWindow):
     def _open_public(self) -> None:
         try:
             self.status_text.emit("待ち受けを確認しています")
-            _wait_port("127.0.0.1", PORT)
+            worker = self._server
+            if worker is None:
+                raise RuntimeError("待ち受けが始まりませんでした。")
+            _wait_port("127.0.0.1", PORT, worker.isRunning)
             self.status_text.emit("アドレスを出しています")
             self.progress.emit(0, 0)
             self._tunnel.start(f"http://127.0.0.1:{PORT}")
@@ -125,7 +131,9 @@ class MainWindow(QMainWindow):
             self.progress.emit(-1, 0)
             self.status_text.emit("アドレスが出ませんでした")
             self.public_url.emit("")
-            self.fail_text.emit(str(exc))
+            worker = self._server
+            text = (worker.error if worker is not None else "") or str(exc)
+            self.fail_text.emit(text)
             return
         self.progress.emit(-1, 0)
         self.public_url.emit(self._tunnel.url)
@@ -169,9 +177,8 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def _wait_port(host: str, port: int) -> None:
-    deadline = time.time() + 12
-    while time.time() < deadline:
+def _wait_port(host: str, port: int, running) -> None:
+    while running():
         try:
             with socket.create_connection((host, port), timeout=0.4):
                 return

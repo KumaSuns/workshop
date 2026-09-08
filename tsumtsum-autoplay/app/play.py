@@ -3,6 +3,7 @@ from __future__ import annotations
 import colorsys
 import json
 import math
+import random
 import sys
 import tempfile
 import time
@@ -69,11 +70,15 @@ SKILL_GAP = 2.2
 SKILL_FILL_READY = 0.90
 SKILL_FILL_SPENT = 0.40
 SKIP_TTL = 4.0
-ERASE_WAIT = 0.5
+ERASE_WAIT = 0.15
 FAN_GAP = 8.0
 _gpu_lock = Lock()
 
 StatusFn = Callable[[str], None]
+
+
+def _is_tsum(piece: dict) -> bool:
+    return str(piece.get("kind") or "") in {"tsum", "big"}
 
 
 class PlayWorker(QThread):
@@ -388,6 +393,32 @@ def run_play(
         bomb_pick = (sit, pressed)
         bomb_acc = 0.0
 
+    def settle_pending(erased: bool) -> None:
+        nonlocal pending_lesson, pending_burst, pending_spots, pending_key
+        nonlocal pending_n, pending_at, pending_group, pending_skip
+        nonlocal bomb_asked, bomb_asked_sit, skill_wait_empty
+        nonlocal skip_chains, skip_born
+        bomb_asked = False
+        bomb_asked_sit = ""
+        if pending_lesson is not None:
+            record_pick(pending_lesson[0], pending_lesson[1], erased)
+            pending_lesson = None
+        if not erased:
+            born = time.time()
+            for key in pending_skip:
+                if key not in skip_chains:
+                    skip_chains.append(key)
+                skip_born[key] = born
+        pending_burst = 1
+        pending_spots = None
+        pending_key = None
+        pending_n = 0
+        pending_at = 0.0
+        pending_group = 0
+        pending_skip = []
+        if erased:
+            skill_wait_empty = False
+
     def ask_bomb(sit: str, default: bool) -> bool:
         nonlocal bomb_asked, bomb_asked_sit
         if bomb_asked and bomb_asked_sit == sit:
@@ -404,6 +435,64 @@ def run_play(
         flush_skill()
         skill_pick = (sit, pressed)
         skill_acc = 0.0
+
+    def try_bomb(sit: str) -> bool:
+        nonlocal last_bomb_at, bomb_taps
+        bombs = _bombs_on_board(pieces, game)
+        if not bombs:
+            return False
+        live = {_piece_cell(piece) for piece in bombs}
+        skip_bomb_cells.intersection_update(live)
+        sit_bomb = bomb_situation(sit, len(bombs))
+        if not ask_bomb(sit_bomb, True):
+            return False
+        did, cell = _tap_biggest_bomb(
+            pieces, image, say, stop, game, skip_bomb_cells
+        )
+        if not did:
+            return False
+        if cell is not None:
+            skip_bomb_cells.add(cell)
+        bomb_taps += 1
+        last_bomb_at = time.time()
+        pending_hud.append((sit, "bomb", True))
+        return True
+
+    def try_skill(sit: str) -> bool:
+        nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps
+        if skill is None:
+            return False
+        tapped, skill_wait_empty, spent = _press_skill(
+            skill,
+            image,
+            rgb,
+            say,
+            stop,
+            last_skill_at,
+            skill_wait_empty,
+            pending_hud,
+            sit,
+        )
+        if spent:
+            skill_ok += 1
+        if tapped:
+            start_skill_pick(sit, True)
+            last_skill_at = time.time()
+            skill_taps += 1
+            return True
+        return False
+
+    def skill_sit(has_chain: bool) -> str:
+        fever_fill = _fever_fill(rgb, fever)
+        fever_on = _fever_playing(rgb, game)
+        has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
+        return hud_situation(
+            fever_on,
+            fever_fill,
+            has_chain,
+            has_bomb,
+            len(tsums) >= BOARD_TSUMS,
+        )
 
     my_group = 0
     kinds = 5
@@ -532,13 +621,25 @@ def run_play(
                 kinds = 4 if used else 5
                 kinds_locked = True
                 say(f"5＞4 {'使用' if used else '未使用'} / 種類 {kinds}")
+        erased_now = False
+        if saw_board and pending_spots is not None:
+            erased = not _spots_lingered(rgb, pending_spots)
+            if erased:
+                settle_pending(True)
+                erased_now = True
+            elif time.time() - pending_at < ERASE_WAIT:
+                sit = skill_sit(True)
+                try_skill(sit)
+                try_bomb(sit)
+                note_idle(True)
+                continue
         with _gpu_lock:
             pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
-        tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
+        tsums = [piece for piece in pieces if _is_tsum(piece)]
         if len(tsums) < BOARD_TSUMS and not saw_board:
             with _gpu_lock:
                 pieces = predictor.predict_pieces(Path("."), None, rgb=rgb, inner=False)
-            tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
+            tsums = [piece for piece in pieces if _is_tsum(piece)]
         _check_stop(stop)
         if len(tsums) >= BOARD_READY:
             saw_board = True
@@ -554,41 +655,13 @@ def run_play(
                 _sleep_stop(2.0, stop)
                 continue
             continue
-        erased_now = False
         if pending_spots is not None:
-            erased = not _spots_lingered(rgb, pending_spots)
-            if pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN:
-                erased = True
+            erased = pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN
             if erased:
-                bomb_asked = False
-                bomb_asked_sit = ""
-                if pending_lesson is not None:
-                    record_pick(pending_lesson[0], pending_lesson[1], True)
-                    pending_lesson = None
-                pending_burst = 1
-                pending_spots = None
-                pending_key = None
-                pending_n = 0
-                pending_at = 0.0
-                pending_group = 0
-                pending_skip = []
+                settle_pending(True)
                 erased_now = True
-                skill_wait_empty = False
-            elif time.time() - pending_at < ERASE_WAIT:
-                note_idle(True)
-            else:
-                bomb_asked = False
-                bomb_asked_sit = ""
-                if pending_lesson is not None:
-                    record_pick(pending_lesson[0], pending_lesson[1], False)
-                    pending_lesson = None
-                pending_spots = None
-                pending_key = None
-                pending_n = 0
-                pending_at = 0.0
-                pending_burst = 1
-                pending_group = 0
-                pending_skip = []
+            elif time.time() - pending_at >= ERASE_WAIT:
+                settle_pending(False)
         now = time.time()
         skip_chains = [
             key for key in skip_chains if now - skip_born.get(key, 0) < SKIP_TTL
@@ -598,45 +671,28 @@ def run_play(
         pick_n = 0
         found = list_found(pieces, tsums)
         if found:
-            leftovers = [
-                _leftover_len(pieces, chain, candidates) for chain in found
-            ]
-            found, pick_opts, pick_n = order_found(found, leftovers)
+            found, pick_opts, pick_n = order_found(found)
             say("候補 " + " / ".join(str(len(item)) for item in found))
-            fever_fill = _fever_fill(rgb, fever)
-            fever_on = _fever_playing(rgb, game)
-            has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
-            sit = hud_situation(
-                fever_on,
-                fever_fill,
-                True,
-                has_bomb,
-                len(tsums) >= BOARD_TSUMS,
+            sit = skill_sit(True)
+            if try_skill(sit):
+                continue
+            last_save_at = _learn_board(
+                predictor,
+                image,
+                rgb,
+                game,
+                skill,
+                fever,
+                timer,
+                fan,
+                last_boxes,
+                pieces,
+                tsums,
+                saved_boards,
+                last_save_at,
+                save_boards,
+                say,
             )
-            if skill is not None and _skill_ready(rgb, skill):
-                go = should_skill(sit, True, skill_ok)
-                if go:
-                    tapped, skill_wait_empty, spent = _press_skill(
-                        skill,
-                        image,
-                        rgb,
-                        say,
-                        stop,
-                        last_skill_at,
-                        skill_wait_empty,
-                        pending_hud,
-                        sit,
-                    )
-                    if spent:
-                        skill_ok += 1
-                    if tapped:
-                        start_skill_pick(sit, True)
-                        last_skill_at = time.time()
-                        skill_taps += 1
-                        continue
-                    go = False
-                if not go:
-                    start_skill_pick(sit, False)
             skill_fill = _skill_fill(rgb, skill)
             if pick_n >= MIN_CHAIN:
                 flush_idle()
@@ -766,6 +822,8 @@ def run_play(
                 pending_skip = pending_skip + burst_skip
                 bomb_asked = False
                 bomb_asked_sit = ""
+            try_skill(skill_sit(True))
+            try_bomb(skill_sit(True))
             load_hud()
             note_idle(True)
             continue
@@ -796,43 +854,14 @@ def run_play(
                 ok = erased_now or fever_on or (kind == "fan" and bool(found))
                 record_hud(old_sit, kind, pressed, ok)
             pending_hud = []
-        if skill is not None and _skill_ready(rgb, skill) and not should_skill(
-            sit, True, skill_ok
-        ):
-            start_skill_pick(sit, False)
-            tapped, spent = False, False
-        else:
-            tapped, skill_wait_empty, spent = _press_skill(
-                skill, image, rgb, say, stop, last_skill_at, skill_wait_empty, pending_hud, sit
-            )
-        if spent:
-            skill_ok += 1
-        if tapped:
-            start_skill_pick(sit, True)
-            last_skill_at = time.time()
-            skill_taps += 1
+        if try_skill(sit):
             continue
         skill_fill = _skill_fill(rgb, skill)
         if gauges is not None:
             gauges(skill_fill, fever_fill, fever_on)
         if preview is not None:
             preview(_draw_plan(image, pieces, [], game, skill_fill))
-        did = False
-        if has_bomb:
-            bombs = _bombs_on_board(pieces, game)
-            live = {_piece_cell(piece) for piece in bombs}
-            skip_bomb_cells.intersection_update(live)
-            sit_bomb = bomb_situation(sit, len(bombs))
-            if ask_bomb(sit_bomb, True):
-                did, cell = _tap_biggest_bomb(
-                    pieces, image, say, stop, game, skip_bomb_cells
-                )
-                if did and cell is not None:
-                    skip_bomb_cells.add(cell)
-        if did:
-            bomb_taps += 1
-            last_bomb_at = time.time()
-            pending_hud.append((sit, "bomb", True))
+        if try_bomb(sit):
             continue
         if _press_fan(fan, image, say, stop, last_fan_at, len(tsums), pending_hud, sit):
             last_fan_at = time.time()
@@ -1044,13 +1073,19 @@ def _learn_board(
     last_save_at: float,
     save_boards: Callable[[], bool] | None,
     say: StatusFn,
+    sample: bool = False,
 ) -> float:
-    if save_boards is None or not save_boards():
+    toggle = save_boards is not None and save_boards()
+    if not toggle and not sample:
         return last_save_at
     if not tsums:
         return last_save_at
     board = _board_key(tsums)
-    if board in saved_boards or time.time() - last_save_at < 2.5:
+    if board in saved_boards:
+        return last_save_at
+    if not toggle and time.time() - last_save_at < 2.5:
+        return last_save_at
+    if not toggle and random.randrange(len(saved_boards) + 3) != 0:
         return last_save_at
     saved_boards.add(board)
     boxes = dict(last_boxes)
@@ -1061,7 +1096,7 @@ def _learn_board(
         )
     except Exception:
         learned = False
-    if learned and save_boards is not None and save_boards():
+    if learned:
         say("消す前の盤面を取り込みました")
     return time.time()
 
@@ -1089,8 +1124,10 @@ def _press_skill(
         if fill is not None and fill < SKILL_FILL_SPENT:
             wait_empty = False
             spent = True
-        else:
+        elif time.time() - last_skill_at < SKILL_GAP:
             return False, wait_empty, False
+        else:
+            wait_empty = False
     if time.time() - last_skill_at < SKILL_GAP:
         return False, wait_empty, spent
     if not _skill_ready(rgb, skill):
@@ -1107,7 +1144,7 @@ def _skill_ready(rgb, skill: dict[str, int]) -> bool:
     if fill is not None and fill >= SKILL_FILL_READY:
         return True
     yellow, blue = _skill_ring_yellow_blue(rgb, skill)
-    if yellow + blue >= SLOT_ON and yellow > blue:
+    if yellow + blue >= SLOT_ON:
         return True
     if fill is not None and fill >= 0.75:
         return True
@@ -1381,14 +1418,14 @@ def _drop_down(remaining: list[dict[str, int]], before: list[dict[str, int]]) ->
     origins = [
         piece
         for piece in before
-        if str(piece.get("kind") or "") in {"tsum", "bomb"}
+        if _is_tsum(piece) or str(piece.get("kind") or "") == "bomb"
     ]
     movers = [
         piece
         for piece in remaining
-        if str(piece.get("kind") or "") in {"tsum", "bomb"}
+        if _is_tsum(piece) or str(piece.get("kind") or "") == "bomb"
     ]
-    tsums = [piece for piece in origins if str(piece.get("kind") or "") == "tsum"]
+    tsums = [piece for piece in origins if _is_tsum(piece)]
     spacing = _median_spacing(tsums or origins)
     if spacing <= 0 or not movers or not origins:
         return
@@ -2238,7 +2275,7 @@ def _leftover_len(
     others = [
         piece
         for piece in leftover
-        if str(piece.get("kind") or "") != "tsum"
+        if not _is_tsum(piece)
         or int(piece.get("group") or 0) != group
     ]
     found = [item for item in candidates(others, 1) if len(item) >= MIN_CHAIN]
@@ -2297,7 +2334,7 @@ def _attach_type_vecs(
     rgb,
     pieces: list[dict[str, int]],
 ) -> None:
-    tsums = [piece for piece in pieces if str(piece.get("kind") or "") == "tsum"]
+    tsums = [piece for piece in pieces if _is_tsum(piece)]
     if not tsums:
         return
     vecs = _type_vectors(predictor, rgb, tsums)
@@ -2400,8 +2437,6 @@ def _chain_too_similar(
     key = _chain_key(chain)
     for old in used_keys:
         if key == old or key <= old or old <= key:
-            return True
-        if len(key & old) >= 2:
             return True
     return False
 

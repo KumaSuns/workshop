@@ -27,7 +27,7 @@ from app.piece_model import (
     peaks_from_heat,
 )
 from app.paths import WORKSHOP_ROOT
-from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename, piece_radius_from_game
+from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, is_tsum_kind, model_filename, piece_radius_from_game
 from app.scene_model import SCENE_CLASSES, SCENE_INPUT, SceneNet
 from app.tsum_type import (
     IMAGENET_MEAN as TYPE_MEAN,
@@ -41,9 +41,9 @@ from app.tsum_type import (
 
 
 class Predictor:
-    def __init__(self, models_dir: Path) -> None:
+    def __init__(self, models_dir: Path, load: bool = True) -> None:
         self.models_dir = models_dir
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")
         self.models: dict[str, GameRegionNet] = {}
         self.piece_model: PieceNet | None = None
         self.type_model: TsumTypeNet | None = None
@@ -85,7 +85,8 @@ class Predictor:
                 transforms.Normalize(TYPE_MEAN, TYPE_STD),
             ]
         )
-        self.reload()
+        if load:
+            self.reload()
 
     def release(self) -> None:
         self.models = {}
@@ -117,13 +118,23 @@ class Predictor:
             keys.extend(SCENE_KEYS)
         return keys
 
-    def reload(self) -> bool:
+    def reload(self, pump=None, device: str | None = None) -> bool:
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
         self.models = {}
         self.piece_model = None
         self.type_model = None
         self.digit_models = {}
         self.scene_model = None
         self.scene_classes = SCENE_CLASSES
+
+        def tick() -> None:
+            if pump is not None:
+                pump()
+
+        tick()
         for key in REGION_KEYS:
             path = self.models_dir / model_filename(key)
             if not path.exists():
@@ -139,6 +150,7 @@ class Predictor:
             model.to(self.device)
             model.eval()
             self.models[key] = model
+            tick()
         piece_path = self.models_dir / model_filename("pieces")
         if piece_path.exists():
             checkpoint = torch.load(piece_path, map_location=self.device, weights_only=False)
@@ -152,6 +164,7 @@ class Predictor:
             model.to(self.device)
             model.eval()
             self.piece_model = model
+            tick()
         type_path = self.models_dir / model_filename("tsum_types")
         if type_path.exists():
             checkpoint = torch.load(type_path, map_location=self.device, weights_only=False)
@@ -169,6 +182,7 @@ class Predictor:
                 model.to(self.device)
                 model.eval()
                 self.type_model = model
+                tick()
         self.digit_models = {}
         for key, filename in (("coin", "coin_digits.pt"), ("result_coin", "result_coin_digits.pt")):
             path = self.models_dir / filename
@@ -188,6 +202,7 @@ class Predictor:
             model.to(self.device)
             model.eval()
             self.digit_models[key] = model
+            tick()
         if "coin" in self.digit_models and "result_coin" not in self.digit_models:
             self.digit_models["result_coin"] = self.digit_models["coin"]
         scene_path = self.models_dir / model_filename("scene")
@@ -215,6 +230,7 @@ class Predictor:
                 model.eval()
                 self.scene_model = model
                 self.scene_classes = classes
+                tick()
         return self.is_ready()
 
     def predict_scene(self, image_path: Path) -> tuple[str, float]:
@@ -329,11 +345,12 @@ class Predictor:
         min_sep = max(2.0, HEATMAP_SIZE / 18.0)
         kept = nms_peaks(raw, min_sep)
         found: list[dict[str, int]] = []
+        big_r = int(round(base_r * 1.8))
         for score, hx, hy, r_norm in kept:
             pred_r = max(1, int(round(float(r_norm) * scale)))
             x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
             big = False
-            if pred_r >= int(round(base_r * 1.8)):
+            if pred_r >= big_r:
                 heat_r = pred_r / max(1.0, float(crop_w)) * HEATMAP_SIZE
                 strong = 0
                 for other_score, ox, oy, _or in raw:
@@ -355,13 +372,29 @@ class Predictor:
                 "x": int(round(x)),
                 "y": int(round(y)),
                 "r": int(pred_r if big else base_r),
-                "kind": "tsum",
+                "kind": "big" if big else "tsum",
                 "group": 1,
             }
             if big:
                 item["big"] = 1
             found.append(item)
-        return found
+        bigs = [piece for piece in found if int(piece.get("big") or 0)]
+        if not bigs:
+            return found
+        pruned: list[dict[str, int]] = []
+        for piece in found:
+            if int(piece.get("big") or 0):
+                pruned.append(piece)
+                continue
+            px, py = int(piece["x"]), int(piece["y"])
+            inside = False
+            for big in bigs:
+                if math.hypot(px - int(big["x"]), py - int(big["y"])) < int(big["r"]):
+                    inside = True
+                    break
+            if not inside:
+                pruned.append(piece)
+        return pruned
 
     def _assign_groups(
         self,
@@ -372,7 +405,7 @@ class Predictor:
     ) -> None:
         tsums: list[dict[str, int]] = []
         for piece in pieces:
-            if piece["kind"] != "tsum":
+            if not is_tsum_kind(piece["kind"]):
                 piece["group"] = 0
             else:
                 tsums.append(piece)
