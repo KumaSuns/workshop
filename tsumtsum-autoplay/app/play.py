@@ -35,6 +35,7 @@ from app.intro import (
     _retry_button,
     _slow_tap,
 )
+from app.skill_tsum import after_skill_tap, skill_breaks_bombs
 from app.play_style import (
     hud_net,
     hud_situation,
@@ -180,15 +181,20 @@ def run_play(
             report(text)
 
     arrived = ""
+    used_tsum = ""
     if start_match:
-        _seen, _locked, arrived = _click_start_or_continue(say, stop, tap_start=False)
+        _seen, _locked, arrived, seen_tsum = _click_start_or_continue(
+            say, stop, tap_start=False
+        )
+        if seen_tsum:
+            used_tsum = seen_tsum
         if arrived in ("start", "continue") and request_used_tsum is not None:
             if arrived == "start":
                 try:
                     path = capture_screen_path()
                 except Exception:
                     path = None
-                guess = _read_used_tsum(path) if path is not None else ""
+                guess = _read_used_tsum(path) if path is not None else seen_tsum
                 if guess:
                     say(f"使用ツム {guess}")
                 confirmed = request_used_tsum(guess, path, False)
@@ -197,6 +203,7 @@ def run_play(
             if confirmed is None:
                 raise Stopped()
             if confirmed:
+                used_tsum = confirmed
                 say(f"使用ツム {confirmed}")
         if arrived in ("start", "continue") and request_kinds is not None:
             asked = request_kinds()
@@ -460,6 +467,7 @@ def run_play(
 
     def try_skill(sit: str) -> bool:
         nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps
+        nonlocal bomb_taps, last_bomb_at
         if skill is None:
             return False
         tapped, skill_wait_empty, spent = _press_skill(
@@ -472,13 +480,22 @@ def run_play(
             skill_wait_empty,
             pending_hud,
             sit,
+            used_tsum=used_tsum,
         )
         if spent:
             skill_ok += 1
         if tapped:
             start_skill_pick(sit, True)
-            last_skill_at = time.time()
             skill_taps += 1
+            last_skill_at = time.time()
+            after_skill_tap(
+                used_tsum, image, rgb, say, stop, watch_hit=watch_hit, game=game
+            )
+            if skill_breaks_bombs(used_tsum):
+                n = _break_bombs_until_two(predictor, game, say, stop, watch_hit)
+                bomb_taps += n
+                if n:
+                    last_bomb_at = time.time()
             return True
         return False
 
@@ -603,7 +620,9 @@ def run_play(
                 stop_watch.set()
                 watching.clear()
                 return
-            _replay_after_timeup(say, stop)
+            seen = _replay_after_timeup(say, stop)
+            if seen:
+                used_tsum = seen
             fresh_match()
             say("プレイを開始します")
             continue
@@ -804,7 +823,9 @@ def run_play(
                     stop_watch.set()
                     watching.clear()
                     return
-                _replay_after_timeup(say, stop)
+                seen = _replay_after_timeup(say, stop)
+                if seen:
+                    used_tsum = seen
                 fresh_match()
                 say("プレイを開始します")
                 continue
@@ -1113,6 +1134,7 @@ def _press_skill(
     sit: str,
     carry: bool = False,
     force: bool = False,
+    used_tsum: str = "",
 ) -> tuple[bool, bool, bool]:
     if skill is None:
         if not carry and not force:
@@ -1130,16 +1152,19 @@ def _press_skill(
             wait_empty = False
     if time.time() - last_skill_at < SKILL_GAP:
         return False, wait_empty, spent
-    if not _skill_ready(rgb, skill):
+    if not _skill_ready(rgb, skill, used_tsum):
         return False, wait_empty, spent
     pending_hud.append((sit, "skill", True))
     _tap_skill(skill, image, say, stop)
     return True, True, spent
 
 
-def _skill_ready(rgb, skill: dict[str, int]) -> bool:
+def _skill_ready(rgb, skill: dict[str, int], used_tsum: str = "") -> bool:
     if rgb is None:
         return False
+    if skill_breaks_bombs(used_tsum):
+        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+        return yellow >= SLOT_ON
     fill = _skill_fill(rgb, skill)
     if fill is not None and fill >= SKILL_FILL_READY:
         return True
@@ -1402,6 +1427,74 @@ def _bombs_on_board(
             continue
         found.append(piece)
     return found
+
+
+def _break_bombs_until_two(
+    predictor,
+    game: dict[str, int] | None,
+    say: StatusFn,
+    stop: Event | None,
+    watch_hit: Event,
+) -> int:
+    if game is None:
+        return 0
+    skip: set[tuple[int, int]] = set()
+    taps = 0
+    while True:
+        _check_stop(stop)
+        if watch_hit.is_set():
+            return taps
+        try:
+            image = capture_play_frame()
+            rgb = _qimage_rgb(image)
+        except Exception:
+            _sleep_stop(ERASE_WAIT, stop)
+            continue
+        if rgb is None or image.isNull():
+            _sleep_stop(ERASE_WAIT, stop)
+            continue
+        with _gpu_lock:
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+        bombs = _bombs_on_board(pieces, game)
+        n = len(bombs)
+        tsums = [piece for piece in pieces if _is_tsum(piece)]
+        if n == 2:
+            say("cバズ ボム 2")
+            return taps
+        if n > 2:
+            say(f"cバズ ボム {n}")
+            extra = [
+                piece
+                for piece in sorted(
+                    bombs, key=lambda piece: int(piece.get("r") or 0), reverse=True
+                )
+                if _piece_cell(piece) not in skip
+            ][: n - 2]
+            if not extra:
+                skip.clear()
+                extra = sorted(
+                    bombs, key=lambda piece: int(piece.get("r") or 0), reverse=True
+                )[: n - 2]
+            for bomb in extra:
+                _check_stop(stop)
+                if watch_hit.is_set():
+                    return taps
+                say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+                tap(
+                    int(bomb["x"]),
+                    int(bomb["y"]),
+                    hold_ms=40,
+                    screen_w=image.width(),
+                    screen_h=image.height(),
+                )
+                skip.add(_piece_cell(bomb))
+                taps += 1
+            _sleep_stop(ERASE_WAIT, stop)
+            continue
+        if len(tsums) >= BOARD_READY:
+            return taps
+        skip.clear()
+        _sleep_stop(ERASE_WAIT, stop)
 
 
 def _remaining_after_erase(
@@ -1694,12 +1787,15 @@ def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
     return int(digits) == 0
 
 
-def _replay_after_timeup(say: StatusFn, stop: Event | None) -> None:
-    _seen, _locked, arrived = _click_start_or_continue(say, stop, tap_start=False)
+def _replay_after_timeup(say: StatusFn, stop: Event | None) -> str:
+    _seen, _locked, arrived, used_name = _click_start_or_continue(
+        say, stop, tap_start=False
+    )
     if arrived == "start":
         _tap_start_now(say, stop)
     elif arrived == "continue":
         _tap_continue_now(say, stop)
+    return used_name
 
 
 def _tap_point(image: QImage, x: int, y: int) -> None:
@@ -1911,10 +2007,11 @@ def _click_start_or_continue(
     stop: Event | None,
     tap_start: bool = True,
     skip_retry: bool = False,
-) -> tuple[int, bool, str]:
+) -> tuple[int, bool, str, str]:
     deadline = time.time() + 12
     kinds = 5
     locked = False
+    used_name = ""
     while time.time() < deadline:
         _check_stop(stop)
         try:
@@ -1935,6 +2032,7 @@ def _click_start_or_continue(
         if start is not None:
             name = _read_used_tsum(path)
             if name:
+                used_name = name
                 say(f"使用ツム {name}")
             if tap_start:
                 say("スタートをクリックします")
@@ -1942,7 +2040,7 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
             else:
                 say("スタートを検出しました")
-            return kinds, locked, "start"
+            return kinds, locked, "start", used_name
         pause = _pause_continue_button(image)
         if pause is not None:
             if tap_start:
@@ -1951,9 +2049,9 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
             else:
                 say("続けるを検出しました")
-            return kinds, locked, "continue"
+            return kinds, locked, "continue", used_name
         if _in_play_hud(image):
-            return kinds, locked, ""
+            return kinds, locked, "", used_name
         retry = None if skip_retry else _retry_button(image)
         if retry is not None:
             say("リトライをクリックします")
@@ -1983,12 +2081,12 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
             else:
                 say("続けるを検出しました")
-            return kinds, locked, "continue"
+            return kinds, locked, "continue", used_name
         say("画面の最上部をタップします")
         _slow_tap(image.width() // 2, 1)
         _sleep_stop(1.2, stop)
         deadline = max(deadline, time.time() + 12)
-    return kinds, locked, ""
+    return kinds, locked, "", used_name
 
 
 def _tap_start_now(say: StatusFn, stop: Event | None) -> bool:

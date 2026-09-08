@@ -112,7 +112,7 @@ def main() -> None:
 
     lock = _acquire_instance_lock()
     if lock is None:
-        if _handoff_to_running(paths):
+        if paths and _handoff_to_running(paths):
             sys.exit(0)
         stale = QLockFile(str(_lock_path()))
         _kill_stale_instance(stale)

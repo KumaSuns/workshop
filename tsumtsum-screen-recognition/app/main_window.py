@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -342,6 +343,7 @@ class _GroupStripBody(QWidget):
     CELL = 80
     GAP = 6
     LABEL = 36
+    COLS = 8
 
     pieceClicked = Signal(int)
     pieceRemoveRequested = Signal(int)
@@ -351,6 +353,7 @@ class _GroupStripBody(QWidget):
         self._rows: list[tuple[str, QColor, list[tuple[QPixmap, int]]]] = []
         self._selected: int | None = None
         self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
     def set_pieces(
         self,
@@ -361,9 +364,8 @@ class _GroupStripBody(QWidget):
         self._rows = []
         self._selected = selected
         if pixmap is None or pixmap.isNull() or not pieces:
-            self.updateGeometry()
+            self.setFixedSize(self.LABEL + self.CELL, self.CELL)
             self.update()
-            self.setMinimumHeight(0)
             return
         grouped: dict[str, list[tuple[QPixmap, int]]] = {}
         for index, piece in enumerate(pieces):
@@ -378,8 +380,9 @@ class _GroupStripBody(QWidget):
         for key in sorted(grouped, key=sort_key):
             color = QColor("#FF5C5C") if key == "B" else QColor(tsum_group_color(int(key)))
             self._rows.append((key, color, grouped[key]))
-        self.setMinimumHeight(self.heightForWidth(max(self.width(), 1)))
-        self.updateGeometry()
+        width = self.LABEL + self.COLS * (self.CELL + self.GAP)
+        height = max(1, self._needed_height())
+        self.setFixedSize(width, height)
         self.update()
 
     def _crop(self, pixmap: QPixmap, piece: dict[str, int]) -> QPixmap:
@@ -390,31 +393,25 @@ class _GroupStripBody(QWidget):
             self.CELL,
             self.CELL,
             Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         )
 
     def hasHeightForWidth(self) -> bool:
-        return True
-
-    def heightForWidth(self, width: int) -> int:
-        return self._needed_height(width)
+        return False
 
     def sizeHint(self) -> QSize:
-        return QSize(480, self._needed_height(max(self.width(), 480)))
+        return QSize(self.LABEL + self.COLS * (self.CELL + self.GAP), self._needed_height())
 
     def minimumSizeHint(self) -> QSize:
-        if not self._rows:
-            return QSize(0, 0)
         return QSize(self.LABEL + self.CELL, self.CELL)
 
-    def _per_row(self, width: int) -> int:
-        inner = max(self.CELL, width - self.LABEL - 8)
-        return max(1, (inner + self.GAP) // (self.CELL + self.GAP))
+    def _per_row(self, _width: int = 0) -> int:
+        return self.COLS
 
-    def _needed_height(self, width: int) -> int:
+    def _needed_height(self, _width: int = 0) -> int:
         if not self._rows:
             return 0
-        per = self._per_row(width)
+        per = self.COLS
         lines = 0
         for _key, _color, tiles in self._rows:
             lines += max(1, (len(tiles) + per - 1) // per)
@@ -437,10 +434,6 @@ class _GroupStripBody(QWidget):
                     yield QRect(x, y, self.CELL, self.CELL), index, key, color, tile
                     x += self.CELL + self.GAP
                 y += self.CELL + self.GAP
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self.setMinimumHeight(self.heightForWidth(max(self.width(), 1)))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         hit = self._hit(event.position().toPoint())
@@ -493,13 +486,24 @@ class GroupStrip(QScrollArea):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("groupStrip")
-        self.setWidgetResizable(True)
+        self.setWidgetResizable(False)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._body = _GroupStripBody()
         self._body.pieceClicked.connect(self.pieceClicked.emit)
         self._body.pieceRemoveRequested.connect(self.pieceRemoveRequested.emit)
         self.setWidget(self._body)
+
+    def sizeHint(self) -> QSize:
+        return QSize(480, 640)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(160, 160)
+
+    def hasHeightForWidth(self) -> bool:
+        return False
 
     def set_pieces(
         self,
@@ -533,6 +537,7 @@ class GroupListWindow(QDialog):
         self._pieces: list[dict[str, int]] = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         bar = QHBoxLayout()
         bar.addWidget(QLabel("ツム種類"))
         self.group_label = QLabel("No.  1")
@@ -628,6 +633,22 @@ class GroupListWindow(QDialog):
         super().keyPressEvent(event)
 
 
+class PredictWorker(QThread):
+    finished_ok = Signal(str, list)
+    failed = Signal(str)
+
+    def __init__(self, work) -> None:
+        super().__init__()
+        self._work = work
+
+    def run(self) -> None:
+        try:
+            sample_id, added = self._work()
+            self.finished_ok.emit(sample_id, added)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -646,12 +667,17 @@ class MainWindow(QMainWindow):
         self.current_id: str | None = None
         self._active_key = "game"
         self.train_worker: TrainWorker | None = None
+        self._predict_worker: PredictWorker | None = None
         self._train_started_at: float | None = None
         self._cuda_ready: bool | None = None
         self._dirty = False
         self._shutdown_after_train = False
         self._awake_timer: QTimer | None = None
         self._switching = False
+        self._refreshing_list = False
+        self._refresh_list_again: str | bool | None = False
+        self._list_filling = False
+        self._list_fill_restart = False
         self._extractor_process = None
         self._ipc_buffers: dict[int, bytes] = {}
         self._last_boxes: dict[str, dict[str, int]] = {}
@@ -794,7 +820,6 @@ class MainWindow(QMainWindow):
         canvas_host_layout.setContentsMargins(0, 0, 0, 0)
         canvas_host_layout.setSpacing(0)
         canvas_host_layout.addWidget(self.canvas)
-        self._canvas_host.installEventFilter(self)
         self._toast = QLabel(self.canvas)
         self._toast.setObjectName("toast")
         self._toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1156,43 +1181,86 @@ class MainWindow(QMainWindow):
         self.refresh_list(self.current_id)
 
     def refresh_list(self, select_id: str | None = None) -> None:
+        self._list_fill_select = select_id
+        if self._list_filling:
+            self._list_fill_restart = True
+            return
+        self._begin_list_fill(select_id)
+
+    def _begin_list_fill(self, select_id: str | None = None) -> None:
+        self._list_filling = True
+        self._list_fill_restart = False
         self._skill_registered = registered_skills_by_sample()
         self._sync_list_columns()
-        selected = select_id or self.current_id
         samples = self._ordered_visible_samples()
-        scroll = self.list_widget.verticalScrollBar().value()
-        prev_current = self._list_id_at(self.list_widget.currentRow())
+        self._list_fill_samples = samples
+        self._list_fill_selected = select_id or self.current_id
+        self._list_fill_scroll = self.list_widget.verticalScrollBar().value()
+        self._list_fill_prev = self._list_id_at(self.list_widget.currentRow())
         existing = [self._list_id_at(row) for row in range(self.list_widget.rowCount())]
         new_ids = [sample.id for sample in samples]
         self.list_widget.blockSignals(True)
         if existing != new_ids:
             self.list_widget.setRowCount(len(samples))
-        for row, sample in enumerate(samples):
-            self._style_list_row(row, sample)
-            if row % 40 == 0:
-                QApplication.processEvents()
-        moved_row = None
-        if selected and selected != prev_current:
-            for row in range(self.list_widget.rowCount()):
-                if self._list_id_at(row) == selected:
-                    self.list_widget.setCurrentCell(row, 0)
-                    moved_row = row
-                    break
-        elif selected is None and self.list_widget.rowCount() and prev_current is None:
-            self.list_widget.setCurrentCell(0, 0)
-            moved_row = 0
-        elif selected and selected == prev_current:
-            for row in range(self.list_widget.rowCount()):
-                if self._list_id_at(row) == selected:
-                    self.list_widget.setCurrentCell(row, 0)
-                    break
         self.list_widget.blockSignals(False)
+        self._list_fill_row = 0
+        self._fill_list_chunk()
+
+    def _fill_list_chunk(self) -> None:
+        if self._list_fill_restart:
+            self._list_filling = False
+            self._begin_list_fill(self._list_fill_select)
+            return
+        samples = self._list_fill_samples
+        start = self._list_fill_row
+        end = min(start + 20, len(samples))
+        self.list_widget.setUpdatesEnabled(False)
+        self.list_widget.blockSignals(True)
+        try:
+            for row in range(start, end):
+                self._style_list_row(row, samples[row])
+        finally:
+            self.list_widget.blockSignals(False)
+            self.list_widget.setUpdatesEnabled(True)
+        self._list_fill_row = end
+        if end < len(samples):
+            QTimer.singleShot(0, self._fill_list_chunk)
+            return
+        self._finish_list_fill()
+
+    def _finish_list_fill(self) -> None:
+        selected = self._list_fill_selected
+        prev_current = self._list_fill_prev
+        scroll = self._list_fill_scroll
+        moved_row = None
+        self.list_widget.blockSignals(True)
+        try:
+            if selected and selected != prev_current:
+                for row in range(self.list_widget.rowCount()):
+                    if self._list_id_at(row) == selected:
+                        self.list_widget.setCurrentCell(row, 0)
+                        moved_row = row
+                        break
+            elif selected is None and self.list_widget.rowCount() and prev_current is None:
+                self.list_widget.setCurrentCell(0, 0)
+                moved_row = 0
+            elif selected and selected == prev_current:
+                for row in range(self.list_widget.rowCount()):
+                    if self._list_id_at(row) == selected:
+                        self.list_widget.setCurrentCell(row, 0)
+                        break
+        finally:
+            self.list_widget.blockSignals(False)
         if moved_row is None:
             self.list_widget.verticalScrollBar().setValue(scroll)
         else:
             item = self.list_widget.item(moved_row, 0)
             if item is not None:
                 self.list_widget.scrollToItem(item)
+        self._list_filling = False
+        if self._list_fill_restart:
+            self._begin_list_fill(self._list_fill_select)
+            return
         self.update_stats()
 
     def _list_id_at(self, row: int) -> str | None:
@@ -1400,7 +1468,6 @@ class MainWindow(QMainWindow):
         if self.region_list.signalsBlocked():
             return
         self._apply_visible_keys()
-        self.refresh_list(select_id=self.current_id)
         self.update_stats()
 
     def on_region_type_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
@@ -1417,8 +1484,8 @@ class MainWindow(QMainWindow):
             self.region_list.blockSignals(False)
         self._apply_visible_keys()
         self._refresh_region_list()
-        self.refresh_list(select_id=self.current_id)
         self._apply_sample_hint()
+        self.update_stats()
 
     def _refresh_region_list(self) -> None:
         self.region_list.blockSignals(True)
@@ -2667,23 +2734,48 @@ class MainWindow(QMainWindow):
     def predict_current(self) -> None:
         if not self.current_id:
             return
-        if not self._ensure_predictor():
-            QMessageBox.information(self, "予測", "モデルがありません。範囲を教えてから学習してください。")
+        if self._block_if_training():
             return
-        sample = self.dataset.get(self.current_id)
+        if self._predict_worker is not None and self._predict_worker.isRunning():
+            return
+        sample_id = self.current_id
+        self.predict_btn.setEnabled(False)
+        self.statusBar().showMessage("予測しています")
+        worker = PredictWorker(lambda: self._predict_work(sample_id))
+        worker.finished_ok.connect(self._on_predict_finished)
+        worker.failed.connect(self._on_predict_failed)
+        self._predict_worker = worker
+        worker.start()
+
+    def _predict_work(self, sample_id: str) -> tuple[str, list[str]]:
+        if not self.predictor.is_ready():
+            self.predictor.reload(pump=None, device="cpu")
+        if not self.predictor.is_ready():
+            raise RuntimeError("モデルがありません。範囲を教えてから学習してください。")
+        sample = self.dataset.get(sample_id)
         if sample is None:
+            raise RuntimeError("画像がありません")
+        return sample_id, self._predict_into_sample(sample)
+
+    def _on_predict_finished(self, sample_id: str, added: list) -> None:
+        self._predict_worker = None
+        self.refresh_list(select_id=self.current_id or sample_id)
+        if sample_id == self.current_id:
+            self.show_sample(sample_id)
+        if added:
+            names = "、".join(PLACE_LABELS.get(key, key) for key in added)
+            self.statusBar().showMessage(f"予測を入れました: {names}。合っていれば保存してください", 4000)
+        else:
+            self.statusBar().showMessage("保存済みの場所はそのままです。足りない場所はありませんでした", 4000)
+        self.update_stats()
+
+    def _on_predict_failed(self, message: str) -> None:
+        self._predict_worker = None
+        self.update_stats()
+        if "モデルがありません" in message:
+            QMessageBox.information(self, "予測", message)
             return
-        try:
-            added = self._predict_into_sample(sample)
-            self.refresh_list(select_id=sample.id)
-            self.show_sample(sample.id)
-            if added:
-                names = "、".join(PLACE_LABELS.get(key, key) for key in added)
-                self.statusBar().showMessage(f"予測を入れました: {names}。合っていれば保存してください", 4000)
-            else:
-                self.statusBar().showMessage("保存済みの場所はそのままです。足りない場所はありませんでした", 4000)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "予測に失敗", str(exc))
+        QMessageBox.warning(self, "予測に失敗", message)
 
     def _trainable_jobs(self) -> list[tuple]:
         selected = set(self._selected_place_keys())
@@ -2821,12 +2913,13 @@ class MainWindow(QMainWindow):
         keys = self._list_status_keys()
         headers = [LIST_STATUS_HEADERS.get(key, PLACE_LABELS.get(key, key)) for key in keys] + ["ファイル"]
         header = self.list_widget.horizontalHeader()
-        self.list_widget.setColumnCount(len(headers))
-        self.list_widget.setHorizontalHeaderLabels(headers)
-        for col, key in enumerate(keys):
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-            self.list_widget.setColumnWidth(col, LIST_STATUS_WIDTHS.get(key, 88))
-        header.setSectionResizeMode(len(keys), QHeaderView.ResizeMode.Stretch)
+        if self.list_widget.columnCount() != len(headers):
+            self.list_widget.setColumnCount(len(headers))
+            self.list_widget.setHorizontalHeaderLabels(headers)
+            for col, key in enumerate(keys):
+                header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+                self.list_widget.setColumnWidth(col, LIST_STATUS_WIDTHS.get(key, 88))
+            header.setSectionResizeMode(len(keys), QHeaderView.ResizeMode.Stretch)
         header.setSortIndicatorShown(False)
 
     def _selected_place_keys(self) -> list[str]:
@@ -3017,7 +3110,6 @@ class MainWindow(QMainWindow):
 
     def _load_dataset(self) -> None:
         self.statusBar().showMessage("画像一覧を読み込み中")
-        QApplication.processEvents()
         self.dataset.reload()
         self._remember_last_boxes()
         self.refresh_list()
@@ -3027,9 +3119,8 @@ class MainWindow(QMainWindow):
         if self.predictor.is_ready():
             return True
         self.statusBar().showMessage("モデルを読み込み中")
-        QApplication.processEvents()
         try:
-            self.predictor.reload(pump=QApplication.processEvents, device="cpu")
+            self.predictor.reload(pump=None, device="cpu")
         except Exception:
             return False
         self.update_stats()
@@ -3358,8 +3449,6 @@ class MainWindow(QMainWindow):
         return added
 
     def eventFilter(self, watched, event) -> bool:
-        if watched is getattr(self, "_canvas_host", None) and event.type() == QEvent.Type.Resize:
-            self._sync_canvas_3_2()
         if watched is self.canvas and event.type() == QEvent.Type.Resize:
             self._place_train_fx()
         if self._is_training() and watched is self.canvas and event.type() == QEvent.Type.KeyPress:
@@ -3473,6 +3562,8 @@ class MainWindow(QMainWindow):
             self.train_worker.requestInterruption()
             self.train_worker.wait(15000)
             self._train_fx.stop()
+        if self._predict_worker is not None and self._predict_worker.isRunning():
+            self._predict_worker.wait(8000)
         self._keep_display_awake(False)
         event.accept()
 
