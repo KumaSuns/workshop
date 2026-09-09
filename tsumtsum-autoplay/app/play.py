@@ -404,18 +404,11 @@ def run_play(
         nonlocal pending_lesson, pending_burst, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_group, pending_skip
         nonlocal bomb_asked, bomb_asked_sit, skill_wait_empty
-        nonlocal skip_chains, skip_born
         bomb_asked = False
         bomb_asked_sit = ""
         if pending_lesson is not None:
             record_pick(pending_lesson[0], pending_lesson[1], erased)
             pending_lesson = None
-        if not erased:
-            born = time.time()
-            for key in pending_skip:
-                if key not in skip_chains:
-                    skip_chains.append(key)
-                skip_born[key] = born
         pending_burst = 1
         pending_spots = None
         pending_key = None
@@ -646,12 +639,6 @@ def run_play(
             if erased:
                 settle_pending(True)
                 erased_now = True
-            elif time.time() - pending_at < ERASE_WAIT:
-                sit = skill_sit(True)
-                try_skill(sit)
-                try_bomb(sit)
-                note_idle(True)
-                continue
         with _gpu_lock:
             pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
         tsums = [piece for piece in pieces if _is_tsum(piece)]
@@ -679,8 +666,6 @@ def run_play(
             if erased:
                 settle_pending(True)
                 erased_now = True
-            elif time.time() - pending_at >= ERASE_WAIT:
-                settle_pending(False)
         now = time.time()
         skip_chains = [
             key for key in skip_chains if now - skip_born.get(key, 0) < SKIP_TTL

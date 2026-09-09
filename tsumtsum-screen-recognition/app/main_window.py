@@ -382,7 +382,8 @@ class _GroupStripBody(QWidget):
             self._rows.append((key, color, grouped[key]))
         width = self.LABEL + self.COLS * (self.CELL + self.GAP)
         height = max(1, self._needed_height())
-        self.setFixedSize(width, height)
+        if self.width() != width or self.height() != height:
+            self.setFixedSize(width, height)
         self.update()
 
     def _crop(self, pixmap: QPixmap, piece: dict[str, int]) -> QPixmap:
@@ -755,6 +756,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(place_hint)
         self.region_list = QListWidget()
         self.region_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.region_list.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.region_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.region_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         for key, label, color in PLACE_SPECS:
@@ -786,7 +788,6 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         left_layout.addWidget(self.progress)
-        left_layout.addStretch(1)
         self.copy_data_btn = QPushButton("DATAをアップ")
         self.import_data_btn = QPushButton("DATA DOWNLOAD")
         self.server_save_btn = QPushButton("サーバーに保存")
@@ -3076,12 +3077,23 @@ class MainWindow(QMainWindow):
         self._train_fx.setGeometry(0, 0, host.width(), host.height())
         self._train_fx.raise_()
 
+    def _request_canvas_3_2(self) -> None:
+        if getattr(self, "_syncing_canvas", False):
+            return
+        timer = getattr(self, "_canvas_sync_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._sync_canvas_3_2)
+            self._canvas_sync_timer = timer
+        if not timer.isActive():
+            timer.start(0)
+
     def _sync_canvas_3_2(self) -> None:
         if getattr(self, "_syncing_canvas", False):
             return
         col = getattr(self, "_canvas_host", None)
-        split = getattr(self, "_body_split", None)
-        if col is None or split is None or not hasattr(self, "canvas"):
+        if col is None or not hasattr(self, "canvas"):
             return
         height = col.height()
         if height < 80:
@@ -3089,15 +3101,14 @@ class MainWindow(QMainWindow):
         width = (height * 2) // 3
         if col.minimumWidth() == width and col.maximumWidth() == width:
             return
+        applied = getattr(self, "_canvas_applied_w", None)
+        if applied is not None and abs(applied - width) <= 2:
+            if col.minimumWidth() == applied and col.maximumWidth() == applied:
+                return
         self._syncing_canvas = True
         col.setMinimumWidth(width)
         col.setMaximumWidth(width)
-        sizes = split.sizes()
-        if len(sizes) >= 3 and sizes[1] != width:
-            leftover = sizes[1] - width
-            sizes[1] = width
-            sizes[2] = max(480, sizes[2] + leftover)
-            split.setSizes(sizes)
+        self._canvas_applied_w = width
         self._syncing_canvas = False
 
     def showEvent(self, event) -> None:
@@ -3129,8 +3140,8 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if hasattr(self, "canvas"):
-            self._sync_canvas_3_2()
-        if hasattr(self, "_train_fx"):
+            self._request_canvas_3_2()
+        if hasattr(self, "_train_fx") and self._train_fx.isVisible():
             self._place_train_fx()
 
     def _train_eta_line(self, seconds: float) -> str:
@@ -3450,7 +3461,8 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self.canvas and event.type() == QEvent.Type.Resize:
-            self._place_train_fx()
+            if hasattr(self, "_train_fx") and self._train_fx.isVisible():
+                self._place_train_fx()
         if self._is_training() and watched is self.canvas and event.type() == QEvent.Type.KeyPress:
             return True
         if (

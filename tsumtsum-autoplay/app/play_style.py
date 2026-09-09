@@ -357,16 +357,17 @@ def order_found(
         return leftovers[index]
 
     def pick_among(indices: list[int]) -> int:
-        best_len = max(scores[i] for i in indices)
-        tied = [i for i in indices if scores[i] == best_len]
+        tied = list(indices)
+        if wait_n > 0:
+            best_wait = min(waits[i] for i in tied)
+            tied = [i for i in tied if waits[i] == best_wait]
+        best_len = max(scores[i] for i in tied)
+        tied = [i for i in tied if scores[i] == best_len]
         lefts = [leftover_at(i) for i in tied]
         best_left = max(lefts)
         tied = [i for i in tied if leftover_at(i) == best_left]
         best_big = max(bigs[i] for i in tied)
         tied = [i for i in tied if bigs[i] == best_big]
-        if wait_n > 0:
-            best_wait = min(waits[i] for i in tied)
-            tied = [i for i in tied if waits[i] == best_wait]
         return tied[0]
 
     explore_n = wait_n if wait_n > 0 else matches
@@ -455,6 +456,21 @@ def should_bomb(sit: str, default: bool) -> bool:
     n = int(rl.get("n") or 0)
     if n > 0 and random.randrange(n + 2) == 0:
         return random.randrange(2) == 0
+    if n <= 0:
+        return default
+    choices = rl.get("choices") if isinstance(rl.get("choices"), dict) else {}
+    tap = choices.get(f"{sit}:tap") if isinstance(choices.get(f"{sit}:tap"), dict) else None
+    skip = choices.get(f"{sit}:skip") if isinstance(choices.get(f"{sit}:skip"), dict) else None
+    tap_n = int(tap.get("n") or 0) if tap else 0
+    skip_n = int(skip.get("n") or 0) if skip else 0
+    if tap_n <= 0 or skip_n <= 0:
+        return default
+    tap_avg = float(tap.get("sum") or 0) / tap_n
+    skip_avg = float(skip.get("sum") or 0) / skip_n
+    if tap_avg < skip_avg:
+        return True
+    if skip_avg < tap_avg:
+        return False
     return default
 
 

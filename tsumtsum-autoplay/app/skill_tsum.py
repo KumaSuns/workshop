@@ -11,8 +11,8 @@ from app.intro import _check_stop
 SayFn = Callable[[str], None]
 
 _CBUZZ_FPS = 60.0
-_CBUZZ_A = (0.293, 0.563)
-_CBUZZ_B = (0.643, 0.546)
+_CBUZZ_A = (0.273, 0.563)
+_CBUZZ_B = (0.673, 0.546)
 _CBUZZ_C = (0.500, 0.204)
 _CBUZZ_STEPS = (
     (_CBUZZ_B, 130, "B"),
