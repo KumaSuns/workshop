@@ -657,8 +657,12 @@ class MainWindow(QMainWindow):
         icon = self._ensure_app_icon()
         if icon is not None:
             self.setWindowIcon(QIcon(str(icon)))
-        self.resize(1280, 840)
         self.setMinimumSize(980, 640)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            self.setGeometry(screen.availableGeometry())
+        else:
+            self.resize(1280, 840)
         self.setAcceptDrops(True)
         self.setStyleSheet(STYLESHEET)
 
@@ -688,6 +692,9 @@ class MainWindow(QMainWindow):
         self._skill_registered: dict[str, str] = {}
         self._settings = QSettings("workshop", "TsumTsumScreenTrainer")
         self._group_window: GroupListWindow | None = None
+        self._syncing_canvas = False
+        self._canvas_echo = False
+        self._canvas_sync_h: int | None = None
         self._remember_last_boxes()
 
         self._build_ui()
@@ -704,16 +711,16 @@ class MainWindow(QMainWindow):
         top = QFrame()
         top.setObjectName("topbar")
         top_layout = QHBoxLayout(top)
-        top_layout.setContentsMargins(16, 12, 16, 12)
-        title_box = QVBoxLayout()
+        top_layout.setContentsMargins(16, 8, 16, 8)
         title = QLabel("ツムツム ゲーム範囲トレーナー")
         title.setObjectName("title")
+        title.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.hint_label = QLabel("画像をドロップ / Ctrl+V / 「画像を開く」。左で種類にチェックを付けて保存します。")
         self.hint_label.setObjectName("hint")
-        self.hint_label.setWordWrap(True)
-        title_box.addWidget(title)
-        title_box.addWidget(self.hint_label)
-        top_layout.addLayout(title_box, 1)
+        self.hint_label.setWordWrap(False)
+        self.hint_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        top_layout.addWidget(title)
+        top_layout.addWidget(self.hint_label, 1)
 
         self.open_btn = QPushButton("画像を開く")
         self.paste_btn = QPushButton("貼り付け")
@@ -811,12 +818,14 @@ class MainWindow(QMainWindow):
         for col in range(2):
             left_grid.setColumnStretch(col, 1)
         left_layout.addLayout(left_grid)
+        left_layout.addStretch(1)
         left.setMinimumWidth(317)
         left.setMaximumWidth(461)
 
         self.canvas = ImageCanvas()
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._canvas_host = QWidget()
+        self._canvas_host.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         canvas_host_layout = QVBoxLayout(self._canvas_host)
         canvas_host_layout.setContentsMargins(0, 0, 0, 0)
         canvas_host_layout.setSpacing(0)
@@ -923,7 +932,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
-        splitter.setSizes([346, 860, 720])
+        splitter.setChildrenCollapsible(False)
         layout.addWidget(splitter, 1)
 
         coords = QFrame()
@@ -3080,6 +3089,8 @@ class MainWindow(QMainWindow):
     def _request_canvas_3_2(self) -> None:
         if getattr(self, "_syncing_canvas", False):
             return
+        if getattr(self, "_canvas_echo", False):
+            return
         timer = getattr(self, "_canvas_sync_timer", None)
         if timer is None:
             timer = QTimer(self)
@@ -3098,18 +3109,34 @@ class MainWindow(QMainWindow):
         height = col.height()
         if height < 80:
             return
+        last = getattr(self, "_canvas_sync_h", None)
         width = (height * 2) // 3
-        if col.minimumWidth() == width and col.maximumWidth() == width:
+        same_height = last is not None and abs(height - last) <= 2
+        already = (
+            col.width() == width
+            and col.minimumWidth() == width
+            and col.maximumWidth() == width
+        )
+        if already and (same_height or last is None):
+            self._canvas_sync_h = height
             return
-        applied = getattr(self, "_canvas_applied_w", None)
-        if applied is not None and abs(applied - width) <= 2:
-            if col.minimumWidth() == applied and col.maximumWidth() == applied:
-                return
+        if same_height:
+            return
         self._syncing_canvas = True
-        col.setMinimumWidth(width)
-        col.setMaximumWidth(width)
-        self._canvas_applied_w = width
+        col.setFixedWidth(width)
+        self._canvas_sync_h = col.height()
+        QTimer.singleShot(0, self._end_canvas_sync)
+
+    def _end_canvas_sync(self) -> None:
+        col = getattr(self, "_canvas_host", None)
+        if col is not None:
+            self._canvas_sync_h = col.height()
         self._syncing_canvas = False
+        self._canvas_echo = True
+        QTimer.singleShot(0, self._clear_canvas_echo)
+
+    def _clear_canvas_echo(self) -> None:
+        self._canvas_echo = False
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -3139,9 +3166,20 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        train_fx = hasattr(self, "_train_fx") and self._train_fx.isVisible()
+        if getattr(self, "_syncing_canvas", False) or getattr(self, "_canvas_echo", False):
+            if train_fx:
+                self._place_train_fx()
+            return
+        col = getattr(self, "_canvas_host", None)
+        last = getattr(self, "_canvas_sync_h", None)
+        if col is not None and last is not None and abs(col.height() - last) <= 2:
+            if train_fx:
+                self._place_train_fx()
+            return
         if hasattr(self, "canvas"):
             self._request_canvas_3_2()
-        if hasattr(self, "_train_fx") and self._train_fx.isVisible():
+        if train_fx:
             self._place_train_fx()
 
     def _train_eta_line(self, seconds: float) -> str:
