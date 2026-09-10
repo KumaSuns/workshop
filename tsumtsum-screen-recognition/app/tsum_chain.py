@@ -70,8 +70,23 @@ def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
     if not found or longest < biggest:
         phys = _physical_links(tsums, spacing, scale=1.12, blockers=bombs)
         extra = _paths_from_blobs(tsums, phys)
-        if extra and (not found or max(len(path) for path in extra) > longest):
-            found = extra
+        if extra:
+            if not found or max(len(path) for path in extra) > longest:
+                found = extra
+            else:
+                used = {
+                    (int(piece["x"]), int(piece["y"]))
+                    for path in found
+                    for piece in path
+                }
+                for path in extra:
+                    spots = {
+                        (int(piece["x"]), int(piece["y"])) for piece in path
+                    }
+                    if spots & used:
+                        continue
+                    found.append(path)
+                    used |= spots
     found.sort(key=len, reverse=True)
     return found
 

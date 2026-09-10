@@ -303,6 +303,7 @@ def run_play(
         last_save_at = 0.0
         ignore_start_until = time.time() + 6
         saw_board = False
+        watching.clear()
         clears = 0
         swipes = 0
         coin = 0
@@ -586,21 +587,30 @@ def run_play(
             game, _, fever, timer, fan = _merge_hud(
                 boxes, game, None, fever, timer, fan
             )
-        ended = _end_on_timeup(
-            predictor,
-            image,
-            rgb,
-            pending_spots,
-            clears,
-            swipes,
-            pieces if saw_board else None,
-            game,
-            say,
-            stop,
-            timer,
-            saw_board,
-            last_boxes,
+        retry_now = (
+            saw_board
+            and image is not None
+            and not image.isNull()
+            and _retry_button(image) is not None
         )
+        if retry_now or watch_hit.is_set():
+            ended = _end_on_timeup(
+                predictor,
+                image,
+                rgb,
+                pending_spots,
+                clears,
+                swipes,
+                pieces if saw_board else None,
+                game,
+                say,
+                stop,
+                timer,
+                saw_board,
+                last_boxes,
+            )
+        else:
+            ended = False
         if not ended and saw_board and watch_hit.is_set():
             say("TIME UP / " + _counts_line(clears, swipes, coin))
             ended = True
@@ -665,6 +675,7 @@ def run_play(
         if len(tsums) >= BOARD_READY:
             saw_board = True
             kinds_locked = True
+            watching.set()
         if not saw_board:
             say(f"ツム {len(tsums)}体（盤面が少ない）")
             if time.time() >= ignore_start_until and _tap_start_or_continue(image, say, stop):
@@ -740,20 +751,11 @@ def run_play(
                     if watch_hit.is_set():
                         timeup = True
                         break
-                    try:
-                        look = capture_play_frame()
-                        look_rgb = _qimage_rgb(look)
-                    except Exception:
-                        look = None
-                        look_rgb = None
-                    if (
-                        look is not None
-                        and not look.isNull()
-                        and look_rgb is not None
-                        and _end_on_timeup(
+                    if saw_board and _retry_button(image) is not None:
+                        if _end_on_timeup(
                             predictor,
-                            look,
-                            look_rgb,
+                            image,
+                            rgb,
                             pending_spots,
                             clears,
                             swipes,
@@ -764,13 +766,12 @@ def run_play(
                             timer,
                             True,
                             last_boxes,
-                        )
-                    ):
-                        timeup = True
-                        timeup_ended = True
-                        check = look
-                        check_rgb = look_rgb
-                        break
+                        ):
+                            timeup = True
+                            timeup_ended = True
+                            check = image
+                            check_rgb = rgb
+                            break
                     chain = queue.pop(0)
                     spots = {(int(piece["x"]), int(piece["y"])) for piece in chain}
                     if spots & used:
@@ -829,7 +830,8 @@ def run_play(
                         seen_keys.add(key)
                         queue.append(item)
             finally:
-                watching.clear()
+                if not saw_board:
+                    watching.clear()
             if length_pick:
                 record_rl_length(pick_opts, pick_n)
             if timeup or watch_hit.is_set():
@@ -1305,7 +1307,7 @@ def _skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
     radius = min(width, height) / 2.0
     filled = 0
     empty = 0
-    for frac in (0.60, 0.70):
+    for frac in (0.60,):
         ring = radius * frac
         for index in range(72):
             ang = -math.pi / 2.0 + (2.0 * math.pi * index / 72.0)
