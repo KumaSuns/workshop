@@ -56,6 +56,7 @@ from app.play_style import (
     should_skill,
     unlike_hit,
 )
+from app.play_web import append_play
 from app.trainer_bridge import (
     TRAINER_ROOT,
     load_play_tools,
@@ -88,7 +89,7 @@ class PlayWorker(QThread):
     completed = Signal()
     status = Signal(str)
     preview = Signal(QImage)
-    gauges = Signal(object, object, object)
+    gauges = Signal(object, object, object, object)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
 
@@ -169,7 +170,7 @@ def run_play(
     stop: Event | None,
     start_match: bool = False,
     preview: Callable[[QImage], None] | None = None,
-    gauges: Callable[[float | None, float, bool], None] | None = None,
+    gauges: Callable[[float | None, float | None, bool, int | None], None] | None = None,
     kind_count: int | None = None,
     save_boards: Callable[[], bool] | None = None,
     loop: bool = False,
@@ -182,8 +183,9 @@ def run_play(
 
     arrived = ""
     used_tsum = ""
+    start_items: list[str] | None = None
     if start_match:
-        _seen, _locked, arrived, seen_tsum = _click_start_or_continue(
+        _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
             say, stop, tap_start=False
         )
         if seen_tsum:
@@ -197,6 +199,8 @@ def run_play(
                 guess = _read_used_tsum(path) if path is not None else seen_tsum
                 if guess:
                     say(f"使用ツム {guess}")
+                if path is not None and not start_items:
+                    start_items = _items_used_path(path) or start_items
                 confirmed = request_used_tsum(guess, path, False)
             else:
                 confirmed = request_used_tsum("", None, True)
@@ -226,6 +230,7 @@ def run_play(
         raise RuntimeError("TIME UP のモデルがありません。")
 
     say("プレイを開始します")
+    say(f"予測デバイス {predictor.device}")
     reset_swipe_mouse()
     unlike = load_unlike()
     skip_chains: list[frozenset[tuple[int, int]]] = []
@@ -234,12 +239,16 @@ def run_play(
     game = None
     skill = None
     fever = None
+    fever_full_w = None
+    fever_seen = None
+    fever_cache = None
     timer = None
     fan = None
     hud_ready = False
     last_skill_at = 0.0
     skill_wait_empty = False
     skip_after_skill = False
+    skip_loss = False
     last_fan_at = 0.0
     last_bomb_at = 0.0
     skip_bomb_cells: set[tuple[int, int]] = set()
@@ -257,6 +266,13 @@ def run_play(
     idle_pick: tuple[list[int], int] | None = None
     idle_acc = 0.0
     idle_since: float | None = None
+    idle_cap = 0.0
+    idle_pred = 0.0
+    idle_heat = 0.0
+    idle_type = 0.0
+    idle_find = 0.0
+    idle_act = 0.0
+    wait_times: list[float] = []
     bomb_pick: tuple[str, bool] | None = None
     bomb_acc = 0.0
     bomb_asked = False
@@ -278,24 +294,30 @@ def run_play(
     pieces: list[dict[str, int]] = []
 
     def fresh_match() -> None:
-        nonlocal game, skill, fever, timer, fan, hud_ready
+        nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
-        nonlocal ignore_start_until, saw_board, skip_after_skill
+        nonlocal ignore_start_until, saw_board, skip_after_skill, skip_loss
         nonlocal clears, swipes, coin, skill_taps, skill_ok, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_skip, pending_used, skip_chains, skip_born, saved_boards
         nonlocal my_group, match_picks, idle_pick, idle_acc, idle_since
+        nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
+        nonlocal go_at, used_items, wait_times
         game = None
         skill = None
         fever = None
+        fever_full_w = None
+        fever_seen = None
+        fever_cache = None
         timer = None
         fan = None
         hud_ready = False
         last_skill_at = 0.0
         skill_wait_empty = False
         skip_after_skill = False
+        skip_loss = False
         last_fan_at = 0.0
         last_bomb_at = 0.0
         skip_bomb_cells = set()
@@ -314,6 +336,13 @@ def run_play(
         idle_pick = None
         idle_acc = 0.0
         idle_since = None
+        idle_cap = 0.0
+        idle_pred = 0.0
+        idle_heat = 0.0
+        idle_type = 0.0
+        idle_find = 0.0
+        idle_act = 0.0
+        wait_times = []
         bomb_pick = None
         bomb_acc = 0.0
         bomb_asked = False
@@ -338,6 +367,8 @@ def run_play(
         my_group = 0
         watch_hit.clear()
         watching.clear()
+        go_at = None
+        used_items = None
 
     def close_idle() -> None:
         nonlocal idle_acc, idle_since, bomb_acc, skill_acc
@@ -359,6 +390,32 @@ def run_play(
     def note_found(has_chain: bool) -> None:
         note_idle(bool(saw_board and not has_chain))
 
+    def add_idle(name: str, dt: float) -> None:
+        nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
+        if idle_since is None:
+            return
+        if name == "cap":
+            idle_cap += dt
+        elif name == "pred":
+            idle_pred += dt
+        elif name == "heat":
+            idle_heat += dt
+        elif name == "type":
+            idle_type += dt
+        elif name == "find":
+            idle_find += dt
+        else:
+            idle_act += dt
+
+    def clear_idle_parts() -> None:
+        nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
+        idle_cap = 0.0
+        idle_pred = 0.0
+        idle_heat = 0.0
+        idle_type = 0.0
+        idle_find = 0.0
+        idle_act = 0.0
+
     def load_hud() -> None:
         nonlocal last_boxes, skill, game, fever, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty
@@ -375,13 +432,30 @@ def run_play(
         last_skill_at = 0.0
         skill_wait_empty = False
 
-    def flush_idle() -> None:
-        nonlocal idle_acc, idle_pick
+    def flush_idle(keep: bool = False) -> None:
+        nonlocal idle_acc, idle_pick, skip_loss
         close_idle()
         if idle_pick is not None:
             record_rl_wait(idle_pick[0], idle_pick[1], idle_acc)
+            if keep and not skip_loss:
+                wait_times.append(round(max(0.0, float(idle_acc)), 1))
+                rest = max(
+                    0.0,
+                    float(idle_acc) - idle_cap - idle_heat - idle_type - idle_find - idle_act,
+                )
+                say(
+                    f"LossTime {idle_acc:.1f}s / "
+                    f"画面 {idle_cap:.1f}s / "
+                    f"位置 {idle_heat:.1f}s / "
+                    f"種類 {idle_type:.1f}s / "
+                    f"つなぎ {idle_find:.1f}s / "
+                    f"スキルボム扇 {idle_act:.1f}s / "
+                    f"ほか {rest:.1f}s"
+                )
+        skip_loss = False
         idle_acc = 0.0
         idle_pick = None
+        clear_idle_parts()
 
     def flush_bomb() -> None:
         nonlocal bomb_acc, bomb_pick
@@ -422,6 +496,23 @@ def run_play(
         pending_group = 0
         pending_skip = []
         pending_used = set()
+
+    def credit_pending(after=None, by_count: bool = False) -> bool:
+        nonlocal clears
+        if pending_spots is None:
+            return False
+        if by_count:
+            gone = pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN
+        else:
+            if after is None:
+                return False
+            gone = not _spots_lingered(after, pending_spots)
+        if not gone:
+            return False
+        clears += max(1, int(pending_burst))
+        settle_pending(True)
+        say(_counts_line(clears, swipes, coin))
+        return True
 
     def ask_bomb(sit: str, default: bool) -> bool:
         nonlocal bomb_asked, bomb_asked_sit
@@ -464,7 +555,8 @@ def run_play(
 
     def try_skill(sit: str) -> bool:
         nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps
-        nonlocal bomb_taps, last_bomb_at
+        nonlocal bomb_taps, last_bomb_at, skip_loss
+        load_hud()
         if skill is None:
             return False
         tapped, skill_wait_empty, spent = _press_skill(
@@ -482,6 +574,8 @@ def run_play(
         if spent:
             skill_ok += 1
         if tapped:
+            flush_idle(True)
+            skip_loss = True
             start_skill_pick(sit, True)
             skill_taps += 1
             last_skill_at = time.time()
@@ -496,8 +590,21 @@ def run_play(
             return True
         return False
 
+    def take_timer() -> int | None:
+        with _gpu_lock:
+            return _read_timer(predictor, rgb, timer)
+
+    def take_fever() -> float | None:
+        nonlocal fever_full_w, fever_seen, fever_cache
+        if fever_seen is rgb:
+            return fever_cache
+        fill, fever_full_w = _read_fever(rgb, fever, skill, fan, fever_full_w)
+        fever_seen = rgb
+        fever_cache = fill
+        return fill
+
     def skill_sit(has_chain: bool) -> str:
-        fever_fill = _fever_fill(rgb, fever)
+        fever_fill = take_fever() or 0.0
         fever_on = _fever_playing(rgb, game)
         has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
         return hud_situation(
@@ -531,7 +638,7 @@ def run_play(
         blocked = skip_chains
         raw = [
             part
-            for item in candidates(live, max(MIN_CHAIN, len(live_tsums)))
+            for item in candidates(live, 8)
             for part in _parts_without_unlike(item, unlike)
             if len(part) >= MIN_CHAIN
         ]
@@ -550,12 +657,18 @@ def run_play(
             )
         return found
     kinds_locked = False
+    used_items: list[str] | None = start_items
+    go_at: float | None = None
     if kind_count is not None and int(kind_count) >= 1:
         kinds = int(kind_count)
         kinds_locked = True
         say(f"種類 {kinds}")
+    if used_items:
+        say("アイテム " + "、".join(used_items))
     if start_match and arrived == "start":
-        _tap_start_now(say, stop)
+        found_items = _tap_start_now(say, stop)
+        if found_items:
+            used_items = found_items
     elif start_match and arrived == "continue":
         _tap_continue_now(say, stop)
     watching = Event()
@@ -569,23 +682,33 @@ def run_play(
     watcher.start()
     while True:
         _check_stop(stop)
+        t0 = time.perf_counter()
         try:
             image = capture_play_frame()
             rgb = _qimage_rgb(image)
         except Exception:
-            say("画面を待っています")
-            _sleep_stop(0.25, stop)
+            add_idle("cap", time.perf_counter() - t0)
+            if not saw_board:
+                say("画面を待っています")
+                _sleep_stop(0.25, stop)
             continue
+        add_idle("cap", time.perf_counter() - t0)
         if rgb is None or image.isNull():
-            say("画面を待っています")
-            _sleep_stop(0.25, stop)
+            if not saw_board:
+                say("画面を待っています")
+                _sleep_stop(0.25, stop)
             continue
+        if go_at is None and not saw_board:
+            with _gpu_lock:
+                scene, _score = _scene_top(predictor, rgb)
+            if scene == "go":
+                go_at = time.time()
         if game is None:
             with _gpu_lock:
                 boxes = predictor.predict_all(Path("."), rgb=rgb)
             last_boxes = boxes
-            game, _, fever, timer, fan = _merge_hud(
-                boxes, game, None, fever, timer, fan
+            game, skill, fever, timer, fan = _merge_hud(
+                boxes, game, skill, fever, timer, fan
             )
         retry_now = (
             saw_board
@@ -594,6 +717,7 @@ def run_play(
             and _retry_button(image) is not None
         )
         if retry_now or watch_hit.is_set():
+            credit_pending(rgb)
             ended = _end_on_timeup(
                 predictor,
                 image,
@@ -615,7 +739,8 @@ def run_play(
             say("TIME UP / " + _counts_line(clears, swipes, coin))
             ended = True
         if ended:
-            flush_idle()
+            credit_pending(rgb)
+            flush_idle(True)
             flush_bomb()
             flush_skill()
             _note_match_end(
@@ -632,22 +757,32 @@ def run_play(
                 fan_taps,
                 match_picks,
                 coin,
+                used_tsum,
+                used_items,
+                None if go_at is None else max(0, int(round(time.time() - go_at))),
+                sorted(wait_times, reverse=True)[:3],
             )
             watch_hit.clear()
             if not loop:
                 stop_watch.set()
                 watching.clear()
                 return
-            seen = _replay_after_timeup(say, stop)
+            seen, replay_items = _replay_after_timeup(say, stop)
             if seen:
                 used_tsum = seen
             fresh_match()
+            if replay_items:
+                used_items = replay_items
             say("プレイを開始します")
             continue
         _check_stop(stop)
         if time.time() >= ignore_start_until:
             start = _match_start_button(image)
             if start is not None:
+                found_items = _items_used_pil(rgb)
+                if found_items:
+                    used_items = found_items
+                    say("アイテム " + "、".join(used_items))
                 say("スタートをクリックします")
                 _slow_tap(start.center().x(), start.center().y())
                 _sleep_stop(1.2, stop)
@@ -659,25 +794,39 @@ def run_play(
                 kinds_locked = True
                 say(f"5＞4 {'使用' if used else '未使用'} / 種類 {kinds}")
         erased_now = False
-        if saw_board and pending_spots is not None:
-            erased = not _spots_lingered(rgb, pending_spots)
-            if erased:
-                settle_pending(True)
-                erased_now = True
+        if saw_board and credit_pending(rgb):
+            erased_now = True
+        t0 = time.perf_counter()
+        heat_s = 0.0
+        type_s = 0.0
         with _gpu_lock:
             pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+            heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
+            type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
         tsums = [piece for piece in pieces if _is_tsum(piece)]
         if len(tsums) < BOARD_TSUMS and not saw_board:
             with _gpu_lock:
                 pieces = predictor.predict_pieces(Path("."), None, rgb=rgb, inner=False)
+                heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
+                type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
+        add_idle("pred", time.perf_counter() - t0)
+        add_idle("heat", heat_s)
+        add_idle("type", type_s)
         _check_stop(stop)
         if len(tsums) >= BOARD_READY:
             saw_board = True
             kinds_locked = True
             watching.set()
+            if go_at is None:
+                go_at = time.time()
         if not saw_board:
             say(f"ツム {len(tsums)}体（盤面が少ない）")
+            start = None if image.isNull() else _match_start_button(image)
+            if start is not None:
+                found_items = _items_used_pil(rgb)
+                if found_items:
+                    used_items = found_items
             if time.time() >= ignore_start_until and _tap_start_or_continue(image, say, stop):
                 continue
             play = None if image.isNull() else _play_button(image)
@@ -687,11 +836,8 @@ def run_play(
                 _sleep_stop(2.0, stop)
                 continue
             continue
-        if pending_spots is not None:
-            erased = pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN
-            if erased:
-                settle_pending(True)
-                erased_now = True
+        if credit_pending(by_count=True):
+            erased_now = True
         now = time.time()
         skip_chains = [
             key for key in skip_chains if now - skip_born.get(key, 0) < SKIP_TTL
@@ -699,35 +845,36 @@ def run_play(
         skip_chains = _prune_skip(skip_chains, tsums)
         pick_opts: list[int] = []
         pick_n = 0
+        t0 = time.perf_counter()
         found = list_found(pieces, tsums)
         if found:
             found, pick_opts, pick_n = order_found(found)
+        add_idle("find", time.perf_counter() - t0)
+        if found:
             say("候補 " + " / ".join(str(len(item)) for item in found))
             looked_after_skill = skip_after_skill
             skip_after_skill = False
-            if not looked_after_skill and try_skill(skill_sit(True)):
+            t0 = time.perf_counter()
+            did_skill = not looked_after_skill and try_skill(skill_sit(True))
+            add_idle("act", time.perf_counter() - t0)
+            if did_skill:
                 skip_after_skill = True
                 continue
-            last_save_at = _learn_board(
-                predictor,
-                image,
-                rgb,
-                game,
-                skill,
-                fever,
-                timer,
-                fan,
-                last_boxes,
-                pieces,
-                tsums,
-                saved_boards,
-                last_save_at,
-                save_boards,
-                say,
-            )
+            t0 = time.perf_counter()
+            did_bomb = try_bomb(skill_sit(True))
+            add_idle("act", time.perf_counter() - t0)
+            if did_bomb:
+                continue
             skill_fill = _skill_fill(rgb, skill)
+            if gauges is not None:
+                gauges(
+                    skill_fill,
+                    take_fever(),
+                    _fever_playing(rgb, game),
+                    None,
+                )
             if pick_n >= MIN_CHAIN:
-                flush_idle()
+                flush_idle(True)
                 idle_pick = (list(pick_opts), int(pick_n))
                 idle_acc = 0.0
             note_idle(False)
@@ -800,7 +947,6 @@ def run_play(
                     ):
                         continue
                     swipes += 1
-                    clears += 1
                     say(_counts_line(clears, swipes, coin))
                     burst += 1
                     used |= spots
@@ -834,6 +980,20 @@ def run_play(
                     watching.clear()
             if length_pick:
                 record_rl_length(pick_opts, pick_n)
+            if last_chain is not None:
+                extra = burst
+                if pending_spots is not None:
+                    extra = pending_burst + burst
+                pending_spots = _chain_spots(rgb, last_chain)
+                pending_key = _chain_key(last_chain)
+                pending_n = len(tsums)
+                pending_burst = extra
+                pending_group = int(last_chain[0].get("group") or 0)
+                pending_lesson = ([len(item) for item in found], len(last_chain))
+                pending_at = time.time()
+                pending_used |= used
+                bomb_asked = False
+                bomb_asked_sit = ""
             if timeup or watch_hit.is_set():
                 timeup = True
                 if not timeup_ended:
@@ -867,7 +1027,8 @@ def run_play(
                             coin = _read_coin(predictor, check_rgb, last_boxes)
                         say("TIME UP / " + _counts_line(clears, swipes, coin))
             if timeup:
-                flush_idle()
+                credit_pending(check_rgb)
+                flush_idle(True)
                 flush_bomb()
                 flush_skill()
                 _note_match_end(
@@ -884,97 +1045,86 @@ def run_play(
                     fan_taps,
                     match_picks,
                     coin,
+                    used_tsum,
+                    used_items,
+                    None if go_at is None else max(0, int(round(time.time() - go_at))),
+                    sorted(wait_times, reverse=True)[:3],
                 )
                 if not loop:
                     stop_watch.set()
                     watching.clear()
                     return
-                seen = _replay_after_timeup(say, stop)
+                seen, replay_items = _replay_after_timeup(say, stop)
                 if seen:
                     used_tsum = seen
                 fresh_match()
+                if replay_items:
+                    used_items = replay_items
                 say("プレイを開始します")
                 continue
-            if last_chain is not None:
-                extra = burst
-                if pending_spots is not None:
-                    extra = pending_burst + burst
-                pending_spots = _chain_spots(rgb, last_chain)
-                pending_key = _chain_key(last_chain)
-                pending_n = len(tsums)
-                pending_burst = extra
-                pending_group = int(last_chain[0].get("group") or 0)
-                pending_lesson = ([len(item) for item in found], len(last_chain))
-                pending_at = time.time()
-                pending_used |= used
-                bomb_asked = False
-                bomb_asked_sit = ""
+            last_save_at = _learn_board(
+                predictor,
+                image,
+                rgb,
+                game,
+                skill,
+                fever,
+                timer,
+                fan,
+                last_boxes,
+                pieces,
+                tsums,
+                saved_boards,
+                last_save_at,
+                save_boards,
+                say,
+            )
             if try_skill(skill_sit(True)):
                 skip_after_skill = True
                 continue
-            try_bomb(skill_sit(True))
-            load_hud()
+            if try_bomb(skill_sit(True)):
+                continue
             note_idle(True)
             continue
         note_found(False)
         if my_group <= 0 and skill is not None and now - last_skill_look >= 2.0:
             last_skill_look = now
+            t0 = time.perf_counter()
             with _gpu_lock:
                 looked = _mytsum_group(predictor, rgb, tsums, skill)
+            add_idle("pred", time.perf_counter() - t0)
             if looked > 0:
                 my_group = looked
+                t0 = time.perf_counter()
                 found = list_found(pieces, tsums)
+                add_idle("find", time.perf_counter() - t0)
                 if found:
                     continue
-        load_hud()
-        fever_fill = _fever_fill(rgb, fever)
-        fever_on = _fever_playing(rgb, game)
-        say(_group_counts_line(tsums))
-        has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
-        sit = hud_situation(
-            fever_on,
-            fever_fill,
-            False,
-            has_bomb,
-            len(tsums) >= BOARD_TSUMS,
-        )
         if pending_hud:
+            fever_on = _fever_playing(rgb, game)
             for old_sit, kind, pressed in pending_hud:
                 ok = erased_now or fever_on or (kind == "fan" and bool(found))
                 record_hud(old_sit, kind, pressed, ok)
             pending_hud = []
-        if try_skill(sit):
+        t0 = time.perf_counter()
+        did_skill = try_skill(skill_sit(False))
+        add_idle("act", time.perf_counter() - t0)
+        if did_skill:
             skip_after_skill = True
             continue
-        skill_fill = _skill_fill(rgb, skill)
-        if gauges is not None:
-            gauges(skill_fill, fever_fill, fever_on)
-        if preview is not None:
-            preview(_draw_plan(image, pieces, [], game, skill_fill))
-        if try_bomb(sit):
+        t0 = time.perf_counter()
+        did_bomb = try_bomb(skill_sit(False))
+        add_idle("act", time.perf_counter() - t0)
+        if did_bomb:
             continue
-        if _press_fan(fan, image, say, stop, last_fan_at, len(tsums), pending_hud, sit):
+        t0 = time.perf_counter()
+        did_fan = _press_fan(fan, image, say, stop, last_fan_at, len(tsums), pending_hud, skill_sit(False))
+        add_idle("act", time.perf_counter() - t0)
+        if did_fan:
             last_fan_at = time.time()
             fan_taps += 1
             skip_chains = []
             continue
-        last_save_at = _learn_board(
-            predictor,
-            image,
-            rgb,
-            game,
-            skill,
-            fever,
-            timer,
-            fan,
-            last_boxes,
-            pieces,
-            tsums,
-            saved_boards,
-            last_save_at,
-            save_boards,
-            say,
-        )
         say(f"ツム {len(tsums)}体 / なぞれる3体以上なし")
         continue
 
@@ -1215,7 +1365,7 @@ def _press_skill(
         if fill is not None and fill < SKILL_FILL_SPENT:
             wait_empty = False
             spent = True
-        elif time.time() - last_skill_at < SKILL_GAP:
+        elif _skill_ready(rgb, skill, used_tsum):
             return False, wait_empty, False
         else:
             wait_empty = False
@@ -1381,44 +1531,135 @@ def _tap_fan(
     _sleep_stop(0.12, stop)
 
 
-def _fever_pixel_lit(red: int, green: int, blue: int) -> bool:
+def _fever_class(red: int, green: int, blue: int) -> tuple[bool, bool, bool]:
     hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
-    if val < 0.45 or sat < 0.28:
-        return False
-    if hue >= 0.82 or hue <= 0.08:
-        return True
-    return 0.08 < hue <= 0.22
+    trough = 0.45 <= hue <= 0.62 and sat >= 0.25 and 0.28 <= val < 0.80
+    hot = (
+        red > green
+        and val >= 0.45
+        and sat >= 0.25
+        and not (0.28 <= hue <= 0.70)
+    )
+    remain = hot or (
+        val >= 0.50 and not (0.40 <= hue <= 0.70 and sat >= 0.18)
+    )
+    return hot, remain, trough
 
 
-def _fever_fill(image, box: dict[str, int] | None) -> float:
-    if image is None or box is None:
-        return 0.0
-    left = max(0, int(box["x"]))
-    top = max(0, int(box["y"]))
-    right = min(image.width, left + max(1, int(box["w"])))
-    bottom = min(image.height, top + max(1, int(box["h"])))
-    if right - left < 2 or bottom - top < 2:
-        return 0.0
-    crop = image.crop((left, top, right, bottom))
-    width, height = crop.size
-    step_x = max(1, width // 24)
-    step_y = max(1, height // 24)
-    pixels = crop.load()
-    lit_cols = 0
-    total_cols = 0
-    for xx in range(0, width, step_x):
-        total_cols += 1
-        on = False
-        for yy in range(0, height, step_y):
-            red, green, blue = pixels[xx, yy][:3]
-            if _fever_pixel_lit(red, green, blue):
-                on = True
-                break
+def _fever_region(fever, skill, fan) -> dict[str, int] | None:
+    if fever is not None:
+        return fever
+    if skill is None or fan is None:
+        return None
+    left = int(skill["x"]) + max(1, int(skill["w"]))
+    right = int(fan["x"])
+    top = max(int(skill["y"]), int(fan["y"]))
+    bottom = min(
+        int(skill["y"]) + max(1, int(skill["h"])),
+        int(fan["y"]) + max(1, int(fan["h"])),
+    )
+    if bottom - top < 8:
+        top = min(int(skill["y"]), int(fan["y"]))
+        bottom = max(
+            int(skill["y"]) + max(1, int(skill["h"])),
+            int(fan["y"]) + max(1, int(fan["h"])),
+        )
+    if right - left < 8 or bottom - top < 8:
+        return None
+    return {"x": left, "y": top, "w": right - left, "h": bottom - top}
+
+
+def _fever_flag_runs(flags: list[bool]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = None
+    last = -1
+    for index, on in enumerate(flags):
         if on:
-            lit_cols += 1
-    if total_cols <= 0:
-        return 0.0
-    return lit_cols / total_cols
+            if start is None:
+                start = index
+            last = index
+            continue
+        if start is not None:
+            runs.append((start, last))
+            start = None
+    if start is not None:
+        runs.append((start, last))
+    return runs
+
+
+def _read_fever(
+    image, fever, skill=None, fan=None, full_w: int | None = None
+) -> tuple[float | None, int | None]:
+    region = _fever_region(fever, skill, fan)
+    if image is None or region is None:
+        return None, full_w
+    left = max(0, int(region["x"]))
+    top = max(0, int(region["y"]))
+    right = min(image.width, left + max(1, int(region["w"])))
+    bottom = min(image.height, top + max(1, int(region["h"])))
+    if right - left < 8 or bottom - top < 4:
+        return None, full_w
+    height = bottom - top
+    mid_y = (top + bottom) // 2
+    band = max(6, min(16, height // 4))
+    y0 = max(top, mid_y - band)
+    y1 = min(bottom, mid_y + band + 1)
+    step_y = max(1, (y1 - y0) // 10)
+    step_x = 1 if right - left <= 480 else 2
+    pixels = image.load()
+    mid_x = (left + right) / 2
+    charge: tuple[int, int, int, int] | None = None
+    empty: tuple[int, int, int, int] | None = None
+    gold: tuple[int, int, int, int] | None = None
+    for y in range(y0, y1, step_y):
+        filled_hot: list[bool] = []
+        filled_remain: list[bool] = []
+        trough: list[bool] = []
+        bar: list[bool] = []
+        for x in range(left, right, step_x):
+            red, green, blue = pixels[x, y][:3]
+            is_hot, is_remain, is_trough = _fever_class(red, green, blue)
+            filled_hot.append(is_hot)
+            filled_remain.append(is_remain)
+            trough.append(is_trough)
+            bar.append(is_hot or is_remain or is_trough)
+        runs = [item for item in _fever_flag_runs(bar) if item[1] - item[0] >= 4]
+        if not runs:
+            continue
+        chosen = None
+        for start, end in runs:
+            x0 = left + start * step_x
+            x1 = left + end * step_x
+            if x0 <= mid_x <= x1:
+                chosen = (start, end)
+                break
+        if chosen is None:
+            chosen = max(runs, key=lambda item: item[1] - item[0])
+        start, end = chosen
+        hot_n = sum(1 for index in range(start, end + 1) if filled_hot[index])
+        remain_n = sum(1 for index in range(start, end + 1) if filled_remain[index])
+        trough_n = sum(1 for index in range(start, end + 1) if trough[index])
+        if trough_n > 0 and hot_n > 0:
+            row = (hot_n, trough_n, start, end)
+            if charge is None or hot_n > charge[0]:
+                charge = row
+        elif trough_n > 0:
+            row = (0, trough_n, start, end)
+            if empty is None or trough_n > empty[1]:
+                empty = row
+        elif remain_n > 0:
+            row = (remain_n, 0, start, end)
+            if gold is None or remain_n > gold[0]:
+                gold = row
+    chosen_row = charge if charge is not None else gold if gold is not None else empty
+    if chosen_row is None:
+        return None, full_w
+    fill_n, trough_n, start, end = chosen_row
+    if trough_n > 0:
+        return fill_n / (fill_n + trough_n), None
+    gold_w = (end - start + 1) * step_x
+    stored = gold_w if full_w is None or gold_w > full_w else full_w
+    return gold_w / stored, stored
 
 
 def _fever_playing(image, box: dict[str, int] | None) -> bool:
@@ -1707,10 +1948,16 @@ def _watch_timeup(
             continue
         if not watching.is_set() or stop_watch.is_set() or hit.is_set():
             continue
-        with _gpu_lock:
+        got_gpu = _gpu_lock.acquire(blocking=False)
+        if not got_gpu:
+            time.sleep(0.02)
+            continue
+        try:
             if not watching.is_set() or stop_watch.is_set() or hit.is_set():
                 continue
             seen, _score = _timeup_hit(predictor, rgb)
+        finally:
+            _gpu_lock.release()
         if seen:
             hit.set()
         else:
@@ -1779,6 +2026,10 @@ def _note_match_end(
     fan_taps: int,
     match_picks: list[tuple[list[int], int]],
     coin,
+    used_tsum: str = "",
+    items: list[str] | None = None,
+    duration: int | None = None,
+    waits: list[float] | None = None,
 ) -> None:
     if skill_wait_empty:
         fill = _skill_fill(rgb, skill)
@@ -1790,7 +2041,18 @@ def _note_match_end(
     coin_n = None
     if got:
         coin_n = play_coin(got)
-    record_play(clears, swipes, skill_taps, skill_ok, bomb_taps, fan_taps, coin_n)
+    record_play(clears, swipes, skill_taps, skill_ok, bomb_taps, fan_taps, coin_n, waits)
+    append_play(
+        clears,
+        swipes,
+        skill_taps,
+        skill_ok,
+        coin_n,
+        used_tsum,
+        items,
+        duration,
+        waits,
+    )
 
 
 def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
@@ -1829,39 +2091,46 @@ def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
     return ""
 
 
-def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
+def _read_timer(predictor, rgb, timer: dict[str, int] | None) -> int | None:
     if timer is None or rgb is None:
-        return False
+        return None
     predict = getattr(predictor, "predict_coin_digits", None)
     if predict is None:
-        return False
+        return None
     width, height = rgb.size
     left = max(0, int(timer["x"]))
     top = max(0, int(timer["y"]))
     right = min(width, left + max(1, int(timer["w"])))
     bottom = min(height, top + max(1, int(timer["h"])))
     if right - left < 4 or bottom - top < 4:
-        return False
+        return None
     crop = rgb.crop((left, top, right, bottom))
     try:
         raw = str(predict(crop, "timer") or "")
     except Exception:
-        return False
+        return None
     digits = "".join(char for char in raw if char.isdigit())
     if not digits:
-        return False
-    return int(digits) == 0
+        return None
+    return int(digits)
 
 
-def _replay_after_timeup(say: StatusFn, stop: Event | None) -> str:
-    _seen, _locked, arrived, used_name = _click_start_or_continue(
+def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
+    left = _read_timer(predictor, rgb, timer)
+    return left is not None and left == 0
+
+
+def _replay_after_timeup(say: StatusFn, stop: Event | None) -> tuple[str, list[str] | None]:
+    _seen, _locked, arrived, used_name, items = _click_start_or_continue(
         say, stop, tap_start=False
     )
     if arrived == "start":
-        _tap_start_now(say, stop)
+        found = _tap_start_now(say, stop)
+        if found:
+            items = found
     elif arrived == "continue":
         _tap_continue_now(say, stop)
-    return used_name
+    return used_name, items
 
 
 def _tap_point(image: QImage, x: int, y: int) -> None:
@@ -2073,11 +2342,12 @@ def _click_start_or_continue(
     stop: Event | None,
     tap_start: bool = True,
     skip_retry: bool = False,
-) -> tuple[int, bool, str, str]:
+) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
     locked = False
     used_name = ""
+    items: list[str] | None = None
     while time.time() < deadline:
         _check_stop(stop)
         try:
@@ -2100,13 +2370,18 @@ def _click_start_or_continue(
             if name:
                 used_name = name
                 say(f"使用ツム {name}")
+            found_items = _items_used_path(path)
+            if found_items is not None:
+                items = found_items
+            if items:
+                say("アイテム " + "、".join(items))
             if tap_start:
                 say("スタートをクリックします")
                 _slow_tap(start.center().x(), start.center().y())
                 _sleep_stop(1.2, stop)
             else:
                 say("スタートを検出しました")
-            return kinds, locked, "start", used_name
+            return kinds, locked, "start", used_name, items
         pause = _pause_continue_button(image)
         if pause is not None:
             if tap_start:
@@ -2115,9 +2390,9 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
             else:
                 say("続けるを検出しました")
-            return kinds, locked, "continue", used_name
+            return kinds, locked, "continue", used_name, items
         if _in_play_hud(image):
-            return kinds, locked, "", used_name
+            return kinds, locked, "", used_name, items
         retry = None if skip_retry else _retry_button(image)
         if retry is not None:
             say("リトライをクリックします")
@@ -2147,29 +2422,30 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
             else:
                 say("続けるを検出しました")
-            return kinds, locked, "continue", used_name
+            return kinds, locked, "continue", used_name, items
         say("画面の最上部をタップします")
         _slow_tap(image.width() // 2, 1)
         _sleep_stop(1.2, stop)
         deadline = max(deadline, time.time() + 12)
-    return kinds, locked, "", used_name
+    return kinds, locked, "", used_name, items
 
 
-def _tap_start_now(say: StatusFn, stop: Event | None) -> bool:
+def _tap_start_now(say: StatusFn, stop: Event | None) -> list[str] | None:
     try:
         path = capture_screen_path()
         image = QImage(str(path))
     except Exception:
-        return False
+        return None
     if image.isNull():
-        return False
+        return None
+    items = _items_used_path(path)
     start = _match_start_button(image)
     if start is None:
-        return False
+        return items
     say("スタートをクリックします")
     _slow_tap(start.center().x(), start.center().y())
     _sleep_stop(1.2, stop)
-    return True
+    return items
 
 
 def _tap_continue_now(say: StatusFn, stop: Event | None) -> bool:
@@ -2239,39 +2515,53 @@ def _wait_and_tap_start(say: StatusFn, stop: Event | None) -> bool:
     return False
 
 
-_SLOT_5TO4: tuple[dict[str, int], int, int] | None | bool = False
+_ITEM_SLOTS: dict[str, tuple[dict[str, int], int, int]] | None | bool = False
 SLOT_ON = 0.28
+_ITEM_ORDER = (
+    ("score_plus", "+Score"),
+    ("coin_plus", "+Coin"),
+    ("exp_plus", "+Exp"),
+    ("time_plus", "+Time"),
+    ("bomb_plus", "+Bomb"),
+    ("5to4", "5＞4"),
+    ("combo_plus", "+Combo"),
+)
+
+
+def _item_slots() -> dict[str, tuple[dict[str, int], int, int]]:
+    global _ITEM_SLOTS
+    if _ITEM_SLOTS is not False:
+        return _ITEM_SLOTS or {}
+    path = TRAINER_ROOT / "data" / "item_slots.json"
+    loaded: dict[str, tuple[dict[str, int], int, int]] = {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for key, _label in _ITEM_ORDER:
+            for item in payload.get(key) or []:
+                box = item.get("box")
+                width = int(item.get("width") or 0)
+                height = int(item.get("height") or 0)
+                if not box or width <= 0 or height <= 0:
+                    continue
+                loaded[key] = (
+                    {
+                        "x": int(box["x"]),
+                        "y": int(box["y"]),
+                        "w": max(1, int(box["w"])),
+                        "h": max(1, int(box["h"])),
+                    },
+                    width,
+                    height,
+                )
+                break
+    except Exception:
+        loaded = {}
+    _ITEM_SLOTS = loaded if loaded else None
+    return loaded
 
 
 def _five_to_four_slot() -> tuple[dict[str, int], int, int] | None:
-    global _SLOT_5TO4
-    if _SLOT_5TO4 is not False:
-        return _SLOT_5TO4
-    path = TRAINER_ROOT / "data" / "item_slots.json"
-    loaded = None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        for item in payload.get("5to4") or []:
-            box = item.get("box")
-            width = int(item.get("width") or 0)
-            height = int(item.get("height") or 0)
-            if not box or width <= 0 or height <= 0:
-                continue
-            loaded = (
-                {
-                    "x": int(box["x"]),
-                    "y": int(box["y"]),
-                    "w": max(1, int(box["w"])),
-                    "h": max(1, int(box["h"])),
-                },
-                width,
-                height,
-            )
-            break
-    except Exception:
-        loaded = None
-    _SLOT_5TO4 = loaded
-    return loaded
+    return _item_slots().get("5to4")
 
 
 def _five_to_four_used_path(path: Path) -> bool | None:
@@ -2279,6 +2569,13 @@ def _five_to_four_used_path(path: Path) -> bool | None:
 
     with Image.open(path) as board:
         return _five_to_four_used_pil(board.convert("RGB"))
+
+
+def _items_used_path(path: Path) -> list[str] | None:
+    from PIL import Image
+
+    with Image.open(path) as board:
+        return _items_used_pil(board.convert("RGB"))
 
 
 def _five_to_four_used_pil(image) -> bool | None:
@@ -2292,6 +2589,31 @@ def _five_to_four_used_pil(image) -> bool | None:
     if yellow + blue < SLOT_ON:
         return None
     return yellow > blue
+
+
+def _items_used_pil(image) -> list[str] | None:
+    slots = _item_slots()
+    if not slots:
+        return None
+    view = _portrait_frame(image)
+    vw, vh = view.size
+    seen_panel = False
+    used: list[str] = []
+    for key, label in _ITEM_ORDER:
+        slot = slots.get(key)
+        if slot is None:
+            continue
+        box, src_w, src_h = slot
+        scaled = _scale_item_box(box, src_w, src_h, vw, vh)
+        yellow, blue = _slot_yellow_blue(view, scaled)
+        if yellow + blue < SLOT_ON:
+            continue
+        seen_panel = True
+        if yellow > blue:
+            used.append(label)
+    if not seen_panel:
+        return None
+    return used
 
 
 def read_kind_count() -> int | None:

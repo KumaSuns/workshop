@@ -141,10 +141,11 @@ class PieceHeatmapDataset(Dataset):
             if flip:
                 cx = HEATMAP_SIZE - cx
             r_hm = max(1.0, int(piece["r"]) / crop_w * HEATMAP_SIZE)
-            draw_gaussian(heat[channel], cx, cy, max(1.0, r_hm / 2.2))
-            ix = min(max(int(cx), 0), HEATMAP_SIZE - 1)
-            iy = min(max(int(cy), 0), HEATMAP_SIZE - 1)
-            radius[iy, ix] = min(1.0, int(piece["r"]) / scale)
+            sigma = max(1.0, r_hm / 2.2)
+            draw_gaussian(heat[channel], cx, cy, sigma)
+            blob = torch.zeros_like(radius)
+            draw_gaussian(blob, cx, cy, sigma)
+            radius = torch.maximum(radius, blob * min(1.0, int(piece["r"]) / scale))
         return self.normalize(crop), heat, radius
 
 

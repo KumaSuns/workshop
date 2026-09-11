@@ -353,6 +353,99 @@ def _color_pills(image: QImage, match, max_w_frac: float) -> list[QRect]:
     return pills
 
 
+def _is_mission_star_edge(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return (
+        90 < red < 210
+        and 30 < green < 150
+        and blue < 90
+        and red > green + 15
+        and green >= blue
+        and red + green + blue < 430
+    )
+
+
+def _is_daily_mission(image: QImage, rect: QRect) -> bool:
+    height = rect.height()
+    width = rect.width()
+    if height < 8 or width < height:
+        return False
+    top = rect.y() + int(height * 0.45)
+    bottom = rect.y() + height
+    left = rect.x() + max(2, width // 20)
+    right = rect.x() + width - max(2, width // 20)
+    if bottom - top < 4 or right - left < 4:
+        return False
+    seen = [[False] * (right - left) for _ in range(bottom - top)]
+    stars: list[tuple[int, int, int]] = []
+    for y in range(top, bottom):
+        for x in range(left, right):
+            if seen[y - top][x - left]:
+                continue
+            color = image.pixelColor(x, y)
+            if not _is_mission_star_edge((color.red(), color.green(), color.blue())):
+                continue
+            stack = [(x, y)]
+            seen[y - top][x - left] = True
+            min_x = max_x = x
+            min_y = max_y = y
+            while stack:
+                cx, cy = stack.pop()
+                if cx < min_x:
+                    min_x = cx
+                if cx > max_x:
+                    max_x = cx
+                if cy < min_y:
+                    min_y = cy
+                if cy > max_y:
+                    max_y = cy
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if nx < left or ny < top or nx >= right or ny >= bottom:
+                        continue
+                    if seen[ny - top][nx - left]:
+                        continue
+                    neighbor = image.pixelColor(nx, ny)
+                    if not _is_mission_star_edge(
+                        (neighbor.red(), neighbor.green(), neighbor.blue())
+                    ):
+                        continue
+                    seen[ny - top][nx - left] = True
+                    stack.append((nx, ny))
+            box_w = max_x - min_x + 1
+            box_h = max_y - min_y + 1
+            if min(box_w, box_h) < 4:
+                continue
+            if max(box_w, box_h) / min(box_w, box_h) > 1.2:
+                continue
+            if box_h < height * 0.22 or box_h > height * 0.45:
+                continue
+            inset = max(1, min(box_w, box_h) // 5)
+            dark = 0
+            count = 0
+            for py in range(min_y + inset, max_y + 1 - inset):
+                for px in range(min_x + inset, max_x + 1 - inset):
+                    pixel = image.pixelColor(px, py)
+                    count += 1
+                    if pixel.red() < 120 and pixel.green() < 100:
+                        dark += 1
+            if count <= 0 or dark * 100 > count * 12:
+                continue
+            stars.append(((min_x + max_x) // 2, (min_y + max_y) // 2, box_h))
+    if not (2 <= len(stars) <= 3):
+        return False
+    stars.sort(key=lambda item: item[0])
+    ys = [item[1] for item in stars]
+    hs = [item[2] for item in stars]
+    if max(ys) - min(ys) > max(hs) * 0.5:
+        return False
+    if max(hs) > min(hs) * 1.35:
+        return False
+    span = stars[-1][0] - stars[0][0]
+    if span < width * 0.12 or span > width * 0.55:
+        return False
+    return True
+
+
 def _play_button(image: QImage) -> QRect | None:
     if _retry_button(image) is not None or _pause_continue_button(image) is not None:
         return None
@@ -367,6 +460,8 @@ def _play_button(image: QImage) -> QRect | None:
     if play.width() < image.width() * 0.18:
         return None
     if abs(play.center().x() - image.width() / 2) > image.width() * 0.15:
+        return None
+    if _is_daily_mission(image, play):
         return None
     return play
 
@@ -433,6 +528,8 @@ def _continue_button(image: QImage) -> QRect | None:
         return None
     button = max(low, key=lambda rect: rect.center().y())
     if button.width() < image.width() * 0.18:
+        return None
+    if _is_daily_mission(image, button):
         return None
     return button
 
@@ -507,6 +604,8 @@ def _cancel_button(image: QImage) -> QRect | None:
         gap = right.x() - left.right()
         if gap < -left.width() * 0.2 or gap > left.width() * 2.2:
             continue
+        if _is_daily_mission(image, right) or _is_daily_mission(image, left):
+            continue
         if _play_button(image) is not None:
             return None
         return left
@@ -526,6 +625,7 @@ def _close_button(image: QImage) -> QRect | None:
         for pill in _yellow_pills(image)
         if pill.center().y() > image.height() * 0.55
         and abs(pill.center().x() - image.width() / 2) < image.width() * 0.28
+        and not _is_daily_mission(image, pill)
     ]
     if not pills:
         return None

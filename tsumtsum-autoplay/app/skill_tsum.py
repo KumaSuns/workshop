@@ -47,8 +47,11 @@ def after_skill_tap(
     handler(image, rgb, say, stop, watch_hit, game)
 
 
+_PLAIN_SKILL_WAIT = 2.8
+
+
 def _after_plain(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
-    return
+    _wait_until(time.time() + _PLAIN_SKILL_WAIT, stop, watch_hit)
 
 
 def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:

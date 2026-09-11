@@ -126,6 +126,29 @@ def heat_peaks(
     return points
 
 
+def heat_support_radius(heat: torch.Tensor, hx: float, hy: float) -> float:
+    if heat.ndim == 3:
+        heat = heat.squeeze(0)
+    height, width = heat.shape[-2:]
+    cx = min(max(int(round(hx)), 0), width - 1)
+    cy = min(max(int(round(hy)), 0), height - 1)
+    peak = float(heat[cy, cx])
+    if peak < 0.22:
+        return 0.0
+    thresh = max(0.22, 0.45 * peak)
+    limit = 24
+    y0 = max(0, cy - limit)
+    y1 = min(height, cy + limit + 1)
+    x0 = max(0, cx - limit)
+    x1 = min(width, cx + limit + 1)
+    ys, xs = torch.where(heat[y0:y1, x0:x1] >= thresh)
+    if ys.numel() <= 0:
+        return 0.0
+    dx = xs.float() + float(x0) - hx
+    dy = ys.float() + float(y0) - hy
+    return float(torch.sqrt(dx * dx + dy * dy).max())
+
+
 def nms_peaks(
     points: list[tuple[float, float, float, float]],
     min_sep: float,

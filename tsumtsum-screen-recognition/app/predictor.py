@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -40,6 +41,75 @@ from app.tsum_type import (
 )
 
 
+def _body_radius(
+    pixels,
+    width: int,
+    height: int,
+    cx: int,
+    cy: int,
+    limit: int,
+    base_r: int,
+    others: list[tuple[int, int]],
+) -> float:
+    if not (0 <= cx < width and 0 <= cy < height):
+        return 0.0
+    inner = max(3, int(base_r * 0.35))
+    samples: list[tuple[int, int, int]] = []
+    for dy in range(-inner, inner + 1):
+        py = cy + dy
+        if py < 0 or py >= height:
+            continue
+        for dx in range(-inner, inner + 1):
+            if dx * dx + dy * dy > inner * inner:
+                continue
+            px = cx + dx
+            if px < 0 or px >= width:
+                continue
+            red, green, blue = pixels[px, py][:3]
+            samples.append((int(red), int(green), int(blue)))
+    if not samples:
+        return 0.0
+    cr = sum(item[0] for item in samples) / len(samples)
+    cg = sum(item[1] for item in samples) / len(samples)
+    cb = sum(item[2] for item in samples) / len(samples)
+    devs = sorted(
+        ((item[0] - cr) ** 2 + (item[1] - cg) ** 2 + (item[2] - cb) ** 2) ** 0.5
+        for item in samples
+    )
+    p90 = devs[int((len(devs) - 1) * 0.9)]
+    max_dev = max(p90 * 1.8, p90 + 12.0)
+    clear = base_r * 0.7
+    lengths: list[float] = []
+    for index in range(16):
+        ang = 2.0 * math.pi * index / 16.0
+        dx = math.cos(ang)
+        dy = math.sin(ang)
+        last = 0.0
+        step = 2.0
+        dist = step
+        while dist <= limit:
+            px = int(round(cx + dx * dist))
+            py = int(round(cy + dy * dist))
+            if px < 0 or py < 0 or px >= width or py >= height:
+                break
+            hit = False
+            for ox, oy in others:
+                if math.hypot(px - ox, py - oy) < clear:
+                    hit = True
+                    break
+            if hit:
+                break
+            red, green, blue = pixels[px, py][:3]
+            gap = ((red - cr) ** 2 + (green - cg) ** 2 + (blue - cb) ** 2) ** 0.5
+            if gap > max_dev:
+                break
+            last = dist
+            dist += step
+        lengths.append(last)
+    lengths.sort()
+    return lengths[len(lengths) // 2] if lengths else 0.0
+
+
 class Predictor:
     def __init__(self, models_dir: Path, load: bool = True) -> None:
         self.models_dir = models_dir
@@ -50,6 +120,8 @@ class Predictor:
         self.digit_models: dict[str, CoinDigitNet] = {}
         self.scene_model: SceneNet | None = None
         self.scene_classes: tuple[str, ...] = SCENE_CLASSES
+        self.last_heat_s = 0.0
+        self.last_type_s = 0.0
         self._transform = transforms.Compose(
             [
                 transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
@@ -306,6 +378,7 @@ class Predictor:
         crop = rgb.crop((left, top, right, bottom))
         crop_w = max(1, right - left)
         crop_h = max(1, bottom - top)
+        t_heat = time.perf_counter()
         tensor = self._piece_transform(crop).unsqueeze(0).to(self.device)
         with torch.no_grad():
             heat, radius = self.piece_model(tensor)
@@ -313,7 +386,9 @@ class Predictor:
         radius = radius[0, 0].cpu()
         pieces: list[dict[str, int]] = []
         board_w = int(game["w"]) if game is not None else crop_w
-        pieces.extend(self._tsums_from_heat(heat[0], radius, left, top, crop_w, crop_h, board_w))
+        pieces.extend(
+            self._tsums_from_heat(heat[0], radius, left, top, crop_w, crop_h, board_w, crop)
+        )
         base_bomb = piece_radius_from_game(board_w, "bomb")
         for _score, hx, hy, _r_norm in peaks_from_heat(heat[1], radius):
             x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
@@ -326,7 +401,10 @@ class Predictor:
                     "group": 0,
                 }
             )
+        self.last_heat_s = time.perf_counter() - t_heat
+        t_type = time.perf_counter()
         self._assign_groups(rgb, pieces, kinds=kinds, inner=inner)
+        self.last_type_s = time.perf_counter() - t_type
         return pieces
 
     def _tsums_from_heat(
@@ -338,6 +416,7 @@ class Predictor:
         crop_w: int,
         crop_h: int,
         board_w: int,
+        crop: Image.Image,
     ) -> list[dict[str, int]]:
         base_r = piece_radius_from_game(board_w, "tsum")
         scale = min(crop_w, crop_h)
@@ -346,32 +425,48 @@ class Predictor:
         kept = nms_peaks(raw, min_sep)
         found: list[dict[str, int]] = []
         big_r = int(round(base_r * 1.8))
+        heat_small = base_r / max(1.0, float(crop_w)) * HEATMAP_SIZE
+        pixels = crop.load()
+        centers: list[tuple[int, int]] = []
+        parsed: list[tuple[float, float, float, float, int, int]] = []
         for score, hx, hy, r_norm in kept:
             pred_r = max(1, int(round(float(r_norm) * scale)))
             x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
+            cx = int(round(x)) - left
+            cy = int(round(y)) - top
+            parsed.append((score, hx, hy, r_norm, pred_r, cx, cy))
+            centers.append((cx, cy))
+        bodies: list[float] = []
+        for _score, hx, hy, r_norm, pred_r, cx, cy in parsed:
+            others = [(ox, oy) for ox, oy in centers if ox != cx or oy != cy]
+            bodies.append(
+                _body_radius(pixels, crop_w, crop_h, cx, cy, big_r, base_r, others)
+            )
+        typical = sorted(bodies)[len(bodies) // 2] if bodies else 0.0
+        big_body = typical * 1.8
+        for index, (_score, hx, hy, r_norm, pred_r, cx, cy) in enumerate(parsed):
+            x = cx + left
+            y = cy + top
             big = False
-            if pred_r >= big_r:
-                heat_r = pred_r / max(1.0, float(crop_w)) * HEATMAP_SIZE
-                strong = 0
-                for other_score, ox, oy, _or in raw:
-                    if math.hypot(ox - hx, oy - hy) > heat_r:
+            wide = typical > 0 and bodies[index] >= big_body
+            if pred_r >= big_r or wide:
+                heat_r = max(pred_r, bodies[index]) / max(1.0, float(crop_w)) * HEATMAP_SIZE
+                cluster = 0
+                for other, (_os, oxh, oyh, or_norm, opred, ocx, ocy) in enumerate(parsed):
+                    if other == index:
                         continue
-                    if other_score >= max(0.22, 0.6 * score):
-                        strong += 1
-                nearby_kept = 0
-                for _s, ox, oy, _or in kept:
-                    if (ox, oy) == (hx, hy):
+                    dist = math.hypot(oxh - hx, oyh - hy)
+                    if dist > heat_r or dist < heat_small * 0.85:
                         continue
-                    if math.hypot(ox - hx, oy - hy) <= heat_r:
-                        nearby_kept += 1
-                if strong >= 3 or nearby_kept >= 2:
-                    pred_r = base_r
-                else:
+                    if opred >= big_r or (typical > 0 and bodies[other] >= big_body):
+                        continue
+                    cluster += 1
+                if cluster < 2:
                     big = True
             item = {
                 "x": int(round(x)),
                 "y": int(round(y)),
-                "r": int(pred_r if big else base_r),
+                "r": int(big_r if big else base_r),
                 "kind": "big" if big else "tsum",
                 "group": 1,
             }
@@ -379,6 +474,24 @@ class Predictor:
                 item["big"] = 1
             found.append(item)
         bigs = [piece for piece in found if int(piece.get("big") or 0)]
+        if len(bigs) >= 2:
+            kept_bigs: list[dict[str, int]] = []
+            for piece in sorted(bigs, key=lambda item: -int(item["r"])):
+                overlap = False
+                for other in kept_bigs:
+                    if math.hypot(
+                        int(piece["x"]) - int(other["x"]),
+                        int(piece["y"]) - int(other["y"]),
+                    ) < int(other["r"]):
+                        overlap = True
+                        break
+                if overlap:
+                    piece["kind"] = "tsum"
+                    piece["r"] = base_r
+                    piece.pop("big", None)
+                else:
+                    kept_bigs.append(piece)
+            bigs = kept_bigs
         if not bigs:
             return found
         pruned: list[dict[str, int]] = []

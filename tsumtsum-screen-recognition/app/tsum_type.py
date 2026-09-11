@@ -52,13 +52,23 @@ def isolated_tsum_rgb(
     fade = torch.where(dist_self <= inner, torch.ones_like(fade), fade)
     fade = torch.where(dist_self < outer, fade, torch.zeros_like(fade))
     if others:
+        oxs: list[float] = []
+        oys: list[float] = []
+        orads: list[float] = []
         for other in others:
             ox, oy = int(other["x"]), int(other["y"])
             if ox == x and oy == y:
                 continue
-            orad = max(4, int(other.get("r") or r)) * scale * TYPE_DISK_INNER
-            dist_other = torch.hypot(xs - (ox - left) * scale, ys - (oy - top) * scale)
-            fade = torch.where(dist_other < orad, torch.zeros_like(fade), fade)
+            oxs.append((ox - left) * scale)
+            oys.append((oy - top) * scale)
+            orads.append(max(4, int(other.get("r") or r)) * scale * TYPE_DISK_INNER)
+        if oxs:
+            ocx = torch.tensor(oxs, dtype=torch.float32).view(-1, 1, 1)
+            ocy = torch.tensor(oys, dtype=torch.float32).view(-1, 1, 1)
+            orad = torch.tensor(orads, dtype=torch.float32).view(-1, 1, 1)
+            dist_other = torch.hypot(xs - ocx, ys - ocy)
+            hit = (dist_other < orad).any(dim=0)
+            fade = torch.where(hit, torch.zeros_like(fade), fade)
     fill = torch.tensor(TYPE_FILL, dtype=torch.float32).view(3, 1, 1)
     isolated = rgb * fade.unsqueeze(0) + fill * (1.0 - fade.unsqueeze(0))
     return _suppress_effect_pixels(isolated, fade)

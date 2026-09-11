@@ -118,6 +118,9 @@ def _load() -> dict:
             kept = play_coin(item.get("coin"))
             if kept is not None:
                 cleaned[-1]["coin"] = kept
+        waits = _play_waits(item)
+        if waits:
+            cleaned[-1]["waits"] = waits
     hud_raw = payload.get("hud") if isinstance(payload.get("hud"), dict) else {}
     hud: dict[str, dict[str, int]] = {}
     for key, item in hud_raw.items():
@@ -248,8 +251,25 @@ def history_text() -> str:
                 line += f" / コイン {int(item.get('coin') or 0):>{coin_w}}"
             else:
                 line += f" / コイン {'':>{coin_w}}"
+        waits = _play_waits(item)
+        if waits:
+            line += " / LossTime / " + " ".join(f"{wait:.1f}s" for wait in waits)
         lines.append(line)
     return "\n".join(lines)
+
+
+def _play_waits(item: dict) -> list[float]:
+    raw = item.get("waits")
+    if not isinstance(raw, list):
+        return []
+    shown: list[float] = []
+    for part in raw:
+        try:
+            shown.append(round(max(0.0, float(part)), 1))
+        except (TypeError, ValueError):
+            continue
+    shown.sort(reverse=True)
+    return shown[:3]
 
 
 def _num_width(*nums: int) -> int:
@@ -597,6 +617,7 @@ def record_play(
     bombs: int,
     fans: int,
     coin: int | None = None,
+    waits: list[float] | None = None,
 ) -> None:
     data = _load()
     plays = list(data.get("plays") or [])
@@ -612,6 +633,9 @@ def record_play(
         kept = play_coin(coin)
         if kept is not None:
             item["coin"] = kept
+    shown_waits = _play_waits({"waits": waits or []})
+    if shown_waits:
+        item["waits"] = shown_waits
     plays.append(item)
     data["plays"] = plays[-40:]
     _save(data)

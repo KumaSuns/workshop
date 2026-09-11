@@ -29,6 +29,7 @@ from app.bluestacks import capture_play_frame, halt_input, start_tsum, tsum_is_r
 from app.intro import IntroWorker
 from app.paths import APP_ROOT, IPC_NAME
 from app.play_style import history_text
+from app.play_web import start_server, stop_server
 from app.record_play import RecordWorker, play_video_path
 from app.play import (
     PlayWorker,
@@ -73,7 +74,7 @@ class DebugWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         layout = QVBoxLayout(self)
         row = QHBoxLayout()
-        self._gauges = QLabel("スキル  —    フィーバー  —")
+        self._gauges = QLabel("スキル  —    フィーバー  —    タイマー  —")
         self._gauges.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._fever_mark = QLabel("FEVER")
         self._fever_mark.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -110,10 +111,23 @@ class DebugWindow(QWidget):
             )
         )
 
-    def set_gauges(self, skill, fever, fever_on=False) -> None:
+    def set_gauges(self, skill, fever, fever_on=False, timer=None) -> None:
         skill_s = "—" if skill is None else f"{float(skill):.2f}"
-        fever_s = "—" if fever is None else f"{float(fever):.2f}"
-        self._gauges.setText(f"スキル  {skill_s}    フィーバー  {fever_s}")
+        if fever is None:
+            fever_s = "—"
+        else:
+            try:
+                fever_s = f"{int(round(float(fever) * 100))}%"
+            except (TypeError, ValueError, OverflowError):
+                fever_s = "—"
+        if timer is None:
+            timer_s = "—"
+        else:
+            try:
+                timer_s = str(int(timer))
+            except (TypeError, ValueError, OverflowError):
+                timer_s = "—"
+        self._gauges.setText(f"スキル  {skill_s}    フィーバー  {fever_s}    タイマー  {timer_s}")
         self._set_fever_mark(bool(fever_on))
 
     def _set_fever_mark(self, on: bool) -> None:
@@ -229,6 +243,10 @@ class MainWindow(QMainWindow):
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
         self._debug.append("待機中")
+        try:
+            self._debug.append(start_server())
+        except Exception as exc:
+            self._debug.append(str(exc))
         self._start_ipc()
 
     def _on_capture_toggled(self, on: bool) -> None:
@@ -783,6 +801,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._stop_record()
         self._unregister_stop_hotkey()
+        stop_server()
         self._debug.close()
         super().closeEvent(event)
 

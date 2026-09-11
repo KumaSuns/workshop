@@ -250,6 +250,10 @@ def _pad_to_slots(crop: Image.Image) -> Image.Image:
 
 def prepare_digit_crop(crop: Image.Image, key: str = "coin") -> Image.Image:
     crop = crop.convert("RGB")
+    if key == "timer":
+        crop = ImageOps.autocontrast(crop, cutoff=1)
+        crop = _tight_ink(crop)
+        return _pad_to_slots(crop)
     if key != "coin":
         return crop
     crop = ImageOps.autocontrast(crop, cutoff=1)
