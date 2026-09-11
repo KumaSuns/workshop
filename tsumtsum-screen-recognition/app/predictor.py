@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 import math
 import time
 from pathlib import Path
@@ -41,73 +42,55 @@ from app.tsum_type import (
 )
 
 
-def _body_radius(
+def _is_board_pixel(red: int, green: int, blue: int) -> bool:
+    hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+    return 0.50 <= hue <= 0.72 and sat >= 0.20 and val <= 0.70
+
+
+def _body_area(
     pixels,
     width: int,
     height: int,
     cx: int,
     cy: int,
     limit: int,
-    base_r: int,
+    ignore: float,
     others: list[tuple[int, int]],
-) -> float:
+) -> int:
     if not (0 <= cx < width and 0 <= cy < height):
-        return 0.0
-    inner = max(3, int(base_r * 0.35))
-    samples: list[tuple[int, int, int]] = []
-    for dy in range(-inner, inner + 1):
+        return 0
+    span = 2 * limit
+    nearby: list[tuple[int, int]] = []
+    for ox, oy in others:
+        dist = math.hypot(ox - cx, oy - cy)
+        if ignore <= dist <= span:
+            nearby.append((ox, oy))
+    count = 0
+    lim2 = limit * limit
+    step = 2
+    for dy in range(-limit, limit + 1, step):
         py = cy + dy
         if py < 0 or py >= height:
             continue
-        for dx in range(-inner, inner + 1):
-            if dx * dx + dy * dy > inner * inner:
+        for dx in range(-limit, limit + 1, step):
+            if dx * dx + dy * dy > lim2:
                 continue
             px = cx + dx
             if px < 0 or px >= width:
                 continue
-            red, green, blue = pixels[px, py][:3]
-            samples.append((int(red), int(green), int(blue)))
-    if not samples:
-        return 0.0
-    cr = sum(item[0] for item in samples) / len(samples)
-    cg = sum(item[1] for item in samples) / len(samples)
-    cb = sum(item[2] for item in samples) / len(samples)
-    devs = sorted(
-        ((item[0] - cr) ** 2 + (item[1] - cg) ** 2 + (item[2] - cb) ** 2) ** 0.5
-        for item in samples
-    )
-    p90 = devs[int((len(devs) - 1) * 0.9)]
-    max_dev = max(p90 * 1.8, p90 + 12.0)
-    clear = base_r * 0.7
-    lengths: list[float] = []
-    for index in range(16):
-        ang = 2.0 * math.pi * index / 16.0
-        dx = math.cos(ang)
-        dy = math.sin(ang)
-        last = 0.0
-        step = 2.0
-        dist = step
-        while dist <= limit:
-            px = int(round(cx + dx * dist))
-            py = int(round(cy + dy * dist))
-            if px < 0 or py < 0 or px >= width or py >= height:
-                break
-            hit = False
-            for ox, oy in others:
-                if math.hypot(px - ox, py - oy) < clear:
-                    hit = True
+            dself = dx * dx + dy * dy
+            closer = False
+            for ox, oy in nearby:
+                if (px - ox) ** 2 + (py - oy) ** 2 <= dself:
+                    closer = True
                     break
-            if hit:
-                break
+            if closer:
+                continue
             red, green, blue = pixels[px, py][:3]
-            gap = ((red - cr) ** 2 + (green - cg) ** 2 + (blue - cb) ** 2) ** 0.5
-            if gap > max_dev:
-                break
-            last = dist
-            dist += step
-        lengths.append(last)
-    lengths.sort()
-    return lengths[len(lengths) // 2] if lengths else 0.0
+            if _is_board_pixel(int(red), int(green), int(blue)):
+                continue
+            count += 1
+    return count
 
 
 class Predictor:
@@ -425,7 +408,6 @@ class Predictor:
         kept = nms_peaks(raw, min_sep)
         found: list[dict[str, int]] = []
         big_r = int(round(base_r * 1.8))
-        heat_small = base_r / max(1.0, float(crop_w)) * HEATMAP_SIZE
         pixels = crop.load()
         centers: list[tuple[int, int]] = []
         parsed: list[tuple[float, float, float, float, int, int]] = []
@@ -436,29 +418,30 @@ class Predictor:
             cy = int(round(y)) - top
             parsed.append((score, hx, hy, r_norm, pred_r, cx, cy))
             centers.append((cx, cy))
-        bodies: list[float] = []
+        ignore = base_r * 0.85
+        limit = int(round(base_r * 2.2))
+        areas: list[int] = []
         for _score, hx, hy, r_norm, pred_r, cx, cy in parsed:
             others = [(ox, oy) for ox, oy in centers if ox != cx or oy != cy]
-            bodies.append(
-                _body_radius(pixels, crop_w, crop_h, cx, cy, big_r, base_r, others)
+            areas.append(
+                _body_area(pixels, crop_w, crop_h, cx, cy, limit, ignore, others)
             )
-        typical = sorted(bodies)[len(bodies) // 2] if bodies else 0.0
-        big_body = typical * 1.8
+        typical = sorted(areas)[len(areas) // 2] if areas else 0
+        big_area = typical * 1.8
         for index, (_score, hx, hy, r_norm, pred_r, cx, cy) in enumerate(parsed):
             x = cx + left
             y = cy + top
             big = False
-            wide = typical > 0 and bodies[index] >= big_body
+            wide = typical > 0 and areas[index] >= big_area
             if pred_r >= big_r or wide:
-                heat_r = max(pred_r, bodies[index]) / max(1.0, float(crop_w)) * HEATMAP_SIZE
                 cluster = 0
                 for other, (_os, oxh, oyh, or_norm, opred, ocx, ocy) in enumerate(parsed):
                     if other == index:
                         continue
-                    dist = math.hypot(oxh - hx, oyh - hy)
-                    if dist > heat_r or dist < heat_small * 0.85:
+                    dist = math.hypot(ocx - cx, ocy - cy)
+                    if dist > base_r or dist < base_r * 0.5:
                         continue
-                    if opred >= big_r or (typical > 0 and bodies[other] >= big_body):
+                    if opred >= big_r or (typical > 0 and areas[other] >= big_area):
                         continue
                     cluster += 1
                 if cluster < 2:
@@ -472,11 +455,12 @@ class Predictor:
             }
             if big:
                 item["big"] = 1
+                item["_area"] = areas[index]
             found.append(item)
         bigs = [piece for piece in found if int(piece.get("big") or 0)]
         if len(bigs) >= 2:
             kept_bigs: list[dict[str, int]] = []
-            for piece in sorted(bigs, key=lambda item: -int(item["r"])):
+            for piece in sorted(bigs, key=lambda item: -int(item.get("_area") or 0)):
                 overlap = False
                 for other in kept_bigs:
                     if math.hypot(
@@ -489,13 +473,17 @@ class Predictor:
                     piece["kind"] = "tsum"
                     piece["r"] = base_r
                     piece.pop("big", None)
+                    piece.pop("_area", None)
                 else:
                     kept_bigs.append(piece)
             bigs = kept_bigs
         if not bigs:
+            for piece in found:
+                piece.pop("_area", None)
             return found
         pruned: list[dict[str, int]] = []
         for piece in found:
+            piece.pop("_area", None)
             if int(piece.get("big") or 0):
                 pruned.append(piece)
                 continue
