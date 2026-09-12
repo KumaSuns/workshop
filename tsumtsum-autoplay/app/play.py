@@ -578,10 +578,12 @@ def run_play(
             skill_ok += 1
         if tapped:
             flush_idle(True)
-            skip_loss = True
             start_skill_pick(sit, True)
             skill_taps += 1
             last_skill_at = time.time()
+            if not _skill_tap_spent(skill, stop, watch_hit):
+                return False
+            skip_loss = True
             after_skill_tap(
                 used_tsum, image, rgb, say, stop, watch_hit=watch_hit, game=game
             )
@@ -1082,9 +1084,6 @@ def run_play(
                 save_boards,
                 say,
             )
-            if try_skill(skill_sit(True)):
-                skip_after_skill = True
-                continue
             if try_bomb(skill_sit(True)):
                 continue
             note_idle(True)
@@ -1342,6 +1341,23 @@ def _learn_board(
     if learned:
         say("消す前の盤面を取り込みました")
     return time.time()
+
+
+def _skill_tap_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
+    if skill is None:
+        return False
+    for _ in range(2):
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        try:
+            image = capture_play_frame()
+        except Exception:
+            return False
+        fill = _skill_fill(_qimage_rgb(image), skill)
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            return True
+    return False
 
 
 def _press_skill(
