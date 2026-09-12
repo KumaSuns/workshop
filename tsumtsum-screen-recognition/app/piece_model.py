@@ -11,7 +11,8 @@ PIECE_INPUT = 512
 HEATMAP_SIZE = 128
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-KIND_CHANNELS = {"tsum": 0, "big": 0, "bomb": 1}
+KIND_CHANNELS = {"tsum": 0, "bomb": 1, "big": 2}
+HEAT_KINDS = 3
 
 
 def pixel_to_heat(
@@ -45,7 +46,7 @@ class PieceNet(nn.Module):
         self.fuse = nn.Sequential(
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 3, kernel_size=1),
+            nn.Conv2d(64, 4, kernel_size=1),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -57,8 +58,8 @@ class PieceNet(nn.Module):
         if up.shape[-2:] != skip.shape[-2:]:
             up = F.interpolate(up, size=skip.shape[-2:], mode="bilinear", align_corners=False)
         raw = self.fuse(torch.cat([up, skip], dim=1))
-        heat = torch.sigmoid(raw[:, :2])
-        radius = torch.sigmoid(raw[:, 2:3])
+        heat = torch.sigmoid(raw[:, :HEAT_KINDS])
+        radius = torch.sigmoid(raw[:, HEAT_KINDS : HEAT_KINDS + 1])
         return heat, radius
 
     def freeze_backbone(self) -> None:
@@ -67,6 +68,43 @@ class PieceNet(nn.Module):
         for block in self.stem[-2:]:
             for parameter in block.parameters():
                 parameter.requires_grad = True
+
+
+def adapt_piece_state(model: PieceNet, state: dict) -> None:
+    current = model.state_dict()
+    adapted: dict = {}
+    for key, value in current.items():
+        incoming = state.get(key)
+        if incoming is not None and incoming.shape == value.shape:
+            adapted[key] = incoming
+            continue
+        if (
+            incoming is not None
+            and key.endswith("fuse.2.weight")
+            and incoming.shape[0] == 3
+            and value.shape[0] == 4
+        ):
+            weight = value.clone()
+            weight.zero_()
+            weight[0:2] = incoming[0:2]
+            weight[3:4] = incoming[2:3]
+            adapted[key] = weight
+            continue
+        if (
+            incoming is not None
+            and key.endswith("fuse.2.bias")
+            and incoming.shape[0] == 3
+            and value.shape[0] == 4
+        ):
+            bias = value.clone()
+            bias.zero_()
+            bias[0:2] = incoming[0:2]
+            bias[3:4] = incoming[2:3]
+            bias[2] = -6.0
+            adapted[key] = bias
+            continue
+        adapted[key] = value
+    model.load_state_dict(adapted)
 
 
 def draw_gaussian(canvas: torch.Tensor, cx: float, cy: float, sigma: float) -> None:

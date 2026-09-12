@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import colorsys
 import math
 import time
 from pathlib import Path
@@ -23,6 +22,7 @@ from app.piece_model import (
     HEATMAP_SIZE,
     PIECE_INPUT,
     PieceNet,
+    adapt_piece_state,
     heat_peaks,
     heat_to_pixel,
     nms_peaks,
@@ -40,57 +40,6 @@ from app.tsum_type import (
     piece_lab,
     isolated_tsum_rgb,
 )
-
-
-def _is_board_pixel(red: int, green: int, blue: int) -> bool:
-    hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
-    return 0.50 <= hue <= 0.72 and sat >= 0.20 and val <= 0.70
-
-
-def _body_area(
-    pixels,
-    width: int,
-    height: int,
-    cx: int,
-    cy: int,
-    limit: int,
-    ignore: float,
-    others: list[tuple[int, int]],
-) -> int:
-    if not (0 <= cx < width and 0 <= cy < height):
-        return 0
-    span = 2 * limit
-    nearby: list[tuple[int, int]] = []
-    for ox, oy in others:
-        dist = math.hypot(ox - cx, oy - cy)
-        if ignore <= dist <= span:
-            nearby.append((ox, oy))
-    count = 0
-    lim2 = limit * limit
-    step = 2
-    for dy in range(-limit, limit + 1, step):
-        py = cy + dy
-        if py < 0 or py >= height:
-            continue
-        for dx in range(-limit, limit + 1, step):
-            if dx * dx + dy * dy > lim2:
-                continue
-            px = cx + dx
-            if px < 0 or px >= width:
-                continue
-            dself = dx * dx + dy * dy
-            closer = False
-            for ox, oy in nearby:
-                if (px - ox) ** 2 + (py - oy) ** 2 <= dself:
-                    closer = True
-                    break
-            if closer:
-                continue
-            red, green, blue = pixels[px, py][:3]
-            if _is_board_pixel(int(red), int(green), int(blue)):
-                continue
-            count += 1
-    return count
 
 
 class Predictor:
@@ -215,7 +164,7 @@ class Predictor:
                 if isinstance(checkpoint, dict) and "state_dict" in checkpoint
                 else checkpoint
             )
-            model.load_state_dict(state, strict=False)
+            adapt_piece_state(model, state)
             model.to(self.device)
             model.eval()
             self.piece_model = model
@@ -370,8 +319,13 @@ class Predictor:
         pieces: list[dict[str, int]] = []
         board_w = int(game["w"]) if game is not None else crop_w
         pieces.extend(
-            self._tsums_from_heat(heat[0], radius, left, top, crop_w, crop_h, board_w, crop)
+            self._kind_from_heat(heat[0], radius, left, top, crop_w, crop_h, board_w, "tsum")
         )
+        if heat.shape[0] >= 3:
+            pieces.extend(
+                self._kind_from_heat(heat[2], radius, left, top, crop_w, crop_h, board_w, "big")
+            )
+        pieces = self._prune_inside_bigs(pieces, board_w)
         base_bomb = piece_radius_from_game(board_w, "bomb")
         for _score, hx, hy, _r_norm in peaks_from_heat(heat[1], radius):
             x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
@@ -390,7 +344,7 @@ class Predictor:
         self.last_type_s = time.perf_counter() - t_type
         return pieces
 
-    def _tsums_from_heat(
+    def _kind_from_heat(
         self,
         heat: torch.Tensor,
         radius_map: torch.Tensor,
@@ -399,68 +353,36 @@ class Predictor:
         crop_w: int,
         crop_h: int,
         board_w: int,
-        crop: Image.Image,
+        kind: str,
     ) -> list[dict[str, int]]:
-        base_r = piece_radius_from_game(board_w, "tsum")
-        scale = min(crop_w, crop_h)
+        radius = piece_radius_from_game(board_w, kind)
         raw = heat_peaks(heat, radius_map)
         min_sep = max(2.0, HEATMAP_SIZE / 18.0)
-        kept = nms_peaks(raw, min_sep)
         found: list[dict[str, int]] = []
-        big_r = int(round(base_r * 1.8))
-        pixels = crop.load()
-        centers: list[tuple[int, int]] = []
-        parsed: list[tuple[float, float, float, float, int, int]] = []
-        for score, hx, hy, r_norm in kept:
-            pred_r = max(1, int(round(float(r_norm) * scale)))
+        for _score, hx, hy, _r_norm in nms_peaks(raw, min_sep):
             x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
-            cx = int(round(x)) - left
-            cy = int(round(y)) - top
-            parsed.append((score, hx, hy, r_norm, pred_r, cx, cy))
-            centers.append((cx, cy))
-        ignore = base_r * 0.85
-        limit = int(round(base_r * 2.2))
-        areas: list[int] = []
-        for _score, hx, hy, r_norm, pred_r, cx, cy in parsed:
-            others = [(ox, oy) for ox, oy in centers if ox != cx or oy != cy]
-            areas.append(
-                _body_area(pixels, crop_w, crop_h, cx, cy, limit, ignore, others)
-            )
-        typical = sorted(areas)[len(areas) // 2] if areas else 0
-        big_area = typical * 1.8
-        for index, (_score, hx, hy, r_norm, pred_r, cx, cy) in enumerate(parsed):
-            x = cx + left
-            y = cy + top
-            big = False
-            wide = typical > 0 and areas[index] >= big_area
-            if pred_r >= big_r or wide:
-                cluster = 0
-                for other, (_os, oxh, oyh, or_norm, opred, ocx, ocy) in enumerate(parsed):
-                    if other == index:
-                        continue
-                    dist = math.hypot(ocx - cx, ocy - cy)
-                    if dist > base_r or dist < base_r * 0.5:
-                        continue
-                    if opred >= big_r or (typical > 0 and areas[other] >= big_area):
-                        continue
-                    cluster += 1
-                if cluster < 2:
-                    big = True
             item = {
                 "x": int(round(x)),
                 "y": int(round(y)),
-                "r": int(big_r if big else base_r),
-                "kind": "big" if big else "tsum",
+                "r": radius,
+                "kind": kind,
                 "group": 1,
             }
-            if big:
+            if kind == "big":
                 item["big"] = 1
-                item["_area"] = areas[index]
             found.append(item)
-        bigs = [piece for piece in found if int(piece.get("big") or 0)]
+        return found
+
+    def _prune_inside_bigs(
+        self,
+        pieces: list[dict[str, int]],
+        board_w: int,
+    ) -> list[dict[str, int]]:
+        base_r = piece_radius_from_game(board_w, "tsum")
+        bigs = [piece for piece in pieces if int(piece.get("big") or 0)]
         if len(bigs) >= 2:
             kept_bigs: list[dict[str, int]] = []
-            for piece in sorted(bigs, key=lambda item: -int(item.get("_area") or 0)):
+            for piece in bigs:
                 overlap = False
                 for other in kept_bigs:
                     if math.hypot(
@@ -473,17 +395,13 @@ class Predictor:
                     piece["kind"] = "tsum"
                     piece["r"] = base_r
                     piece.pop("big", None)
-                    piece.pop("_area", None)
                 else:
                     kept_bigs.append(piece)
             bigs = kept_bigs
         if not bigs:
-            for piece in found:
-                piece.pop("_area", None)
-            return found
+            return pieces
         pruned: list[dict[str, int]] = []
-        for piece in found:
-            piece.pop("_area", None)
+        for piece in pieces:
             if int(piece.get("big") or 0):
                 pruned.append(piece)
                 continue
@@ -512,15 +430,18 @@ class Predictor:
                 tsums.append(piece)
         if not tsums:
             return
-        colors = [self._tsum_color(image, piece) for piece in tsums]
+        colors: list[tuple[float, ...]] | None = None
         cosine = False
-        points: list[tuple[float, ...]] = colors
+        points: list[tuple[float, ...]]
         inner_points: list[tuple[float, ...]] | None = None
         if self.type_model is not None:
             points = self._tsum_embeddings(image, tsums)
             cosine = True
             if inner:
                 inner_points = self._tsum_embeddings(image, tsums, crop_scale=TYPE_CROP_INNER)
+        else:
+            colors = [self._tsum_color(image, piece) for piece in tsums]
+            points = colors
         if kinds > 0:
             k = min(max(1, kinds), len(tsums))
             labels = self._kmeans(points, k, cosine=cosine)
@@ -544,7 +465,14 @@ class Predictor:
             uniq,
             key=lambda g: (
                 -sum(1 for label in labels if label == g),
-                next((colors[i][0] for i, label in enumerate(labels) if label == g), 0.0),
+                next(
+                    (
+                        colors[i][0]
+                        for i, label in enumerate(labels)
+                        if colors is not None and label == g
+                    ),
+                    0.0,
+                ),
             ),
         )
         remap = {old: new for new, old in enumerate(order, start=1)}

@@ -424,10 +424,13 @@ def run_play(
         with _gpu_lock:
             boxes = predictor.predict_all(Path("."), rgb=rgb)
         last_boxes = boxes
-        skill = None
-        game, skill, fever, timer, fan = _merge_hud(
-            boxes, game, skill, fever, timer, fan, meters=True
+        game, found_skill, fever, timer, fan = _merge_hud(
+            boxes, game, None, fever, timer, fan, meters=True
         )
+        if found_skill is not None:
+            skill = found_skill
+        if skill is None:
+            return
         hud_ready = True
         last_skill_at = 0.0
         skill_wait_empty = False
@@ -1365,7 +1368,7 @@ def _press_skill(
         if fill is not None and fill < SKILL_FILL_SPENT:
             wait_empty = False
             spent = True
-        elif _skill_ready(rgb, skill, used_tsum):
+        elif time.time() - last_skill_at < SKILL_GAP:
             return False, wait_empty, False
         else:
             wait_empty = False

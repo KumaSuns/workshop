@@ -24,7 +24,7 @@ from app.digit_model import (
 )
 from app.hud_number import crop_box, prepare_digit_crop
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
-from app.piece_model import HEATMAP_SIZE, KIND_CHANNELS, PIECE_INPUT, PieceNet, draw_gaussian, pixel_to_heat
+from app.piece_model import HEATMAP_SIZE, HEAT_KINDS, KIND_CHANNELS, PIECE_INPUT, PieceNet, draw_gaussian, pixel_to_heat
 from app.regions import REGION_LABELS, is_tsum_kind
 from app.scene_model import SCENE_INPUT, SceneNet, scene_index
 from app.tsum_type import (
@@ -130,7 +130,7 @@ class PieceHeatmapDataset(Dataset):
             crop = crop.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         if self.augment:
             crop = self.jitter(crop)
-        heat = torch.zeros(2, HEATMAP_SIZE, HEATMAP_SIZE, dtype=torch.float32)
+        heat = torch.zeros(HEAT_KINDS, HEATMAP_SIZE, HEATMAP_SIZE, dtype=torch.float32)
         radius = torch.zeros(HEATMAP_SIZE, HEATMAP_SIZE, dtype=torch.float32)
         scale = min(crop_w, crop_h)
         for piece in sample.pieces:

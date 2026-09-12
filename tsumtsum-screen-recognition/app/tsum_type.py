@@ -16,6 +16,17 @@ TYPE_DISK_OUTER = 0.98
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 TYPE_FILL = tuple(int(round(value * 255)) for value in IMAGENET_MEAN)
+_GRID_CACHE: tuple[int, torch.Tensor, torch.Tensor] | None = None
+
+
+def _type_grid(size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    global _GRID_CACHE
+    if _GRID_CACHE is not None and _GRID_CACHE[0] == size:
+        return _GRID_CACHE[1], _GRID_CACHE[2]
+    ys = torch.arange(size, dtype=torch.float32).unsqueeze(1) + 0.5
+    xs = torch.arange(size, dtype=torch.float32).unsqueeze(0) + 0.5
+    _GRID_CACHE = (size, xs, ys)
+    return xs, ys
 
 
 def crop_tsum(image: Image.Image, piece: dict[str, int], scale: float = TYPE_CROP_SCALE) -> Image.Image:
@@ -42,8 +53,7 @@ def isolated_tsum_rgb(
     cx = (x - left) * scale
     cy = (y - top) * scale
     rgb = pil_to_tensor(crop).float()
-    ys = torch.arange(size, dtype=torch.float32).unsqueeze(1) + 0.5
-    xs = torch.arange(size, dtype=torch.float32).unsqueeze(0) + 0.5
+    xs, ys = _type_grid(size)
     dist_self = torch.hypot(xs - cx, ys - cy)
     half = size / 2.0
     inner = half * TYPE_DISK_INNER
@@ -55,13 +65,23 @@ def isolated_tsum_rgb(
         oxs: list[float] = []
         oys: list[float] = []
         orads: list[float] = []
+        right = x + span
+        bottom = y + span
         for other in others:
             ox, oy = int(other["x"]), int(other["y"])
             if ox == x and oy == y:
                 continue
+            orad_px = max(4, int(other.get("r") or r)) * TYPE_DISK_INNER
+            if (
+                ox + orad_px <= left
+                or oy + orad_px <= top
+                or ox - orad_px >= right
+                or oy - orad_px >= bottom
+            ):
+                continue
             oxs.append((ox - left) * scale)
             oys.append((oy - top) * scale)
-            orads.append(max(4, int(other.get("r") or r)) * scale * TYPE_DISK_INNER)
+            orads.append(orad_px * scale)
         if oxs:
             ocx = torch.tensor(oxs, dtype=torch.float32).view(-1, 1, 1)
             ocy = torch.tensor(oys, dtype=torch.float32).view(-1, 1, 1)
