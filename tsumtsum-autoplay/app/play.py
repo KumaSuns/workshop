@@ -25,6 +25,7 @@ from app.bluestacks import (
 )
 from app.intro import (
     Stopped,
+    _cancel_button,
     _check_stop,
     _close_button,
     _continue_button,
@@ -2410,6 +2411,13 @@ def _click_start_or_continue(
             else:
                 say("続けるを検出しました")
             return kinds, locked, "continue", used_name, items
+        cancel = _cancel_button(image)
+        if cancel is not None:
+            say("キャンセルをクリックします")
+            _slow_tap(cancel.center().x(), cancel.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
         if _in_play_hud(image):
             return kinds, locked, "", used_name, items
         retry = None if skip_retry else _retry_button(image)

@@ -447,7 +447,11 @@ def _is_daily_mission(image: QImage, rect: QRect) -> bool:
 
 
 def _play_button(image: QImage) -> QRect | None:
-    if _retry_button(image) is not None or _pause_continue_button(image) is not None:
+    if (
+        _retry_button(image) is not None
+        or _pause_continue_button(image) is not None
+        or _has_highscore_plate(image)
+    ):
         return None
     bottom = [
         pill
@@ -516,7 +520,7 @@ def _retry_is_orange(image: QImage, rect: QRect) -> bool:
 
 
 def _continue_button(image: QImage) -> QRect | None:
-    if _retry_button(image) is not None:
+    if _retry_button(image) is not None or _has_highscore_plate(image):
         return None
     low = [
         pill
@@ -612,7 +616,41 @@ def _cancel_button(image: QImage) -> QRect | None:
     return None
 
 
+def _has_highscore_plate(image: QImage) -> bool:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return False
+    for blob in _all_blobs(sample, _is_highscore_cyan):
+        xs = [p[0] for p in blob]
+        ys = [p[1] for p in blob]
+        box_w = max(xs) - min(xs) + 1
+        box_h = max(ys) - min(ys) + 1
+        cx = (min(xs) + max(xs)) / 2 / width
+        cy = (min(ys) + max(ys)) / 2 / height
+        if box_w < width * 0.45 or box_w > width * 0.92:
+            continue
+        if box_h > height * 0.12:
+            continue
+        if abs(cx - 0.5) > 0.18:
+            continue
+        if 0.32 <= cy <= 0.62:
+            return True
+    return False
+
+
 def _close_button(image: QImage) -> QRect | None:
+    if _has_highscore_plate(image):
+        pills = [
+            pill
+            for pill in _yellow_pills(image)
+            if image.height() * 0.62 < pill.center().y() < image.height() * 0.80
+            and abs(pill.center().x() - image.width() / 2) < image.width() * 0.18
+            and not _is_daily_mission(image, pill)
+        ]
+        if pills:
+            return max(pills, key=lambda rect: rect.width() * rect.height())
     if (
         _play_button(image) is not None
         or _cancel_button(image) is not None
@@ -632,6 +670,11 @@ def _close_button(image: QImage) -> QRect | None:
     if len(pills) >= 3:
         return pills[len(pills) // 2]
     return max(pills, key=lambda rect: rect.width() * rect.height())
+
+
+def _is_highscore_cyan(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return red < 100 and green > 150 and blue > 190 and blue >= green - 10
 
 
 def _is_start_yellow(pixel: tuple[int, int, int]) -> bool:
