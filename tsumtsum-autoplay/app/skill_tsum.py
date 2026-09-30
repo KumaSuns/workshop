@@ -33,6 +33,11 @@ def skill_breaks_bombs(name: str) -> bool:
     return handler is _after_cbuzz
 
 
+def skill_is_gadget(name: str) -> bool:
+    key = skill_tsum_key(name)
+    return key == "ガジェット" or key.casefold() == "gadget"
+
+
 def after_skill_tap(
     name: str,
     image: QImage,

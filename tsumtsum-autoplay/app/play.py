@@ -36,7 +36,7 @@ from app.intro import (
     _retry_button,
     _slow_tap,
 )
-from app.skill_tsum import after_skill_tap, skill_breaks_bombs
+from app.skill_tsum import after_skill_tap, skill_breaks_bombs, skill_is_gadget
 from app.play_style import (
     hud_net,
     hud_situation,
@@ -72,6 +72,7 @@ TIMEUP_SCORE = 0.70
 SKILL_GAP = 2.2
 SKILL_FILL_READY = 0.90
 SKILL_FILL_SPENT = 0.40
+GADGET_FEVER_SKILL_MIN = 0.40
 SKIP_TTL = 4.0
 ERASE_WAIT = 0.15
 FAN_GAP = 8.0
@@ -185,31 +186,42 @@ def run_play(
     arrived = ""
     used_tsum = ""
     start_items: list[str] | None = None
+    tsum_asked = request_used_tsum is None
+
+    def ask_used_now(at_start: bool) -> None:
+        nonlocal used_tsum, tsum_asked, start_items
+        if tsum_asked or request_used_tsum is None:
+            return
+        if at_start:
+            try:
+                path = capture_screen_path()
+            except Exception:
+                path = None
+            guess = used_tsum
+            if not guess and path is not None:
+                guess = _read_used_tsum(path)
+            if guess and not used_tsum:
+                say(f"使用ツム {guess}")
+            if path is not None and not start_items:
+                start_items = _items_used_path(path) or start_items
+            confirmed = request_used_tsum(guess, path, False)
+        else:
+            confirmed = request_used_tsum("", None, True)
+        if confirmed is None:
+            raise Stopped()
+        tsum_asked = True
+        if confirmed:
+            used_tsum = confirmed
+            say(f"使用ツム {confirmed}")
+
     if start_match:
         _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
             say, stop, tap_start=False
         )
         if seen_tsum:
             used_tsum = seen_tsum
-        if arrived in ("start", "continue") and request_used_tsum is not None:
-            if arrived == "start":
-                try:
-                    path = capture_screen_path()
-                except Exception:
-                    path = None
-                guess = _read_used_tsum(path) if path is not None else seen_tsum
-                if guess:
-                    say(f"使用ツム {guess}")
-                if path is not None and not start_items:
-                    start_items = _items_used_path(path) or start_items
-                confirmed = request_used_tsum(guess, path, False)
-            else:
-                confirmed = request_used_tsum("", None, True)
-            if confirmed is None:
-                raise Stopped()
-            if confirmed:
-                used_tsum = confirmed
-                say(f"使用ツム {confirmed}")
+        if arrived in ("start", "continue"):
+            ask_used_now(arrived == "start")
         if arrived in ("start", "continue") and request_kinds is not None:
             asked = request_kinds()
             if asked is None:
@@ -563,6 +575,8 @@ def run_play(
         load_hud()
         if skill is None:
             return False
+        if skill_is_gadget(used_tsum) and _gadget_fever_hold(rgb, fever, skill, fan):
+            return False
         tapped, skill_wait_empty, spent = _press_skill(
             skill,
             image,
@@ -773,9 +787,7 @@ def run_play(
                 stop_watch.set()
                 watching.clear()
                 return
-            seen, replay_items = _replay_after_timeup(say, stop)
-            if seen:
-                used_tsum = seen
+            _seen, replay_items = _replay_after_timeup(say, stop)
             fresh_match()
             if replay_items:
                 used_items = replay_items
@@ -785,6 +797,7 @@ def run_play(
         if time.time() >= ignore_start_until:
             start = _match_start_button(image)
             if start is not None:
+                ask_used_now(True)
                 found_items = _items_used_pil(rgb)
                 if found_items:
                     used_items = found_items
@@ -833,8 +846,11 @@ def run_play(
                 found_items = _items_used_pil(rgb)
                 if found_items:
                     used_items = found_items
-            if time.time() >= ignore_start_until and _tap_start_or_continue(image, say, stop):
-                continue
+            if time.time() >= ignore_start_until:
+                if _match_start_button(image) is not None:
+                    ask_used_now(True)
+                if _tap_start_or_continue(image, say, stop):
+                    continue
             play = None if image.isNull() else _play_button(image)
             if play is not None:
                 say("プレイをクリックします")
@@ -1060,9 +1076,7 @@ def run_play(
                     stop_watch.set()
                     watching.clear()
                     return
-                seen, replay_items = _replay_after_timeup(say, stop)
-                if seen:
-                    used_tsum = seen
+                _seen, replay_items = _replay_after_timeup(say, stop)
                 fresh_match()
                 if replay_items:
                     used_items = replay_items
@@ -1682,6 +1696,56 @@ def _read_fever(
     return gold_w / stored, stored
 
 
+def _gadget_fever_hold(image, fever, skill=None, fan=None) -> bool:
+    region = _fever_region(fever, skill, fan)
+    if image is None or region is None:
+        return False
+    left = max(0, int(region["x"]))
+    top = max(0, int(region["y"]))
+    right = min(image.width, left + max(1, int(region["w"])))
+    bottom = min(image.height, top + max(1, int(region["h"])))
+    if right - left < 8 or bottom - top < 4:
+        return False
+    height = bottom - top
+    mid_y = (top + bottom) // 2
+    band = max(6, min(16, height // 4))
+    y0 = max(top, mid_y - band)
+    y1 = min(bottom, mid_y + band + 1)
+    step_y = max(1, (y1 - y0) // 10)
+    step_x = 1 if right - left <= 480 else 2
+    pixels = image.load()
+    best_dark = 0
+    best_fill = None
+    for y in range(y0, y1, step_y):
+        gold_n = 0
+        dark_n = 0
+        trough_n = 0
+        for x in range(left, right, step_x):
+            red, green, blue = pixels[x, y][:3]
+            is_hot, _remain, is_trough = _fever_class(red, green, blue)
+            hue, sat, val = colorsys.rgb_to_hsv(
+                red / 255.0, green / 255.0, blue / 255.0
+            )
+            gold = is_hot or (
+                0.06 <= hue <= 0.20 and sat >= 0.30 and val >= 0.45
+            )
+            if gold:
+                gold_n += 1
+            elif is_trough:
+                trough_n += 1
+            elif val < 0.30:
+                dark_n += 1
+        if dark_n <= trough_n or dark_n < 8:
+            continue
+        total = gold_n + dark_n + trough_n
+        if total < 8:
+            continue
+        if dark_n >= best_dark:
+            best_dark = dark_n
+            best_fill = gold_n / total
+    return best_fill is not None and best_fill <= GADGET_FEVER_SKILL_MIN
+
+
 def _fever_playing(image, box: dict[str, int] | None) -> bool:
     if image is None or box is None:
         return False
@@ -2142,7 +2206,7 @@ def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
 
 def _replay_after_timeup(say: StatusFn, stop: Event | None) -> tuple[str, list[str] | None]:
     _seen, _locked, arrived, used_name, items = _click_start_or_continue(
-        say, stop, tap_start=False
+        say, stop, tap_start=False, read_tsum=False
     )
     if arrived == "start":
         found = _tap_start_now(say, stop)
@@ -2362,6 +2426,7 @@ def _click_start_or_continue(
     stop: Event | None,
     tap_start: bool = True,
     skip_retry: bool = False,
+    read_tsum: bool = True,
 ) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
@@ -2386,10 +2451,11 @@ def _click_start_or_continue(
             locked = True
         start = _match_start_button(image)
         if start is not None:
-            name = _read_used_tsum(path)
-            if name:
-                used_name = name
-                say(f"使用ツム {name}")
+            if read_tsum:
+                name = _read_used_tsum(path)
+                if name:
+                    used_name = name
+                    say(f"使用ツム {name}")
             found_items = _items_used_path(path)
             if found_items is not None:
                 items = found_items
@@ -2418,6 +2484,13 @@ def _click_start_or_continue(
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue
+        close = _close_button(image)
+        if close is not None:
+            say("とじるをクリックします")
+            _slow_tap(close.center().x(), close.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
         if _in_play_hud(image):
             return kinds, locked, "", used_name, items
         retry = None if skip_retry else _retry_button(image)
@@ -2431,13 +2504,6 @@ def _click_start_or_continue(
         if play is not None:
             say("プレイをクリックします")
             _slow_tap(play.center().x(), play.center().y())
-            _sleep_stop(1.2, stop)
-            deadline = max(deadline, time.time() + 12)
-            continue
-        close = _close_button(image)
-        if close is not None:
-            say("とじるをクリックします")
-            _slow_tap(close.center().x(), close.center().y())
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue

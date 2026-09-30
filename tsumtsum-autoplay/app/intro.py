@@ -645,7 +645,7 @@ def _close_button(image: QImage) -> QRect | None:
         pills = [
             pill
             for pill in _yellow_pills(image)
-            if image.height() * 0.62 < pill.center().y() < image.height() * 0.80
+            if image.height() * 0.62 < pill.center().y() < image.height() * 0.92
             and abs(pill.center().x() - image.width() / 2) < image.width() * 0.18
             and not _is_daily_mission(image, pill)
         ]
@@ -655,7 +655,6 @@ def _close_button(image: QImage) -> QRect | None:
         _play_button(image) is not None
         or _cancel_button(image) is not None
         or _pause_continue_button(image) is not None
-        or _in_play_hud(image)
     ):
         return None
     pills = [
