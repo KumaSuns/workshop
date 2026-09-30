@@ -74,7 +74,8 @@ def append_play(
     with _lock:
         with LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-    threading.Thread(target=_post_remote, args=(item,), daemon=True).start()
+    if coin is not None:
+        threading.Thread(target=_post_remote, args=(item,), daemon=True).start()
     return item
 
 

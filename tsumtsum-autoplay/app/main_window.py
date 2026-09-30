@@ -111,7 +111,7 @@ class DebugWindow(QWidget):
             )
         )
 
-    def set_gauges(self, skill, fever, fever_on=False, timer=None) -> None:
+    def set_gauges(self, skill, fever, fever_on=False, timer=None, skill_n=None, skill_n_ok=False) -> None:
         skill_s = "—" if skill is None else f"{float(skill):.2f}"
         if fever is None:
             fever_s = "—"
@@ -127,7 +127,18 @@ class DebugWindow(QWidget):
                 timer_s = str(int(timer))
             except (TypeError, ValueError, OverflowError):
                 timer_s = "—"
-        self._gauges.setText(f"スキル  {skill_s}    フィーバー  {fever_s}    タイマー  {timer_s}")
+        line = f"スキル  {skill_s}    フィーバー  {fever_s}    タイマー  {timer_s}"
+        if skill_n is not None:
+            try:
+                n = int(skill_n)
+            except (TypeError, ValueError, OverflowError):
+                n = None
+            if n is not None:
+                if skill_n_ok:
+                    line += f"    満タン  {n}個"
+                else:
+                    line += f"    満タン  {n}"
+        self._gauges.setText(line)
         self._set_fever_mark(bool(fever_on))
 
     def _set_fever_mark(self, on: bool) -> None:
@@ -177,6 +188,10 @@ class MainWindow(QMainWindow):
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
         layout.addWidget(self.capture_btn)
+        self.skill_n_btn = QPushButton("スキル満タン個数")
+        self.skill_n_btn.setCheckable(True)
+        self.skill_n_btn.toggled.connect(self._on_skill_n_toggled)
+        layout.addWidget(self.skill_n_btn)
         self.shot_btn = QPushButton("キャプチャー")
         self.shot_btn.clicked.connect(self.on_capture_screen)
         layout.addWidget(self.shot_btn)
@@ -225,6 +240,7 @@ class MainWindow(QMainWindow):
         self._fill_history()
         self._stop = threading.Event()
         self._save_boards = threading.Event()
+        self._count_skill = threading.Event()
         self._loop_play = False
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
@@ -254,6 +270,12 @@ class MainWindow(QMainWindow):
             self._save_boards.set()
         else:
             self._save_boards.clear()
+
+    def _on_skill_n_toggled(self, on: bool) -> None:
+        if on:
+            self._count_skill.set()
+        else:
+            self._count_skill.clear()
 
     def on_capture_screen(self) -> None:
         try:
@@ -427,6 +449,7 @@ class MainWindow(QMainWindow):
             start_match=start_match,
             kind_count=kind_count,
             save_boards=self._save_boards.is_set,
+            count_skill=self._count_skill.is_set,
             loop=loop,
             ask_kinds=ask_kinds,
         )

@@ -5,7 +5,7 @@ from typing import Callable
 
 from PySide6.QtGui import QImage
 
-from app.bluestacks import tap
+from app.bluestacks import swipe_path, tap
 from app.intro import _check_stop
 
 SayFn = Callable[[str], None]
@@ -24,7 +24,7 @@ _CBUZZ_STEPS = (
 
 
 def skill_tsum_key(name: str) -> str:
-    return " ".join((name or "").split())
+    return " ".join((name or "").split()).replace("＋", "+")
 
 
 def skill_breaks_bombs(name: str) -> bool:
@@ -36,6 +36,12 @@ def skill_breaks_bombs(name: str) -> bool:
 def skill_is_gadget(name: str) -> bool:
     key = skill_tsum_key(name)
     return key == "ガジェット" or key.casefold() == "gadget"
+
+
+def skill_is_pooh(name: str) -> bool:
+    key = skill_tsum_key(name)
+    handler = _AFTER.get(key) or _AFTER.get(key.casefold())
+    return handler is _after_pooh
 
 
 def after_skill_tap(
@@ -56,6 +62,36 @@ _PLAIN_SKILL_WAIT = 2.8
 
 
 def _after_plain(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
+    _wait_until(time.time() + _PLAIN_SKILL_WAIT, stop, watch_hit)
+
+
+_POOH_SWIPE_AT = 1.8
+_POOH_SWIPE = (
+    (0.50, 0.40),
+    (0.50, 0.52),
+    (0.50, 0.64),
+    (0.50, 0.74),
+)
+
+
+def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
+    width = image.width()
+    height = image.height()
+    if width < 2 or height < 2:
+        return
+    start = time.time()
+    _wait_until(start + _POOH_SWIPE_AT, stop, watch_hit)
+    if watch_hit is not None and watch_hit.is_set():
+        return
+    points = [(int(fx * width), int(fy * height)) for fx, fy in _POOH_SWIPE]
+    say(f"おしり {points[0][0]},{points[0][1]} → {points[-1][0]},{points[-1][1]}")
+    swipe_path(
+        points,
+        screen_w=width,
+        screen_h=height,
+        stop=stop,
+        abort=watch_hit,
+    )
     _wait_until(time.time() + _PLAIN_SKILL_WAIT, stop, watch_hit)
 
 
@@ -91,4 +127,7 @@ _AFTER = {
     "cバズ": _after_cbuzz,
     "c_bazu": _after_cbuzz,
     "キャプテンライトイヤー": _after_cbuzz,
+    "おしりまんまるプー+": _after_pooh,
+    "おしりまんまるプー": _after_pooh,
+    "RoundButtPooh": _after_pooh,
 }

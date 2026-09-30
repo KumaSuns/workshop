@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 import re
 import subprocess
 import tempfile
@@ -248,9 +249,52 @@ def _pad_to_slots(crop: Image.Image) -> Image.Image:
     return canvas
 
 
+def _is_timer_digit_pixel(red: int, green: int, blue: int) -> bool:
+    hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+    if val >= 0.88:
+        return True
+    if val >= 0.78 and sat <= 0.40:
+        return True
+    return blue >= 200 and green >= 190 and red >= 140 and val >= 0.75
+
+
+def _timer_digit_crop(crop: Image.Image) -> Image.Image:
+    width, height = crop.size
+    dx = max(1, width // 5)
+    dy = max(1, height // 5)
+    if width - 2 * dx < 4 or height - 2 * dy < 4:
+        return crop
+    inner = crop.crop((dx, dy, width - dx, height - dy))
+    rgb = inner.convert("RGB")
+    w, h = rgb.size
+    pixels = rgb.load()
+    xs = [
+        x
+        for x in range(w)
+        if sum(1 for y in range(h) if _is_timer_digit_pixel(*pixels[x, y][:3])) >= 2
+    ]
+    ys = [
+        y
+        for y in range(h)
+        if sum(1 for x in range(w) if _is_timer_digit_pixel(*pixels[x, y][:3])) >= 2
+    ]
+    if not xs or not ys:
+        return inner
+    pad = 2
+    return inner.crop(
+        (
+            max(0, xs[0] - pad),
+            max(0, ys[0] - pad),
+            min(w, xs[-1] + 1 + pad),
+            min(h, ys[-1] + 1 + pad),
+        )
+    )
+
+
 def prepare_digit_crop(crop: Image.Image, key: str = "coin") -> Image.Image:
     crop = crop.convert("RGB")
     if key == "timer":
+        crop = _timer_digit_crop(crop)
         crop = ImageOps.autocontrast(crop, cutoff=1)
         crop = _tight_ink(crop)
         return _pad_to_slots(crop)
