@@ -1515,11 +1515,21 @@ class MainWindow(QMainWindow):
         rows = self.region_list.count()
         if rows <= 0:
             return
-        row_h = self.region_list.sizeHintForRow(0)
-        if row_h <= 0:
-            row_h = 28
+        first = self.region_list.item(0)
+        last = self.region_list.item(rows - 1)
+        if first is not None and last is not None:
+            top = self.region_list.visualItemRect(first).top()
+            bottom = self.region_list.visualItemRect(last).bottom()
+            if bottom > top:
+                frame = self.region_list.frameWidth() * 2
+                self.region_list.setFixedHeight(bottom - top + 1 + frame + 8)
+                return
+        row_h = 0
+        for row in range(rows):
+            row_h = max(row_h, self.region_list.sizeHintForRow(row))
+        row_h = max(row_h, self.region_list.fontMetrics().height() + 16)
         frame = self.region_list.frameWidth() * 2
-        self.region_list.setFixedHeight(rows * row_h + frame + 12)
+        self.region_list.setFixedHeight(rows * row_h + frame + 8)
 
     def show_sample(self, sample_id: str) -> None:
         sample = self.dataset.get(sample_id)
@@ -3141,6 +3151,8 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._sync_canvas_3_2()
+        self._fit_region_list()
+        QTimer.singleShot(0, self._fit_region_list)
         if self._data_loaded:
             return
         self._data_loaded = True
