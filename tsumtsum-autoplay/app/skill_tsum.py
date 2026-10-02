@@ -38,6 +38,11 @@ def skill_is_gadget(name: str) -> bool:
     return key == "ガジェット" or key.casefold() == "gadget"
 
 
+def skill_is_elsa(name: str) -> bool:
+    key = skill_tsum_key(name)
+    return key in {"戴冠式エルサ", "Coronation_Elsa"} or key.casefold() == "coronation_elsa"
+
+
 def skill_is_pooh(name: str) -> bool:
     key = skill_tsum_key(name)
     handler = _AFTER.get(key) or _AFTER.get(key.casefold())
@@ -54,7 +59,9 @@ def after_skill_tap(
     game=None,
 ) -> None:
     key = skill_tsum_key(name)
-    handler = _AFTER.get(key) or _AFTER.get(key.casefold()) or _after_plain
+    handler = _AFTER.get(key) or _AFTER.get(key.casefold())
+    if handler is None:
+        return
     handler(image, rgb, say, stop, watch_hit, game)
 
 
@@ -92,7 +99,6 @@ def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
         stop=stop,
         abort=watch_hit,
     )
-    _wait_until(time.time() + _PLAIN_SKILL_WAIT, stop, watch_hit)
 
 
 def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:

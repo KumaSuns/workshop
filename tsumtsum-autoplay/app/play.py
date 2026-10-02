@@ -36,7 +36,14 @@ from app.intro import (
     _retry_button,
     _slow_tap,
 )
-from app.skill_tsum import after_skill_tap, skill_breaks_bombs, skill_is_gadget, skill_is_pooh
+from app.elsa_skill import run_elsa_skill
+from app.skill_tsum import (
+    after_skill_tap,
+    skill_breaks_bombs,
+    skill_is_elsa,
+    skill_is_gadget,
+    skill_is_pooh,
+)
 from app.play_style import (
     hud_net,
     hud_situation,
@@ -192,11 +199,12 @@ def run_play(
 
     arrived = ""
     used_tsum = ""
+    tsum_unspecified = False
     start_items: list[str] | None = None
     tsum_asked = request_used_tsum is None
 
     def ask_used_now(at_start: bool) -> None:
-        nonlocal used_tsum, tsum_asked, start_items
+        nonlocal used_tsum, tsum_asked, start_items, tsum_unspecified
         if tsum_asked or request_used_tsum is None:
             return
         if at_start:
@@ -219,7 +227,12 @@ def run_play(
         tsum_asked = True
         if confirmed:
             used_tsum = confirmed
+            tsum_unspecified = False
             say(f"使用ツム {confirmed}")
+        else:
+            used_tsum = ""
+            tsum_unspecified = True
+            say("使用ツム —")
 
     if start_match:
         _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
@@ -604,7 +617,7 @@ def run_play(
 
     def try_skill(sit: str) -> bool:
         nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps
-        nonlocal bomb_taps, last_bomb_at, skip_loss, pooh_long
+        nonlocal bomb_taps, last_bomb_at, skip_loss, pooh_long, swipes
         nonlocal skill_my_n, skill_saw_empty
         load_hud()
         if skill is None:
@@ -636,12 +649,29 @@ def run_play(
             start_skill_pick(sit, True)
             skill_taps += 1
             last_skill_at = time.time()
-            if not _skill_tap_spent(skill, stop, watch_hit):
+            if skill_is_elsa(used_tsum):
+                skip_loss = True
+                swipes += run_elsa_skill(
+                    predict=lambda shot: predictor.predict_pieces(
+                        Path("."), game, rgb=shot, inner=False
+                    ),
+                    game=game,
+                    say=say,
+                    stop=stop,
+                    watch_hit=watch_hit,
+                    preview=preview,
+                    draw=_draw_plan,
+                    gpu_lock=_gpu_lock,
+                )
+                return True
+            spent_ok = _skill_tap_spent(skill, stop, watch_hit)
+            if not spent_ok:
                 return False
             skip_loss = True
-            after_skill_tap(
-                used_tsum, image, rgb, say, stop, watch_hit=watch_hit, game=game
-            )
+            if not tsum_unspecified:
+                after_skill_tap(
+                    used_tsum, image, rgb, say, stop, watch_hit=watch_hit, game=game
+                )
             if skill_is_pooh(used_tsum):
                 pooh_long = True
             if skill_breaks_bombs(used_tsum):
@@ -902,6 +932,7 @@ def run_play(
                 used_items,
                 None if go_at is None else max(0, int(round(time.time() - go_at))),
                 sorted(wait_times, reverse=True)[:3],
+                upload=not tsum_unspecified,
             )
             watch_hit.clear()
             if not loop:
@@ -1106,7 +1137,6 @@ def run_play(
                         stop,
                         preview,
                         watch_hit,
-                        skill_fill,
                     ):
                         continue
                     swipes += 1
@@ -1219,6 +1249,7 @@ def run_play(
                     used_items,
                     None if go_at is None else max(0, int(round(time.time() - go_at))),
                     sorted(wait_times, reverse=True)[:3],
+                    upload=not tsum_unspecified,
                 )
                 if not loop:
                     stop_watch.set()
@@ -1309,7 +1340,6 @@ def _swipe_chain(
     stop: Event | None,
     preview: Callable[[QImage], None] | None,
     abort: Event | None = None,
-    skill_fill: float | None = None,
 ) -> bool:
     points = [(int(piece["x"]), int(piece["y"])) for piece in chain]
     cells = {(x // 24, y // 24) for x, y in points}
@@ -1320,7 +1350,7 @@ def _swipe_chain(
     say(f"ツム {tsum_count}体 / チェーン {len(chain)}体")
     say(f"経路 {route}")
     if preview is not None:
-        preview(_draw_plan(image, pieces, chain, game, skill_fill))
+        preview(_draw_plan(image, pieces, chain, game))
     say("なぞっています")
     _check_stop(stop)
     how = swipe_path(
@@ -2344,6 +2374,7 @@ def _note_match_end(
     items: list[str] | None = None,
     duration: int | None = None,
     waits: list[float] | None = None,
+    upload: bool = True,
 ) -> None:
     if skill_wait_empty:
         fill = _skill_fill(rgb, skill)
@@ -2366,6 +2397,7 @@ def _note_match_end(
         items,
         duration,
         waits,
+        upload,
     )
 
 
@@ -3171,7 +3203,6 @@ def _draw_plan(
     pieces: list[dict[str, int]],
     chain: list[dict[str, int]],
     game: dict[str, int] | None,
-    skill_fill: float | None = None,
 ) -> QImage:
     if image.isNull():
         return image
@@ -3210,23 +3241,11 @@ def _draw_plan(
     font.setBold(True)
     painter.setFont(font)
     for index, (x, y, radius) in enumerate(points, start=1):
-        painter.setPen(QPen(QColor("#1A1A1A"), 2))
-        painter.setBrush(QColor("#7CFF7C"))
+        painter.setPen(QPen(QColor("#7CFF7C"), max(3, radius // 5)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QPoint(x, y), radius, radius)
         painter.setPen(QColor("#1A1A1A"))
         painter.drawText(QRect(x - radius, y - radius, radius * 2, radius * 2), Qt.AlignmentFlag.AlignCenter, str(index))
-    if skill_fill is not None:
-        label = f"{skill_fill:.2f}"
-        fill_font = QFont()
-        fill_font.setBold(True)
-        fill_font.setPixelSize(max(64, painted.width() // 6))
-        painter.setFont(fill_font)
-        box = QRect(8, 8, max(1, painted.width() - 16), fill_font.pixelSize() + 24)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 180))
-        painter.drawRect(box)
-        painter.setPen(QColor("#FFE066"))
-        painter.drawText(box, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
     painter.end()
     return painted
 

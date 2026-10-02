@@ -53,6 +53,7 @@ def append_play(
     items: list[str] | None = None,
     duration: int | None = None,
     waits: list[float] | None = None,
+    upload: bool = True,
 ) -> dict:
     item = {
         "at": _now(),
@@ -74,7 +75,7 @@ def append_play(
     with _lock:
         with LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-    if coin is not None:
+    if upload and coin is not None:
         threading.Thread(target=_post_remote, args=(item,), daemon=True).start()
     return item
 

@@ -523,9 +523,11 @@ class MainWindow(QMainWindow):
         if guess:
             yes = buttons.addButton("はい", QDialogButtonBox.ButtonRole.AcceptRole)
         no = buttons.addButton("いいえ", QDialogButtonBox.ButtonRole.NoRole)
+        skip = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
         new = buttons.addButton("新規", QDialogButtonBox.ButtonRole.ActionRole)
         cancel = buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
         no.setAutoDefault(False)
+        skip.setAutoDefault(False)
         new.setAutoDefault(False)
         cancel.setAutoDefault(False)
         if yes is not None:
@@ -535,6 +537,7 @@ class MainWindow(QMainWindow):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         no.clicked.connect(lambda: dialog.done(2))
+        skip.clicked.connect(lambda: dialog.done(4))
         new.clicked.connect(lambda: dialog.done(3))
         if yes is not None:
             yes.setFocus()
@@ -566,6 +569,8 @@ class MainWindow(QMainWindow):
             return self._pick_used_tsum(guess, path)
         if result == 3:
             return self._register_used_tsum(path)
+        if result == 4:
+            return ""
         return None
 
     def _choose_used_tsum(self, path: Path | None) -> str | None:
@@ -585,16 +590,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(name_list, 1)
         buttons = QDialogButtonBox()
         ok_btn = buttons.addButton("これにします", QDialogButtonBox.ButtonRole.AcceptRole)
+        skip_btn = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
         new_btn = buttons.addButton("新規", QDialogButtonBox.ButtonRole.ActionRole)
         cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        skip_btn.setAutoDefault(False)
+        new_btn.setAutoDefault(False)
+        cancel_btn.setAutoDefault(False)
         layout.addWidget(buttons)
         name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
         ok_btn.clicked.connect(dialog.accept)
         cancel_btn.clicked.connect(dialog.reject)
+        skip_btn.clicked.connect(lambda: dialog.done(3))
         new_btn.clicked.connect(lambda: dialog.done(2))
         result = dialog.exec()
         if result == 2:
             return self._register_used_tsum(path)
+        if result == 3:
+            return ""
         if result != QDialog.DialogCode.Accepted:
             return None
         row = name_list.currentItem()
@@ -663,11 +675,17 @@ class MainWindow(QMainWindow):
         cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
         ok_btn.setText("保存する")
         cancel_btn.setText("やめる")
+        skip_btn = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
+        skip_btn.setAutoDefault(False)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
+        skip_btn.clicked.connect(lambda: dialog.done(2))
         layout.addWidget(buttons)
         name_edit.returnPressed.connect(dialog.accept)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        result = dialog.exec()
+        if result == 2:
+            return ""
+        if result != QDialog.DialogCode.Accepted:
             return None
         name = " ".join(name_edit.text().split())
         folder_id = "".join(dir_edit.text().split())
