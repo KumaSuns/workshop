@@ -38,6 +38,11 @@ def skill_is_gadget(name: str) -> bool:
     return key == "ガジェット" or key.casefold() == "gadget"
 
 
+def skill_is_cloud(name: str) -> bool:
+    key = skill_tsum_key(name)
+    return key in {"クラウドKH2ver.", "KH2Cloud"} or key.casefold() == "kh2cloud"
+
+
 def skill_is_elsa(name: str) -> bool:
     key = skill_tsum_key(name)
     return key in {"戴冠式エルサ", "Coronation_Elsa"} or key.casefold() == "coronation_elsa"

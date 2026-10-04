@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import struct
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from threading import Lock
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
@@ -27,6 +29,26 @@ _mouse_ready = False
 _capture_how: str | None = None
 _adb_ok = False
 _last_cap_size: tuple[int, int] | None = None
+_mouse_lock = Lock()
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_ulong),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+class _INPUTunion(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTunion)]
 
 
 def tsum_is_running() -> bool:
@@ -438,25 +460,17 @@ def _send_mouse_path(
     hold: set[tuple[int, int]],
     abort=None,
 ) -> bool:
-    import ctypes
+    with _mouse_lock:
+        return _send_mouse_path_locked(user32, mapped, hold, abort)
 
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [
-            ("dx", ctypes.c_long),
-            ("dy", ctypes.c_long),
-            ("mouseData", ctypes.c_ulong),
-            ("dwFlags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
-            ("dwExtraInfo", ctypes.c_void_p),
-        ]
 
-    class _INPUTunion(ctypes.Union):
-        _fields_ = [("mi", MOUSEINPUT)]
-
-    class INPUT(ctypes.Structure):
-        _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTunion)]
-
-    user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+def _send_mouse_path_locked(
+    user32,
+    mapped: list[tuple[int, int]],
+    hold: set[tuple[int, int]],
+    abort=None,
+) -> bool:
+    user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
     user32.SendInput.restype = ctypes.c_uint
 
     vx = user32.GetSystemMetrics(76)
@@ -470,8 +484,8 @@ def _send_mouse_path(
     def emit(x: int, y: int, flags: int) -> None:
         ax = int((x - vx) * 65535 / vw)
         ay = int((y - vy) * 65535 / vh)
-        inp = INPUT(type=0, union=_INPUTunion(mi=MOUSEINPUT(ax, ay, 0, flags, 0, None)))
-        user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+        inp = _INPUT(type=0, union=_INPUTunion(mi=_MOUSEINPUT(ax, ay, 0, flags, 0, None)))
+        user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
 
     x0, y0 = mapped[0]
     emit(x0, y0, move)

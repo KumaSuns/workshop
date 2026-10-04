@@ -467,6 +467,8 @@ def _play_button(image: QImage) -> QRect | None:
         return None
     if _is_daily_mission(image, play):
         return None
+    if _menu_pair_rows(image, play.y()) >= 2:
+        return None
     return play
 
 
@@ -519,6 +521,25 @@ def _retry_is_orange(image: QImage, rect: QRect) -> bool:
     return red > 200 and green < red * 0.72
 
 
+def _menu_pair_rows(image: QImage, below_y: int) -> int:
+    above = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() < below_y and pill.width() >= image.width() * 0.22
+    ]
+    rows: list[list[QRect]] = []
+    for pill in above:
+        placed = False
+        for row in rows:
+            if abs(pill.center().y() - row[0].center().y()) <= image.height() * 0.04:
+                row.append(pill)
+                placed = True
+                break
+        if not placed:
+            rows.append([pill])
+    return len([row for row in rows if len(row) >= 2])
+
+
 def _continue_button(image: QImage) -> QRect | None:
     if _retry_button(image) is not None or _has_highscore_plate(image):
         return None
@@ -534,6 +555,8 @@ def _continue_button(image: QImage) -> QRect | None:
     if button.width() < image.width() * 0.18:
         return None
     if _is_daily_mission(image, button):
+        return None
+    if _menu_pair_rows(image, button.y()) >= 2:
         return None
     return button
 
@@ -740,7 +763,14 @@ def _largest_blob(
     return max(blobs, key=len)
 
 
+_sample_cache: tuple[int, list[list[tuple[int, int, int]]]] | None = None
+
+
 def _sample(image: QImage) -> list[list[tuple[int, int, int]]]:
+    global _sample_cache
+    key = int(image.cacheKey())
+    if _sample_cache is not None and _sample_cache[0] == key:
+        return _sample_cache[1]
     scaled = image.scaled(SAMPLE_W, SAMPLE_H)
     rows: list[list[tuple[int, int, int]]] = []
     for y in range(scaled.height()):
@@ -749,6 +779,7 @@ def _sample(image: QImage) -> list[list[tuple[int, int, int]]]:
             color = scaled.pixelColor(x, y)
             row.append((color.red(), color.green(), color.blue()))
         rows.append(row)
+    _sample_cache = (key, rows)
     return rows
 
 

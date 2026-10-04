@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -73,15 +72,6 @@ class DebugWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         layout = QVBoxLayout(self)
-        row = QHBoxLayout()
-        self._gauges = QLabel("スキル  —    フィーバー  —    タイマー  —")
-        self._gauges.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._fever_mark = QLabel("FEVER")
-        self._fever_mark.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._set_fever_mark(False)
-        row.addWidget(self._gauges, 1)
-        row.addWidget(self._fever_mark, 0)
-        layout.addLayout(row)
         self._preview = QLabel("なぞる経路")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumHeight(280)
@@ -110,42 +100,6 @@ class DebugWindow(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
-
-    def set_gauges(self, skill, fever, fever_on=False, timer=None, skill_n=None, skill_n_ok=False) -> None:
-        skill_s = "—" if skill is None else f"{float(skill):.2f}"
-        if fever is None:
-            fever_s = "—"
-        else:
-            try:
-                fever_s = f"{int(round(float(fever) * 100))}%"
-            except (TypeError, ValueError, OverflowError):
-                fever_s = "—"
-        if timer is None:
-            timer_s = "—"
-        else:
-            try:
-                timer_s = str(int(timer))
-            except (TypeError, ValueError, OverflowError):
-                timer_s = "—"
-        line = f"スキル  {skill_s}    フィーバー  {fever_s}    タイマー  {timer_s}"
-        if skill_n is not None:
-            try:
-                n = int(skill_n)
-            except (TypeError, ValueError, OverflowError):
-                n = None
-            if n is not None:
-                if skill_n_ok:
-                    line += f"    満タン  {n}個"
-                else:
-                    line += f"    満タン  {n}"
-        self._gauges.setText(line)
-        self._set_fever_mark(bool(fever_on))
-
-    def _set_fever_mark(self, on: bool) -> None:
-        if on:
-            self._fever_mark.setStyleSheet("color:#FF2A2A; font-weight:700;")
-        else:
-            self._fever_mark.setStyleSheet("color:#888888; font-weight:400;")
 
     def set_used_tsum(self, name: str) -> None:
         shown = " ".join((name or "").split()) or "—"
@@ -305,7 +259,7 @@ class MainWindow(QMainWindow):
             return
         self._want_record = True
         if tsum_is_running():
-            self.on_play_now()
+            self._play_now()
         else:
             self._begin_play(loop=False)
         if not self._is_busy():
@@ -335,6 +289,9 @@ class MainWindow(QMainWindow):
         self._start_play(loop=False)
 
     def on_play_now(self) -> None:
+        self._play_now()
+
+    def _play_now(self) -> None:
         if self._is_busy():
             return
         if not tsum_is_running():
@@ -455,7 +412,6 @@ class MainWindow(QMainWindow):
         )
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
-        self._play.gauges.connect(self._debug.set_gauges)
         self._play.failed.connect(self._on_play_fail)
         self._play.stopped.connect(self._on_stopped)
         self._play.completed.connect(self._on_play_done)
