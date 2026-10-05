@@ -290,6 +290,9 @@ def run_play(
     skip_after_skill = False
     skip_loss = False
     skill_busy = [False]
+    gadget_fever_seen = [False]
+    gadget_fever_off = [0]
+    gadget_fever_ended = [False]
     pooh_long = False
     bomb_after_long = False
     last_fan_at = 0.0
@@ -365,6 +368,9 @@ def run_play(
         skip_after_skill = False
         skip_loss = False
         skill_busy[0] = False
+        gadget_fever_seen[0] = False
+        gadget_fever_off[0] = 0
+        gadget_fever_ended[0] = False
         pooh_long = False
         bomb_after_long = False
         last_fan_at = 0.0
@@ -993,6 +999,14 @@ def run_play(
             skill_fill = _skill_fill(shot_rgb, skill)
             fever_fill, full_w = _read_fever(shot_rgb, fever, skill, fan, full_w)
             fever_on = _fever_playing(shot_rgb, game)
+            if skill_is_gadget(used_tsum):
+                if fever_on:
+                    gadget_fever_seen[0] = True
+                    gadget_fever_off[0] = 0
+                elif gadget_fever_seen[0] and not gadget_fever_ended[0]:
+                    gadget_fever_off[0] += 1
+                    if gadget_fever_off[0] >= 5:
+                        gadget_fever_ended[0] = True
             left = _read_timer(predictor, shot_rgb, timer)
             if left is None:
                 left = last_left
@@ -1010,6 +1024,7 @@ def run_play(
                 if (
                     ready
                     and skill_is_gadget(used_tsum)
+                    and not gadget_fever_ended[0]
                     and _gadget_fever_hold(shot_rgb, fever, skill, fan, skill_fill)
                     and (left is None or left > GADGET_TIMER_SKILL)
                 ):
@@ -1025,6 +1040,7 @@ def run_play(
                 )
             fever_hold = bool(
                 skill_is_gadget(used_tsum)
+                and not gadget_fever_ended[0]
                 and _gadget_fever_hold(shot_rgb, fever, skill, fan, skill_fill)
             )
             latest_gauge[0] = skill_fill

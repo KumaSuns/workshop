@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QStandardPaths, Qt, QTimer, QEvent
-from PySide6.QtGui import QFont, QIcon, QImage, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
@@ -107,7 +107,26 @@ class DebugWindow(QWidget):
 
     def append(self, text: str) -> None:
         now = datetime.now().strftime("%H:%M:%S")
-        self._log.appendPlainText(f"{now}  {text}")
+        cursor = self._log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self._log.toPlainText():
+            cursor.insertBlock()
+        normal = QTextCharFormat()
+        red = QTextCharFormat()
+        red.setForeground(QColor(220, 0, 0))
+        cursor.setCharFormat(normal)
+        cursor.insertText(f"{now}  ")
+        mark = "TIME UP"
+        rest = text
+        while mark in rest:
+            head, rest = rest.split(mark, 1)
+            if head:
+                cursor.insertText(head, normal)
+            cursor.insertText(mark, red)
+        if rest:
+            cursor.insertText(rest, normal)
+        cursor.setCharFormat(normal)
+        self._log.setTextCursor(cursor)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
         if text.startswith("使用ツム "):
             self.set_used_tsum(text[len("使用ツム ") :])

@@ -440,7 +440,12 @@ class Dataset:
             self._save()
         return added
 
-    def apply_piece_predictions(self, sample_id: str, pieces: list[dict[str, int]]) -> list[str]:
+    def apply_piece_predictions(
+        self,
+        sample_id: str,
+        pieces: list[dict[str, int]],
+        replace_empty: tuple[str, ...] = (),
+    ) -> list[str]:
         sample = self.get(sample_id)
         if sample is None:
             raise KeyError(sample_id)
@@ -461,6 +466,12 @@ class Dataset:
                 if piece.get("kind") == kind and int(piece.get("r") or 0) >= 4
             ]
             if not incoming:
+                if kind not in replace_empty:
+                    continue
+                if not any(piece.get("kind") == kind for piece in sample.pieces):
+                    continue
+                sample.pieces = [piece for piece in sample.pieces if piece.get("kind") != kind]
+                added.append(kind)
                 continue
             sample.pieces = [piece for piece in sample.pieces if piece.get("kind") != kind] + incoming
             added.append(kind)

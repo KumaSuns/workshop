@@ -323,9 +323,19 @@ class Predictor:
         )
         if heat.shape[0] >= 3:
             pieces.extend(
-                self._kind_from_heat(heat[2], radius, left, top, crop_w, crop_h, board_w, "big")
+                self._kind_from_heat(
+                    heat[2],
+                    radius,
+                    left,
+                    top,
+                    crop_w,
+                    crop_h,
+                    board_w,
+                    "big",
+                    min_score=0.75,
+                )
             )
-        pieces = self._prune_inside_bigs(pieces, board_w)
+        pieces = self._prune_inside_bigs(pieces, board_w, left, crop_w)
         base_bomb = piece_radius_from_game(board_w, "bomb")
         for _score, hx, hy, _r_norm in peaks_from_heat(heat[1], radius):
             x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
@@ -354,9 +364,10 @@ class Predictor:
         crop_h: int,
         board_w: int,
         kind: str,
+        min_score: float = 0.22,
     ) -> list[dict[str, int]]:
         radius = piece_radius_from_game(board_w, kind)
-        raw = heat_peaks(heat, radius_map)
+        raw = heat_peaks(heat, radius_map, threshold=min_score)
         min_sep = max(2.0, HEATMAP_SIZE / 18.0)
         found: list[dict[str, int]] = []
         for _score, hx, hy, _r_norm in nms_peaks(raw, min_sep):
@@ -377,9 +388,24 @@ class Predictor:
         self,
         pieces: list[dict[str, int]],
         board_w: int,
+        origin_x: int = 0,
+        span: int = 0,
     ) -> list[dict[str, int]]:
         base_r = piece_radius_from_game(board_w, "tsum")
+        tsums = [piece for piece in pieces if not int(piece.get("big") or 0)]
         bigs = [piece for piece in pieces if int(piece.get("big") or 0)]
+        kept: list[dict[str, int]] = []
+        for piece in bigs:
+            if span > 0:
+                inset = min(int(piece["x"]) - origin_x, origin_x + span - int(piece["x"]))
+                if inset < base_r:
+                    continue
+            kept.append(piece)
+        bigs = kept
+        if tsums and bigs:
+            top_y = min(int(piece["y"]) for piece in tsums)
+            bigs = [piece for piece in bigs if int(piece["y"]) >= top_y - base_r]
+        pieces = tsums + bigs
         if len(bigs) >= 2:
             kept_bigs: list[dict[str, int]] = []
             for piece in bigs:

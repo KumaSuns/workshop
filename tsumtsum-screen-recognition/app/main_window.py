@@ -3494,9 +3494,12 @@ class MainWindow(QMainWindow):
             pieces = [
                 piece
                 for piece in pieces
-                if not is_tsum_kind(str(piece.get("kind") or ""))
+                if str(piece.get("kind") or "") != "tsum"
             ]
-        if pieces:
+        replace_empty: tuple[str, ...] = ()
+        if overwrite and "big" not in sample.confirmed:
+            replace_empty = ("big",)
+        if pieces or replace_empty:
             if not overwrite:
                 existing = {str(piece.get("kind")) for piece in sample.pieces}
                 confirmed = set(sample.confirmed)
@@ -3505,8 +3508,14 @@ class MainWindow(QMainWindow):
                     for piece in pieces
                     if piece.get("kind") not in existing and piece.get("kind") not in confirmed
                 ]
-            if pieces:
-                added.extend(self.dataset.apply_piece_predictions(sample.id, pieces))
+            if pieces or replace_empty:
+                added.extend(
+                    self.dataset.apply_piece_predictions(
+                        sample.id,
+                        pieces,
+                        replace_empty=replace_empty,
+                    )
+                )
         return added
 
     def eventFilter(self, watched, event) -> bool:
