@@ -607,7 +607,7 @@ class MainWindow(QMainWindow):
             self._debug.setEnabled(True)
             self._front_timer.start()
         if yes is not None and result == QDialog.DialogCode.Accepted:
-            return guess
+            return self._save_used_tsum_choice(path, guess, None)
         if result == 2:
             return self._pick_used_tsum(guess, path)
         if result == 3:
