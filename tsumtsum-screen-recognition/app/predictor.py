@@ -337,12 +337,20 @@ class Predictor:
             )
         pieces = self._prune_inside_bigs(pieces, board_w, left, crop_w)
         base_bomb = piece_radius_from_game(board_w, "bomb")
+        tsums = [piece for piece in pieces if is_tsum_kind(piece.get("kind"))]
         for _score, hx, hy, _r_norm in peaks_from_heat(heat[1], radius):
             x, y = heat_to_pixel(hx, hy, left, top, crop_w, crop_h)
+            ix = int(round(x))
+            iy = int(round(y))
+            if any(
+                math.hypot(ix - int(tsum["x"]), iy - int(tsum["y"])) < int(tsum["r"])
+                for tsum in tsums
+            ):
+                continue
             pieces.append(
                 {
-                    "x": int(round(x)),
-                    "y": int(round(y)),
+                    "x": ix,
+                    "y": iy,
                     "r": base_bomb,
                     "kind": "bomb",
                     "group": 0,

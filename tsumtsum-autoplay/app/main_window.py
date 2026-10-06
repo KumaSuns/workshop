@@ -27,7 +27,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.bluestacks import capture_play_frame, halt_input, start_tsum, tsum_is_running
+from app.bluestacks import (
+    capture_play_frame,
+    halt_input,
+    reset_swipe_speeds,
+    set_swipe_speeds,
+    start_tsum,
+    swipe_speeds,
+    tsum_is_running,
+)
 from app.intro import IntroWorker
 from app.paths import APP_ROOT, IPC_NAME
 from app.play_style import history_text
@@ -153,6 +161,9 @@ class MainWindow(QMainWindow):
         self._info_frame = QFrame()
         self._info_frame.setFrameShape(QFrame.Shape.Box)
         info = QVBoxLayout(self._info_frame)
+        self._info_items = QLabel("－")
+        self._info_items.setWordWrap(True)
+        info.addWidget(self._info_items)
         heart_row = QHBoxLayout()
         heart_row.setContentsMargins(0, 0, 0, 0)
         self._info_label = QLabel("♥ ハート")
@@ -183,6 +194,9 @@ class MainWindow(QMainWindow):
         left = QWidget()
         layout = QVBoxLayout(left)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_btn = QPushButton("設定")
+        self.settings_btn.clicked.connect(self._open_swipe_settings)
+        layout.addWidget(self.settings_btn)
         self.capture_btn = QPushButton("消す前の盤面を取り込む")
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
@@ -449,6 +463,9 @@ class MainWindow(QMainWindow):
         else:
             self._info_skill_value.setText(f"{round(float(skill_fill) * 100)}％")
 
+    def _show_items(self, text: str) -> None:
+        self._info_items.setText(text or "－")
+
     def _start_intro(self) -> None:
         self._intro = IntroWorker(self._stop, self)
         self._intro.status.connect(self._set_status)
@@ -482,6 +499,7 @@ class MainWindow(QMainWindow):
         self._play.preview.connect(self._debug.set_preview)
         self._play.gauges.connect(self._show_meters)
         self._play.failed.connect(self._on_play_fail)
+        self._play.items.connect(self._show_items)
         self._play.stopped.connect(self._on_stopped)
         self._play.completed.connect(self._on_play_done)
         if ask_kinds:
@@ -640,6 +658,56 @@ class MainWindow(QMainWindow):
         if path is not None and path.is_file():
             return self._save_used_tsum_choice(path, row.text(), None)
         return row.text()
+
+    def _open_swipe_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("なぞるスピード")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("あいだの点（秒）"))
+        point_edit = QLineEdit()
+        layout.addWidget(point_edit)
+        layout.addWidget(QLabel("ツムの中心（秒）"))
+        center_edit = QLineEdit()
+        layout.addWidget(center_edit)
+
+        def show(point_s: float, center_s: float) -> None:
+            point_edit.setText(f"{point_s:.3f}")
+            center_edit.setText(f"{center_s:.3f}")
+
+        def read() -> tuple[float, float] | None:
+            try:
+                point_s = float(point_edit.text().strip())
+                center_s = float(center_edit.text().strip())
+            except ValueError:
+                return None
+            if point_s < 0 or center_s < 0:
+                return None
+            return point_s, center_s
+
+        def save() -> None:
+            speeds = read()
+            if speeds is None:
+                QMessageBox.information(dialog, "なぞるスピード", "0以上の秒数を入力してください。")
+                return
+            set_swipe_speeds(speeds[0], speeds[1])
+            dialog.accept()
+
+        def reset() -> None:
+            show(*reset_swipe_speeds())
+
+        show(*swipe_speeds())
+        buttons = QDialogButtonBox()
+        save_btn = buttons.addButton("保存する", QDialogButtonBox.ButtonRole.AcceptRole)
+        reset_btn = buttons.addButton("リセット", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        save_btn.clicked.connect(save)
+        reset_btn.setAutoDefault(False)
+        reset_btn.clicked.connect(reset)
+        cancel_btn.clicked.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _pick_used_tsum(self, guess: str, path: Path | None) -> str | None:
         names = [name for name in used_tsum_names() if name != guess]

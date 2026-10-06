@@ -19,9 +19,11 @@ from app.bluestacks import (
     capture_play_frame,
     capture_screen_path,
     capture_window_frame,
+    try_capture_play_frame,
     reset_swipe_mouse,
     swipe_path,
     tap,
+    tap_skill,
 )
 from app.intro import (
     Stopped,
@@ -82,7 +84,7 @@ SKILL_FILL_READY = 0.90
 SKILL_FILL_SPENT = 0.40
 GADGET_FEVER_SKILL_MIN = 0.40
 GADGET_TIMER_SKILL = 6
-BOMB_LONG = 8
+TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
 ERASE_WAIT = 0.15
@@ -90,6 +92,12 @@ FAN_GAP = 8.0
 _gpu_lock = Lock()
 
 StatusFn = Callable[[str], None]
+
+
+def time_bomb_number(items: list[str] | None) -> int:
+    if items and "+Bomb" in items:
+        return 8
+    return TIME_BOMB_NUMBER
 
 
 def _is_tsum(piece: dict) -> bool:
@@ -103,6 +111,7 @@ class PlayWorker(QThread):
     status = Signal(str)
     preview = Signal(QImage)
     gauges = Signal(object, object, object, object, object, object, object, object, object)
+    items = Signal(str)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
 
@@ -166,6 +175,7 @@ class PlayWorker(QThread):
                 start_match=self._start_match,
                 preview=self.preview.emit,
                 gauges=self.gauges.emit,
+                show_items=self.items.emit,
                 kind_count=self._kind_count,
                 save_boards=self._save_boards,
                 count_skill=self._count_skill,
@@ -191,6 +201,7 @@ def run_play(
     start_match: bool = False,
     preview: Callable[[QImage], None] | None = None,
     gauges: Callable[..., None] | None = None,
+    show_items: Callable[[str], None] | None = None,
     kind_count: int | None = None,
     save_boards: Callable[[], bool] | None = None,
     count_skill: Callable[[], bool] | None = None,
@@ -203,6 +214,11 @@ def run_play(
     def say(text: str) -> None:
         if report is not None:
             report(text)
+
+    def show_used(names: list[str] | None) -> None:
+        if show_items is None:
+            return
+        show_items("、".join(names) if names else "－")
 
     arrived = ""
     used_tsum = ""
@@ -290,9 +306,6 @@ def run_play(
     skip_after_skill = False
     skip_loss = False
     skill_busy = [False]
-    gadget_fever_seen = [False]
-    gadget_fever_off = [0]
-    gadget_fever_ended = [False]
     pooh_long = False
     bomb_after_long = False
     last_fan_at = 0.0
@@ -368,9 +381,6 @@ def run_play(
         skip_after_skill = False
         skip_loss = False
         skill_busy[0] = False
-        gadget_fever_seen[0] = False
-        gadget_fever_off[0] = 0
-        gadget_fever_ended[0] = False
         pooh_long = False
         bomb_after_long = False
         last_fan_at = 0.0
@@ -838,12 +848,15 @@ def run_play(
         kinds = int(kind_count)
         kinds_locked = True
         say(f"種類 {kinds}")
+    if start_items is not None:
+        show_used(start_items)
     if used_items:
         say("アイテム " + "、".join(used_items))
     if start_match and arrived == "start":
         found_items = _tap_start_now(say, stop)
-        if found_items:
+        if found_items is not None:
             used_items = found_items
+            show_used(found_items)
     elif start_match and arrived == "continue":
         _tap_continue_now(say, stop)
     watching = Event()
@@ -871,7 +884,7 @@ def run_play(
                 return
             next_skill_at[0] = now + SKILL_GAP
         try:
-            tap(
+            tap_skill(
                 int(point[0]),
                 int(point[1]),
                 screen_w=int(point[2]),
@@ -884,35 +897,112 @@ def run_play(
         if skill_pressed is not None:
             skill_pressed.set()
 
+    def about_to_fill_skill(chain: list[dict[str, int]]) -> bool:
+        if skill_is_gadget(used_tsum):
+            return False
+        added = mytsum_in_chain(chain)
+        if skill is None or added <= 0 or not skill_saw_empty or watch_hit.is_set():
+            return False
+        if skill_my_full is None or skill_my_full <= 0:
+            return False
+        return skill_my_n + added >= skill_my_full
+
+    def mash_skill_until_on(sure: bool) -> bool:
+        if skill is None:
+            return False
+        button = _skill_button_square(skill)
+        point = (
+            int(button["x"] + max(1, int(button["w"])) / 2),
+            int(button["y"] + max(1, int(button["h"])) / 2),
+            int(image.width()),
+            int(image.height()),
+        )
+        skill_busy[0] = True
+        say("スキルを連打します")
+        base = _window_skill_fill(skill)
+        seen_charged = base is not None and base >= SKILL_FILL_SPENT
+        tapped = False
+        still = 0
+        try:
+            while True:
+                _check_stop(stop)
+                if watch_hit.is_set():
+                    return False
+                try:
+                    tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
+                except Exception:
+                    return False
+                tapped = True
+                fill = _window_skill_fill(skill)
+                if fill is not None and fill >= SKILL_FILL_SPENT:
+                    seen_charged = True
+                    if base is None or fill > base:
+                        still = 0
+                        base = fill
+                if seen_charged and fill is not None and fill < SKILL_FILL_SPENT:
+                    with skill_press_lock:
+                        next_skill_at[0] = time.time() + SKILL_GAP
+                    return True
+                if (
+                    not sure
+                    and not seen_charged
+                    and tapped
+                    and fill is not None
+                    and fill < SKILL_FILL_READY
+                    and (base is None or fill <= base)
+                ):
+                    still += 1
+                    if still >= 2:
+                        return False
+        finally:
+            skill_busy[0] = False
+
     latest_gauge = [None, None, False, None, 0, False, None, False]
     play_frame = [None, None]
+    play_frame_at = [0.0]
 
     def _watch_skill_window() -> None:
         while checker_alive[0] and (stop is None or not stop.is_set()):
-            ready = False
-            tap = latest_gauge[6]
             if (
-                saw_board
-                and not watch_hit.is_set()
-                and skill is not None
-                and not skill_busy[0]
-                and tap is not None
+                not saw_board
+                or before_start[0]
+                or watch_hit.is_set()
+                or skill is None
+                or skill_busy[0]
+                or time.time() - play_frame_at[0] < 0.25
             ):
-                try:
-                    ready = _skill_ready_on_window(skill, used_tsum)
-                except Exception:
-                    ready = False
-                left = latest_gauge[3]
-                if (
-                    ready
-                    and skill_is_gadget(used_tsum)
-                    and latest_gauge[7]
-                    and (left is None or left > GADGET_TIMER_SKILL)
-                ):
-                    ready = False
+                time.sleep(0.05)
+                continue
+            try:
+                shot = try_capture_play_frame()
+            except Exception:
+                shot = None
+            if shot is None or shot.isNull():
+                time.sleep(0.05)
+                continue
+            rgb_now = _qimage_rgb(shot)
+            if rgb_now is None:
+                time.sleep(0.05)
+                continue
+            ready = _skill_ready(rgb_now, skill, used_tsum)
+            left = latest_gauge[3]
+            if ready and skill_is_gadget(used_tsum) and _gadget_skill_hold(
+                _fever_playing(rgb_now, game),
+                _meter_fever_fill(rgb_now, fever, skill, fan),
+                left,
+            ):
+                ready = False
             if ready and not skill_busy[0]:
-                press_skill_now(tap)
-            time.sleep(0.05)
+                button = _skill_button_square(skill)
+                press_skill_now(
+                    (
+                        int(button["x"] + max(1, int(button["w"])) / 2),
+                        int(button["y"] + max(1, int(button["h"])) / 2),
+                        int(shot.width()),
+                        int(shot.height()),
+                    )
+                )
+            time.sleep(0.2)
 
     Thread(target=_watch_skill_window, daemon=True).start()
 
@@ -935,14 +1025,7 @@ def run_play(
             skill_fill = _skill_fill(shot_rgb, skill)
             fever_fill, full_w = _read_fever(shot_rgb, fever, skill, fan, full_w)
             fever_on = _fever_playing(shot_rgb, game)
-            if skill_is_gadget(used_tsum):
-                if fever_on:
-                    gadget_fever_seen[0] = True
-                    gadget_fever_off[0] = 0
-                elif gadget_fever_seen[0] and not gadget_fever_ended[0]:
-                    gadget_fever_off[0] += 1
-                    if gadget_fever_off[0] >= 5:
-                        gadget_fever_ended[0] = True
+            meter_fever = _meter_fever_fill(shot_rgb, fever, skill, fan)
             left = _read_timer(predictor, shot_rgb, timer)
             if left is None:
                 left = last_left
@@ -957,12 +1040,8 @@ def run_play(
                 and not skill_busy[0]
             ):
                 ready = _skill_ready(shot_rgb, skill, used_tsum)
-                if (
-                    ready
-                    and skill_is_gadget(used_tsum)
-                    and not gadget_fever_ended[0]
-                    and _gadget_fever_hold(shot_rgb, fever, skill, fan, skill_fill)
-                    and (left is None or left > GADGET_TIMER_SKILL)
+                if ready and skill_is_gadget(used_tsum) and _gadget_skill_hold(
+                    fever_on, meter_fever, left
                 ):
                     ready = False
             tap_at = None
@@ -976,8 +1055,7 @@ def run_play(
                 )
             fever_hold = bool(
                 skill_is_gadget(used_tsum)
-                and not gadget_fever_ended[0]
-                and _gadget_fever_hold(shot_rgb, fever, skill, fan, skill_fill)
+                and _gadget_skill_hold(fever_on, meter_fever, left)
             )
             latest_gauge[0] = skill_fill
             latest_gauge[1] = fever_fill
@@ -991,7 +1069,7 @@ def run_play(
                 press_skill_now(tap_at)
             gauges(
                 _meter_skill_fill(shot_rgb, skill),
-                _meter_fever_fill(shot_rgb, fever, skill, fan),
+                meter_fever,
                 fever_on,
                 left,
                 n,
@@ -1019,6 +1097,7 @@ def run_play(
             add_idle("cap", time.perf_counter() - t0)
             play_frame[0] = image
             play_frame[1] = rgb
+            play_frame_at[0] = time.time()
             if rgb is None or image.isNull():
                 if not saw_board:
                     say("画面を待っています")
@@ -1119,8 +1198,9 @@ def run_play(
                 _seen, replay_items = _replay_after_timeup(say, stop)
                 fresh_match()
                 match_over = True
-                if replay_items:
+                if replay_items is not None:
                     used_items = replay_items
+                    show_used(replay_items)
                 say("プレイを開始します")
                 continue
             _check_stop(stop)
@@ -1129,9 +1209,11 @@ def run_play(
                 if start is not None:
                     ask_used_now(True)
                     found_items = _items_used_pil(rgb)
-                    if found_items:
+                    if found_items is not None:
                         used_items = found_items
-                        say("アイテム " + "、".join(used_items))
+                        show_used(found_items)
+                        if found_items:
+                            say("アイテム " + "、".join(used_items))
                     _say_heart_mail(say, rgb or image)
                     say("スタートをクリックします")
                     _slow_tap(start.center().x(), start.center().y())
@@ -1154,8 +1236,9 @@ def run_play(
                 start = None if image.isNull() else _match_start_button(image)
                 if start is not None:
                     found_items = _items_used_pil(rgb)
-                    if found_items:
+                    if found_items is not None:
                         used_items = found_items
+                        show_used(found_items)
                 if time.time() >= ignore_start_until:
                     if _match_start_button(image) is not None:
                         ask_used_now(True)
@@ -1166,6 +1249,12 @@ def run_play(
                     say("プレイをクリックします")
                     _slow_tap(play.center().x(), play.center().y())
                     _sleep_stop(2.0, stop)
+                    continue
+                close = None if image.isNull() else _close_button(image)
+                if close is not None:
+                    say("とじるをクリックします")
+                    _slow_tap(close.center().x(), close.center().y())
+                    _sleep_stop(1.2, stop)
                     continue
                 continue
             erased_now = False
@@ -1311,6 +1400,18 @@ def run_play(
                             continue
                         swipes += 1
                         say(_counts_line(clears, swipes, coin))
+                        added = mytsum_in_chain(chain)
+                        sure = (
+                            skill_my_full is not None
+                            and skill_my_full > 0
+                            and skill_my_n + added >= skill_my_full
+                        )
+                        if about_to_fill_skill(chain) and mash_skill_until_on(sure):
+                            if skill_pressed is not None:
+                                skill_pressed.set()
+                            apply_checker_skill(True)
+                            skip_after_skill = True
+                            break
                         burst_my_n += mytsum_in_chain(chain)
                         burst += 1
                         burst_max = max(burst_max, len(chain))
@@ -1451,8 +1552,9 @@ def run_play(
                     _seen, replay_items = _replay_after_timeup(say, stop)
                     fresh_match()
                     match_over = True
-                    if replay_items:
+                    if replay_items is not None:
                         used_items = replay_items
+                        show_used(replay_items)
                     say("プレイを開始します")
                     continue
                 last_save_at = _learn_board(
@@ -1472,7 +1574,7 @@ def run_play(
                     save_boards,
                     say,
                 )
-                if burst_max >= BOMB_LONG:
+                if burst_max >= time_bomb_number(used_items):
                     bomb_after_long = True
                 note_idle(True)
                 continue
@@ -1804,34 +1906,6 @@ def _press_skill(
     return True, True, spent
 
 
-def _skill_ready_on_window(skill: dict[str, int], used_tsum: str = "") -> bool:
-    from app import bluestacks
-
-    size = bluestacks._last_cap_size
-    if size is None:
-        return False
-    screen_w, screen_h = size
-    if screen_w < 2 or screen_h < 2:
-        return False
-    image = capture_window_frame()
-    if image is None or image.isNull():
-        return False
-    rgb = _qimage_rgb(image)
-    if rgb is None:
-        return False
-    button = _skill_button_square(skill)
-    scale = min(rgb.width / screen_w, rgb.height / screen_h)
-    ox = (rgb.width - screen_w * scale) / 2
-    oy = (rgb.height - screen_h * scale) / 2
-    mapped = {
-        "x": int(ox + int(button["x"]) * scale),
-        "y": int(oy + int(button["y"]) * scale),
-        "w": max(1, int(int(button["w"]) * scale)),
-        "h": max(1, int(int(button["h"]) * scale)),
-    }
-    return _skill_ready(rgb, mapped, used_tsum)
-
-
 def _skill_ready(rgb, skill: dict[str, int], used_tsum: str = "") -> bool:
     if rgb is None:
         return False
@@ -1936,6 +2010,41 @@ def _skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
     return filled / (filled + empty)
 
 
+def _window_skill_box(skill: dict[str, int]):
+    from app import bluestacks
+
+    size = bluestacks._last_cap_size
+    if size is None:
+        return None, None
+    screen_w, screen_h = size
+    if screen_w < 2 or screen_h < 2:
+        return None, None
+    image = capture_window_frame()
+    if image is None or image.isNull():
+        return None, None
+    rgb = _qimage_rgb(image)
+    if rgb is None:
+        return None, None
+    button = _skill_button_square(skill)
+    scale = min(rgb.width / screen_w, rgb.height / screen_h)
+    ox = (rgb.width - screen_w * scale) / 2
+    oy = (rgb.height - screen_h * scale) / 2
+    mapped = {
+        "x": int(ox + int(button["x"]) * scale),
+        "y": int(oy + int(button["y"]) * scale),
+        "w": max(1, int(int(button["w"]) * scale)),
+        "h": max(1, int(int(button["h"]) * scale)),
+    }
+    return rgb, mapped
+
+
+def _window_skill_fill(skill: dict[str, int]) -> float | None:
+    rgb, mapped = _window_skill_box(skill)
+    if rgb is None or mapped is None:
+        return None
+    return _skill_fill(rgb, mapped)
+
+
 def _meter_skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
     if rgb is None or skill is None:
         return None
@@ -1975,8 +2084,22 @@ def _meter_skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
         if start >= 8 or not charged[start]:
             continue
         end = start
-        while end + 1 < steps and charged[end + 1]:
-            end += 1
+        index = start
+        while index + 1 < steps:
+            if charged[index + 1]:
+                end = index + 1
+                index += 1
+                continue
+            gap = 0
+            probe = index + 1
+            while probe < steps and not charged[probe] and gap < 2:
+                gap += 1
+                probe += 1
+            if probe < steps and charged[probe] and gap <= 2:
+                end = probe
+                index = probe
+                continue
+            break
         best = max(best, (end + 1) / steps)
     return best
 
@@ -2213,58 +2336,12 @@ def _read_fever(
     return gold_w / stored, stored
 
 
-def _gadget_fever_hold(image, fever, skill=None, fan=None, fill=None) -> bool:
-    if fill is not None and fill >= GADGET_FEVER_SKILL_MIN:
+def _gadget_skill_hold(fever_on: bool, fever_fill: float | None, left: int | None) -> bool:
+    if left is not None and int(left) <= GADGET_TIMER_SKILL:
         return False
-    region = _fever_region(fever, skill, fan)
-    if image is None or region is None:
+    if not fever_on or fever_fill is None:
         return False
-    left = max(0, int(region["x"]))
-    top = max(0, int(region["y"]))
-    right = min(image.width, left + max(1, int(region["w"])))
-    bottom = min(image.height, top + max(1, int(region["h"])))
-    if right - left < 8 or bottom - top < 4:
-        return False
-    height = bottom - top
-    mid_y = (top + bottom) // 2
-    band = max(6, min(16, height // 4))
-    y0 = max(top, mid_y - band)
-    y1 = min(bottom, mid_y + band + 1)
-    step_y = max(1, (y1 - y0) // 10)
-    step_x = 1 if right - left <= 480 else 2
-    pixels = image.load()
-    best_dark = 0
-    best_fill = None
-    for y in range(y0, y1, step_y):
-        gold_n = 0
-        dark_n = 0
-        trough_n = 0
-        for x in range(left, right, step_x):
-            red, green, blue = pixels[x, y][:3]
-            is_hot, is_remain, is_trough = _fever_class(red, green, blue)
-            hue, sat, val = colorsys.rgb_to_hsv(
-                red / 255.0, green / 255.0, blue / 255.0
-            )
-            gold = is_hot or is_remain or (
-                0.06 <= hue <= 0.20 and sat >= 0.30 and val >= 0.45
-            )
-            if gold:
-                gold_n += 1
-            elif is_trough:
-                trough_n += 1
-            elif val < 0.30:
-                dark_n += 1
-        if dark_n <= trough_n or dark_n < 8:
-            continue
-        total = gold_n + dark_n + trough_n
-        if total < 8:
-            continue
-        if dark_n >= best_dark:
-            best_dark = dark_n
-            best_fill = gold_n / total
-    if fill is not None:
-        return best_fill is not None and fill < GADGET_FEVER_SKILL_MIN
-    return best_fill is not None and best_fill < GADGET_FEVER_SKILL_MIN
+    return float(fever_fill) <= GADGET_FEVER_SKILL_MIN
 
 
 def _fever_playing(image, box: dict[str, int] | None) -> bool:
@@ -2379,10 +2456,7 @@ def _break_bombs_until_one(
             if _piece_cell(piece) not in skip
         ][: n - 1]
         if not extra:
-            skip.clear()
-            extra = sorted(
-                bombs, key=lambda piece: int(piece.get("r") or 0), reverse=True
-            )[: n - 1]
+            return taps
         say(f"ボム {n}")
         for bomb in extra:
             _check_stop(stop)
@@ -2443,10 +2517,7 @@ def _break_bombs_until_two(
                 if _piece_cell(piece) not in skip
             ][: n - 2]
             if not extra:
-                skip.clear()
-                extra = sorted(
-                    bombs, key=lambda piece: int(piece.get("r") or 0), reverse=True
-                )[: n - 2]
+                return taps
             for bomb in extra:
                 _check_stop(stop)
                 if watch_hit.is_set():

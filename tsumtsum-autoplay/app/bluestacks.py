@@ -30,6 +30,26 @@ _capture_how: str | None = None
 _adb_ok = False
 _last_cap_size: tuple[int, int] | None = None
 _mouse_lock = Lock()
+_cap_lock = Lock()
+SWIPE_POINT_S = 0.006
+SWIPE_CENTER_S = 0.018
+swipe_point_s = SWIPE_POINT_S
+swipe_center_s = SWIPE_CENTER_S
+
+
+def swipe_speeds() -> tuple[float, float]:
+    return swipe_point_s, swipe_center_s
+
+
+def set_swipe_speeds(point_s: float, center_s: float) -> None:
+    global swipe_point_s, swipe_center_s
+    swipe_point_s = float(point_s)
+    swipe_center_s = float(center_s)
+
+
+def reset_swipe_speeds() -> tuple[float, float]:
+    set_swipe_speeds(SWIPE_POINT_S, SWIPE_CENTER_S)
+    return swipe_speeds()
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -197,13 +217,35 @@ def capture_screen_path() -> Path:
 
 
 def capture_play_frame() -> QImage:
+    with _cap_lock:
+        image = _capture_play_frame()
+    if image is None or image.isNull():
+        raise RuntimeError("画面を取れませんでした。")
+    return image
+
+
+def try_capture_play_frame() -> QImage | None:
+    if not _cap_lock.acquire(blocking=False):
+        return None
+    try:
+        image = _capture_play_frame()
+    except Exception:
+        return None
+    finally:
+        _cap_lock.release()
+    if image is None or image.isNull():
+        return None
+    return image
+
+
+def _capture_play_frame() -> QImage | None:
     global _last_cap_size
     image = _capture_adb_qimage()
     if image is None or image.isNull():
         path = capture_screen_path()
         image = QImage(str(path))
-    if image.isNull():
-        raise RuntimeError("画面を取れませんでした。")
+    if image is None or image.isNull():
+        return None
     _last_cap_size = (image.width(), image.height())
     return image
 
@@ -363,6 +405,23 @@ def tap(x: int, y: int, hold_ms: int = 180, screen_w: int = 0, screen_h: int = 0
         width, height = _last_cap_size
     if _tap_mouse(int(x), int(y), width, height, hold_ms):
         return
+    _adb_tap(int(x), int(y), hold_ms)
+
+
+def tap_skill(x: int, y: int, screen_w: int = 0, screen_h: int = 0) -> None:
+    width, height = screen_w, screen_h
+    if (width < 2 or height < 2) and _last_cap_size is not None:
+        width, height = _last_cap_size
+    if _mouse_lock.acquire(blocking=False):
+        try:
+            if _tap_mouse(int(x), int(y), width, height, 180, locked=True):
+                return
+        finally:
+            _mouse_lock.release()
+    _adb_tap(int(x), int(y), 180)
+
+
+def _adb_tap(x: int, y: int, hold_ms: int) -> None:
     xi, yi = str(int(x)), str(int(y))
     result = adb(["shell", "input", "tap", xi, yi], timeout=6)
     if result.returncode != 0:
@@ -500,14 +559,17 @@ def _send_mouse_path_locked(
             emit(x, y, up)
             return True
         emit(x, y, move)
-        time.sleep(0.018 if (x, y) in hold else 0.006)
+        time.sleep(swipe_center_s if (x, y) in hold else swipe_point_s)
     time.sleep(0.02)
     xl, yl = mapped[-1]
     emit(xl, yl, up)
     return True
 
 
-def _tap_mouse(x: int, y: int, screen_w: int, screen_h: int, hold_ms: int) -> bool:
+def _tap_mouse(
+    x: int, y: int, screen_w: int, screen_h: int, hold_ms: int, locked: bool = False
+) -> bool:
+    del hold_ms
     if sys.platform != "win32" or screen_w < 2 or screen_h < 2:
         return False
     import ctypes
@@ -524,7 +586,8 @@ def _tap_mouse(x: int, y: int, screen_w: int, screen_h: int, hold_ms: int) -> bo
     hwnd = _player_hwnd(user32, wintypes)
     if hwnd:
         user32.SetForegroundWindow(hwnd)
-    return _send_mouse_path(user32, mapped, set())
+    send = _send_mouse_path_locked if locked else _send_mouse_path
+    return send(user32, mapped, set())
 
 
 def _map_to_view(

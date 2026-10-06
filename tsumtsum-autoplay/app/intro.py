@@ -453,20 +453,22 @@ def _play_button(image: QImage) -> QRect | None:
         or _has_highscore_plate(image)
     ):
         return None
-    bottom = [
-        pill
-        for pill in _yellow_pills(image)
-        if pill.center().y() > image.height() * 0.58
-    ]
+    bottom = []
+    for pill in _yellow_pills(image):
+        if pill.center().y() <= image.height() * 0.58:
+            continue
+        if pill.width() < image.width() * 0.18:
+            continue
+        if abs(pill.center().x() - image.width() / 2) > image.width() * 0.15:
+            continue
+        if _is_daily_mission(image, pill):
+            continue
+        if not _retry_is_orange(image, pill):
+            continue
+        bottom.append(pill)
     if not bottom:
         return None
-    play = max(bottom, key=lambda rect: rect.width() * rect.height())
-    if play.width() < image.width() * 0.18:
-        return None
-    if abs(play.center().x() - image.width() / 2) > image.width() * 0.15:
-        return None
-    if _is_daily_mission(image, play):
-        return None
+    play = max(bottom, key=lambda rect: rect.center().y())
     if _menu_pair_rows(image, play.y()) >= 2:
         return None
     return play
@@ -630,6 +632,8 @@ def _cancel_button(image: QImage) -> QRect | None:
             continue
         gap = right.x() - left.right()
         if gap < -left.width() * 0.2 or gap > left.width() * 2.2:
+            continue
+        if left.width() < image.width() * 0.18 or right.width() < image.width() * 0.18:
             continue
         if _is_daily_mission(image, right) or _is_daily_mission(image, left):
             continue
