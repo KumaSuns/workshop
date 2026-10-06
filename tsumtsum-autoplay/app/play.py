@@ -884,70 +884,6 @@ def run_play(
         if skill_pressed is not None:
             skill_pressed.set()
 
-    def about_to_fill_skill(chain: list[dict[str, int]]) -> bool:
-        added = mytsum_in_chain(chain)
-        if skill is None or added <= 0 or not skill_saw_empty or watch_hit.is_set():
-            return False
-        if (
-            skill_is_gadget(used_tsum)
-            and latest_gauge[7]
-            and (latest_gauge[3] is None or latest_gauge[3] > GADGET_TIMER_SKILL)
-        ):
-            return False
-        if skill_my_full is None or skill_my_full <= 0:
-            return False
-        return skill_my_n + added >= skill_my_full
-
-    def mash_skill_until_on(sure: bool) -> bool:
-        if skill is None:
-            return False
-        button = _skill_button_square(skill)
-        point = (
-            int(button["x"] + max(1, int(button["w"])) / 2),
-            int(button["y"] + max(1, int(button["h"])) / 2),
-            int(image.width()),
-            int(image.height()),
-        )
-        skill_busy[0] = True
-        say("スキルを連打します")
-        base = _window_skill_fill(skill)
-        seen_charged = base is not None and base >= SKILL_FILL_SPENT
-        tapped = False
-        still = 0
-        try:
-            while True:
-                _check_stop(stop)
-                if watch_hit.is_set():
-                    return False
-                try:
-                    tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
-                except Exception:
-                    return False
-                tapped = True
-                fill = _window_skill_fill(skill)
-                if fill is not None and fill >= SKILL_FILL_SPENT:
-                    seen_charged = True
-                    if base is None or fill > base:
-                        still = 0
-                        base = fill
-                if seen_charged and fill is not None and fill < SKILL_FILL_SPENT:
-                    with skill_press_lock:
-                        next_skill_at[0] = time.time() + SKILL_GAP
-                    return True
-                if (
-                    not sure
-                    and not seen_charged
-                    and tapped
-                    and fill is not None
-                    and fill < SKILL_FILL_READY
-                    and (base is None or fill <= base)
-                ):
-                    still += 1
-                    if still >= 2:
-                        return False
-        finally:
-            skill_busy[0] = False
-
     latest_gauge = [None, None, False, None, 0, False, None, False]
     play_frame = [None, None]
 
@@ -1054,8 +990,8 @@ def run_play(
             if ready:
                 press_skill_now(tap_at)
             gauges(
-                skill_fill,
-                fever_fill,
+                _meter_skill_fill(shot_rgb, skill),
+                _meter_fever_fill(shot_rgb, fever, skill, fan),
                 fever_on,
                 left,
                 n,
@@ -1196,6 +1132,7 @@ def run_play(
                     if found_items:
                         used_items = found_items
                         say("アイテム " + "、".join(used_items))
+                    _say_heart_mail(say, rgb or image)
                     say("スタートをクリックします")
                     _slow_tap(start.center().x(), start.center().y())
                     _sleep_stop(1.2, stop)
@@ -1374,18 +1311,6 @@ def run_play(
                             continue
                         swipes += 1
                         say(_counts_line(clears, swipes, coin))
-                        added = mytsum_in_chain(chain)
-                        sure = (
-                            skill_my_full is not None
-                            and skill_my_full > 0
-                            and skill_my_n + added >= skill_my_full
-                        )
-                        if about_to_fill_skill(chain) and mash_skill_until_on(sure):
-                            if skill_pressed is not None:
-                                skill_pressed.set()
-                            apply_checker_skill(True)
-                            skip_after_skill = True
-                            break
                         burst_my_n += mytsum_in_chain(chain)
                         burst += 1
                         burst_max = max(burst_max, len(chain))
@@ -1879,41 +1804,6 @@ def _press_skill(
     return True, True, spent
 
 
-def _window_skill_box(skill: dict[str, int]):
-    from app import bluestacks
-
-    size = bluestacks._last_cap_size
-    if size is None:
-        return None, None
-    screen_w, screen_h = size
-    if screen_w < 2 or screen_h < 2:
-        return None, None
-    image = capture_window_frame()
-    if image is None or image.isNull():
-        return None, None
-    rgb = _qimage_rgb(image)
-    if rgb is None:
-        return None, None
-    button = _skill_button_square(skill)
-    scale = min(rgb.width / screen_w, rgb.height / screen_h)
-    ox = (rgb.width - screen_w * scale) / 2
-    oy = (rgb.height - screen_h * scale) / 2
-    mapped = {
-        "x": int(ox + int(button["x"]) * scale),
-        "y": int(oy + int(button["y"]) * scale),
-        "w": max(1, int(int(button["w"]) * scale)),
-        "h": max(1, int(int(button["h"]) * scale)),
-    }
-    return rgb, mapped
-
-
-def _window_skill_fill(skill: dict[str, int]) -> float | None:
-    rgb, mapped = _window_skill_box(skill)
-    if rgb is None or mapped is None:
-        return None
-    return _skill_fill(rgb, mapped)
-
-
 def _skill_ready_on_window(skill: dict[str, int], used_tsum: str = "") -> bool:
     from app import bluestacks
 
@@ -2046,6 +1936,51 @@ def _skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
     return filled / (filled + empty)
 
 
+def _meter_skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
+    if rgb is None or skill is None:
+        return None
+    box = _skill_button_square(skill)
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(rgb.width, left + max(1, int(box["w"])))
+    bottom = min(rgb.height, top + max(1, int(box["h"])))
+    if right - left < 8 or bottom - top < 8:
+        return None
+    crop = rgb.crop((left, top, right, bottom))
+    width, height = crop.size
+    pixels = crop.load()
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    steps = 72
+    best = 0.0
+    for scale in (0.34, 0.40):
+        radius = min(width, height) * scale
+        charged: list[bool] = []
+        for index in range(steps):
+            ang = -math.pi / 2.0 + (2.0 * math.pi * index / steps)
+            xx = int(round(cx + math.cos(ang) * radius))
+            yy = int(round(cy + math.sin(ang) * radius))
+            if xx < 0 or yy < 0 or xx >= width or yy >= height:
+                charged.append(False)
+                continue
+            red, green, blue_v = pixels[xx, yy][:3]
+            hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
+            on = (0.48 <= hue <= 0.58 and sat >= 0.55 and val >= 0.75) or (
+                0.06 <= hue <= 0.20 and sat >= 0.35 and val >= 0.70
+            )
+            charged.append(on)
+        start = 0
+        while start < 8 and not charged[start]:
+            start += 1
+        if start >= 8 or not charged[start]:
+            continue
+        end = start
+        while end + 1 < steps and charged[end + 1]:
+            end += 1
+        best = max(best, (end + 1) / steps)
+    return best
+
+
 def _press_fan(
     fan: dict[str, int] | None,
     image: QImage,
@@ -2149,6 +2084,58 @@ def _fever_flag_runs(flags: list[bool]) -> list[tuple[int, int]]:
     if start is not None:
         runs.append((start, last))
     return runs
+
+
+def _meter_fever_fill(image, fever, skill=None, fan=None) -> float | None:
+    region = _fever_region(fever, skill, fan)
+    if image is None or region is None:
+        return None
+    left = max(0, int(region["x"]))
+    top = max(0, int(region["y"]))
+    right = min(image.width, left + max(1, int(region["w"])))
+    bottom = min(image.height, top + max(1, int(region["h"])))
+    if right - left < 8 or bottom - top < 4:
+        return None
+    crop = image.crop((left, top, right, bottom))
+    width, height = crop.size
+    pixels = crop.load()
+    y = height // 2
+    marks: list[str] = []
+    for x in range(width):
+        red, green, blue = pixels[x, y][:3]
+        hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+        yellow = 0.08 <= hue <= 0.22 and sat >= 0.35 and val >= 0.72
+        white = val >= 0.88 and sat <= 0.42
+        blue_empty = 0.45 <= hue <= 0.70 and sat >= 0.45 and val < 0.78
+        dark = val < 0.42
+        if yellow or white:
+            marks.append("F")
+        elif blue_empty or dark:
+            marks.append("E")
+        else:
+            marks.append(".")
+    body = "".join(marks[int(width * 0.08) : int(width * 0.92)])
+    start = body.find("F")
+    if start < 0:
+        return 0.0
+    last = max(index for index, mark in enumerate(body) if mark in ("F", "E"))
+    end = start
+    empty_run = 0
+    for index in range(start, len(body)):
+        mark = body[index]
+        if mark == "F":
+            end = index
+            empty_run = 0
+        elif mark == "E":
+            empty_run += 1
+            if empty_run >= 10:
+                break
+        else:
+            empty_run = 0
+    span = last - start + 1
+    if span < 8:
+        return 0.0
+    return (end - start + 1) / span
 
 
 def _read_fever(
@@ -3013,6 +3000,224 @@ def register_used_tsum_id(name: str, folder_id: str) -> str:
     return tsum_display_name(tsum_id)
 
 
+def _heart_mail_pink(red: int, green: int, blue: int) -> bool:
+    return (
+        red > 170
+        and 30 < green < 180
+        and 50 < blue < 200
+        and red > green + 50
+        and red > blue + 20
+    )
+
+
+def _heart_mail_red(red: int, green: int, blue: int) -> bool:
+    return red > 180 and green < 100 and blue < 110 and red > green + 80 and red > blue + 70
+
+
+def _heart_mail_blobs(image, match, min_pixels: int) -> list[tuple[int, int, int, int]]:
+    width, height = image.size
+    pixels = image.load()
+    seen = [[False] * width for _ in range(height)]
+    found: list[tuple[int, int, int, int]] = []
+    for y in range(height):
+        for x in range(width):
+            if seen[y][x] or not match(*pixels[x, y][:3]):
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            points: list[tuple[int, int]] = []
+            while stack:
+                cx, cy = stack.pop()
+                points.append((cx, cy))
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if (
+                        0 <= nx < width
+                        and 0 <= ny < height
+                        and not seen[ny][nx]
+                        and match(*pixels[nx, ny][:3])
+                    ):
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if len(points) < min_pixels:
+                continue
+            xs = [pt[0] for pt in points]
+            ys = [pt[1] for pt in points]
+            box_w = max(xs) - min(xs) + 1
+            box_h = max(ys) - min(ys) + 1
+            if box_w < 4 or box_h < 4:
+                continue
+            if not (0.55 <= box_w / box_h <= 1.8):
+                continue
+            if len(points) < box_w * box_h * 0.35:
+                continue
+            found.append((min(xs), min(ys), max(xs) + 1, max(ys) + 1))
+    return found
+
+
+def _heart_mail_plus(glyph) -> bool:
+    width, height = glyph.size
+    if width < 4 or height < 4:
+        return False
+    if height > width * 1.8 or width > height * 1.8:
+        return False
+    pixels = glyph.load()
+    row = sum(1 for x in range(width) if pixels[x, height // 2] > 128) / width
+    col = sum(1 for y in range(height) if pixels[width // 2, y] > 128) / height
+    corners = (
+        pixels[1, 1],
+        pixels[width - 2, 1],
+        pixels[1, height - 2],
+        pixels[width - 2, height - 2],
+    )
+    empty = sum(1 for value in corners if value < 128)
+    return row > 0.45 and col > 0.45 and empty >= 3
+
+
+def _heart_mail_glyphs(mask: list[list[bool]]):
+    from PIL import Image
+
+    from app.timer_digits import _MAX_DIST, _SAMPLES, _bits
+
+    height = len(mask)
+    width = len(mask[0]) if height else 0
+    counts = [sum(1 for y in range(height) if mask[y][x]) for x in range(width)]
+    spans: list[tuple[int, int]] = []
+    x = 0
+    while x < width:
+        if counts[x] == 0:
+            x += 1
+            continue
+        start = x
+        while x < width and counts[x] > 0:
+            x += 1
+        if x - start >= 2:
+            spans.append((start, x))
+    chars: list[str] = []
+    for start, end in spans:
+        ys = [y for y in range(height) for xx in range(start, end) if mask[y][xx]]
+        if not ys:
+            continue
+        top, bottom = min(ys), max(ys) + 1
+        if bottom - top < 4:
+            continue
+        glyph = Image.new("L", (end - start, bottom - top), 0)
+        target = glyph.load()
+        for y in range(top, bottom):
+            for xx in range(start, end):
+                if mask[y][xx]:
+                    target[xx - start, y - top] = 255
+        if _heart_mail_plus(glyph):
+            chars.append("+")
+            continue
+        row = _bits(glyph)
+        best = ""
+        dist = _MAX_DIST + 1
+        for digit, samples in _SAMPLES.items():
+            for sample in samples:
+                score = sum(left != right for left, right in zip(row, sample))
+                if score < dist:
+                    dist = score
+                    best = digit
+        if best and dist <= _MAX_DIST:
+            chars.append(best)
+    return "".join(chars)
+
+
+def _heart_mail_text(image, box: tuple[int, int, int, int], ink) -> str:
+    left, top, right, bottom = box
+    left = max(0, left)
+    top = max(0, top)
+    right = min(image.width, right)
+    bottom = min(image.height, bottom)
+    if right - left < 4 or bottom - top < 4:
+        return ""
+    pixels = image.load()
+    mask = [
+        [ink(*pixels[x, y][:3]) for x in range(left, right)]
+        for y in range(top, bottom)
+    ]
+    return _heart_mail_glyphs(mask)
+
+
+def _read_heart_mail(image) -> tuple[int, str, str] | None:
+    from PIL import Image
+
+    view = _portrait_frame(image)
+    width, _height = view.size
+    scale = 220 / max(width, 1)
+    small = view.resize(
+        (max(1, int(width * scale)), max(1, int(view.size[1] * scale))),
+        Image.Resampling.BOX,
+    )
+    hearts = _heart_mail_blobs(small, _heart_mail_pink, 12)
+    badges = [
+        box
+        for box in _heart_mail_blobs(small, _heart_mail_red, 8)
+        if (box[2] - box[0]) <= small.size[0] * 0.12
+    ]
+    best: tuple[int, list[tuple[int, int, int, int]], tuple[int, int, int, int]] | None = None
+    for badge in badges:
+        band = [
+            heart
+            for heart in hearts
+            if heart[2] < badge[0] and heart[1] < badge[3] + 8 and heart[3] > badge[1] - 8
+        ]
+        if not band:
+            continue
+        band.sort(key=lambda item: item[0])
+        heights = [item[3] - item[1] for item in band]
+        median = sorted(heights)[len(heights) // 2]
+        row = [
+            item
+            for item in band
+            if abs((item[3] - item[1]) - median) <= max(2, median * 0.45)
+        ]
+        if not row:
+            continue
+        cy = sum((item[1] + item[3]) / 2 for item in row) / len(row)
+        row = [item for item in row if abs((item[1] + item[3]) / 2 - cy) <= median]
+        if row and (best is None or len(row) > best[0]):
+            best = (len(row), row, badge)
+    if best is None:
+        return None
+    count, row, badge = best
+    inv = 1 / scale
+    heart_right = int(row[-1][2] * inv)
+    top = int(min(item[1] for item in row) * inv)
+    bottom = int(max(item[3] for item in row) * inv)
+    badge_box = tuple(int(value * inv) for value in badge)
+
+    def number_ink(red: int, green: int, blue: int) -> bool:
+        luma = 0.3 * red + 0.59 * green + 0.11 * blue
+        return luma > 175 and blue > 150 and green > 140
+
+    def badge_ink(red: int, green: int, blue: int) -> bool:
+        return red > 200 and green > 160 and blue > 160
+
+    number = _heart_mail_text(view, (heart_right + 2, top, badge_box[0] - 2, bottom), number_ink)
+    mail = _heart_mail_text(view, badge_box, badge_ink)
+    return count, number, mail
+
+
+def _say_heart_mail(say: StatusFn, image) -> None:
+    from PIL import Image
+
+    if isinstance(image, QImage):
+        image = _qimage_rgb(image)
+    if not isinstance(image, Image.Image):
+        return
+    found = _read_heart_mail(image)
+    if found is None:
+        return
+    hearts, number, mail = found
+    parts = [f"ハート {hearts}"]
+    if number:
+        parts.append(number)
+    if mail:
+        parts.append(f"メール {mail}")
+    say(" / ".join(parts))
+
+
 def _click_start_or_continue(
     say: StatusFn,
     stop: Event | None,
@@ -3053,6 +3258,7 @@ def _click_start_or_continue(
                 items = found_items
             if items:
                 say("アイテム " + "、".join(items))
+            _say_heart_mail(say, image)
             if tap_start:
                 say("スタートをクリックします")
                 _slow_tap(start.center().x(), start.center().y())
@@ -3132,6 +3338,7 @@ def _tap_start_now(say: StatusFn, stop: Event | None) -> list[str] | None:
     start = _match_start_button(image)
     if start is None:
         return items
+    _say_heart_mail(say, image)
     say("スタートをクリックします")
     _slow_tap(start.center().x(), start.center().y())
     _sleep_stop(1.2, stop)
@@ -3161,6 +3368,7 @@ def _tap_start_or_continue(image: QImage, say: StatusFn, stop: Event | None) -> 
     start = _match_start_button(image)
     resume = _continue_button(image)
     if start is not None:
+        _say_heart_mail(say, image)
         say("スタートをクリックします")
         _slow_tap(start.center().x(), start.center().y())
         _sleep_stop(1.2, stop)
@@ -3198,6 +3406,7 @@ def _wait_and_tap_start(say: StatusFn, stop: Event | None) -> bool:
         if hits < 4:
             _sleep_stop(0.4, stop)
             continue
+        _say_heart_mail(say, image)
         say("スタートをクリックします")
         _tap_point(image, start.center().x(), start.center().y())
         return True

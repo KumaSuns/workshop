@@ -132,7 +132,7 @@ def _bits(glyph: Image.Image) -> str:
     )
 
 
-def _glyphs(image: Image.Image) -> list[Image.Image]:
+def _glyphs(image: Image.Image, loose: bool = False) -> list[Image.Image]:
     width, height = image.size
     pixels = image.convert("RGB").load()
     ink = [[False] * width for _ in range(height)]
@@ -141,6 +141,8 @@ def _glyphs(image: Image.Image) -> list[Image.Image]:
             red, green, blue = pixels[x, y]
             _hue, sat, val = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
             if val >= 0.75 and sat <= 0.35:
+                ink[y][x] = True
+            elif loose and val >= 0.92 and sat <= 0.50:
                 ink[y][x] = True
     seen = [[False] * width for _ in range(height)]
     keep = [[False] * width for _ in range(height)]
@@ -168,7 +170,7 @@ def _glyphs(image: Image.Image) -> list[Image.Image]:
                 continue
             if max(xs) - min(xs) + 1 > 26:
                 continue
-            if cx < width * 0.18 or cx > width * 0.82 or cy < height * 0.12 or cy > height * 0.88:
+            if cx < width * 0.18 or cx > width * 0.82 or cy < height * 0.35 or cy > height * 0.72:
                 continue
             for px, py in points:
                 keep[py][px] = True
@@ -227,14 +229,11 @@ def _glyphs(image: Image.Image) -> list[Image.Image]:
     return glyphs
 
 
-def read_timer_digits(image: Image.Image) -> str | None:
-    side = max(image.width, image.height)
-    if side < 40 or side > 60:
-        image = image.resize((50, 50), Image.Resampling.BOX)
-    found = _glyphs(image)
+def _match_glyphs(found: list[Image.Image]) -> tuple[str, int] | None:
     if not found or len(found) > 2:
         return None
-    chars = []
+    chars: list[str] = []
+    worst = 0
     for glyph in found:
         row = _bits(glyph)
         best_digit = ""
@@ -248,5 +247,27 @@ def read_timer_digits(image: Image.Image) -> str | None:
         if not best_digit or best_dist > _MAX_DIST:
             return None
         chars.append(best_digit)
-    return "".join(chars)
+        worst = max(worst, best_dist)
+    if not chars:
+        return None
+    return "".join(chars), worst
+
+
+def read_timer_digits(image: Image.Image) -> str | None:
+    source = image
+    side = max(image.width, image.height)
+    if side < 40 or side > 60:
+        image = image.resize((50, 50), Image.Resampling.BOX)
+    strict = _match_glyphs(_glyphs(image))
+    if strict is not None and strict[1] <= 40:
+        return strict[0]
+    loose = _match_glyphs(_glyphs(image, loose=True))
+    if loose is not None and (strict is None or loose[1] < strict[1]):
+        return loose[0]
+    if strict is not None:
+        return strict[0]
+    raw = _match_glyphs(_glyphs(source, loose=True))
+    if raw is not None:
+        return raw[0]
+    return None
 

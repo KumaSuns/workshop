@@ -13,6 +13,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -68,10 +71,8 @@ def _is_not_charm_tsum(name: str) -> bool:
 class DebugWindow(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("デバッグ")
-        self.setWindowFlag(Qt.WindowType.Window, True)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         self._preview = QLabel("なぞる経路")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumHeight(280)
@@ -83,9 +84,7 @@ class DebugWindow(QWidget):
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMaximumBlockCount(400)
-        layout.addWidget(self._log)
-        self.resize(420, 720)
-        self._on_stop = None
+        layout.addWidget(self._log, 1)
 
     def set_preview(self, image: QImage) -> None:
         if image.isNull():
@@ -131,17 +130,11 @@ class DebugWindow(QWidget):
         if text.startswith("使用ツム "):
             self.set_used_tsum(text[len("使用ツム ") :])
 
-    def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat() and self._on_stop:
-            self._on_stop()
-            return
-        super().keyPressEvent(event)
-
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle("オートプレイ　コントローラー")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         icon = self._ensure_app_icon()
         if icon is not None:
@@ -156,7 +149,40 @@ class MainWindow(QMainWindow):
                 app_inst.setWindowIcon(window_icon)
         self._refresh_desktop_shortcut()
         root = QWidget()
-        layout = QVBoxLayout(root)
+        outer = QVBoxLayout(root)
+        self._info_frame = QFrame()
+        self._info_frame.setFrameShape(QFrame.Shape.Box)
+        info = QVBoxLayout(self._info_frame)
+        heart_row = QHBoxLayout()
+        heart_row.setContentsMargins(0, 0, 0, 0)
+        self._info_label = QLabel("♥ ハート")
+        heart_row.addWidget(self._info_label)
+        heart_row.addStretch(1)
+        info.addLayout(heart_row)
+        meter = QGridLayout()
+        meter.setContentsMargins(0, 0, 0, 0)
+        self._info_time = QLabel("タイム")
+        self._info_time_value = QLabel("－")
+        self._info_fever_en = QLabel("FEVER")
+        self._info_fever = QLabel("フィーバー")
+        self._info_fever_value = QLabel("－")
+        self._info_skill = QLabel("スキル")
+        self._info_skill_value = QLabel("－")
+        meter.addWidget(self._info_time, 0, 0)
+        meter.addWidget(self._info_time_value, 0, 1)
+        meter.addWidget(self._info_fever_en, 1, 0, 1, 2)
+        meter.addWidget(self._info_fever, 2, 0)
+        meter.addWidget(self._info_fever_value, 2, 1)
+        meter.addWidget(self._info_skill, 3, 0)
+        meter.addWidget(self._info_skill_value, 3, 1)
+        meter.setColumnStretch(2, 1)
+        info.addLayout(meter)
+        outer.addWidget(self._info_frame)
+        columns = QHBoxLayout()
+        columns.setContentsMargins(0, 0, 0, 0)
+        left = QWidget()
+        layout = QVBoxLayout(left)
+        layout.setContentsMargins(0, 0, 0, 0)
         self.capture_btn = QPushButton("消す前の盤面を取り込む")
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
@@ -187,18 +213,6 @@ class MainWindow(QMainWindow):
         self.shortcut_btn = QPushButton("起動アイコン作成")
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         layout.addWidget(self.shortcut_btn)
-        self.remote_btn = QPushButton("新アプリを起動")
-        self.remote_btn.clicked.connect(self._start_remote_app)
-        layout.addWidget(self.remote_btn)
-        self.tsum_btn = QPushButton("ツムツムを起動")
-        self.tsum_btn.clicked.connect(self._start_tsum_app)
-        layout.addWidget(self.tsum_btn)
-        self.shutdown_btn = QPushButton("PCをシャットダウン")
-        self.shutdown_btn.clicked.connect(self._confirm_shutdown)
-        layout.addWidget(self.shutdown_btn)
-        self.reboot_btn = QPushButton("PCを再起動")
-        self.reboot_btn.clicked.connect(self._confirm_reboot)
-        layout.addWidget(self.reboot_btn)
         self.status_label = QLabel("待機中")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -208,8 +222,13 @@ class MainWindow(QMainWindow):
         font.setStyleHint(QFont.StyleHint.Monospace)
         self._history.setFont(font)
         layout.addWidget(self._history, 1)
+        left.setMinimumWidth(max(1, left.sizeHint().width() * 2))
+        self._debug = DebugWindow(root)
+        self._debug.setMinimumWidth(420)
+        columns.addWidget(left, 1)
+        columns.addWidget(self._debug, 1)
+        outer.addLayout(columns, 1)
         self.setCentralWidget(root)
-        self.setMinimumWidth(max(1, self.sizeHint().width() * 2))
         self._fill_history()
         self._stop = threading.Event()
         self._save_boards = threading.Event()
@@ -220,8 +239,6 @@ class MainWindow(QMainWindow):
         self._record: RecordWorker | None = None
         self._want_record = False
         self._selected_used_tsum = ""
-        self._debug = DebugWindow()
-        self._debug._on_stop = self.on_stop
         self._placed = False
         self._enter_yes = None
         app = QApplication.instance()
@@ -386,19 +403,51 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(running)
         if running:
             self._front_timer.stop()
-            self._debug.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
-            self._debug.show()
             self.show()
             self._register_stop_hotkey()
         else:
             self._unregister_stop_hotkey()
-            self._debug.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-            self._debug.show()
             self.show()
             self._front_timer.start()
             self._keep_front()
+            self._clear_meters()
+
+    def _clear_meters(self) -> None:
+        self._info_time_value.setText("－")
+        self._info_fever_value.setText("－")
+        self._info_skill_value.setText("－")
+        self._info_fever_en.setStyleSheet("")
+
+    def _show_meters(
+        self,
+        skill_fill,
+        fever_fill,
+        fever_on,
+        left,
+        _skill_n,
+        _skill_ok,
+        _ready,
+        _busy,
+        _tap_at,
+    ) -> None:
+        if left is None:
+            self._info_time_value.setText("－")
+        else:
+            self._info_time_value.setText(str(int(left)))
+        if fever_on:
+            self._info_fever_en.setStyleSheet("color: rgb(220, 0, 0);")
+        else:
+            self._info_fever_en.setStyleSheet("")
+        if fever_fill is None:
+            self._info_fever_value.setText("－")
+        else:
+            self._info_fever_value.setText(f"{round(float(fever_fill) * 100)}％")
+        if skill_fill is None:
+            self._info_skill_value.setText("－")
+        else:
+            self._info_skill_value.setText(f"{round(float(skill_fill) * 100)}％")
 
     def _start_intro(self) -> None:
         self._intro = IntroWorker(self._stop, self)
@@ -431,6 +480,7 @@ class MainWindow(QMainWindow):
         )
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
+        self._play.gauges.connect(self._show_meters)
         self._play.failed.connect(self._on_play_fail)
         self._play.stopped.connect(self._on_stopped)
         self._play.completed.connect(self._on_play_done)
@@ -733,31 +783,29 @@ class MainWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
-        self._debug.show()
-        self._debug.raise_()
 
     def _keep_front(self) -> None:
         if QApplication.activeModalWidget() is not None:
             return
         self.raise_()
-        if self._debug.isVisible():
-            self._debug.raise_()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self._debug.show()
         if self._placed:
             return
         self._placed = True
+        QTimer.singleShot(0, self._fill_screen_height)
+
+    def _fill_screen_height(self) -> None:
         screen = self.screen() or QApplication.primaryScreen()
         if screen is None:
             return
         area = screen.availableGeometry()
-        dbg = self._debug.frameGeometry()
-        self._debug.move(area.right() - dbg.width() + 1, area.top())
-        dbg = self._debug.frameGeometry()
-        main = self.frameGeometry()
-        self.move(max(area.left(), dbg.left() - main.width() - 40), dbg.top())
+        frame = self.frameGeometry()
+        extra = frame.height() - self.height()
+        self.resize(self.width(), max(1, area.height() - max(0, extra)))
+        frame = self.frameGeometry()
+        self.move(max(area.left(), area.right() - frame.width() + 1), area.top())
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
@@ -818,7 +866,6 @@ class MainWindow(QMainWindow):
         self._stop_record()
         self._unregister_stop_hotkey()
         stop_server()
-        self._debug.close()
         super().closeEvent(event)
 
     def _on_intro_ok(self) -> None:
@@ -855,76 +902,6 @@ class MainWindow(QMainWindow):
         self._stop_record()
         self._set_running(False)
         self._set_status("停止しました")
-
-    def _start_remote_app(self) -> None:
-        script = APP_ROOT.parent / "pc-web-remote" / "main.py"
-        if not script.is_file():
-            QMessageBox.critical(self, "新アプリを起動", "新アプリが見つかりませんでした。")
-            return
-        python = Path(sys.executable)
-        pythonw = python.with_name("pythonw.exe")
-        target = pythonw if pythonw.exists() else python
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            subprocess.Popen(
-                [str(target), str(script)],
-                cwd=str(script.parent),
-                creationflags=flags,
-            )
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "新アプリを起動", str(exc))
-            return
-        self._set_status("新アプリを起動しました")
-
-    def _start_tsum_app(self) -> None:
-        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
-        try:
-            start_tsum(desktop or "")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "ツムツムを起動", str(exc))
-            return
-        self._set_status("ツムツムを起動しました")
-
-    def _confirm_shutdown(self) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle("PCをシャットダウン")
-        box.setText("この PC をシャットダウンしますか？")
-        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
-        box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
-        box.setDefaultButton(yes)
-        box.exec()
-        if box.clickedButton() is not yes:
-            return
-        self._run_shutdown("/s")
-
-    def _confirm_reboot(self) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle("PCを再起動")
-        box.setText("この PC を再起動しますか？")
-        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
-        box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
-        box.setDefaultButton(yes)
-        box.exec()
-        if box.clickedButton() is not yes:
-            return
-        self._run_shutdown("/r")
-
-    def _run_shutdown(self, flag: str) -> None:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            result = subprocess.run(
-                ["shutdown", flag, "/t", "0"],
-                check=False,
-                capture_output=True,
-                text=True,
-                creationflags=flags,
-            )
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "PC", str(exc))
-            return
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout or "実行できませんでした").strip()
-            QMessageBox.critical(self, "PC", err)
 
     def create_launch_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
