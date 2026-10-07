@@ -41,6 +41,7 @@ from app.intro import (
 from app.elsa_skill import run_elsa_skill
 from app.skill_tsum import (
     after_skill_tap,
+    cbuzz_press_to_b,
     skill_breaks_bombs,
     skill_is_cloud,
     skill_is_elsa,
@@ -315,6 +316,7 @@ def run_play(
     last_save_at = 0.0
     ignore_start_until = 0.0
     saw_board = False
+    resumed_pause = False
     match_over = False
     clears = 0
     swipes = 0
@@ -357,7 +359,7 @@ def run_play(
     def fresh_match() -> None:
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
-        nonlocal ignore_start_until, saw_board, skip_after_skill, skip_loss, pooh_long, bomb_after_long
+        nonlocal ignore_start_until, saw_board, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
         nonlocal clears, swipes, coin, skill_taps, skill_ok, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
@@ -390,6 +392,7 @@ def run_play(
         last_save_at = 0.0
         ignore_start_until = time.time() + 6
         saw_board = False
+        resumed_pause = False
         pieces = []
         watching.clear()
         clears = 0
@@ -686,6 +689,27 @@ def run_play(
             if skill_is_cloud(used_tsum):
                 skip_loss = True
                 return True
+            if skill_breaks_bombs(used_tsum):
+                start = skill_tap_at[0] or time.time()
+                if not _cbuzz_activated(skill, start, stop, watch_hit):
+                    return False
+                skip_loss = True
+                if not tsum_unspecified:
+                    after_skill_tap(
+                        used_tsum,
+                        image,
+                        rgb,
+                        say,
+                        stop,
+                        watch_hit=watch_hit,
+                        game=game,
+                        started_at=start,
+                    )
+                n = _break_bombs_until_two(predictor, game, say, stop, watch_hit)
+                bomb_taps += n
+                if n:
+                    last_bomb_at = time.time()
+                return True
             spent_ok = _skill_tap_spent(skill, stop, watch_hit)
             if not spent_ok:
                 return False
@@ -696,11 +720,6 @@ def run_play(
                 )
             if skill_is_pooh(used_tsum):
                 pooh_long = True
-            if skill_breaks_bombs(used_tsum):
-                n = _break_bombs_until_two(predictor, game, say, stop, watch_hit)
-                bomb_taps += n
-                if n:
-                    last_bomb_at = time.time()
             return True
         finally:
             skill_busy[0] = False
@@ -755,10 +774,10 @@ def run_play(
             my_group = looked
 
     def tick_skill_count() -> None:
-        nonlocal skill_my_n, skill_my_full, skill_saw_empty
+        nonlocal skill_my_n, skill_my_full, skill_saw_empty, skill_wait_empty
         if skill is None or rgb is None:
             return
-        fill = _skill_fill(rgb, skill)
+        fill = _meter_skill_fill(rgb, skill)
         if fill is not None and fill >= SKILL_FILL_READY:
             if skill_saw_empty and skill_my_n > 0:
                 if skill_my_full != skill_my_n:
@@ -770,6 +789,10 @@ def run_play(
         if fill is not None and fill < SKILL_FILL_SPENT:
             if not skill_saw_empty:
                 skill_my_n = 0
+                if skill_wait_empty:
+                    skill_wait_empty = False
+                else:
+                    skill_my_full = None
             skill_saw_empty = True
 
     def mytsum_in_chain(chain: list[dict[str, int]]) -> int:
@@ -832,14 +855,15 @@ def run_play(
         found.sort(key=len, reverse=True)
         if pooh_long:
             return found
-        if my_group > 0:
-            found.sort(
-                key=lambda chain: (
-                    len(chain),
-                    int(chain[0].get("group") or 0) == my_group,
-                ),
-                reverse=True,
-            )
+        need = time_bomb_number(used_items)
+        found.sort(
+            key=lambda chain: (
+                len(chain) >= need,
+                len(chain),
+                my_group > 0 and int(chain[0].get("group") or 0) == my_group,
+            ),
+            reverse=True,
+        )
         return found
     kinds_locked = False
     used_items: list[str] | None = start_items
@@ -871,6 +895,7 @@ def run_play(
     checker_alive = [True]
     before_start = [False]
     next_skill_at = [0.0]
+    skill_tap_at = [0.0]
     skill_press_lock = Lock()
 
     def press_skill_now(point) -> None:
@@ -883,6 +908,7 @@ def run_play(
             if now < next_skill_at[0]:
                 return
             next_skill_at[0] = now + SKILL_GAP
+        skill_tap_at[0] = now
         try:
             tap_skill(
                 int(point[0]),
@@ -905,7 +931,10 @@ def run_play(
             return False
         if skill_my_full is None or skill_my_full <= 0:
             return False
-        return skill_my_n + added >= skill_my_full
+        if skill_my_n + added < skill_my_full:
+            return False
+        fill = _meter_skill_fill(rgb, skill)
+        return fill is not None and fill >= SKILL_FILL_SPENT
 
     def mash_skill_until_on(sure: bool) -> bool:
         if skill is None:
@@ -928,6 +957,9 @@ def run_play(
                 _check_stop(stop)
                 if watch_hit.is_set():
                     return False
+                now = time.time()
+                if not tapped:
+                    skill_tap_at[0] = now
                 try:
                     tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
                 except Exception:
@@ -1103,6 +1135,28 @@ def run_play(
                     say("画面を待っています")
                     _sleep_stop(0.25, stop)
                 continue
+            pause = _pause_continue_button(image)
+            on_pause = pause is not None
+            if resumed_pause and not on_pause:
+                saw_board = True
+                match_over = False
+                kinds_locked = True
+                watching.set()
+                if go_at is None:
+                    go_at = time.time()
+                resumed_pause = False
+            if saw_board and pause is not None:
+                say("続けるをクリックします")
+                _slow_tap(pause.center().x(), pause.center().y())
+                _sleep_stop(1.2, stop)
+                saw_board = True
+                match_over = False
+                kinds_locked = True
+                watching.set()
+                if go_at is None:
+                    go_at = time.time()
+                resumed_pause = True
+                continue
             if saw_board:
                 before_start[0] = False
             else:
@@ -1114,7 +1168,7 @@ def run_play(
                 saw_board = False
                 go_at = None
                 watching.clear()
-            elif not saw_board:
+            elif not saw_board and not on_pause:
                 if go_at is None:
                     with _gpu_lock:
                         scene, _score = _scene_top(predictor, rgb)
@@ -1163,8 +1217,11 @@ def run_play(
             else:
                 ended = False
             if not ended and watch_hit.is_set():
-                say("TIME UP / " + _counts_line(clears, swipes, coin))
-                ended = True
+                if _timer_still_running(rgb, timer):
+                    watch_hit.clear()
+                else:
+                    say("TIME UP / " + _counts_line(clears, swipes, coin))
+                    ended = True
             if ended:
                 credit_pending(rgb)
                 flush_idle(True)
@@ -1206,6 +1263,9 @@ def run_play(
             _check_stop(stop)
             if time.time() >= ignore_start_until:
                 start = _match_start_button(image)
+                if start is not None and _start_hearts(image) == 0:
+                    _wait_for_heart(say, stop)
+                    continue
                 if start is not None:
                     ask_used_now(True)
                     found_items = _items_used_pil(rgb)
@@ -1240,8 +1300,23 @@ def run_play(
                         used_items = found_items
                         show_used(found_items)
                 if time.time() >= ignore_start_until:
+                    if _match_start_button(image) is not None and _start_hearts(image) == 0:
+                        _wait_for_heart(say, stop)
+                        continue
                     if _match_start_button(image) is not None:
                         ask_used_now(True)
+                    if pause is not None:
+                        say("続けるをクリックします")
+                        _slow_tap(pause.center().x(), pause.center().y())
+                        _sleep_stop(1.2, stop)
+                        saw_board = True
+                        match_over = False
+                        kinds_locked = True
+                        watching.set()
+                        if go_at is None:
+                            go_at = time.time()
+                        resumed_pause = True
+                        continue
                     if _tap_start_or_continue(image, say, stop):
                         continue
                 play = None if image.isNull() else _play_button(image)
@@ -1291,21 +1366,20 @@ def run_play(
                     pick_n = pick_opts[0]
                 else:
                     found, pick_opts, pick_n = order_found(found)
-                    if my_group > 0 and found:
-                        def _is_mine(chain: list[dict[str, int]]) -> bool:
-                            return int(chain[0].get("group") or 0) == my_group
+                    if found:
+                        need = time_bomb_number(used_items)
 
-                        longest = max(len(chain) for chain in found)
-                        if len(found[0]) < longest and _is_mine(found[0]):
-                            found.sort(
-                                key=lambda chain: (len(chain), _is_mine(chain)),
-                                reverse=True,
-                            )
-                        elif len(found[0]) == longest:
-                            same = [chain for chain in found if len(chain) == longest]
-                            rest = [chain for chain in found if len(chain) != longest]
-                            same.sort(key=_is_mine, reverse=True)
-                            found = same + rest
+                        def _is_mine(chain: list[dict[str, int]]) -> bool:
+                            return my_group > 0 and int(chain[0].get("group") or 0) == my_group
+
+                        found.sort(
+                            key=lambda chain: (
+                                len(chain) >= need,
+                                len(chain),
+                                _is_mine(chain),
+                            ),
+                            reverse=True,
+                        )
                         pick_n = len(found[0])
                         pick_opts = [len(item) for item in found]
             add_idle("find", time.perf_counter() - t0)
@@ -1497,7 +1571,10 @@ def run_play(
                         except Exception:
                             check = image
                             check_rgb = rgb
-                        if not (
+                        if _timer_still_running(check_rgb, timer):
+                            timeup = False
+                            watch_hit.clear()
+                        elif not (
                             check is not None
                             and not check.isNull()
                             and check_rgb is not None
@@ -1850,6 +1927,41 @@ def _learn_board(
     if learned:
         say("消す前の盤面を取り込みました")
     return time.time()
+
+
+def _cbuzz_activated(skill: dict[str, int], started_at: float, stop: Event | None, watch_hit) -> bool:
+    deadline = float(started_at) + cbuzz_press_to_b()
+    saw_yellow = False
+    while True:
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        yellow = None
+        fill = None
+        try:
+            shot = capture_play_frame()
+        except Exception:
+            shot = None
+        rgb = None if shot is None or shot.isNull() else _qimage_rgb(shot)
+        if rgb is not None:
+            button = _skill_button_square(skill)
+            yellow, _blue = _skill_ring_yellow_blue(rgb, button)
+            fill = _skill_fill(rgb, skill)
+        if yellow is not None and yellow >= SLOT_ON:
+            saw_yellow = True
+        elif saw_yellow and yellow is not None:
+            return True
+        if (
+            not saw_yellow
+            and yellow is not None
+            and yellow < SLOT_ON
+            and fill is not None
+            and fill < SKILL_FILL_SPENT
+        ):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _skill_tap_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
@@ -2733,6 +2845,8 @@ def _end_on_timeup(
             coin = ""
             if hit:
                 coin = _read_coin(predictor, rgb, boxes)
+    if _timer_still_running(rgb, timer):
+        return False
     if not hit and not timer_zero and not retry:
         return False
     extra = 0
@@ -2852,6 +2966,11 @@ def _read_timer(predictor, rgb, timer: dict[str, int] | None) -> int | None:
 def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
     left = _read_timer(predictor, rgb, timer)
     return left is not None and left == 0
+
+
+def _timer_still_running(rgb, timer: dict[str, int] | None) -> bool:
+    left = _read_timer(None, rgb, timer)
+    return left is not None and left > 0
 
 
 def _replay_after_timeup(say: StatusFn, stop: Event | None) -> tuple[str, list[str] | None]:
@@ -3270,6 +3389,74 @@ def _read_heart_mail(image) -> tuple[int, str, str] | None:
     return count, number, mail
 
 
+def _heart_mail_badge_on_row(image) -> bool:
+    from PIL import Image
+
+    if isinstance(image, QImage):
+        image = _qimage_rgb(image)
+    if not isinstance(image, Image.Image):
+        return False
+    view = _portrait_frame(image)
+    width, height = view.size
+    scale = 220 / max(width, 1)
+    small = view.resize(
+        (max(1, int(width * scale)), max(1, int(height * scale))),
+        Image.Resampling.BOX,
+    )
+    sw, sh = small.size
+    if sw < 2 or sh < 2:
+        return False
+    for box in _heart_mail_blobs(small, _heart_mail_red, 8):
+        if (box[2] - box[0]) > sw * 0.12:
+            continue
+        cx = (box[0] + box[2]) / 2 / sw
+        cy = (box[1] + box[3]) / 2 / sh
+        if cx > 0.70 and 0.10 < cy < 0.32:
+            return True
+    return False
+
+
+def _start_hearts(image: QImage) -> int | None:
+    if image is None or image.isNull() or _match_start_button(image) is None:
+        return None
+    rgb = _qimage_rgb(image)
+    if rgb is None:
+        return None
+    found = _read_heart_mail(rgb)
+    if found is not None:
+        return int(found[0])
+    if _heart_mail_badge_on_row(rgb):
+        return 0
+    return None
+
+
+def _wait_for_heart(say: StatusFn, stop: Event | None) -> None:
+    said = False
+    while True:
+        _check_stop(stop)
+        try:
+            shot = capture_play_frame()
+        except Exception:
+            shot = None
+        if shot is None or shot.isNull():
+            _sleep_stop(5, stop)
+            continue
+        if _match_start_button(shot) is None:
+            return
+        hearts = _start_hearts(shot)
+        if hearts is None:
+            if not said:
+                return
+        elif hearts > 0:
+            if said:
+                say(f"ハート {hearts}")
+            return
+        elif not said:
+            say("ハートが 0 なので待ちます")
+            said = True
+        _sleep_stop(5, stop)
+
+
 def _say_heart_mail(say: StatusFn, image) -> None:
     from PIL import Image
 
@@ -3330,6 +3517,10 @@ def _click_start_or_continue(
             if items:
                 say("アイテム " + "、".join(items))
             _say_heart_mail(say, image)
+            if _start_hearts(image) == 0:
+                _wait_for_heart(say, stop)
+                deadline = time.time() + 12
+                continue
             if tap_start:
                 say("スタートをクリックします")
                 _slow_tap(start.center().x(), start.center().y())
@@ -3409,6 +3600,9 @@ def _tap_start_now(say: StatusFn, stop: Event | None) -> list[str] | None:
     start = _match_start_button(image)
     if start is None:
         return items
+    if _start_hearts(image) == 0:
+        _wait_for_heart(say, stop)
+        return items
     _say_heart_mail(say, image)
     say("スタートをクリックします")
     _slow_tap(start.center().x(), start.center().y())
@@ -3437,8 +3631,11 @@ def _tap_start_or_continue(image: QImage, say: StatusFn, stop: Event | None) -> 
     if image.isNull():
         return False
     start = _match_start_button(image)
-    resume = _continue_button(image)
+    resume = _pause_continue_button(image) or _continue_button(image)
     if start is not None:
+        if _start_hearts(image) == 0:
+            _wait_for_heart(say, stop)
+            return False
         _say_heart_mail(say, image)
         say("スタートをクリックします")
         _slow_tap(start.center().x(), start.center().y())
@@ -3476,6 +3673,11 @@ def _wait_and_tap_start(say: StatusFn, stop: Event | None) -> bool:
         hits += 1
         if hits < 4:
             _sleep_stop(0.4, stop)
+            continue
+        if _start_hearts(image) == 0:
+            _wait_for_heart(say, stop)
+            hits = 0
+            deadline = time.time() + 90
             continue
         _say_heart_mail(say, image)
         say("スタートをクリックします")

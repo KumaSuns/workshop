@@ -10,17 +10,20 @@ from app.intro import _check_stop
 
 SayFn = Callable[[str], None]
 
-_CBUZZ_FPS = 60.0
-_CBUZZ_A = (0.273, 0.563)
-_CBUZZ_B = (0.673, 0.546)
+_CBUZZ_A = (0.193, 0.566)
+_CBUZZ_B = (0.643, 0.556)
 _CBUZZ_C = (0.500, 0.204)
 _CBUZZ_STEPS = (
-    (_CBUZZ_B, 130, "B"),
-    (_CBUZZ_A, 5, "A"),
-    (_CBUZZ_C, 28, "C"),
-    (_CBUZZ_C, 28, "C"),
-    (_CBUZZ_C, 28, "C"),
+    (_CBUZZ_B, 2.3, "B"),
+    (_CBUZZ_A, 0.08, "A"),
+    (_CBUZZ_C, 0.5, "C"),
+    (_CBUZZ_C, 0.5, "C"),
+    (_CBUZZ_C, 0.5, "C"),
 )
+
+
+def cbuzz_press_to_b() -> float:
+    return float(_CBUZZ_STEPS[0][1])
 
 
 def skill_tsum_key(name: str) -> str:
@@ -62,18 +65,20 @@ def after_skill_tap(
     stop,
     watch_hit=None,
     game=None,
+    started_at: float | None = None,
 ) -> None:
     key = skill_tsum_key(name)
     handler = _AFTER.get(key) or _AFTER.get(key.casefold())
     if handler is None:
         return
-    handler(image, rgb, say, stop, watch_hit, game)
+    handler(image, rgb, say, stop, watch_hit, game, started_at)
 
 
 _PLAIN_SKILL_WAIT = 2.0
 
 
-def _after_plain(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
+def _after_plain(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None) -> None:
+    del started_at
     _wait_until(time.time() + _PLAIN_SKILL_WAIT, stop, watch_hit)
 
 
@@ -86,7 +91,8 @@ _POOH_SWIPE = (
 )
 
 
-def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
+def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None) -> None:
+    del started_at
     width = image.width()
     height = image.height()
     if width < 2 or height < 2:
@@ -106,15 +112,15 @@ def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
     )
 
 
-def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game) -> None:
+def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None) -> None:
     width = image.width()
     height = image.height()
     if width < 2 or height < 2:
         return
-    start = time.time()
+    start = float(started_at) if started_at else time.time()
     at = 0.0
-    for frac, frames, label in _CBUZZ_STEPS:
-        at += frames / _CBUZZ_FPS
+    for frac, delay, label in _CBUZZ_STEPS:
+        at += delay
         _wait_until(start + at, stop, watch_hit)
         if watch_hit is not None and watch_hit.is_set():
             return

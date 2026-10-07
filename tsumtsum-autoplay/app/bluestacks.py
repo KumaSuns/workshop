@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import re
 import struct
@@ -13,6 +14,8 @@ from threading import Lock
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
+
+from app.paths import APP_ROOT
 
 PACKAGE = "com.linecorp.LGTMTM"
 SHORTCUT_NAME = "ツムツム.lnk"
@@ -33,8 +36,31 @@ _mouse_lock = Lock()
 _cap_lock = Lock()
 SWIPE_POINT_S = 0.006
 SWIPE_CENTER_S = 0.018
+_SWIPE_SPEED_PATH = APP_ROOT / "data" / "swipe_speed.json"
 swipe_point_s = SWIPE_POINT_S
 swipe_center_s = SWIPE_CENTER_S
+
+
+def _load_swipe_speeds() -> None:
+    global swipe_point_s, swipe_center_s
+    try:
+        payload = json.loads(_SWIPE_SPEED_PATH.read_text(encoding="utf-8"))
+        point_s = float(payload["point_s"])
+        center_s = float(payload["center_s"])
+    except Exception:
+        return
+    if point_s < 0 or center_s < 0:
+        return
+    swipe_point_s = point_s
+    swipe_center_s = center_s
+
+
+def _save_swipe_speeds() -> None:
+    _SWIPE_SPEED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SWIPE_SPEED_PATH.write_text(
+        json.dumps({"point_s": swipe_point_s, "center_s": swipe_center_s}),
+        encoding="utf-8",
+    )
 
 
 def swipe_speeds() -> tuple[float, float]:
@@ -45,11 +71,15 @@ def set_swipe_speeds(point_s: float, center_s: float) -> None:
     global swipe_point_s, swipe_center_s
     swipe_point_s = float(point_s)
     swipe_center_s = float(center_s)
+    _save_swipe_speeds()
 
 
 def reset_swipe_speeds() -> tuple[float, float]:
     set_swipe_speeds(SWIPE_POINT_S, SWIPE_CENTER_S)
     return swipe_speeds()
+
+
+_load_swipe_speeds()
 
 
 class _MOUSEINPUT(ctypes.Structure):
