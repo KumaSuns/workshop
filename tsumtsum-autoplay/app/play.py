@@ -1438,11 +1438,34 @@ def run_play(
                     seen_keys = {_chain_key(item) for item in found}
                     picked0 = found[0] if found else None
                     board = pieces
-                    while queue:
+                    need_more = False
+                    while queue or need_more:
                         _check_stop(stop)
                         if watch_hit.is_set():
                             timeup = True
                             break
+                        if not queue:
+                            need_more = False
+                            leftover_tsums = [
+                                piece for piece in board if _is_tsum(piece)
+                            ]
+                            if len(leftover_tsums) < MIN_CHAIN:
+                                break
+                            more = list_found(
+                                board,
+                                leftover_tsums,
+                                extra=burst_skip,
+                                used_spots=used,
+                            )
+                            for item in more:
+                                key = _chain_key(item)
+                                if key in seen_keys:
+                                    continue
+                                seen_keys.add(key)
+                                queue.append(item)
+                            if not queue:
+                                break
+                            continue
                         if burst > 0 and apply_checker_skill(True):
                             skip_after_skill = True
                             break
@@ -1500,21 +1523,7 @@ def run_play(
                             if not _is_tsum(piece)
                             or (int(piece["x"]), int(piece["y"])) not in used
                         ]
-                        leftover_tsums = [piece for piece in board if _is_tsum(piece)]
-                        if len(leftover_tsums) < MIN_CHAIN:
-                            break
-                        more = list_found(
-                            board,
-                            leftover_tsums,
-                            extra=burst_skip,
-                            used_spots=used,
-                        )
-                        for item in more:
-                            key = _chain_key(item)
-                            if key in seen_keys:
-                                continue
-                            seen_keys.add(key)
-                            queue.append(item)
+                        need_more = True
                 finally:
                     if not saw_board:
                         watching.clear()
