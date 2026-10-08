@@ -543,8 +543,8 @@ class GroupListWindow(QDialog):
         bar.addWidget(QLabel("ツム種類"))
         self.group_label = QLabel("No.  1")
         bar.addWidget(self.group_label)
-        self.group_down_btn = QPushButton("－")
-        self.group_up_btn = QPushButton("＋")
+        self.group_down_btn = QPushButton("－ (-)")
+        self.group_up_btn = QPushButton("＋ (+)")
         self.group_down_btn.setEnabled(False)
         self.group_up_btn.setEnabled(False)
         bar.addWidget(self.group_down_btn)
@@ -562,6 +562,8 @@ class GroupListWindow(QDialog):
         self.strip.pieceRemoveRequested.connect(self.pieceRemoveRequested.emit)
         self.group_down_btn.clicked.connect(self._nudge_group_down)
         self.group_up_btn.clicked.connect(self._nudge_group_up)
+        QShortcut(QKeySequence(Qt.Key.Key_Minus), self, self._nudge_group_down)
+        QShortcut(QKeySequence(Qt.Key.Key_Plus), self, self._nudge_group_up)
         self.delete_btn.clicked.connect(self._on_delete)
         self.close_btn.clicked.connect(self.close)
 
@@ -600,11 +602,15 @@ class GroupListWindow(QDialog):
         return int(piece.get("group") or 1)
 
     def _nudge_group_down(self) -> None:
+        if not self.group_down_btn.isEnabled():
+            return
         group = self._current_group()
         if group > 1:
             self.groupChanged.emit(group - 1)
 
     def _nudge_group_up(self) -> None:
+        if not self.group_up_btn.isEnabled():
+            return
         group = self._current_group()
         if group < 12:
             self.groupChanged.emit(group + 1)

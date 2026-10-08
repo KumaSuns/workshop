@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -51,8 +52,10 @@ from app.play import (
 
 APP_NAME = "ツムツム オートプレイ"
 _STOP_HOTKEY = 1
+_CAPTURE_HOTKEY = 2
 _WM_HOTKEY = 0x0312
 _VK_Q = 0x51
+_VK_F8 = 0x77
 _MOD_NOREPEAT = 0x4000
 _NOT_CHARM_TSUMS = frozenset(
     {
@@ -197,7 +200,7 @@ class MainWindow(QMainWindow):
         self.settings_btn = QPushButton("設定")
         self.settings_btn.clicked.connect(self._open_swipe_settings)
         layout.addWidget(self.settings_btn)
-        self.capture_btn = QPushButton("消す前の盤面を取り込む")
+        self.capture_btn = QPushButton("消す前の盤面を取り込む (F7)")
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
         layout.addWidget(self.capture_btn)
@@ -205,16 +208,16 @@ class MainWindow(QMainWindow):
         self.skill_n_btn.setCheckable(True)
         self.skill_n_btn.toggled.connect(self._on_skill_n_toggled)
         layout.addWidget(self.skill_n_btn)
-        self.shot_btn = QPushButton("キャプチャー")
+        self.shot_btn = QPushButton("キャプチャー (F8)")
         self.shot_btn.clicked.connect(self.on_capture_screen)
         layout.addWidget(self.shot_btn)
         self.play_btn = QPushButton("PLAY")
         self.play_btn.clicked.connect(self.on_play)
         layout.addWidget(self.play_btn)
-        self.now_btn = QPushButton("今すぐプレイ")
+        self.now_btn = QPushButton("今すぐプレイ (F5)")
         self.now_btn.clicked.connect(self.on_play_now)
         layout.addWidget(self.now_btn)
-        self.loop_btn = QPushButton("連続プレイ")
+        self.loop_btn = QPushButton("連続プレイ (F6)")
         self.loop_btn.clicked.connect(self.on_loop_play)
         layout.addWidget(self.loop_btn)
         self.record_btn = QPushButton("1プレイを録画")
@@ -262,6 +265,11 @@ class MainWindow(QMainWindow):
         self._front_timer.setInterval(800)
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
+        self._f8_down = False
+        self._capture_at = 0.0
+        self._capture_key_timer = QTimer(self)
+        self._capture_key_timer.setInterval(50)
+        self._capture_key_timer.timeout.connect(self._poll_capture_key)
         self._debug.append("待機中")
         try:
             self._debug.append(start_server())
@@ -282,6 +290,10 @@ class MainWindow(QMainWindow):
             self._count_skill.clear()
 
     def on_capture_screen(self) -> None:
+        now = time.monotonic()
+        if now - self._capture_at < 0.4:
+            return
+        self._capture_at = now
         try:
             image = capture_play_frame()
         except Exception as exc:  # noqa: BLE001
@@ -419,8 +431,11 @@ class MainWindow(QMainWindow):
             self._front_timer.stop()
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
             self.show()
+            self._f8_down = False
             self._register_stop_hotkey()
+            self._capture_key_timer.start()
         else:
+            self._capture_key_timer.stop()
             self._unregister_stop_hotkey()
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
             self.show()
@@ -879,7 +894,27 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
             self.on_stop()
             return
+        if self._button_key(event):
+            return
         super().keyPressEvent(event)
+
+    def _button_key(self, event) -> bool:
+        if event.isAutoRepeat() or QApplication.activeModalWidget() is not None:
+            return False
+        key = event.key()
+        if key == Qt.Key.Key_F5:
+            self.on_play_now()
+            return True
+        if key == Qt.Key.Key_F6:
+            self.on_loop_play()
+            return True
+        if key == Qt.Key.Key_F7:
+            self.capture_btn.click()
+            return True
+        if key == Qt.Key.Key_F8:
+            self.on_capture_screen()
+            return True
+        return False
 
     def eventFilter(self, watched, event) -> bool:
         if (
@@ -899,7 +934,20 @@ class MainWindow(QMainWindow):
             if not event.isAutoRepeat() and self._is_busy():
                 self.on_stop()
                 return True
+        if event.type() == QEvent.Type.KeyPress and self._button_key(event):
+            return True
         return super().eventFilter(watched, event)
+
+    def _poll_capture_key(self) -> None:
+        if sys.platform != "win32" or not self._is_busy():
+            return
+        import ctypes
+
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F8) & 0x8000)
+        pressed = down and not self._f8_down
+        self._f8_down = down
+        if pressed:
+            self.on_capture_screen()
 
     def nativeEvent(self, eventType, message):
         if sys.platform == "win32":
@@ -912,6 +960,9 @@ class MainWindow(QMainWindow):
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _STOP_HOTKEY:
                     QTimer.singleShot(0, self.on_stop)
                     return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _CAPTURE_HOTKEY:
+                    QTimer.singleShot(0, self.on_capture_screen)
+                    return True, 0
         return super().nativeEvent(eventType, message)
 
     def _register_stop_hotkey(self) -> None:
@@ -922,6 +973,9 @@ class MainWindow(QMainWindow):
         ctypes.windll.user32.RegisterHotKey(
             int(self.winId()), _STOP_HOTKEY, _MOD_NOREPEAT, _VK_Q
         )
+        ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _CAPTURE_HOTKEY, _MOD_NOREPEAT, _VK_F8
+        )
 
     def _unregister_stop_hotkey(self) -> None:
         if sys.platform != "win32":
@@ -929,6 +983,7 @@ class MainWindow(QMainWindow):
         import ctypes
 
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _CAPTURE_HOTKEY)
 
     def closeEvent(self, event) -> None:
         self._stop_record()

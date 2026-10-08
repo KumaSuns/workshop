@@ -19,7 +19,6 @@ from app.bluestacks import (
     capture_play_frame,
     capture_screen_path,
     capture_window_frame,
-    try_capture_play_frame,
     reset_swipe_mouse,
     swipe_path,
     tap,
@@ -364,7 +363,7 @@ def run_play(
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
         nonlocal my_group, match_picks, idle_pick, idle_acc, idle_since
-        nonlocal skill_my_n, skill_my_full, skill_saw_empty
+        nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
@@ -437,6 +436,7 @@ def run_play(
         my_group = 0
         skill_my_n = 0
         skill_my_full = None
+        skill_my_held = False
         skill_saw_empty = False
         watch_hit.clear()
         watching.clear()
@@ -752,6 +752,7 @@ def run_play(
     my_group = 0
     skill_my_n = 0
     skill_my_full: int | None = None
+    skill_my_held = False
     skill_saw_empty = False
     kinds = 5
 
@@ -774,18 +775,21 @@ def run_play(
             my_group = looked
 
     def tick_skill_count() -> None:
-        nonlocal skill_my_n, skill_my_full, skill_saw_empty, skill_wait_empty
+        nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty, skill_wait_empty
         if skill is None or rgb is None:
             return
         fill = _meter_skill_fill(rgb, skill)
         if fill is not None and fill >= SKILL_FILL_READY:
-            if skill_saw_empty and skill_my_n > 0:
+            yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+            if yellow >= SLOT_ON and skill_saw_empty and skill_my_n > 0:
                 if skill_my_full != skill_my_n:
                     skill_my_full = skill_my_n
+                    skill_my_held = True
                     if count_skill_on():
                         say(f"スキル満タン {skill_my_full}個")
                 skill_saw_empty = False
-            return
+            if yellow >= SLOT_ON:
+                return
         if fill is not None and fill < SKILL_FILL_SPENT:
             if not skill_saw_empty:
                 skill_my_n = 0
@@ -793,6 +797,7 @@ def run_play(
                     skill_wait_empty = False
                 else:
                     skill_my_full = None
+                    skill_my_held = False
             skill_saw_empty = True
 
     def mytsum_in_chain(chain: list[dict[str, int]]) -> int:
@@ -820,9 +825,7 @@ def run_play(
         extra: list[frozenset[tuple[int, int]]] | None = None,
         used_spots: set[tuple[int, int]] | None = None,
     ) -> list[list[dict[str, int]]]:
-        gone = set(pending_used)
-        if used_spots:
-            gone |= used_spots
+        gone = set(used_spots or ())
         live = [
             piece
             for piece in pieces
@@ -929,7 +932,7 @@ def run_play(
         added = mytsum_in_chain(chain)
         if skill is None or added <= 0 or not skill_saw_empty or watch_hit.is_set():
             return False
-        if skill_my_full is None or skill_my_full <= 0:
+        if skill_my_full is None or skill_my_full <= 0 or not skill_my_held:
             return False
         if skill_my_n + added < skill_my_full:
             return False
@@ -937,7 +940,7 @@ def run_play(
         return fill is not None and fill >= SKILL_FILL_SPENT
 
     def mash_skill_until_on(sure: bool) -> bool:
-        if skill is None:
+        if skill is None or not sure:
             return False
         button = _skill_button_square(skill)
         point = (
@@ -994,28 +997,24 @@ def run_play(
     play_frame_at = [0.0]
 
     def _watch_skill_window() -> None:
+        seen = None
         while checker_alive[0] and (stop is None or not stop.is_set()):
+            shot = play_frame[0]
+            rgb_now = play_frame[1]
             if (
                 not saw_board
                 or before_start[0]
                 or watch_hit.is_set()
                 or skill is None
                 or skill_busy[0]
-                or time.time() - play_frame_at[0] < 0.25
+                or shot is None
+                or shot is seen
+                or rgb_now is None
+                or shot.isNull()
             ):
                 time.sleep(0.05)
                 continue
-            try:
-                shot = try_capture_play_frame()
-            except Exception:
-                shot = None
-            if shot is None or shot.isNull():
-                time.sleep(0.05)
-                continue
-            rgb_now = _qimage_rgb(shot)
-            if rgb_now is None:
-                time.sleep(0.05)
-                continue
+            seen = shot
             ready = _skill_ready(rgb_now, skill, used_tsum)
             left = latest_gauge[3]
             if ready and skill_is_gadget(used_tsum) and _gadget_skill_hold(
@@ -1024,7 +1023,7 @@ def run_play(
                 left,
             ):
                 ready = False
-            if ready and not skill_busy[0]:
+            if ready and not skill_is_gadget(used_tsum) and not skill_busy[0]:
                 button = _skill_button_square(skill)
                 press_skill_now(
                     (
@@ -1097,7 +1096,7 @@ def run_play(
             latest_gauge[5] = ok
             latest_gauge[6] = tap_at
             latest_gauge[7] = fever_hold
-            if ready:
+            if ready and not skill_is_gadget(used_tsum):
                 press_skill_now(tap_at)
             gauges(
                 _meter_skill_fill(shot_rgb, skill),
@@ -1383,14 +1382,30 @@ def run_play(
                         pick_n = len(found[0])
                         pick_opts = [len(item) for item in found]
             add_idle("find", time.perf_counter() - t0)
+            if (
+                skill_is_gadget(used_tsum)
+                and skill is not None
+                and not watch_hit.is_set()
+                and not skill_busy[0]
+                and pending_spots is None
+                and _skill_ready(rgb, skill, used_tsum)
+                and not _gadget_skill_hold(
+                    _fever_playing(rgb, game),
+                    _meter_fever_fill(rgb, fever, skill, fan),
+                    latest_gauge[3],
+                )
+            ):
+                button = _skill_button_square(skill)
+                press_skill_now(
+                    (
+                        int(button["x"] + max(1, int(button["w"])) / 2),
+                        int(button["y"] + max(1, int(button["h"])) / 2),
+                        int(image.width()),
+                        int(image.height()),
+                    )
+                )
             if found:
                 say("候補 " + " / ".join(str(len(item)) for item in found))
-                if break_to_one():
-                    continue
-                if bomb_after_long:
-                    if try_bomb(skill_sit(True), force=True):
-                        bomb_after_long = False
-                        continue
                 looked_after_skill = skip_after_skill
                 skip_after_skill = False
                 t0 = time.perf_counter()
@@ -1497,19 +1512,25 @@ def run_play(
                             continue
                         swipes += 1
                         say(_counts_line(clears, swipes, coin))
-                        added = mytsum_in_chain(chain)
+                        already_pending = bool(spots & pending_used)
+                        added = 0 if already_pending else mytsum_in_chain(chain)
                         sure = (
                             skill_my_full is not None
                             and skill_my_full > 0
                             and skill_my_n + added >= skill_my_full
                         )
-                        if about_to_fill_skill(chain) and mash_skill_until_on(sure):
+                        if (
+                            not already_pending
+                            and about_to_fill_skill(chain)
+                            and mash_skill_until_on(sure)
+                        ):
                             if skill_pressed is not None:
                                 skill_pressed.set()
                             apply_checker_skill(True)
                             skip_after_skill = True
                             break
-                        burst_my_n += mytsum_in_chain(chain)
+                        if not already_pending:
+                            burst_my_n += added
                         burst += 1
                         burst_max = max(burst_max, len(chain))
                         used |= spots

@@ -10,15 +10,15 @@ from app.intro import _check_stop
 
 SayFn = Callable[[str], None]
 
-_CBUZZ_A = (0.193, 0.566)
-_CBUZZ_B = (0.643, 0.556)
+_CBUZZ_A = (0.193, 0.556)
+_CBUZZ_B = (0.633, 0.556)
 _CBUZZ_C = (0.500, 0.204)
 _CBUZZ_STEPS = (
-    (_CBUZZ_B, 2.3, "B"),
+    (_CBUZZ_B, 2.5, "B"),
     (_CBUZZ_A, 0.08, "A"),
-    (_CBUZZ_C, 0.5, "C"),
-    (_CBUZZ_C, 0.5, "C"),
-    (_CBUZZ_C, 0.5, "C"),
+    (_CBUZZ_C, 0.45, "C"),
+    (_CBUZZ_C, 0.48, "C"),
+    (_CBUZZ_C, 0.4, "C"),
 )
 
 
