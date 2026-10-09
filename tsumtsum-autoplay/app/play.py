@@ -1457,8 +1457,11 @@ def run_play(
                     while queue or need_more:
                         _check_stop(stop)
                         if watch_hit.is_set():
-                            timeup = True
-                            break
+                            if _timer_still_running(rgb, timer):
+                                watch_hit.clear()
+                            else:
+                                timeup = True
+                                break
                         if not queue:
                             need_more = False
                             leftover_tsums = [
@@ -1481,9 +1484,6 @@ def run_play(
                             if not queue:
                                 break
                             continue
-                        if burst > 0 and apply_checker_skill(True):
-                            skip_after_skill = True
-                            break
                         chain = queue.pop(0)
                         spots = {(int(piece["x"]), int(piece["y"])) for piece in chain}
                         if spots & used:
@@ -1507,7 +1507,6 @@ def run_play(
                             say,
                             stop,
                             preview,
-                            watch_hit,
                         ):
                             continue
                         swipes += 1

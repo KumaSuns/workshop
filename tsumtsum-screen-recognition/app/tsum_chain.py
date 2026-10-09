@@ -574,7 +574,7 @@ def _pick_diverse(
     limit: int,
 ) -> list[list[dict[str, int]]]:
     selected: list[list[dict[str, int]]] = []
-    keys: list[frozenset[tuple[int, int, int]]] = []
+    taken: set[tuple[int, int, int]] = set()
     for path in paths:
         if len(path) < MIN_CHAIN:
             continue
@@ -582,10 +582,10 @@ def _pick_diverse(
             (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
             for piece in path
         )
-        if any(key & old for old in keys):
+        if key <= taken:
             continue
         selected.append(path)
-        keys.append(key)
+        taken |= key
         if len(selected) >= limit:
             break
     return selected
