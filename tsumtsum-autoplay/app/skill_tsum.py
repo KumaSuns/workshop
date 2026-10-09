@@ -5,20 +5,20 @@ from typing import Callable
 
 from PySide6.QtGui import QImage
 
-from app.bluestacks import swipe_path, tap
+from app.bluestacks import capture_play_frame, swipe_path, tap
 from app.intro import _check_stop
 
 SayFn = Callable[[str], None]
 
-_CBUZZ_A = (0.193, 0.556)
+_CBUZZ_A = (0.317, 0.556)
 _CBUZZ_B = (0.633, 0.556)
 _CBUZZ_C = (0.500, 0.204)
 _CBUZZ_STEPS = (
     (_CBUZZ_B, 2.5, "B"),
     (_CBUZZ_A, 0.08, "A"),
     (_CBUZZ_C, 0.45, "C"),
-    (_CBUZZ_C, 0.48, "C"),
-    (_CBUZZ_C, 0.4, "C"),
+    (_CBUZZ_C, 0.52, "C"),
+    (_CBUZZ_C, 0.52, "C"),
 )
 
 
@@ -112,18 +112,99 @@ def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_a
     )
 
 
+def _cbuzz_pose_on(image: QImage) -> bool:
+    width = image.width()
+    height = image.height()
+    if width < 2 or height < 2:
+        return False
+    left = int(width * 0.28)
+    top = int(height * 0.30)
+    right = int(width * 0.72)
+    bottom = int(height * 0.72)
+    if right - left < 8 or bottom - top < 8:
+        return False
+    step = max(1, min(right - left, bottom - top) // 70)
+    cols = list(range(left, right, step))
+    rows = list(range(top, bottom, step))
+    mask = []
+    for y in rows:
+        row = []
+        for x in cols:
+            color = image.pixel(x, y)
+            red = (color >> 16) & 255
+            green = (color >> 8) & 255
+            blue = color & 255
+            row.append(green > 90 and green > red + 15 and green >= blue - 10 and red < 160)
+        mask.append(row)
+    height_n = len(mask)
+    width_n = len(mask[0])
+    seen = [[False] * width_n for _ in range(height_n)]
+    best = 0
+    for y in range(height_n):
+        for x in range(width_n):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            count = 0
+            while stack:
+                cx, cy = stack.pop()
+                count += 1
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < width_n and 0 <= ny < height_n and mask[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if count > best:
+                best = count
+    return best / (height_n * width_n) >= 0.03
+
+
+def _wait_cbuzz_b(start: float, stop, watch_hit) -> bool:
+    fallback = float(start) + 2.5
+    limit = float(start) + 5.0
+    saw = False
+    while True:
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        now = time.time()
+        try:
+            shot = capture_play_frame()
+        except Exception:
+            shot = None
+        if shot is None or shot.isNull():
+            if now >= limit:
+                return True
+            time.sleep(0.02)
+            continue
+        on = _cbuzz_pose_on(shot)
+        if on:
+            saw = True
+        elif saw:
+            return True
+        if not saw and now >= fallback:
+            return True
+        if now >= limit:
+            return True
+        time.sleep(0.02)
+
+
 def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None) -> None:
     width = image.width()
     height = image.height()
     if width < 2 or height < 2:
         return
     start = float(started_at) if started_at else time.time()
-    at = 0.0
+    if not _wait_cbuzz_b(start, stop, watch_hit):
+        return
+    first = True
     for frac, delay, label in _CBUZZ_STEPS:
-        at += delay
-        _wait_until(start + at, stop, watch_hit)
-        if watch_hit is not None and watch_hit.is_set():
-            return
+        if not first:
+            _wait_until(time.time() + delay, stop, watch_hit)
+            if watch_hit is not None and watch_hit.is_set():
+                return
+        first = False
         x = int(frac[0] * width)
         y = int(frac[1] * height)
         say(f"cバズ {label} {x},{y}")
