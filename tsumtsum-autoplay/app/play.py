@@ -39,6 +39,7 @@ from app.intro import (
 )
 from app.elsa_skill import run_elsa_skill
 from app.skill_tsum import (
+    _cbuzz_pose_on,
     after_skill_tap,
     cbuzz_press_to_b,
     skill_breaks_bombs,
@@ -691,7 +692,8 @@ def run_play(
                 return True
             if skill_breaks_bombs(used_tsum):
                 start = skill_tap_at[0] or time.time()
-                if not _cbuzz_activated(skill, start, stop, watch_hit):
+                activated, pose_seen = _cbuzz_activated(skill, start, stop, watch_hit)
+                if not activated:
                     return False
                 skip_loss = True
                 if fan is not None:
@@ -710,6 +712,7 @@ def run_play(
                         watch_hit=watch_hit,
                         game=game,
                         started_at=start,
+                        pose_seen=pose_seen,
                     )
                 n = _break_bombs_until_two(predictor, game, say, stop, watch_hit)
                 bomb_taps += n
@@ -867,9 +870,17 @@ def run_play(
         need = time_bomb_number(used_items)
         found.sort(
             key=lambda chain: (
-                len(chain) >= need,
-                len(chain),
-                my_group > 0 and int(chain[0].get("group") or 0) == my_group,
+                (
+                    my_group > 0 and int(chain[0].get("group") or 0) == my_group,
+                    len(chain) >= need,
+                    len(chain),
+                )
+                if skill_breaks_bombs(used_tsum)
+                else (
+                    len(chain) >= need,
+                    len(chain),
+                    my_group > 0 and int(chain[0].get("group") or 0) == my_group,
+                )
             ),
             reverse=True,
         )
@@ -942,7 +953,14 @@ def run_play(
         was_busy = skill_busy[0]
         skill_busy[0] = True
         try:
-            n = _break_bombs_until_zero(predictor, game, say, stop, watch_hit)
+            n = _break_bombs_until_zero(
+                predictor,
+                game,
+                say,
+                stop,
+                watch_hit,
+                seed=(image, pieces),
+            )
             bomb_taps += n
             if n:
                 last_bomb_at = time.time()
@@ -963,7 +981,7 @@ def run_play(
         )
 
     def about_to_fill_skill(chain: list[dict[str, int]]) -> bool:
-        if skill_is_gadget(used_tsum):
+        if skill_is_gadget(used_tsum) or skill_breaks_bombs(used_tsum):
             return False
         added = mytsum_in_chain(chain)
         if skill is None or added <= 0 or not skill_saw_empty or watch_hit.is_set():
@@ -980,7 +998,7 @@ def run_play(
 
     def mash_skill_until_on(sure: bool) -> bool:
         nonlocal skill_my_n, skill_saw_empty
-        if skill is None or not sure:
+        if skill is None or not sure or skill_breaks_bombs(used_tsum):
             return False
         if time.time() < next_skill_at[0]:
             return False
@@ -1406,6 +1424,28 @@ def run_play(
             erased_now = False
             if credit_pending(rgb):
                 erased_now = True
+            skill_now = (
+                saw_board
+                and skill is not None
+                and not watch_hit.is_set()
+                and not skill_busy[0]
+                and time.time() >= next_skill_at[0]
+                and _skill_ready(rgb, skill, used_tsum)
+            )
+            if skill_now and skill_is_gadget(used_tsum) and (
+                pending_spots is not None
+                or _gadget_skill_hold(
+                    _fever_playing(rgb, game),
+                    _meter_fever_fill(rgb, fever, skill, fan),
+                    latest_gauge[3],
+                )
+            ):
+                skill_now = False
+            if skill_now:
+                _press_ready_skill()
+                if skill_pressed is not None and skill_pressed.is_set():
+                    apply_checker_skill(False)
+                    continue
             t0 = time.perf_counter()
             heat_s = 0.0
             type_s = 0.0
@@ -1445,9 +1485,17 @@ def run_play(
 
                         found.sort(
                             key=lambda chain: (
-                                len(chain) >= need,
-                                len(chain),
-                                _is_mine(chain),
+                                (
+                                    _is_mine(chain),
+                                    len(chain) >= need,
+                                    len(chain),
+                                )
+                                if skill_breaks_bombs(used_tsum)
+                                else (
+                                    len(chain) >= need,
+                                    len(chain),
+                                    _is_mine(chain),
+                                )
                             ),
                             reverse=True,
                         )
@@ -1609,6 +1657,19 @@ def run_play(
                             if not _is_tsum(piece)
                             or (int(piece["x"]), int(piece["y"])) not in used
                         ]
+                        have = {
+                            frozenset((int(piece["x"]), int(piece["y"])) for piece in item)
+                            for item in queue
+                        }
+                        for item in list_found(pieces, tsums, used_spots=used):
+                            spots_item = {(int(piece["x"]), int(piece["y"])) for piece in item}
+                            if spots_item & used:
+                                continue
+                            key = frozenset(spots_item)
+                            if key in have:
+                                continue
+                            queue.append(item)
+                            have.add(key)
                 finally:
                     skill_busy[0] = False
                     if not saw_board:
@@ -2051,19 +2112,24 @@ def _learn_board(
     return time.time()
 
 
-def _cbuzz_activated(skill: dict[str, int], started_at: float, stop: Event | None, watch_hit) -> bool:
+def _cbuzz_activated(
+    skill: dict[str, int], started_at: float, stop: Event | None, watch_hit
+) -> tuple[bool, bool]:
+    del watch_hit
     deadline = float(started_at) + cbuzz_press_to_b()
+    limit = float(started_at) + 5.0
     saw_yellow = False
     while True:
         _check_stop(stop)
-        if watch_hit is not None and watch_hit.is_set():
-            return False
+        now = time.time()
         yellow = None
         fill = None
         try:
             shot = capture_play_frame()
         except Exception:
             shot = None
+        if shot is not None and not shot.isNull() and _cbuzz_pose_on(shot):
+            return True, True
         rgb = None if shot is None or shot.isNull() else _qimage_rgb(shot)
         if rgb is not None:
             button = _skill_button_square(skill)
@@ -2072,7 +2138,7 @@ def _cbuzz_activated(skill: dict[str, int], started_at: float, stop: Event | Non
         if yellow is not None and yellow >= SLOT_ON:
             saw_yellow = True
         elif saw_yellow and yellow is not None:
-            return True
+            return True, False
         if (
             not saw_yellow
             and yellow is not None
@@ -2080,9 +2146,11 @@ def _cbuzz_activated(skill: dict[str, int], started_at: float, stop: Event | Non
             and fill is not None
             and fill < SKILL_FILL_SPENT
         ):
-            return True
-        if time.time() >= deadline:
-            return False
+            return True, False
+        if now >= limit:
+            return False, False
+        if now >= deadline and not saw_yellow:
+            return False, False
         time.sleep(0.1)
 
 
@@ -2715,6 +2783,7 @@ def _break_bombs_until_zero(
     say: StatusFn,
     stop: Event | None,
     watch_hit: Event,
+    seed: tuple | None = None,
 ) -> int:
     if game is None:
         return 0
@@ -2724,17 +2793,24 @@ def _break_bombs_until_zero(
         _check_stop(stop)
         if watch_hit.is_set():
             return taps
-        try:
-            image = capture_play_frame()
-            rgb = _qimage_rgb(image)
-        except Exception:
-            _sleep_stop(ERASE_WAIT, stop)
-            continue
-        if rgb is None or image.isNull():
-            _sleep_stop(ERASE_WAIT, stop)
-            continue
-        with _gpu_lock:
-            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+        if seed is not None:
+            image, pieces = seed
+            seed = None
+            rgb = None if image is None else _qimage_rgb(image)
+        else:
+            try:
+                image = capture_play_frame()
+                rgb = _qimage_rgb(image)
+            except Exception:
+                _sleep_stop(ERASE_WAIT, stop)
+                continue
+            if rgb is None or image.isNull():
+                _sleep_stop(ERASE_WAIT, stop)
+                continue
+            with _gpu_lock:
+                pieces = predictor.predict_pieces(
+                    Path("."), game, rgb=rgb, inner=False, assign_groups=False
+                )
         bombs = _bombs_on_board(pieces, game)
         if not bombs:
             return taps
@@ -2794,18 +2870,13 @@ def _break_bombs_until_two(
         bombs = _bombs_on_board(pieces, game)
         n = len(bombs)
         tsums = [piece for piece in pieces if _is_tsum(piece)]
-        if n == 2:
-            say("cバズ ボム 2")
-            return taps
-        if n > 2:
+        if n > 1:
             say(f"cバズ ボム {n}")
             extra = [
                 piece
-                for piece in sorted(
-                    bombs, key=lambda piece: int(piece.get("r") or 0), reverse=True
-                )
+                for piece in sorted(bombs, key=lambda piece: int(piece["y"]))
                 if _piece_cell(piece) not in skip
-            ][: n - 2]
+            ][: n - 1]
             if not extra:
                 return taps
             for bomb in extra:

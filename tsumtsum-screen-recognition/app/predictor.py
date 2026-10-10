@@ -289,6 +289,7 @@ class Predictor:
         kinds: int = 0,
         rgb: Image.Image | None = None,
         inner: bool = True,
+        assign_groups: bool = True,
     ) -> list[dict[str, int]]:
         if self.piece_model is None:
             return []
@@ -358,7 +359,8 @@ class Predictor:
             )
         self.last_heat_s = time.perf_counter() - t_heat
         t_type = time.perf_counter()
-        self._assign_groups(rgb, pieces, kinds=kinds, inner=inner)
+        if assign_groups:
+            self._assign_groups(rgb, pieces, kinds=kinds, inner=inner)
         self.last_type_s = time.perf_counter() - t_type
         return pieces
 

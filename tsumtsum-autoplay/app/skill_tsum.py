@@ -15,10 +15,10 @@ _CBUZZ_B = (0.633, 0.556)
 _CBUZZ_C = (0.500, 0.204)
 _CBUZZ_STEPS = (
     (_CBUZZ_B, 2.5, "B"),
-    (_CBUZZ_A, 0.08, "A"),
+    (_CBUZZ_A, 0.04, "A"),
+    (_CBUZZ_C, 0.28, "C"),
+    (_CBUZZ_C, 0.42, "C"),
     (_CBUZZ_C, 0.45, "C"),
-    (_CBUZZ_C, 0.52, "C"),
-    (_CBUZZ_C, 0.52, "C"),
 )
 
 
@@ -66,19 +66,20 @@ def after_skill_tap(
     watch_hit=None,
     game=None,
     started_at: float | None = None,
+    pose_seen: bool = False,
 ) -> None:
     key = skill_tsum_key(name)
     handler = _AFTER.get(key) or _AFTER.get(key.casefold())
     if handler is None:
         return
-    handler(image, rgb, say, stop, watch_hit, game, started_at)
+    handler(image, rgb, say, stop, watch_hit, game, started_at, pose_seen)
 
 
 _PLAIN_SKILL_WAIT = 2.0
 
 
-def _after_plain(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None) -> None:
-    del started_at
+def _after_plain(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None, pose_seen=False) -> None:
+    del started_at, pose_seen
     _wait_until(time.time() + _PLAIN_SKILL_WAIT, stop, watch_hit)
 
 
@@ -91,8 +92,8 @@ _POOH_SWIPE = (
 )
 
 
-def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None) -> None:
-    del started_at
+def _after_pooh(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None, pose_seen=False) -> None:
+    del started_at, pose_seen
     width = image.width()
     height = image.height()
     if width < 2 or height < 2:
@@ -160,14 +161,14 @@ def _cbuzz_pose_on(image: QImage) -> bool:
     return best / (height_n * width_n) >= 0.03
 
 
-def _wait_cbuzz_b(start: float, stop, watch_hit) -> bool:
+def _wait_cbuzz_b(start: float, stop, watch_hit, pose_seen: bool = False) -> bool:
+    del watch_hit
     fallback = float(start) + 2.5
     limit = float(start) + 5.0
-    saw = False
+    saw = bool(pose_seen)
+    off = 0
     while True:
         _check_stop(stop)
-        if watch_hit is not None and watch_hit.is_set():
-            return False
         now = time.time()
         try:
             shot = capture_play_frame()
@@ -181,29 +182,30 @@ def _wait_cbuzz_b(start: float, stop, watch_hit) -> bool:
         on = _cbuzz_pose_on(shot)
         if on:
             saw = True
+            off = 0
         elif saw:
-            return True
-        if not saw and now >= fallback:
+            off += 1
+            if off >= 2:
+                return True
+        elif now >= fallback:
             return True
         if now >= limit:
             return True
         time.sleep(0.02)
 
 
-def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None) -> None:
+def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_at=None, pose_seen=False) -> None:
     width = image.width()
     height = image.height()
     if width < 2 or height < 2:
         return
     start = float(started_at) if started_at else time.time()
-    if not _wait_cbuzz_b(start, stop, watch_hit):
+    if not _wait_cbuzz_b(start, stop, watch_hit, pose_seen):
         return
     first = True
     for frac, delay, label in _CBUZZ_STEPS:
         if not first:
-            _wait_until(time.time() + delay, stop, watch_hit)
-            if watch_hit is not None and watch_hit.is_set():
-                return
+            _wait_until(time.time() + delay, stop, None)
         first = False
         x = int(frac[0] * width)
         y = int(frac[1] * height)

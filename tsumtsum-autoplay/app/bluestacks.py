@@ -578,7 +578,11 @@ def _send_mouse_path_locked(
 
     x0, y0 = mapped[0]
     emit(x0, y0, move)
-    time.sleep(0.01)
+    if len(mapped) == 1:
+        time.sleep(0.05)
+        emit(x0, y0, move)
+    else:
+        time.sleep(0.01)
     emit(x0, y0, down)
     time.sleep(0.03)
     if abort is not None and abort.is_set():
@@ -615,7 +619,10 @@ def _tap_mouse(
         return False
     hwnd = _player_hwnd(user32, wintypes)
     if hwnd:
+        front = int(user32.GetForegroundWindow() or 0)
         user32.SetForegroundWindow(hwnd)
+        if front != int(hwnd):
+            time.sleep(0.2)
     send = _send_mouse_path_locked if locked else _send_mouse_path
     return send(user32, mapped, set())
 
