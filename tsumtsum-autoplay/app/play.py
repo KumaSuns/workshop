@@ -30,6 +30,7 @@ from app.intro import (
     _check_stop,
     _close_button,
     _continue_button,
+    _daily_mission_button,
     _in_play_hud,
     _match_start_button,
     _pause_continue_button,
@@ -1212,9 +1213,10 @@ def run_play(
                     say("画面を待っています")
                     _sleep_stop(0.25, stop)
                 continue
+            on_mission = _daily_mission_button(image) is not None
             pause = _pause_continue_button(image)
             on_pause = pause is not None
-            if resumed_pause and not on_pause:
+            if resumed_pause and not on_pause and not on_mission:
                 saw_board = True
                 match_over = False
                 kinds_locked = True
@@ -1222,7 +1224,7 @@ def run_play(
                 if go_at is None:
                     go_at = time.time()
                 resumed_pause = False
-            if saw_board and pause is not None:
+            if saw_board and pause is not None and not on_mission:
                 say("続けるをクリックします")
                 _slow_tap(pause.center().x(), pause.center().y())
                 _sleep_stop(1.2, stop)
@@ -1234,7 +1236,9 @@ def run_play(
                     go_at = time.time()
                 resumed_pause = True
                 continue
-            if saw_board:
+            if on_mission:
+                before_start[0] = True
+            elif saw_board:
                 before_start[0] = False
             else:
                 on_start = _match_start_button(image) is not None
@@ -1375,6 +1379,19 @@ def run_play(
                     kinds_locked = True
                     say(f"5＞4 {'使用' if used else '未使用'} / 種類 {kinds}")
             if not saw_board:
+                retry = None if image.isNull() else _retry_button(image)
+                if retry is not None and _match_start_button(image) is None:
+                    say("リトライをクリックします")
+                    _slow_tap(retry.center().x(), retry.center().y())
+                    _sleep_stop(1.2, stop)
+                    continue
+                if on_mission:
+                    play = None if image.isNull() else _play_button(image)
+                    if play is not None:
+                        say("プレイをクリックします")
+                        _slow_tap(play.center().x(), play.center().y())
+                        _sleep_stop(2.0, stop)
+                    continue
                 if match_over:
                     close = None if image.isNull() else _close_button(image)
                     if close is not None:
@@ -3769,6 +3786,24 @@ def _click_start_or_continue(
             else:
                 say("スタートを検出しました")
             return kinds, locked, "start", used_name, items
+        retry = None if skip_retry else _retry_button(image)
+        if retry is not None:
+            say("リトライをクリックします")
+            _slow_tap(retry.center().x(), retry.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        if _daily_mission_button(image) is not None:
+            play = _play_button(image)
+            if play is not None:
+                say("プレイをクリックします")
+                _slow_tap(play.center().x(), play.center().y())
+                _sleep_stop(1.2, stop)
+                deadline = max(deadline, time.time() + 12)
+            else:
+                say("プレイを待っています")
+                _sleep_stop(0.4, stop)
+            continue
         pause = _pause_continue_button(image)
         if pause is not None:
             if tap_start:
@@ -3799,13 +3834,6 @@ def _click_start_or_continue(
             and _close_button(image) is None
         ):
             return kinds, locked, "", used_name, items
-        retry = None if skip_retry else _retry_button(image)
-        if retry is not None:
-            say("リトライをクリックします")
-            _slow_tap(retry.center().x(), retry.center().y())
-            _sleep_stop(1.2, stop)
-            deadline = max(deadline, time.time() + 12)
-            continue
         play = _play_button(image)
         if play is not None:
             say("プレイをクリックします")

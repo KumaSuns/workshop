@@ -446,6 +446,17 @@ def _is_daily_mission(image: QImage, rect: QRect) -> bool:
     return True
 
 
+def _daily_mission_button(image: QImage) -> QRect | None:
+    found = [
+        pill
+        for pill in _yellow_pills(image)
+        if _is_daily_mission(image, pill)
+    ]
+    if not found:
+        return None
+    return max(found, key=lambda rect: rect.width() * rect.height())
+
+
 def _play_button(image: QImage) -> QRect | None:
     if (
         _retry_button(image) is not None
@@ -542,7 +553,39 @@ def _menu_pair_rows(image: QImage, below_y: int) -> int:
     return len([row for row in rows if len(row) >= 2])
 
 
+def _mission_dialog_close(image: QImage) -> QRect | None:
+    height = image.height()
+    width = image.width()
+    if width < 2 or height < 2:
+        return None
+    pills = _yellow_pills(image)
+    left = [
+        pill
+        for pill in pills
+        if pill.center().x() < width * 0.38
+        and pill.center().y() > height * 0.78
+        and width * 0.16 <= pill.width() <= width * 0.40
+    ]
+    if not left:
+        return None
+    close = max(left, key=lambda rect: rect.width() * rect.height())
+    claim = [
+        pill
+        for pill in pills
+        if pill.center().x() > width * 0.55
+        and pill.width() >= width * 0.28
+        and pill.bottom() <= close.y() + int(close.height() * 0.15)
+        and pill.center().y() > height * 0.55
+        and pill.center().y() < close.center().y()
+    ]
+    if not claim:
+        return None
+    return close
+
+
 def _continue_button(image: QImage) -> QRect | None:
+    if _mission_dialog_close(image) is not None:
+        return None
     if _retry_button(image) is not None or _has_highscore_plate(image):
         return None
     low = [
@@ -668,6 +711,9 @@ def _has_highscore_plate(image: QImage) -> bool:
 
 
 def _close_button(image: QImage) -> QRect | None:
+    mission_close = _mission_dialog_close(image)
+    if mission_close is not None:
+        return mission_close
     if _has_highscore_plate(image):
         pills = [
             pill
