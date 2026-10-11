@@ -90,7 +90,7 @@ TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
 ERASE_WAIT = 0.15
-FAN_GAP = 8.0
+FAN_GAP = 2.0
 _gpu_lock = Lock()
 
 StatusFn = Callable[[str], None]
@@ -317,6 +317,9 @@ def run_play(
     last_save_at = 0.0
     ignore_start_until = 0.0
     saw_board = False
+    hud_gone_seen = False
+    fan_fall_n: int | None = None
+    fan_fall_moved = False
     resumed_pause = False
     match_over = False
     clears = 0
@@ -324,6 +327,9 @@ def run_play(
     coin = 0
     skill_taps = 0
     skill_ok = 0
+    skill_used = 0
+    press_counted = False
+    my_erase = 0
     bomb_taps = 0
     fan_taps = 0
     idle_pick: tuple[list[int], int] | None = None
@@ -360,11 +366,11 @@ def run_play(
     def fresh_match() -> None:
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
-        nonlocal ignore_start_until, saw_board, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
-        nonlocal clears, swipes, coin, skill_taps, skill_ok, bomb_taps, fan_taps
+        nonlocal ignore_start_until, saw_board, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
+        nonlocal clears, swipes, coin, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
-        nonlocal my_group, match_picks, idle_pick, idle_acc, idle_since
+        nonlocal my_group, skill_face, my_vec, match_picks, idle_pick, idle_acc, idle_since
         nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
@@ -393,6 +399,9 @@ def run_play(
         last_save_at = 0.0
         ignore_start_until = time.time() + 6
         saw_board = False
+        hud_gone_seen = False
+        fan_fall_n = None
+        fan_fall_moved = False
         resumed_pause = False
         pieces = []
         watching.clear()
@@ -401,6 +410,9 @@ def run_play(
         coin = 0
         skill_taps = 0
         skill_ok = 0
+        skill_used = 0
+        press_counted = False
+        my_erase = 0
         bomb_taps = 0
         fan_taps = 0
         idle_pick = None
@@ -436,6 +448,8 @@ def run_play(
         skip_born = {}
         saved_boards = set()
         my_group = 0
+        skill_face = None
+        my_vec = None
         skill_my_n = 0
         skill_my_full = None
         skill_my_held = False
@@ -614,7 +628,7 @@ def run_play(
         skill_pick = (sit, pressed)
         skill_acc = 0.0
 
-    def try_bomb(sit: str, force: bool = False) -> bool:
+    def try_bomb(sit: str, force: bool = False, target: dict[str, int] | None = None) -> bool:
         nonlocal last_bomb_at, bomb_taps
         bombs = _bombs_on_board(pieces, game)
         if not bombs:
@@ -624,9 +638,22 @@ def run_play(
         sit_bomb = bomb_situation(sit, len(bombs))
         if not force and not ask_bomb(sit_bomb, True):
             return False
-        did, cell = _tap_biggest_bomb(
-            pieces, image, say, stop, game, skip_bomb_cells
-        )
+        if target is not None:
+            cell = _piece_cell(target)
+            if cell in skip_bomb_cells:
+                return False
+            say(f"ボムをタップ {int(target['x'])},{int(target['y'])}")
+            tap(
+                int(target["x"]),
+                int(target["y"]),
+                screen_w=image.width(),
+                screen_h=image.height(),
+            )
+            did = True
+        else:
+            did, cell = _tap_biggest_bomb(
+                pieces, image, say, stop, game, skip_bomb_cells
+            )
         if not did:
             return False
         if cell is not None:
@@ -650,9 +677,15 @@ def run_play(
         return taps > 0
 
     def apply_checker_skill(has_chain: bool) -> bool:
-        nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps
+        nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps, skill_used, press_counted
         nonlocal bomb_taps, last_bomb_at, skip_loss, pooh_long, swipes
         nonlocal skill_my_n, skill_saw_empty, fan_taps, last_fan_at
+
+        def note_used() -> None:
+            nonlocal skill_used, press_counted
+            skill_used += 1
+            press_counted = True
+
         if skill_pressed is None or not skill_pressed.is_set():
             return False
         skill_pressed.clear()
@@ -687,9 +720,11 @@ def run_play(
                     draw=_draw_plan,
                     gpu_lock=_gpu_lock,
                 )
+                note_used()
                 return True
             if skill_is_cloud(used_tsum):
                 skip_loss = True
+                note_used()
                 return True
             if skill_breaks_bombs(used_tsum):
                 start = skill_tap_at[0] or time.time()
@@ -719,6 +754,7 @@ def run_play(
                 bomb_taps += n
                 if n:
                     last_bomb_at = time.time()
+                note_used()
                 return True
             spent_ok = _skill_tap_spent(skill, stop, watch_hit)
             if not spent_ok:
@@ -730,6 +766,7 @@ def run_play(
                 )
             if skill_is_pooh(used_tsum):
                 pooh_long = True
+            note_used()
             return True
         finally:
             skill_busy[0] = False
@@ -760,6 +797,8 @@ def run_play(
         )
 
     my_group = 0
+    skill_face = None
+    my_vec = None
     skill_my_n = 0
     skill_my_full: int | None = None
     skill_my_held = False
@@ -770,7 +809,7 @@ def run_play(
         return count_skill is not None and count_skill()
 
     def look_mytsum() -> None:
-        nonlocal my_group, last_skill_look
+        nonlocal my_group, skill_face, last_skill_look
         if my_group > 0 or skill is None:
             return
         now_look = time.time()
@@ -779,8 +818,10 @@ def run_play(
         last_skill_look = now_look
         t0 = time.perf_counter()
         with _gpu_lock:
-            looked = _mytsum_group(predictor, rgb, tsums, skill)
+            looked, face = _mytsum_group(predictor, rgb, tsums, skill)
         add_idle("pred", time.perf_counter() - t0)
+        if face is not None:
+            skill_face = face
         if looked > 0:
             my_group = looked
 
@@ -869,6 +910,7 @@ def run_play(
         if pooh_long:
             return found
         need = time_bomb_number(used_items)
+        mine_first = skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum)
         found.sort(
             key=lambda chain: (
                 (
@@ -876,7 +918,7 @@ def run_play(
                     len(chain) >= need,
                     len(chain),
                 )
-                if skill_breaks_bombs(used_tsum)
+                if mine_first
                 else (
                     len(chain) >= need,
                     len(chain),
@@ -903,7 +945,12 @@ def run_play(
             used_items = found_items
             show_used(found_items)
     elif start_match and arrived == "continue":
-        _tap_continue_now(say, stop)
+        resumed_pause = _tap_continue_now(say, stop)
+        if resumed_pause:
+            saw_board = True
+            kinds_locked = True
+            if go_at is None:
+                go_at = time.time()
     watching = Event()
     watch_hit = Event()
     stop_watch = Event()
@@ -913,6 +960,8 @@ def run_play(
         daemon=True,
     )
     watcher.start()
+    if resumed_pause:
+        watching.set()
     checker_alive = [True]
     before_start = [False]
     next_skill_at = [0.0]
@@ -1111,6 +1160,7 @@ def run_play(
     Thread(target=_watch_skill_window, daemon=True).start()
 
     def _watch_checker() -> None:
+        nonlocal skill_used, press_counted
         full_w = None
         last_left = None
         seen = None
@@ -1135,7 +1185,15 @@ def run_play(
                 left = last_left
             else:
                 last_left = left
-            n, ok = skill_n_show()
+            if (
+                skill_wait_empty
+                and not press_counted
+                and not skill_busy[0]
+            ):
+                spent = _skill_fill(shot_rgb, skill)
+                if spent is not None and spent < SKILL_FILL_SPENT:
+                    skill_used += 1
+                    press_counted = True
             ready = False
             if (
                 saw_board
@@ -1165,8 +1223,8 @@ def run_play(
             latest_gauge[1] = fever_fill
             latest_gauge[2] = fever_on
             latest_gauge[3] = left
-            latest_gauge[4] = n
-            latest_gauge[5] = ok
+            latest_gauge[4] = skill_used
+            latest_gauge[5] = my_erase
             latest_gauge[6] = tap_at
             latest_gauge[7] = fever_hold
             if ready and not skill_is_gadget(used_tsum):
@@ -1176,8 +1234,8 @@ def run_play(
                 meter_fever,
                 fever_on,
                 left,
-                n,
-                ok,
+                skill_used,
+                my_erase,
                 ready,
                 skill_busy[0],
                 tap_at,
@@ -1272,25 +1330,45 @@ def run_play(
                 game, skill, fever, timer, fan = _merge_hud(
                     boxes, game, skill, fever, timer, fan
                 )
+            timer_left = _read_timer(None, rgb, timer) if saw_board else None
+            timer_running = timer_left is not None and timer_left > 0
+            if timer_running and watch_hit.is_set():
+                watch_hit.clear()
+            play_hud = bool(
+                saw_board
+                and image is not None
+                and not image.isNull()
+                and _in_play_hud(image)
+            )
             retry_now = (
                 saw_board
                 and image is not None
                 and not image.isNull()
                 and _retry_button(image) is not None
             )
+            board_left = (
+                saw_board
+                and not on_pause
+                and not play_hud
+                and not timer_running
+            )
             if (
                 saw_board
-                and timer is not None
+                and not timer_running
                 and not retry_now
-                and _read_timer(None, rgb, timer) == 0
+                and (timer_left == 0 or board_left)
             ):
                 with _gpu_lock:
                     seen, _score = _timeup_hit(predictor, rgb)
                 if seen:
                     watch_hit.set()
-            if retry_now or (
-                watch_hit.is_set() and _read_timer(None, rgb, timer) == 0
-            ):
+            if board_left and hud_gone_seen:
+                watch_hit.set()
+            hud_gone_seen = board_left
+            timeup_now = watch_hit.is_set() and saw_board and not timer_running and (
+                timer_left == 0 or board_left
+            )
+            if retry_now or timeup_now:
                 credit_pending(rgb)
                 ended = _end_on_timeup(
                     predictor,
@@ -1309,12 +1387,9 @@ def run_play(
                 )
             else:
                 ended = False
-            if not ended and watch_hit.is_set():
-                if _read_timer(None, rgb, timer) == 0:
-                    say("TIME UP / " + _counts_line(clears, swipes, coin))
-                    ended = True
-                else:
-                    watch_hit.clear()
+            if not ended and timeup_now:
+                say("TIME UP / " + _counts_line(clears, swipes, coin))
+                ended = True
             if ended:
                 credit_pending(rgb)
                 flush_idle(True)
@@ -1382,7 +1457,7 @@ def run_play(
                 retry = None if image.isNull() else _retry_button(image)
                 if retry is not None and _match_start_button(image) is None:
                     say("リトライをクリックします")
-                    _slow_tap(retry.center().x(), retry.center().y())
+                    tap(retry.center().x(), retry.center().y())
                     _sleep_stop(1.2, stop)
                     continue
                 if on_mission:
@@ -1449,15 +1524,19 @@ def run_play(
                 and time.time() >= next_skill_at[0]
                 and _skill_ready(rgb, skill, used_tsum)
             )
-            if skill_now and skill_is_gadget(used_tsum) and (
-                pending_spots is not None
-                or _gadget_skill_hold(
-                    _fever_playing(rgb, game),
-                    _meter_fever_fill(rgb, fever, skill, fan),
-                    latest_gauge[3],
-                )
+            if skill_now and skill_is_gadget(used_tsum) and _gadget_skill_hold(
+                _fever_playing(rgb, game),
+                _meter_fever_fill(rgb, fever, skill, fan),
+                latest_gauge[3],
             ):
                 skill_now = False
+            elif (
+                skill_now
+                and skill_is_gadget(used_tsum)
+                and pending_spots is not None
+                and time.time() - pending_at < 0.5
+            ):
+                continue
             if skill_now:
                 _press_ready_skill()
                 if skill_pressed is not None and skill_pressed.is_set():
@@ -1477,6 +1556,9 @@ def run_play(
             _check_stop(stop)
             if credit_pending(by_count=True):
                 erased_now = True
+            fan_fall_n, fan_fall_moved, _fall_settled = _note_fall(
+                len(tsums), erased_now, fan_fall_n, fan_fall_moved
+            )
             now = time.time()
             skip_chains = [
                 key for key in skip_chains if now - skip_born.get(key, 0) < SKIP_TTL
@@ -1496,6 +1578,7 @@ def run_play(
                     found, pick_opts, pick_n = order_found(found)
                     if found:
                         need = time_bomb_number(used_items)
+                        mine_first = skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum)
 
                         def _is_mine(chain: list[dict[str, int]]) -> bool:
                             return my_group > 0 and int(chain[0].get("group") or 0) == my_group
@@ -1507,7 +1590,7 @@ def run_play(
                                     len(chain) >= need,
                                     len(chain),
                                 )
-                                if skill_breaks_bombs(used_tsum)
+                                if mine_first
                                 else (
                                     len(chain) >= need,
                                     len(chain),
@@ -1565,6 +1648,22 @@ def run_play(
                     if did_skill:
                         skip_after_skill = True
                     continue
+                play_bombs = _bombs_on_board(pieces, game)
+                if len(play_bombs) >= 3:
+                    if try_bomb(skill_sit(True), force=True):
+                        bomb_after_long = False
+                        continue
+                near_bomb = _my_tsum_near_bomb(pieces, my_group, game)
+                if near_bomb is not None:
+                    if try_bomb(skill_sit(True), force=True, target=near_bomb):
+                        bomb_after_long = False
+                        continue
+                elif bomb_after_long and _bombs_on_board(pieces, game):
+                    if try_bomb(skill_sit(True), force=True):
+                        bomb_after_long = False
+                        continue
+                elif bomb_after_long and len(tsums) >= BOARD_READY:
+                    bomb_after_long = False
                 skill_fill = _skill_fill(rgb, skill)
                 emit_gauges(skill_fill)
                 wait_save = None
@@ -1638,6 +1737,11 @@ def run_play(
                         say(_counts_line(clears, swipes, coin))
                         already_pending = bool(spots & pending_used)
                         added = 0 if already_pending else mytsum_in_chain(chain)
+                        if not already_pending:
+                            my_vec = _lock_my_vec(tsums, skill_face, my_vec)
+                            my_erase += _count_mytsum(chain, tsums, my_vec)
+                        if not already_pending:
+                            burst_my_n += added
                         sure = (
                             skill_my_full is not None
                             and skill_my_full > 0
@@ -1659,8 +1763,6 @@ def run_play(
                             apply_checker_skill(True)
                             skip_after_skill = True
                             break
-                        if not already_pending:
-                            burst_my_n += added
                         burst += 1
                         burst_max = max(burst_max, len(chain))
                         used |= spots
@@ -1735,6 +1837,8 @@ def run_play(
                     pending_used |= used
                     bomb_asked = False
                     bomb_asked_sit = ""
+                    fan_fall_n = len(tsums)
+                    fan_fall_moved = False
                 if last_chain is not None and preview is not None:
                     preview(_draw_plan(image, pieces, last_chain, game))
                 if timeup:
@@ -1851,7 +1955,7 @@ def run_play(
                     save_boards,
                     say,
                 )
-                if burst_max >= time_bomb_number(used_items):
+                if burst >= 2 or burst_max >= time_bomb_number(used_items):
                     bomb_after_long = True
                 note_idle(True)
                 continue
@@ -1861,8 +1965,10 @@ def run_play(
                 last_skill_look = now
                 t0 = time.perf_counter()
                 with _gpu_lock:
-                    looked = _mytsum_group(predictor, rgb, tsums, skill)
+                    looked, face = _mytsum_group(predictor, rgb, tsums, skill)
                 add_idle("pred", time.perf_counter() - t0)
+                if face is not None:
+                    skill_face = face
                 if looked > 0:
                     my_group = looked
                     t0 = time.perf_counter()
@@ -1886,13 +1992,22 @@ def run_play(
             if break_to_one():
                 add_idle("act", time.perf_counter() - t0)
                 continue
-            did_bomb = try_bomb(skill_sit(False), force=True)
+            near_bomb = _my_tsum_near_bomb(pieces, my_group, game)
+            if near_bomb is not None:
+                did_bomb = try_bomb(skill_sit(False), force=True, target=near_bomb)
+            else:
+                did_bomb = try_bomb(skill_sit(False), force=True)
             add_idle("act", time.perf_counter() - t0)
             if did_bomb:
                 bomb_after_long = False
                 continue
             t0 = time.perf_counter()
-            did_fan = _press_fan(fan, image, say, stop, last_fan_at, len(tsums), pending_hud, skill_sit(False))
+            did_fan = False
+            fan_open = go_at is None or time.time() - go_at >= 3.0
+            if fan_open and fan_fall_n is None:
+                did_fan = _press_fan(
+                    fan, image, say, stop, last_fan_at, len(tsums), pending_hud, skill_sit(False)
+                )
             add_idle("act", time.perf_counter() - t0)
             if did_fan:
                 last_fan_at = time.time()
@@ -1903,6 +2018,21 @@ def run_play(
             continue
     finally:
         checker_alive[0] = False
+
+
+def _note_fall(
+    count: int,
+    erased: bool,
+    fall_n: int | None,
+    moved: bool,
+) -> tuple[int | None, bool, bool]:
+    if fall_n is None:
+        return None, False, False
+    if erased or count != fall_n:
+        return count, True, False
+    if moved:
+        return None, False, True
+    return fall_n, moved, False
 
 
 def _swipe_chain(
@@ -2441,8 +2571,11 @@ def _press_fan(
     if time.time() - last_fan_at < FAN_GAP:
         return False
     pending_hud.append((sit, "fan", True))
-    _tap_fan(fan, image, say, stop)
-    _tap_fan(fan, image, say, stop)
+    x = int(fan["x"] + max(1, int(fan["w"])) / 2)
+    y = int(fan["y"] + max(1, int(fan["h"])) / 2)
+    for _ in range(3):
+        say(f"扇風機をタップ {x},{y}")
+        tap(x, y, screen_w=image.width(), screen_h=image.height())
     return True
 
 
@@ -2713,6 +2846,38 @@ def _tap_biggest_bomb(
 
 def _piece_cell(piece: dict[str, int]) -> tuple[int, int]:
     return (int(piece["x"]) // 16, int(piece["y"]) // 16)
+
+
+def _my_tsum_near_bomb(
+    pieces: list[dict[str, int]],
+    my_group: int,
+    game: dict[str, int] | None,
+) -> dict[str, int] | None:
+    bombs = _bombs_on_board(pieces, game)
+    if my_group <= 0 or not bombs:
+        return None
+    mine = [
+        piece
+        for piece in pieces
+        if _is_tsum(piece) and int(piece.get("group") or 0) == my_group
+    ]
+    if not mine:
+        return None
+    radii = [max(4, int(piece.get("r") or 12)) for piece in mine]
+    reach = sorted(radii)[len(radii) // 2] * 2.6
+    best: dict[str, int] | None = None
+    best_d: float | None = None
+    for bomb in bombs:
+        bx = int(bomb["x"])
+        by = int(bomb["y"])
+        for piece in mine:
+            dist = math.hypot(int(piece["x"]) - bx, int(piece["y"]) - by)
+            if dist > reach:
+                continue
+            if best_d is None or dist < best_d:
+                best = bomb
+                best_d = dist
+    return best
 
 
 def _bombs_on_board(
@@ -3789,7 +3954,7 @@ def _click_start_or_continue(
         retry = None if skip_retry else _retry_button(image)
         if retry is not None:
             say("リトライをクリックします")
-            _slow_tap(retry.center().x(), retry.center().y())
+            tap(retry.center().x(), retry.center().y())
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue
@@ -4227,9 +4392,69 @@ def _skill_face(skill: dict[str, int]) -> dict[str, int]:
     }
 
 
-def _mytsum_group(predictor, rgb, tsums: list[dict[str, int]], skill) -> int:
-    if skill is None or not tsums:
+def _group_means(tsums: list[dict[str, int]]) -> dict[int, tuple[float, ...]]:
+    buckets: dict[int, list[tuple[float, ...]]] = {}
+    for piece in tsums:
+        group = int(piece.get("group") or 0)
+        vec = piece.get("_vec")
+        if group <= 0 or not vec:
+            continue
+        buckets.setdefault(group, []).append(tuple(float(value) for value in vec))
+    means: dict[int, tuple[float, ...]] = {}
+    for group, vecs in buckets.items():
+        dim = len(vecs[0])
+        total = [0.0] * dim
+        used = 0
+        for vec in vecs:
+            if len(vec) != dim:
+                continue
+            for index, value in enumerate(vec):
+                total[index] += value
+            used += 1
+        if used <= 0:
+            continue
+        scale = sum(value * value for value in total) ** 0.5 or 1.0
+        means[group] = tuple(value / scale for value in total)
+    return means
+
+
+def _lock_my_vec(tsums: list[dict[str, int]], face, my_vec):
+    if face is None:
+        return my_vec
+    means = _group_means(tsums)
+    if not means:
+        return my_vec
+    best = max(means, key=lambda group: _cosine(face, means[group]))
+    sim = _cosine(face, means[best])
+    if my_vec is None or sim > _cosine(face, my_vec):
+        return means[best]
+    return my_vec
+
+
+def _count_mytsum(chain: list[dict[str, int]], tsums: list[dict[str, int]], my_vec) -> int:
+    if my_vec is None or not chain:
         return 0
+    means = _group_means(tsums)
+    if len(means) < 2:
+        return 0
+    mine = max(means, key=lambda group: _cosine(my_vec, means[group]))
+    mean = means[mine]
+    counted = 0
+    for piece in chain:
+        vec = piece.get("_vec")
+        group = int(piece.get("group") or 0)
+        if vec is None or group != mine:
+            continue
+        sim = _cosine(vec, mean)
+        if any(_cosine(vec, other) >= sim for other_group, other in means.items() if other_group != mine):
+            continue
+        counted += 1
+    return counted
+
+
+def _mytsum_group(predictor, rgb, tsums: list[dict[str, int]], skill):
+    if skill is None or not tsums:
+        return 0, None
     reps: list[dict[str, int]] = []
     groups: list[int] = []
     seen: set[int] = set()
@@ -4241,10 +4466,10 @@ def _mytsum_group(predictor, rgb, tsums: list[dict[str, int]], skill) -> int:
         groups.append(group)
         reps.append(piece)
     if not reps:
-        return 0
+        return 0, None
     vecs = _type_vectors(predictor, rgb, reps + [_skill_face(skill)])
     if not vecs or len(vecs) != len(reps) + 1:
-        return 0
+        return 0, None
     skill_vec = vecs[-1]
     best_group = 0
     best_sim: float | None = None
@@ -4253,7 +4478,7 @@ def _mytsum_group(predictor, rgb, tsums: list[dict[str, int]], skill) -> int:
         if best_sim is None or sim > best_sim:
             best_sim = sim
             best_group = group
-    return best_group
+    return best_group, skill_vec
 
 
 def _attach_type_vecs(

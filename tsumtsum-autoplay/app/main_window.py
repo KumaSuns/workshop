@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -8,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QStandardPaths, Qt, QTimer, QEvent
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPixmap, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
@@ -72,11 +73,50 @@ _NOT_CHARM_TSUMS = frozenset(
 )
 
 
+def _dim_icon(pix: QPixmap) -> QPixmap:
+    image = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            if color.alpha() == 0:
+                continue
+            color.setRed(int(color.red() * 0.2))
+            color.setGreen(int(color.green() * 0.2))
+            color.setBlue(int(color.blue() * 0.2))
+            image.setPixelColor(x, y, color)
+    return QPixmap.fromImage(image)
+
+
 def _is_not_charm_tsum(name: str) -> bool:
     raw = " ".join((name or "").split())
     if not raw:
         return False
     return raw in _NOT_CHARM_TSUMS or raw.casefold() in _NOT_CHARM_TSUMS
+
+
+def _used_tsum_folder(name: str) -> Path | None:
+    cleaned = " ".join((name or "").split())
+    if not cleaned or cleaned in {"—", "－", "-"}:
+        return None
+    root = APP_ROOT.parent / "video-frame-extractor" / "app" / "assets" / "images" / "use_tsums"
+    registry_path = APP_ROOT.parent / "video-frame-extractor" / "app" / "assets" / "models" / "use_tsum" / "registry.json"
+    registry: dict[str, str] = {}
+    if registry_path.is_file():
+        try:
+            payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            registry = {str(key): str(value) for key, value in payload.items()}
+    for dir_id, display in registry.items():
+        if display == cleaned or dir_id == cleaned:
+            folder = root / dir_id
+            if folder.is_dir():
+                return folder
+    folder = root / cleaned
+    if folder.is_dir():
+        return folder
+    return None
 
 
 class DebugWindow(QWidget):
@@ -163,10 +203,51 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(root)
         self._info_frame = QFrame()
         self._info_frame.setFrameShape(QFrame.Shape.Box)
-        info = QVBoxLayout(self._info_frame)
+        info_row = QHBoxLayout(self._info_frame)
+        info_text = QWidget()
+        info = QVBoxLayout(info_text)
+        info.setContentsMargins(0, 0, 0, 0)
+        self._info_mytsum = QLabel("マイツム  —")
+        self._info_mytsum.setWordWrap(True)
+        info.addWidget(self._info_mytsum)
         self._info_items = QLabel("－")
         self._info_items.setWordWrap(True)
+        self._info_items.hide()
         info.addWidget(self._info_items)
+        self._item_icon_row = QWidget()
+        item_icons = QHBoxLayout(self._item_icon_row)
+        item_icons.setContentsMargins(0, 0, 0, 0)
+        icon_dir = APP_ROOT.parent / "video-frame-extractor" / "app" / "assets" / "icons"
+        self._item_icon_labels: dict[str, QLabel] = {}
+        self._item_icon_bright: dict[str, QPixmap] = {}
+        self._item_icon_dim: dict[str, QPixmap] = {}
+        for name, filename in (
+            ("+Score", "Score.png"),
+            ("+Coin", "Coin.png"),
+            ("+Exp", "Exp.png"),
+            ("+Time", "Time.png"),
+            ("+Bomb", "Bomb.png"),
+            ("5＞4", "5over4.png"),
+            ("+Combo", "Combo.png"),
+        ):
+            label = QLabel()
+            pix = QPixmap(str(icon_dir / filename))
+            if pix.isNull():
+                label.setText(name)
+            else:
+                pix = pix.scaled(
+                    pix.width() // 2,
+                    pix.height() // 2,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._item_icon_bright[name] = pix
+                self._item_icon_dim[name] = _dim_icon(pix)
+                label.setPixmap(self._item_icon_dim[name])
+            item_icons.addWidget(label)
+            self._item_icon_labels[name] = label
+        item_icons.addStretch(1)
+        info.addWidget(self._item_icon_row)
         heart_row = QHBoxLayout()
         heart_row.setContentsMargins(0, 0, 0, 0)
         self._info_label = QLabel("♥ ハート")
@@ -191,6 +272,37 @@ class MainWindow(QMainWindow):
         meter.addWidget(self._info_skill_value, 3, 1)
         meter.setColumnStretch(2, 1)
         info.addLayout(meter)
+        info_row.addWidget(info_text, 1)
+        self._info_text = info_text
+        self._info_count = QFrame()
+        self._info_count.setFrameShape(QFrame.Shape.Box)
+        count_col = QVBoxLayout(self._info_count)
+        self._info_count_title = QLabel("スキル回数")
+        self._info_count_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_count_title.setWordWrap(True)
+        self._info_count_value = QLabel("－")
+        self._info_count_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_erase_title = QLabel("マイツムを消した数")
+        self._info_erase_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_erase_title.setWordWrap(True)
+        self._info_erase_value = QLabel("－")
+        self._info_erase_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        count_col.addWidget(self._info_count_title)
+        count_col.addWidget(self._info_count_value)
+        count_col.addWidget(self._info_erase_title)
+        count_col.addWidget(self._info_erase_value)
+        self._info_skill_lamp = QLabel("スキル中")
+        self._info_skill_lamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_skill_lamp.setWordWrap(True)
+        self._info_skill_lamp.setStyleSheet("background: palette(mid);")
+        count_col.addWidget(self._info_skill_lamp)
+        count_col.addStretch(1)
+        info_row.addWidget(self._info_count)
+        self._info_tsum = QLabel()
+        self._info_tsum.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_tsum_pix = QPixmap()
+        info_row.addWidget(self._info_tsum)
+        self._fit_tsum_slot()
         outer.addWidget(self._info_frame)
         columns = QHBoxLayout()
         columns.setContentsMargins(0, 0, 0, 0)
@@ -447,6 +559,8 @@ class MainWindow(QMainWindow):
         self._info_time_value.setText("－")
         self._info_fever_value.setText("－")
         self._info_skill_value.setText("－")
+        self._info_count_value.setText("－")
+        self._info_erase_value.setText("－")
         self._info_fever_en.setStyleSheet("")
 
     def _show_meters(
@@ -477,9 +591,87 @@ class MainWindow(QMainWindow):
             self._info_skill_value.setText("－")
         else:
             self._info_skill_value.setText(f"{round(float(skill_fill) * 100)}％")
+        if _skill_n is None:
+            self._info_count_value.setText("－")
+        else:
+            self._info_count_value.setText(str(int(_skill_n)))
+        if _skill_ok is None:
+            self._info_erase_value.setText("－")
+        else:
+            self._info_erase_value.setText(str(int(_skill_ok)))
+
+    def _fit_tsum_slot(self) -> None:
+        side = self._info_text.sizeHint().height()
+        if side < 1:
+            return
+        self._info_count.setFixedSize(side, side)
+        self._info_tsum.setFixedSize(side, side)
+        self._paint_tsum()
+
+    def _paint_tsum(self) -> None:
+        if self._info_tsum_pix.isNull():
+            self._info_tsum.clear()
+            return
+        self._info_tsum.setPixmap(
+            self._info_tsum_pix.scaled(
+                self._info_tsum.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _mytsum_pixmap(self, name: str) -> QPixmap:
+        folder = _used_tsum_folder(name)
+        if folder is None:
+            return QPixmap()
+        files = [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        ]
+        if not files:
+            return QPixmap()
+        target = 1600 / 900
+
+        def aspect_gap(path: Path) -> float:
+            size = QImageReader(str(path)).size()
+            if not size.isValid() or size.width() < 1:
+                return 999.0
+            return abs(size.height() / size.width() - target)
+
+        image = QImage(str(min(files, key=aspect_gap)))
+        if image.isNull():
+            return QPixmap()
+        width = image.width()
+        height = image.height()
+        left = int(width * 0.710)
+        top = int(height * 0.785)
+        crop_w = max(1, int(width * 0.254))
+        crop_h = max(1, int(height * 0.126))
+        return QPixmap.fromImage(image.copy(left, top, crop_w, crop_h))
+
+    def _set_mytsum(self, name: str) -> None:
+        shown = " ".join((name or "").split()) or "—"
+        self._info_mytsum.setText(f"マイツム  {shown}")
+        self._info_tsum_pix = self._mytsum_pixmap(shown)
+        self._fit_tsum_slot()
 
     def _show_items(self, text: str) -> None:
-        self._info_items.setText(text or "－")
+        raw = (text or "").strip()
+        names = [] if not raw or raw == "－" else [part.strip() for part in raw.split("、") if part.strip()]
+        for name, label in self._item_icon_labels.items():
+            bright = self._item_icon_bright.get(name)
+            dim = self._item_icon_dim.get(name)
+            if bright is None or dim is None:
+                continue
+            label.setPixmap(bright if name in names else dim)
+        unknown = [name for name in names if name not in self._item_icon_labels]
+        if unknown:
+            self._info_items.setText("、".join(unknown))
+            self._info_items.show()
+        else:
+            self._info_items.hide()
+        self._fit_tsum_slot()
 
     def _start_intro(self) -> None:
         self._intro = IntroWorker(self._stop, self)
@@ -500,6 +692,7 @@ class MainWindow(QMainWindow):
         if loop is None:
             loop = self._loop_play
         self._selected_used_tsum = ""
+        self._set_mytsum("")
         self._play = PlayWorker(
             self._stop,
             self,
@@ -845,6 +1038,8 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
         self._debug.append(text)
+        if text.startswith("使用ツム "):
+            self._set_mytsum(text[len("使用ツム ") :])
         self._fill_history()
 
     def _fill_history(self) -> None:
