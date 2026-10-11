@@ -15,10 +15,10 @@ _CBUZZ_B = (0.633, 0.556)
 _CBUZZ_C = (0.500, 0.204)
 _CBUZZ_STEPS = (
     (_CBUZZ_B, 2.5, "B"),
-    (_CBUZZ_A, 0.04, "A"),
-    (_CBUZZ_C, 0.28, "C"),
-    (_CBUZZ_C, 0.42, "C"),
-    (_CBUZZ_C, 0.45, "C"),
+    (_CBUZZ_A, 0.02, "A"),
+    (_CBUZZ_C, 0.30, "C"),
+    (_CBUZZ_C, 0.33, "C"),
+    (_CBUZZ_C, 0.33, "C"),
 )
 
 

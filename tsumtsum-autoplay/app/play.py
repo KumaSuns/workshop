@@ -317,6 +317,7 @@ def run_play(
     last_save_at = 0.0
     ignore_start_until = 0.0
     saw_board = False
+    saw_timer = False
     hud_gone_seen = False
     fan_fall_n: int | None = None
     fan_fall_moved = False
@@ -366,7 +367,7 @@ def run_play(
     def fresh_match() -> None:
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
-        nonlocal ignore_start_until, saw_board, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
+        nonlocal ignore_start_until, saw_board, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
         nonlocal clears, swipes, coin, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
@@ -375,7 +376,7 @@ def run_play(
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
-        nonlocal go_at, used_items, wait_times, pieces
+        nonlocal go_at, used_items, wait_times, pieces, tsum_asked
         game = None
         skill = None
         fever = None
@@ -399,6 +400,7 @@ def run_play(
         last_save_at = 0.0
         ignore_start_until = time.time() + 6
         saw_board = False
+        saw_timer = False
         hud_gone_seen = False
         fan_fall_n = None
         fan_fall_moved = False
@@ -454,6 +456,7 @@ def run_play(
         skill_my_full = None
         skill_my_held = False
         skill_saw_empty = False
+        tsum_asked = request_used_tsum is None
         watch_hit.clear()
         watching.clear()
         if timeup_seen is not None:
@@ -1332,6 +1335,8 @@ def run_play(
                 )
             timer_left = _read_timer(None, rgb, timer) if saw_board else None
             timer_running = timer_left is not None and timer_left > 0
+            if timer_running:
+                saw_timer = True
             if timer_running and watch_hit.is_set():
                 watch_hit.clear()
             play_hud = bool(
@@ -1348,10 +1353,12 @@ def run_play(
             )
             board_left = (
                 saw_board
+                and saw_timer
                 and not on_pause
                 and not play_hud
                 and not timer_running
             )
+            model_hit = False
             if (
                 saw_board
                 and not timer_running
@@ -1359,14 +1366,15 @@ def run_play(
                 and (timer_left == 0 or board_left)
             ):
                 with _gpu_lock:
-                    seen, _score = _timeup_hit(predictor, rgb)
-                if seen:
+                    model_hit, _score = _timeup_hit(predictor, rgb)
+                if model_hit:
                     watch_hit.set()
             if board_left and hud_gone_seen:
                 watch_hit.set()
             hud_gone_seen = board_left
-            timeup_now = watch_hit.is_set() and saw_board and not timer_running and (
-                timer_left == 0 or board_left
+            timeup_now = saw_board and not timer_running and (
+                (model_hit and (saw_timer or timer_left == 0))
+                or (watch_hit.is_set() and (timer_left == 0 or board_left))
             )
             if retry_now or timeup_now:
                 credit_pending(rgb)
@@ -1429,13 +1437,13 @@ def run_play(
                 say("プレイを開始します")
                 continue
             _check_stop(stop)
-            if time.time() >= ignore_start_until:
+            if not saw_board:
                 start = _match_start_button(image)
-                if start is not None and _start_hearts(image) == 0:
-                    _wait_for_heart(say, stop)
-                    continue
                 if start is not None:
                     ask_used_now(True)
+                    if _start_hearts(image) == 0:
+                        _wait_for_heart(say, stop)
+                        continue
                     found_items = _items_used_pil(rgb)
                     if found_items is not None:
                         used_items = found_items
@@ -1481,11 +1489,11 @@ def run_play(
                         used_items = found_items
                         show_used(found_items)
                 if time.time() >= ignore_start_until:
+                    if _match_start_button(image) is not None:
+                        ask_used_now(True)
                     if _match_start_button(image) is not None and _start_hearts(image) == 0:
                         _wait_for_heart(say, stop)
                         continue
-                    if _match_start_button(image) is not None:
-                        ask_used_now(True)
                     if pause is not None:
                         say("続けるをクリックします")
                         _slow_tap(pause.center().x(), pause.center().y())
@@ -3075,7 +3083,7 @@ def _break_bombs_until_two(
                 )
                 skip.add(_piece_cell(bomb))
                 taps += 1
-            _sleep_stop(ERASE_WAIT, stop)
+            _sleep_stop(0.05, stop)
             continue
         if len(tsums) >= BOARD_READY:
             return taps
@@ -3400,11 +3408,7 @@ def _replay_after_timeup(say: StatusFn, stop: Event | None) -> tuple[str, list[s
     _seen, _locked, arrived, used_name, items = _click_start_or_continue(
         say, stop, tap_start=False, read_tsum=False
     )
-    if arrived == "start":
-        found = _tap_start_now(say, stop)
-        if found:
-            items = found
-    elif arrived == "continue":
+    if arrived == "continue":
         _tap_continue_now(say, stop)
     return used_name, items
 
@@ -3812,13 +3816,13 @@ def _read_heart_mail(image) -> tuple[int, str, str] | None:
     return count, number, mail
 
 
-def _heart_mail_badge_on_row(image) -> bool:
+def _filled_heart_count(image) -> int | None:
     from PIL import Image
 
     if isinstance(image, QImage):
         image = _qimage_rgb(image)
     if not isinstance(image, Image.Image):
-        return False
+        return None
     view = _portrait_frame(image)
     width, height = view.size
     scale = 220 / max(width, 1)
@@ -3828,15 +3832,19 @@ def _heart_mail_badge_on_row(image) -> bool:
     )
     sw, sh = small.size
     if sw < 2 or sh < 2:
-        return False
-    for box in _heart_mail_blobs(small, _heart_mail_red, 8):
-        if (box[2] - box[0]) > sw * 0.12:
-            continue
+        return None
+    row = []
+    for box in _heart_mail_blobs(small, _heart_mail_pink, 12):
         cx = (box[0] + box[2]) / 2 / sw
         cy = (box[1] + box[3]) / 2 / sh
-        if cx > 0.70 and 0.10 < cy < 0.32:
-            return True
-    return False
+        if 0.14 <= cy <= 0.30 and cx <= 0.55:
+            row.append(box)
+    if not row:
+        return 0
+    row.sort(key=lambda box: (box[1] + box[3]) / 2)
+    cy = (row[0][1] + row[0][3]) / 2
+    same = [box for box in row if abs((box[1] + box[3]) / 2 - cy) <= (box[3] - box[1])]
+    return len(same)
 
 
 def _start_hearts(image: QImage) -> int | None:
@@ -3844,13 +3852,11 @@ def _start_hearts(image: QImage) -> int | None:
         return None
     rgb = _qimage_rgb(image)
     if rgb is None:
-        return None
-    found = _read_heart_mail(rgb)
-    if found is not None:
-        return int(found[0])
-    if _heart_mail_badge_on_row(rgb):
         return 0
-    return None
+    count = _filled_heart_count(rgb)
+    if count is None:
+        return 0
+    return count
 
 
 def _wait_for_heart(say: StatusFn, stop: Event | None) -> None:
@@ -3867,17 +3873,15 @@ def _wait_for_heart(say: StatusFn, stop: Event | None) -> None:
         if _match_start_button(shot) is None:
             return
         hearts = _start_hearts(shot)
-        if hearts is None:
+        if hearts is None or hearts <= 0:
             if not said:
-                return
-        elif hearts > 0:
-            if said:
-                say(f"ハート {hearts}")
-            return
-        elif not said:
-            say("ハートが 0 なので待ちます")
-            said = True
-        _sleep_stop(5, stop)
+                say("ハートが 0 なので待ちます")
+                said = True
+            _sleep_stop(5, stop)
+            continue
+        if said:
+            say(f"ハート {hearts}")
+        return
 
 
 def _say_heart_mail(say: StatusFn, image) -> None:
@@ -3889,6 +3893,9 @@ def _say_heart_mail(say: StatusFn, image) -> None:
         return
     found = _read_heart_mail(image)
     if found is None:
+        hearts = _filled_heart_count(image)
+        if hearts is not None:
+            say(f"ハート {hearts}")
         return
     hearts, number, mail = found
     parts = [f"ハート {hearts}"]
