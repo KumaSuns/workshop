@@ -1,29 +1,122 @@
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtGui import QImage
 
 from app.bluestacks import capture_play_frame, swipe_path, tap
 from app.intro import _check_stop
+from app.paths import APP_ROOT
 
 SayFn = Callable[[str], None]
 
 _CBUZZ_A = (0.317, 0.556)
 _CBUZZ_B = (0.633, 0.556)
 _CBUZZ_C = (0.500, 0.204)
-_CBUZZ_STEPS = (
-    (_CBUZZ_B, 2.5, "B"),
-    (_CBUZZ_A, 0.02, "A"),
-    (_CBUZZ_C, 0.30, "C"),
-    (_CBUZZ_C, 0.33, "C"),
-    (_CBUZZ_C, 0.33, "C"),
-)
+_CBUZZ_SECONDS = (2.5, 0.02, 0.30, 0.45, 0.40)
+_CBUZZ_PATH = APP_ROOT / "data" / "cbuzz.json"
+_CBUZZ_BOARD = Path(__file__).resolve().parent / "cbuzz_board.jpg"
+
+
+def cbuzz_board_path() -> Path:
+    return _CBUZZ_BOARD
+
+
+def _cbuzz_point(value, default: tuple[float, float]) -> tuple[float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return default
+    try:
+        x = float(value[0])
+        y = float(value[1])
+    except (TypeError, ValueError):
+        return default
+    if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
+        return default
+    return x, y
+
+
+def _cbuzz_seconds(value) -> tuple[float, float, float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 5:
+        return _CBUZZ_SECONDS
+    try:
+        seconds = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return _CBUZZ_SECONDS
+    if any(item < 0 for item in seconds):
+        return _CBUZZ_SECONDS
+    return seconds  # type: ignore[return-value]
+
+
+def cbuzz_settings() -> tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float, float, float, float],
+]:
+    try:
+        payload = json.loads(_CBUZZ_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return (
+        _cbuzz_point(payload.get("a"), _CBUZZ_A),
+        _cbuzz_point(payload.get("b"), _CBUZZ_B),
+        _cbuzz_point(payload.get("c"), _CBUZZ_C),
+        _cbuzz_seconds(payload.get("seconds")),
+    )
+
+
+def set_cbuzz_settings(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    c: tuple[float, float],
+    seconds: tuple[float, float, float, float, float],
+) -> None:
+    point_a = _cbuzz_point(a, _CBUZZ_A)
+    point_b = _cbuzz_point(b, _CBUZZ_B)
+    point_c = _cbuzz_point(c, _CBUZZ_C)
+    delays = _cbuzz_seconds(seconds)
+    _CBUZZ_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _CBUZZ_PATH.write_text(
+        json.dumps(
+            {
+                "a": [point_a[0], point_a[1]],
+                "b": [point_b[0], point_b[1]],
+                "c": [point_c[0], point_c[1]],
+                "seconds": list(delays),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def reset_cbuzz_settings() -> tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float, float, float, float],
+]:
+    set_cbuzz_settings(_CBUZZ_A, _CBUZZ_B, _CBUZZ_C, _CBUZZ_SECONDS)
+    return cbuzz_settings()
+
+
+def cbuzz_steps() -> tuple[tuple[tuple[float, float], float, str], ...]:
+    a, b, c, seconds = cbuzz_settings()
+    return (
+        (b, seconds[0], "B"),
+        (a, seconds[1], "A"),
+        (c, seconds[2], "C"),
+        (c, seconds[3], "C"),
+        (c, seconds[4], "C"),
+    )
 
 
 def cbuzz_press_to_b() -> float:
-    return float(_CBUZZ_STEPS[0][1])
+    return float(cbuzz_steps()[0][1])
 
 
 def skill_tsum_key(name: str) -> str:
@@ -203,7 +296,7 @@ def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_
     if not _wait_cbuzz_b(start, stop, watch_hit, pose_seen):
         return
     first = True
-    for frac, delay, label in _CBUZZ_STEPS:
+    for frac, delay, label in cbuzz_steps():
         if not first:
             _wait_until(time.time() + delay, stop, None)
         first = False

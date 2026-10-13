@@ -8,8 +8,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QStandardPaths, Qt, QTimer, QEvent
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPixmap, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QObject, QStandardPaths, Qt, QTimer, QEvent, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,6 +43,12 @@ from app.paths import APP_ROOT, IPC_NAME
 from app.play_style import history_text
 from app.play_web import start_server, stop_server
 from app.record_play import RecordWorker, play_video_path
+from app.skill_tsum import (
+    cbuzz_board_path,
+    cbuzz_settings,
+    reset_cbuzz_settings,
+    set_cbuzz_settings,
+)
 from app.play import (
     PlayWorker,
     read_kind_count,
@@ -117,6 +123,53 @@ def _used_tsum_folder(name: str) -> Path | None:
     if folder.is_dir():
         return folder
     return None
+
+
+class _CbuzzBoard(QLabel):
+    picked = Signal(float, float)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._source = QPixmap(str(cbuzz_board_path()))
+        self._points: dict[str, tuple[float, float]] = {}
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+    def set_points(self, points: dict[str, tuple[float, float]]) -> None:
+        self._points = dict(points)
+        self._paint()
+
+    def _paint(self) -> None:
+        if self._source.isNull():
+            self.setText("画像がありません")
+            return
+        shown = self._source.scaledToHeight(640, Qt.TransformationMode.SmoothTransformation)
+        painter = QPainter(shown)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for name, (fx, fy) in self._points.items():
+            x = int(fx * shown.width())
+            y = int(fy * shown.height())
+            painter.setPen(QPen(QColor("#111111"), 3))
+            painter.setBrush(QColor("#FFFFFF"))
+            painter.drawEllipse(x - 14, y - 14, 28, 28)
+            painter.setPen(QColor("#111111"))
+            font = QFont()
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(x - 14, y - 14, 28, 28, Qt.AlignmentFlag.AlignCenter, name)
+        painter.end()
+        self.setPixmap(shown)
+        self.setFixedSize(shown.size())
+
+    def mousePressEvent(self, event) -> None:
+        pix = self.pixmap()
+        if pix is None or pix.isNull():
+            return
+        pos = event.position()
+        x = float(pos.x())
+        y = float(pos.y())
+        if x < 0 or y < 0 or x >= pix.width() or y >= pix.height():
+            return
+        self.picked.emit(x / pix.width(), y / pix.height())
 
 
 class DebugWindow(QWidget):
@@ -906,6 +959,9 @@ class MainWindow(QMainWindow):
             show(*reset_swipe_speeds())
 
         show(*swipe_speeds())
+        cbuzz_btn = QPushButton("cバズの設定")
+        cbuzz_btn.clicked.connect(self._open_cbuzz_settings)
+        layout.addWidget(cbuzz_btn)
         buttons = QDialogButtonBox()
         save_btn = buttons.addButton("保存する", QDialogButtonBox.ButtonRole.AcceptRole)
         reset_btn = buttons.addButton("リセット", QDialogButtonBox.ButtonRole.ActionRole)
@@ -915,6 +971,91 @@ class MainWindow(QMainWindow):
         reset_btn.clicked.connect(reset)
         cancel_btn.clicked.connect(dialog.reject)
         layout.addWidget(buttons)
+        dialog.exec()
+
+    def _open_cbuzz_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("cバズの設定")
+        dialog.setModal(True)
+        outer = QHBoxLayout(dialog)
+        board = _CbuzzBoard()
+        outer.addWidget(board)
+        form = QVBoxLayout()
+        form.addWidget(QLabel("A・B・C を選んで、画像をタップします"))
+        letter_row = QHBoxLayout()
+        letters: dict[str, QPushButton] = {}
+        chosen = {"letter": "A"}
+        points = {}
+        a, b, c, seconds = cbuzz_settings()
+        points["A"] = a
+        points["B"] = b
+        points["C"] = c
+
+        def select(letter: str) -> None:
+            chosen["letter"] = letter
+            for name, button in letters.items():
+                button.setStyleSheet("font-weight: bold;" if name == letter else "")
+
+        for letter in ("A", "B", "C"):
+            button = QPushButton(letter)
+            button.clicked.connect(lambda _checked=False, name=letter: select(name))
+            letters[letter] = button
+            letter_row.addWidget(button)
+        select("A")
+        form.addLayout(letter_row)
+
+        def place(fx: float, fy: float) -> None:
+            points[chosen["letter"]] = (fx, fy)
+            board.set_points(points)
+
+        board.picked.connect(place)
+        board.set_points(points)
+        labels = ("1回目 B", "2回目 A", "3回目 C", "4回目", "5回目")
+        edits: list[QLineEdit] = []
+        for label, value in zip(labels, seconds):
+            form.addWidget(QLabel(f"{label}（秒）"))
+            edit = QLineEdit(f"{value:.2f}")
+            edits.append(edit)
+            form.addWidget(edit)
+
+        def read_seconds() -> tuple[float, float, float, float, float] | None:
+            try:
+                values = tuple(float(edit.text().strip()) for edit in edits)
+            except ValueError:
+                return None
+            if len(values) != 5 or any(item < 0 for item in values):
+                return None
+            return values  # type: ignore[return-value]
+
+        def save() -> None:
+            delays = read_seconds()
+            if delays is None:
+                QMessageBox.information(dialog, "cバズの設定", "0以上の秒数を入力してください。")
+                return
+            set_cbuzz_settings(points["A"], points["B"], points["C"], delays)
+            dialog.accept()
+
+        def reset() -> None:
+            point_a, point_b, point_c, delays = reset_cbuzz_settings()
+            points["A"] = point_a
+            points["B"] = point_b
+            points["C"] = point_c
+            board.set_points(points)
+            for edit, value in zip(edits, delays):
+                edit.setText(f"{value:.2f}")
+
+        buttons = QDialogButtonBox()
+        save_btn = buttons.addButton("保存する", QDialogButtonBox.ButtonRole.AcceptRole)
+        reset_btn = buttons.addButton("リセット", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        save_btn.clicked.connect(save)
+        reset_btn.setAutoDefault(False)
+        reset_btn.clicked.connect(reset)
+        cancel_btn.clicked.connect(dialog.reject)
+        form.addWidget(buttons)
+        side = QWidget()
+        side.setLayout(form)
+        outer.addWidget(side)
         dialog.exec()
 
     def _pick_used_tsum(self, guess: str, path: Path | None) -> str | None:

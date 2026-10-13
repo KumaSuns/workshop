@@ -376,7 +376,7 @@ def run_play(
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
-        nonlocal go_at, used_items, wait_times, pieces, tsum_asked
+        nonlocal go_at, used_items, wait_times, pieces
         game = None
         skill = None
         fever = None
@@ -456,7 +456,6 @@ def run_play(
         skill_my_full = None
         skill_my_held = False
         skill_saw_empty = False
-        tsum_asked = request_used_tsum is None
         watch_hit.clear()
         watching.clear()
         if timeup_seen is not None:
@@ -1274,8 +1273,18 @@ def run_play(
                     say("画面を待っています")
                     _sleep_stop(0.25, stop)
                 continue
-            on_mission = _daily_mission_button(image) is not None
-            pause = _pause_continue_button(image)
+            on_board = (
+                saw_board
+                and image is not None
+                and not image.isNull()
+                and _in_play_hud(image)
+            )
+            if on_board:
+                on_mission = False
+                pause = None
+            else:
+                on_mission = _daily_mission_button(image) is not None
+                pause = _pause_continue_button(image)
             on_pause = pause is not None
             if resumed_pause and not on_pause and not on_mission:
                 saw_board = True
@@ -1656,22 +1665,6 @@ def run_play(
                     if did_skill:
                         skip_after_skill = True
                     continue
-                play_bombs = _bombs_on_board(pieces, game)
-                if len(play_bombs) >= 3:
-                    if try_bomb(skill_sit(True), force=True):
-                        bomb_after_long = False
-                        continue
-                near_bomb = _my_tsum_near_bomb(pieces, my_group, game)
-                if near_bomb is not None:
-                    if try_bomb(skill_sit(True), force=True, target=near_bomb):
-                        bomb_after_long = False
-                        continue
-                elif bomb_after_long and _bombs_on_board(pieces, game):
-                    if try_bomb(skill_sit(True), force=True):
-                        bomb_after_long = False
-                        continue
-                elif bomb_after_long and len(tsums) >= BOARD_READY:
-                    bomb_after_long = False
                 skill_fill = _skill_fill(rgb, skill)
                 emit_gauges(skill_fill)
                 wait_save = None
@@ -1708,14 +1701,120 @@ def run_play(
                 watching.set()
                 try:
                     queue = list(found)
+                    seen_keys = {_chain_key(item) for item in found}
                     picked0 = found[0] if found else None
                     board = pieces
-                    while queue:
+                    need_more = False
+                    while queue or need_more:
                         skill_busy[0] = True
                         _check_stop(stop)
                         if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
                             timeup = True
                             break
+                        if not queue:
+                            need_more = False
+                            leftover_tsums = [
+                                piece for piece in board if _is_tsum(piece)
+                            ]
+                            if len(leftover_tsums) >= MIN_CHAIN:
+                                more = list_found(
+                                    board,
+                                    leftover_tsums,
+                                    extra=burst_skip,
+                                    used_spots=used,
+                                )
+                                for item in more:
+                                    key = _chain_key(item)
+                                    if key in seen_keys:
+                                        continue
+                                    seen_keys.add(key)
+                                    queue.append(item)
+                            if queue:
+                                continue
+                            if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                                timeup = True
+                                break
+                            if (
+                                skill_is_gadget(used_tsum)
+                                and pending_spots is not None
+                                and time.time() - pending_at < 0.5
+                            ):
+                                break
+                            try:
+                                image = capture_play_frame()
+                                rgb = _qimage_rgb(image)
+                            except Exception:
+                                break
+                            if rgb is None or image.isNull():
+                                break
+                            play_frame[0] = image
+                            play_frame[1] = rgb
+                            play_frame_at[0] = time.time()
+                            if not _in_play_hud(image):
+                                break
+                            skill_busy[0] = False
+                            if (
+                                skill is not None
+                                and not watch_hit.is_set()
+                                and _skill_ready(rgb, skill, used_tsum)
+                                and not (
+                                    skill_is_gadget(used_tsum)
+                                    and _gadget_skill_hold(
+                                        _fever_playing(rgb, game),
+                                        _meter_fever_fill(rgb, fever, skill, fan),
+                                        latest_gauge[3],
+                                    )
+                                )
+                            ):
+                                _press_ready_skill()
+                                if skill_pressed is not None and skill_pressed.is_set():
+                                    skill_busy[0] = True
+                                    skip_after_skill = True
+                                    break
+                            skill_busy[0] = True
+                            with _gpu_lock:
+                                pieces = predictor.predict_pieces(
+                                    Path("."), game, rgb=rgb, inner=False
+                                )
+                            tsums = [piece for piece in pieces if _is_tsum(piece)]
+                            board = pieces
+                            pending_used |= used
+                            used = set()
+                            seen_keys = set()
+                            burst_skip = []
+                            more = list_found(board, tsums)
+                            if more and not pooh_long:
+                                more, _opts, _pick_n = order_found(more)
+                            if more:
+                                need = time_bomb_number(used_items)
+                                mine_first = (
+                                    skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum)
+                                )
+                                more.sort(
+                                    key=lambda chain: (
+                                        (
+                                            my_group > 0
+                                            and int(chain[0].get("group") or 0) == my_group,
+                                            len(chain) >= need,
+                                            len(chain),
+                                        )
+                                        if mine_first
+                                        else (
+                                            len(chain) >= need,
+                                            len(chain),
+                                            my_group > 0
+                                            and int(chain[0].get("group") or 0) == my_group,
+                                        )
+                                    ),
+                                    reverse=True,
+                                )
+                            for item in more:
+                                key = _chain_key(item)
+                                seen_keys.add(key)
+                                queue.append(item)
+                            if not queue:
+                                break
+                            continue
                         chain = queue.pop(0)
                         spots = {(int(piece["x"]), int(piece["y"])) for piece in chain}
                         if spots & used:
@@ -1784,19 +1883,7 @@ def run_play(
                             if not _is_tsum(piece)
                             or (int(piece["x"]), int(piece["y"])) not in used
                         ]
-                        have = {
-                            frozenset((int(piece["x"]), int(piece["y"])) for piece in item)
-                            for item in queue
-                        }
-                        for item in list_found(pieces, tsums, used_spots=used):
-                            spots_item = {(int(piece["x"]), int(piece["y"])) for piece in item}
-                            if spots_item & used:
-                                continue
-                            key = frozenset(spots_item)
-                            if key in have:
-                                continue
-                            queue.append(item)
-                            have.add(key)
+                        need_more = True
                 finally:
                     skill_busy[0] = False
                     if not saw_board:
