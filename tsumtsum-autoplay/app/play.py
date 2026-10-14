@@ -347,6 +347,8 @@ def run_play(
     bomb_acc = 0.0
     bomb_asked = False
     bomb_asked_sit = ""
+    skill_asked = False
+    skill_asked_sit = ""
     skill_pick: tuple[str, bool] | None = None
     skill_acc = 0.0
     pending_lesson: tuple[list[int], int] | None = None
@@ -375,7 +377,7 @@ def run_play(
         nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
-        nonlocal skill_pick, skill_acc
+        nonlocal skill_pick, skill_acc, skill_asked, skill_asked_sit
         nonlocal go_at, used_items, wait_times, pieces
         game = None
         skill = None
@@ -431,6 +433,8 @@ def run_play(
         bomb_acc = 0.0
         bomb_asked = False
         bomb_asked_sit = ""
+        skill_asked = False
+        skill_asked_sit = ""
         skill_pick = None
         skill_acc = 0.0
         pending_lesson = None
@@ -578,9 +582,11 @@ def run_play(
     def settle_pending(erased: bool) -> None:
         nonlocal pending_lesson, pending_burst, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_group, pending_my_n, pending_skip, pending_used
-        nonlocal bomb_asked, bomb_asked_sit
+        nonlocal bomb_asked, bomb_asked_sit, skill_asked, skill_asked_sit
         bomb_asked = False
         bomb_asked_sit = ""
+        skill_asked = False
+        skill_asked_sit = ""
         if pending_lesson is not None:
             record_pick(pending_lesson[0], pending_lesson[1], erased)
             pending_lesson = None
@@ -624,6 +630,18 @@ def run_play(
             bomb_asked_sit = sit
         return go
 
+    def ask_skill(has_chain: bool) -> bool:
+        nonlocal skill_asked, skill_asked_sit
+        sit = skill_sit(has_chain)
+        if skill_asked and skill_asked_sit == sit:
+            return False
+        go = should_skill(sit, True, skill_ok)
+        if not go:
+            start_skill_pick(sit, False)
+            skill_asked = True
+            skill_asked_sit = sit
+        return go
+
     def start_skill_pick(sit: str, pressed: bool) -> None:
         nonlocal skill_pick, skill_acc
         flush_skill()
@@ -664,6 +682,27 @@ def run_play(
         last_bomb_at = time.time()
         pending_hud.append((sit, "bomb", True))
         return True
+
+    def tap_bombs_after_chains(swipes_n: int, longest: int) -> None:
+        if swipes_n < 2 and longest < time_bomb_number(used_items):
+            if swipes_n >= 1:
+                try_bomb(skill_sit(False), force=False)
+            return
+        if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+            return
+        sit = skill_sit(False)
+        while True:
+            left = [
+                piece
+                for piece in _bombs_on_board(pieces, game)
+                if _piece_cell(piece) not in skip_bomb_cells
+            ]
+            if not (len(left) >= BOMB_MANY or len(left) == 1):
+                return
+            if not try_bomb(sit, force=True):
+                return
+            if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                return
 
     def break_to_one() -> bool:
         nonlocal bomb_taps, last_bomb_at, bomb_after_long, skip_bomb_cells
@@ -867,6 +906,12 @@ def run_play(
     def emit_gauges(_skill_fill: float | None) -> None:
         take_fever()
 
+    def _chain_pref(chain: list[dict[str, int]]) -> tuple[bool, int]:
+        return (
+            my_group > 0 and int(chain[0].get("group") or 0) == my_group,
+            len(chain),
+        )
+
     def list_found(
         pieces: list[dict[str, int]],
         tsums: list[dict[str, int]],
@@ -906,24 +951,7 @@ def run_play(
         found.sort(key=len, reverse=True)
         if pooh_long:
             return found
-        need = time_bomb_number(used_items)
-        mine_first = skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum)
-        found.sort(
-            key=lambda chain: (
-                (
-                    my_group > 0 and int(chain[0].get("group") or 0) == my_group,
-                    len(chain) >= need,
-                    len(chain),
-                )
-                if mine_first
-                else (
-                    len(chain) >= need,
-                    len(chain),
-                    my_group > 0 and int(chain[0].get("group") or 0) == my_group,
-                )
-            ),
-            reverse=True,
-        )
+        found.sort(key=_chain_pref, reverse=True)
         return found
     kinds_locked = False
     used_items: list[str] | None = start_items
@@ -966,13 +994,15 @@ def run_play(
     skill_press_lock = Lock()
     board_bombs = [None]
 
-    def press_skill_now(point, bombs_ok: bool = False) -> None:
+    def press_skill_now(point, bombs_ok: bool = False, has_chain: bool = False) -> None:
         nonlocal fan_taps, last_fan_at
         if before_start[0] or not saw_board:
             return
         if not bombs_ok and board_bombs[0] != 0:
             return
         if point is None or skill_busy[0] or watch_hit.is_set():
+            return
+        if not ask_skill(has_chain):
             return
         now = time.time()
         with skill_press_lock:
@@ -1025,7 +1055,7 @@ def run_play(
         finally:
             skill_busy[0] = was_busy
 
-    def _press_ready_skill() -> None:
+    def _press_ready_skill(has_chain: bool = False) -> None:
         _clear_bombs_before_skill()
         button = _skill_button_square(skill)
         press_skill_now(
@@ -1036,6 +1066,7 @@ def run_play(
                 int(image.height()),
             ),
             bombs_ok=True,
+            has_chain=has_chain,
         )
 
     def about_to_fill_skill(chain: list[dict[str, int]]) -> bool:
@@ -1600,28 +1631,7 @@ def run_play(
                 else:
                     found, pick_opts, pick_n = order_found(found)
                     if found:
-                        need = time_bomb_number(used_items)
-                        mine_first = skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum)
-
-                        def _is_mine(chain: list[dict[str, int]]) -> bool:
-                            return my_group > 0 and int(chain[0].get("group") or 0) == my_group
-
-                        found.sort(
-                            key=lambda chain: (
-                                (
-                                    _is_mine(chain),
-                                    len(chain) >= need,
-                                    len(chain),
-                                )
-                                if mine_first
-                                else (
-                                    len(chain) >= need,
-                                    len(chain),
-                                    _is_mine(chain),
-                                )
-                            ),
-                            reverse=True,
-                        )
+                        found.sort(key=_chain_pref, reverse=True)
                         pick_n = len(found[0])
                         pick_opts = [len(item) for item in found]
             add_idle("find", time.perf_counter() - t0)
@@ -1639,7 +1649,7 @@ def run_play(
                     latest_gauge[3],
                 )
             ):
-                _press_ready_skill()
+                _press_ready_skill(bool(found))
             if (
                 skill is not None
                 and not skill_is_gadget(used_tsum)
@@ -1647,7 +1657,7 @@ def run_play(
                 and not skill_busy[0]
                 and _skill_ready(rgb, skill, used_tsum)
             ):
-                _press_ready_skill()
+                _press_ready_skill(bool(found))
             if not found and skill_pressed is not None and skill_pressed.is_set():
                 t0 = time.perf_counter()
                 did_skill = apply_checker_skill(False)
@@ -1697,6 +1707,8 @@ def run_play(
                 burst = 0
                 burst_my_n = 0
                 burst_max = 0
+                screen_swipes = 0
+                screen_max = 0
                 burst_skip: list[frozenset[tuple[int, int]]] = []
                 timeup = False
                 timeup_ended = False
@@ -1740,6 +1752,7 @@ def run_play(
                             if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
                                 timeup = True
                                 break
+                            tap_bombs_after_chains(screen_swipes, screen_max)
                             if (
                                 skill_is_gadget(used_tsum)
                                 and pending_spots is not None
@@ -1788,32 +1801,13 @@ def run_play(
                             used = set()
                             seen_keys = set()
                             burst_skip = []
+                            screen_swipes = 0
+                            screen_max = 0
                             more = list_found(board, tsums)
                             if more and not pooh_long:
                                 more, _opts, _pick_n = order_found(more)
                             if more:
-                                need = time_bomb_number(used_items)
-                                mine_first = (
-                                    skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum)
-                                )
-                                more.sort(
-                                    key=lambda chain: (
-                                        (
-                                            my_group > 0
-                                            and int(chain[0].get("group") or 0) == my_group,
-                                            len(chain) >= need,
-                                            len(chain),
-                                        )
-                                        if mine_first
-                                        else (
-                                            len(chain) >= need,
-                                            len(chain),
-                                            my_group > 0
-                                            and int(chain[0].get("group") or 0) == my_group,
-                                        )
-                                    ),
-                                    reverse=True,
-                                )
+                                more.sort(key=_chain_pref, reverse=True)
                             for item in more:
                                 key = _chain_key(item)
                                 seen_keys.add(key)
@@ -1878,6 +1872,8 @@ def run_play(
                             break
                         burst += 1
                         burst_max = max(burst_max, len(chain))
+                        screen_swipes += 1
+                        screen_max = max(screen_max, len(chain))
                         used |= spots
                         last_chain = chain
                         burst_skip.append(_chain_key(chain))

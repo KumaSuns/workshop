@@ -23,9 +23,7 @@ def play_coin(value) -> int | None:
         n = int(value)
     except (TypeError, ValueError):
         return None
-    if n <= 0:
-        return None
-    if n >= 3000:
+    if n <= 100:
         return None
     return n
 
@@ -353,19 +351,6 @@ def order_found(
             scores.append(float(entry.get("sum") or 0) / n)
         else:
             scores.append(float(len(item)))
-    wait_rl = data.get("rl_wait") if isinstance(data.get("rl_wait"), dict) else _empty_rl_length()
-    wait_choices = wait_rl.get("choices") if isinstance(wait_rl.get("choices"), dict) else {}
-    wait_n = int(wait_rl.get("n") or 0)
-    wait_base = float(wait_rl.get("baseline") or 0)
-    waits: list[float] = []
-    for item in found:
-        key = _rl_key(options, len(item))
-        entry = wait_choices.get(key) if isinstance(wait_choices.get(key), dict) else None
-        n = int(entry.get("n") or 0) if entry else 0
-        if n > 0:
-            waits.append(round(float(entry.get("sum") or 0) / n, 1))
-        else:
-            waits.append(round(wait_base, 1))
 
     def leftover_at(index: int) -> int:
         if cached[index]:
@@ -378,9 +363,6 @@ def order_found(
 
     def pick_among(indices: list[int]) -> int:
         tied = list(indices)
-        if wait_n > 0:
-            best_wait = min(waits[i] for i in tied)
-            tied = [i for i in tied if waits[i] == best_wait]
         best_len = max(scores[i] for i in tied)
         tied = [i for i in tied if scores[i] == best_len]
         lefts = [leftover_at(i) for i in tied]
@@ -390,7 +372,7 @@ def order_found(
         tied = [i for i in tied if bigs[i] == best_big]
         return tied[0]
 
-    explore_n = wait_n if wait_n > 0 else matches
+    explore_n = matches
     if random.randrange(explore_n + 2) == 0:
         index = random.randrange(len(found))
     else:
