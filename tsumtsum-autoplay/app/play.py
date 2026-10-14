@@ -681,7 +681,7 @@ def run_play(
     def apply_checker_skill(has_chain: bool) -> bool:
         nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps, skill_used, press_counted
         nonlocal bomb_taps, last_bomb_at, skip_loss, pooh_long, swipes
-        nonlocal skill_my_n, skill_saw_empty, fan_taps, last_fan_at
+        nonlocal skill_my_n, skill_saw_empty
 
         def note_used() -> None:
             nonlocal skill_used, press_counted
@@ -734,12 +734,7 @@ def run_play(
                 if not activated:
                     return False
                 skip_loss = True
-                if fan is not None:
-                    _tap_fan(fan, image, say, stop)
-                    fan_taps += 1
-                    last_fan_at = time.time()
-                else:
-                    say("扇風機の枠がありません")
+                _sleep_stop(0.12, stop)
                 if not tsum_unspecified:
                     after_skill_tap(
                         used_tsum,
@@ -972,6 +967,7 @@ def run_play(
     board_bombs = [None]
 
     def press_skill_now(point, bombs_ok: bool = False) -> None:
+        nonlocal fan_taps, last_fan_at
         if before_start[0] or not saw_board:
             return
         if not bombs_ok and board_bombs[0] != 0:
@@ -995,6 +991,16 @@ def run_play(
             with skill_press_lock:
                 next_skill_at[0] = time.time() + 0.5
             return
+        shot = play_frame[0]
+        if (
+            skill_breaks_bombs(used_tsum)
+            and fan is not None
+            and shot is not None
+            and not shot.isNull()
+        ):
+            _tap_fan(fan, shot, say, stop)
+            fan_taps += 1
+            last_fan_at = time.time()
         if skill_pressed is not None:
             skill_pressed.set()
 
@@ -2697,7 +2703,6 @@ def _tap_fan(
     y = int(fan["y"] + max(1, int(fan["h"])) / 2)
     say(f"扇風機をタップ {x},{y}")
     tap(x, y, screen_w=image.width(), screen_h=image.height())
-    _sleep_stop(0.12, stop)
 
 
 def _fever_class(red: int, green: int, blue: int) -> tuple[bool, bool, bool]:
