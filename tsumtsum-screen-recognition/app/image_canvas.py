@@ -96,6 +96,9 @@ class ImageCanvas(QGraphicsView):
         self._trace_timer = QTimer(self)
         self._trace_timer.setInterval(16)
         self._trace_timer.timeout.connect(self._on_trace_tick)
+        self._run_lines: list[dict] = []
+        self._run_active = False
+        self._guide_hidden = False
 
         self._guide = QLabel(self)
         self._guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -132,6 +135,8 @@ class ImageCanvas(QGraphicsView):
         self._pieces = [dict(piece) for piece in (pieces or [])]
         self._selected_piece = None
         self._hover_pos = None
+        self._run_lines = []
+        self._run_active = False
         self.stop_chain_trace()
         game = self._game_rect()
         if game is not None:
@@ -355,6 +360,8 @@ class ImageCanvas(QGraphicsView):
         self._region = None
         self._regions = {}
         self._pieces = []
+        self._run_lines = []
+        self._run_active = False
         self._selected_piece = None
         self._status = "unlabeled"
         self._mode = None
@@ -417,7 +424,15 @@ class ImageCanvas(QGraphicsView):
         self._should_fit = True
         self.viewport().update()
 
+    def set_guide_hidden(self, hidden: bool) -> None:
+        self._guide_hidden = hidden
+        self._update_guide()
+
     def _update_guide(self) -> None:
+        if self._guide_hidden:
+            self._guide.hide()
+            return
+        self._guide.show()
         if self._pixmap_item is None:
             self._guide.setText("画像をドロップ  /  Ctrl+V で貼り付け  /  「画像を開く」")
         elif is_scene_key(self._active_key):
@@ -473,6 +488,7 @@ class ImageCanvas(QGraphicsView):
                 painter.setPen(QPen(QColor("#5CFF9E"), 2))
                 painter.drawRect(region_view)
             self._draw_pieces(painter)
+            self._draw_run_lines(painter)
             painter.restore()
             return
         for key, rect in self._regions.items():
@@ -504,6 +520,7 @@ class ImageCanvas(QGraphicsView):
             painter.setPen(accent)
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
         self._draw_pieces(painter)
+        self._draw_run_lines(painter)
         if (
             not is_piece_key(self._active_key)
             and self._region is not None
@@ -523,7 +540,7 @@ class ImageCanvas(QGraphicsView):
         painter.setFont(font)
         for index, piece in enumerate(self._pieces):
             kind = piece["kind"]
-            if not self._key_is_visible(kind):
+            if not self._run_active and not self._key_is_visible(kind):
                 continue
             center = self.mapFromScene(QPointF(piece["x"], piece["y"]))
             radius = self._piece_view_radius(piece)
@@ -597,6 +614,55 @@ class ImageCanvas(QGraphicsView):
         painter.setPen(QPen(QColor(255, 255, 255, 230), 2))
         painter.setBrush(color)
         painter.drawEllipse(current, 9, 9)
+
+    def set_run_mark(self, pieces: list[dict], lines: list[dict]) -> None:
+        self._pieces = [
+            {
+                "x": int(piece["x"]),
+                "y": int(piece["y"]),
+                "r": int(piece["r"]),
+                "kind": str(piece.get("kind") or "tsum"),
+                "group": int(piece.get("group") or 0),
+            }
+            for piece in pieces
+        ]
+        self._selected_piece = None
+        self._run_lines = [dict(line) for line in lines]
+        self._run_active = True
+        self.viewport().update()
+
+    def _draw_run_lines(self, painter: QPainter) -> None:
+        if not self._run_lines:
+            return
+        font = QFont("Yu Gothic UI", 11, QFont.Weight.Bold)
+        painter.setFont(font)
+        for line in self._run_lines:
+            start = self.mapFromScene(QPointF(int(line["x1"]), int(line["y1"])))
+            end = self.mapFromScene(QPointF(int(line["x2"]), int(line["y2"])))
+            color = QColor(tsum_group_color(int(line.get("group") or 1)))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(
+                QPen(QColor(255, 255, 255, 230), 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            )
+            painter.drawLine(start, end)
+            painter.setPen(QPen(color, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(start, end)
+            text = str(line.get("n") or "")
+            if not text:
+                continue
+            mid = QPointF((start.x() + end.x()) / 2, (start.y() + end.y()) / 2)
+            metrics = painter.fontMetrics()
+            badge = QRect(
+                int(mid.x()) - metrics.horizontalAdvance(text) // 2 - 5,
+                int(mid.y()) - metrics.height() // 2 - 3,
+                metrics.horizontalAdvance(text) + 10,
+                metrics.height() + 6,
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(12, 16, 20, 220))
+            painter.drawRoundedRect(badge, 4, 4)
+            painter.setPen(color)
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_piece_guide(self, painter: QPainter) -> None:
         if (

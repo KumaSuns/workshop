@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
@@ -207,6 +208,11 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("workshop", "VideoFrameExtractor")
         self.output_dir = Path(__file__).resolve().parent.parent / "output"
         self._cap = None
+        self._play_frame = 0
+        self._play_syncing = False
+        self._play_timer = QTimer(self)
+        self._play_timer.setInterval(80)
+        self._play_timer.timeout.connect(self._player_tick)
         self._full_pixmap: QPixmap | None = None
         self._saved_by_index: dict[int, Path] = {}
         self._preview_point = None
@@ -357,6 +363,7 @@ class MainWindow(QMainWindow):
         self.server_save_btn = QPushButton("サーバーに保存")
         self.server_load_btn = QPushButton("サーバーから開く")
         self.server_settings_btn = QPushButton("サーバー接続")
+        self.elsa_skill_save_btn = QPushButton("エルサスキル画像に保存")
         data_grid = QGridLayout()
         data_grid.setHorizontalSpacing(6)
         data_grid.setVerticalSpacing(6)
@@ -365,6 +372,7 @@ class MainWindow(QMainWindow):
         data_grid.addWidget(self.server_save_btn, 1, 0)
         data_grid.addWidget(self.server_load_btn, 1, 1)
         data_grid.addWidget(self.server_settings_btn, 2, 0, 1, 2)
+        data_grid.addWidget(self.elsa_skill_save_btn, 3, 0, 1, 2)
         left_layout.addLayout(data_grid)
         left_layout.addStretch(1)
         left.setMinimumWidth(260)
@@ -556,6 +564,24 @@ class MainWindow(QMainWindow):
         extra_col.setObjectName("panel")
         extra_layout = QVBoxLayout(extra_col)
         extra_layout.setContentsMargins(12, 12, 12, 12)
+        extra_layout.setSpacing(6)
+        extra_layout.addWidget(QLabel("再生"))
+        self.player_time = QLabel("—")
+        self.player_time.setObjectName("hint")
+        self.player_time.setWordWrap(True)
+        extra_layout.addWidget(self.player_time)
+        self.player_slider = QSlider(Qt.Orientation.Horizontal)
+        self.player_slider.setEnabled(False)
+        extra_layout.addWidget(self.player_slider)
+        self.player_play_btn = QPushButton("再生")
+        extra_layout.addWidget(self.player_play_btn)
+        step_row = QHBoxLayout()
+        step_row.setSpacing(6)
+        self.player_back_btn = QPushButton("前のコマ")
+        self.player_fwd_btn = QPushButton("次のコマ")
+        step_row.addWidget(self.player_back_btn, 1)
+        step_row.addWidget(self.player_fwd_btn, 1)
+        extra_layout.addLayout(step_row)
         extra_layout.addStretch(1)
         extra_col.setMinimumWidth(160)
         self._extra_col = extra_col
@@ -604,6 +630,10 @@ class MainWindow(QMainWindow):
         self.scene_btn.clicked.connect(self.start_scene_extract)
         self.result_btn.clicked.connect(self.start_result_extract)
         self.play_video_btn.clicked.connect(self.play_current_video)
+        self.player_play_btn.clicked.connect(self._player_toggle)
+        self.player_back_btn.clicked.connect(lambda: self._player_step(-1))
+        self.player_fwd_btn.clicked.connect(lambda: self._player_step(1))
+        self.player_slider.valueChanged.connect(self._player_on_slider)
         self.scene_still_btn.clicked.connect(self.open_scene_still)
         self.wrong_btn.clicked.connect(self.reject_current_scene)
         self.teach_btn.clicked.connect(self.teach_current_kind)
@@ -642,7 +672,34 @@ class MainWindow(QMainWindow):
         self.server_save_btn.clicked.connect(self.upload_data_to_server)
         self.server_load_btn.clicked.connect(self.download_data_from_server)
         self.server_settings_btn.clicked.connect(self.edit_server_settings)
+        self.elsa_skill_save_btn.clicked.connect(self.save_elsa_skill_image)
         self._update_buttons()
+
+    def save_elsa_skill_image(self) -> None:
+        if self._full_pixmap is None or self._full_pixmap.isNull():
+            self.statusBar().showMessage("プレビューに画像がありません", 3000)
+            return
+        folder = (
+            Path(__file__).resolve().parent
+            / "assets"
+            / "images"
+            / "skills"
+            / "Coronation_Elsa"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        frame = int(self._play_frame or 0)
+        if frame <= 0 and self._preview_point is not None:
+            frame = int(getattr(self._preview_point, "frame", 0) or 0)
+        stem = f"frame_{frame:06d}" if frame > 0 else datetime.now().strftime("elsa_%Y%m%d_%H%M%S")
+        dest = folder / f"{stem}.png"
+        extra = 1
+        while dest.exists():
+            extra += 1
+            dest = folder / f"{stem}_{extra}.png"
+        if not self._full_pixmap.save(str(dest), "PNG"):
+            self.statusBar().showMessage("保存できませんでした", 3000)
+            return
+        self.statusBar().showMessage(f"保存しました {dest.name}", 4000)
 
     def _add_info_block(self, layout: QVBoxLayout, caption: str, stretch: int = 0) -> QLabel:
         box = QFrame()
@@ -672,6 +729,13 @@ class MainWindow(QMainWindow):
         self.scene_btn.setText("中止" if extracting else "解析")
         self.result_btn.setEnabled(ready and bool(self.scene_labels.keys_named("result")))
         self.play_video_btn.setEnabled(self.info is not None)
+        can_play = self.info is not None and not busy
+        self.player_play_btn.setEnabled(can_play)
+        self.player_back_btn.setEnabled(can_play)
+        self.player_fwd_btn.setEnabled(can_play)
+        self.player_slider.setEnabled(can_play)
+        if busy and self._play_timer.isActive():
+            self._player_stop()
         self.scene_still_btn.setEnabled(self.info is not None)
         self.open_btn.setEnabled(not busy)
         self.count_spin.setEnabled(not busy)
@@ -690,6 +754,7 @@ class MainWindow(QMainWindow):
         self.server_save_btn.setEnabled(not busy)
         self.server_load_btn.setEnabled(not busy)
         self.server_settings_btn.setEnabled(not busy)
+        self.elsa_skill_save_btn.setEnabled(not busy)
         training = isinstance(self.worker, SceneTrainWorker)
         digit_training = isinstance(self.worker, DigitTrainWorker)
         tsum_training = isinstance(self.worker, TsumTrainWorker)
@@ -1069,6 +1134,8 @@ class MainWindow(QMainWindow):
             self._preview_coin_box = None
             self.preview.editable = False
             self._set_coin_fix_visible(False)
+            self._play_frame = 0
+            self._player_sync_ui()
             return
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb.shape
@@ -1080,6 +1147,8 @@ class MainWindow(QMainWindow):
         self._set_item_fix_visible(False)
         self.preview_title.setText("プレビュー")
         self._fit_preview()
+        self._play_frame = int(round(0.5 * last))
+        self._player_sync_ui()
 
     def refresh_points(self) -> None:
         self.point_list.blockSignals(True)
@@ -1204,6 +1273,9 @@ class MainWindow(QMainWindow):
         self.preview_title.setText("プレビュー")
         self._sync_coin_preview(point)
         self._fit_preview()
+        self._player_stop()
+        self._play_frame = int(point.frame)
+        self._player_sync_ui()
         self.statusBar().showMessage(
             f"{point.index}枚目  {format_timecode(point.seconds)}  ({point.percent * 100:.1f}%)",
             3000,
@@ -3917,6 +3989,89 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("中止しました", 4000)
             return
         QMessageBox.critical(self, "失敗しました", message)
+
+    def _player_sync_ui(self) -> None:
+        if not hasattr(self, "player_slider"):
+            return
+        last = 0
+        if self.info is not None:
+            last = max(self.info.frame_count - 1, 0)
+        frame = max(0, min(int(self._play_frame), last))
+        self._play_frame = frame
+        self._play_syncing = True
+        self.player_slider.setRange(0, last)
+        self.player_slider.setValue(frame)
+        self._play_syncing = False
+        if self.info is None or self.info.fps <= 0:
+            self.player_time.setText("—")
+            return
+        seconds = frame / self.info.fps
+        self.player_time.setText(f"{format_timecode(seconds)}  /  {self.info.format_duration()}")
+
+    def _player_toggle(self) -> None:
+        if self.info is None:
+            return
+        if self._play_timer.isActive():
+            self._player_stop()
+            return
+        last = max(self.info.frame_count - 1, 0)
+        if self._play_frame >= last:
+            self._player_seek(0)
+        self._play_timer.start()
+        self.player_play_btn.setText("停止")
+
+    def _player_stop(self) -> None:
+        self._play_timer.stop()
+        if hasattr(self, "player_play_btn"):
+            self.player_play_btn.setText("再生")
+
+    def _player_tick(self) -> None:
+        if self.info is None:
+            self._player_stop()
+            return
+        step = max(1, int(round(self.info.fps * self._play_timer.interval() / 1000.0)))
+        nxt = self._play_frame + step
+        last = max(self.info.frame_count - 1, 0)
+        if nxt >= last:
+            self._player_seek(last)
+            self._player_stop()
+            return
+        self._player_seek(nxt)
+
+    def _player_step(self, delta: int) -> None:
+        if self.info is None:
+            return
+        self._player_stop()
+        self._player_seek(self._play_frame + int(delta))
+
+    def _player_on_slider(self, value: int) -> None:
+        if self._play_syncing or self.info is None:
+            return
+        self._player_stop()
+        self._player_seek(value)
+
+    def _player_seek(self, frame: int) -> None:
+        if self.info is None:
+            return
+        last = max(self.info.frame_count - 1, 0)
+        frame = max(0, min(int(frame), last))
+        image = self._read_frame(frame)
+        if image is None:
+            self.statusBar().showMessage("この位置の画像を取得できませんでした", 3000)
+            return
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb.shape
+        qimage = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+        self._full_pixmap = QPixmap.fromImage(qimage)
+        self._play_frame = frame
+        self.preview.editable = False
+        self._preview_coin_box = None
+        self._set_coin_fix_visible(False)
+        self._set_item_fix_visible(False)
+        seconds = frame / self.info.fps if self.info.fps else 0.0
+        self.preview_title.setText(f"プレビュー  {format_timecode(seconds)}")
+        self._fit_preview()
+        self._player_sync_ui()
 
     def play_current_video(self) -> None:
         if self.info is None:

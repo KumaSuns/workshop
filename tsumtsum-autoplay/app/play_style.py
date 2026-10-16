@@ -499,34 +499,8 @@ def record_rl_bomb(sit: str, pressed: bool, seconds: float) -> None:
 
 
 def should_skill(sit: str, default: bool, skill_n: int = 0) -> bool:
-    data = _load()
-    coins = _rl_length_from(data.get("rl_skill_coin"))
-    coin_n = int(coins.get("n") or 0)
-    if coin_n > 0 and random.randrange(coin_n + 2) == 0:
-        return random.randrange(2) == 0
-    if coin_n <= 0:
-        return default
-    choices = coins.get("choices") if isinstance(coins.get("choices"), dict) else {}
-    base = float(coins.get("baseline") or 0)
-
-    def coin_at(count: int) -> tuple[int, float]:
-        key = str(max(0, int(count)))
-        entry = choices.get(key) if isinstance(choices.get(key), dict) else None
-        n = int(entry.get("n") or 0) if entry else 0
-        if n <= 0:
-            return 0, base
-        return n, float(entry.get("sum") or 0) / n
-
-    now_n, now_avg = coin_at(skill_n)
-    next_n, next_avg = coin_at(skill_n + 1)
-    if now_n > 0 and next_n > 0:
-        if next_avg > now_avg:
-            return True
-        if now_avg > next_avg:
-            return False
-    elif next_n > 0 and now_n <= 0 and next_avg > base:
-        return True
-    return default
+    del sit, default, skill_n
+    return True
 
 
 def record_rl_skill(sit: str, pressed: bool, seconds: float) -> None:

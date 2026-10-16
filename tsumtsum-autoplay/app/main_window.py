@@ -615,6 +615,7 @@ class MainWindow(QMainWindow):
         self._info_count_value.setText("－")
         self._info_erase_value.setText("－")
         self._info_fever_en.setStyleSheet("")
+        self._set_skill_lamp(False)
 
     def _show_meters(
         self,
@@ -652,6 +653,14 @@ class MainWindow(QMainWindow):
             self._info_erase_value.setText("－")
         else:
             self._info_erase_value.setText(str(int(_skill_ok)))
+
+    def _set_skill_lamp(self, on: bool) -> None:
+        if on:
+            self._info_skill_lamp.setStyleSheet(
+                "background: palette(highlight); color: palette(highlighted-text);"
+            )
+        else:
+            self._info_skill_lamp.setStyleSheet("background: palette(mid);")
 
     def _fit_tsum_slot(self) -> None:
         side = self._info_text.sizeHint().height()
@@ -759,6 +768,7 @@ class MainWindow(QMainWindow):
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
         self._play.gauges.connect(self._show_meters)
+        self._play.skill_lamp.connect(self._set_skill_lamp)
         self._play.failed.connect(self._on_play_fail)
         self._play.items.connect(self._show_items)
         self._play.stopped.connect(self._on_stopped)

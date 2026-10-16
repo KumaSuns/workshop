@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.dataset import Dataset, Sample
+from app.elsa_run import elsa_three_chains
 from app.hud_number import CoinNumberDialog, format_coin_number, read_coin_number as ocr_coin_number
 from app.image_canvas import ImageCanvas
 from app.paths import (
@@ -69,6 +70,7 @@ from app.paths import (
     IMAGE_EXTENSIONS,
     IPC_NAME,
     SERVER_SYNC_PATH,
+    SKILLS_IMAGES_DIR,
     VIDEO_EXTRACTOR_MAIN,
 )
 from app.predictor import Predictor
@@ -824,6 +826,8 @@ class MainWindow(QMainWindow):
         for col in range(2):
             left_grid.setColumnStretch(col, 1)
         left_layout.addLayout(left_grid)
+        self.elsa_list_btn = QPushButton("エルサ")
+        left_layout.addWidget(self.elsa_list_btn)
         left_layout.addStretch(1)
         left.setMinimumWidth(317)
         left.setMaximumWidth(461)
@@ -883,6 +887,15 @@ class MainWindow(QMainWindow):
         self.stats_hint.setObjectName("hint")
         self.stats_hint.setWordWrap(True)
         right_layout.addWidget(self.stats_hint)
+        elsa_action_row = QHBoxLayout()
+        self.elsa_run_btn = QPushButton("RUN")
+        self.elsa_delete_btn = QPushButton("削除")
+        self.elsa_run_btn.hide()
+        self.elsa_delete_btn.hide()
+        elsa_action_row.addWidget(self.elsa_run_btn)
+        elsa_action_row.addWidget(self.elsa_delete_btn)
+        elsa_action_row.addStretch(1)
+        right_layout.addLayout(elsa_action_row)
         unused_row = QHBoxLayout()
         self.show_unused_chk = QCheckBox("使わない画像も見る")
         self.delete_unused_one_btn = QPushButton("この画像を消す")
@@ -1007,6 +1020,9 @@ class MainWindow(QMainWindow):
         self.server_save_btn.clicked.connect(self.upload_data_to_server)
         self.server_load_btn.clicked.connect(self.download_data_from_server)
         self.server_settings_btn.clicked.connect(self.edit_server_settings)
+        self.elsa_list_btn.clicked.connect(self.toggle_elsa_list)
+        self.elsa_run_btn.clicked.connect(self.run_elsa)
+        self.elsa_delete_btn.clicked.connect(self.delete_elsa_image)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
         self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
@@ -1197,6 +1213,8 @@ class MainWindow(QMainWindow):
         self.refresh_list(self.current_id)
 
     def refresh_list(self, select_id: str | None = None) -> None:
+        if getattr(self, "_elsa_list", False):
+            return
         self._list_fill_select = select_id
         if self._list_filling:
             self._list_fill_restart = True
@@ -1469,6 +1487,12 @@ class MainWindow(QMainWindow):
             self._switching = True
             self.list_widget.setCurrentCell(max(previous_row, 0), 0)
             self._switching = False
+            return
+        if getattr(self, "_elsa_list", False):
+            item = self.list_widget.item(current_row, 0)
+            raw = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if raw:
+                self._show_elsa_file(Path(str(raw)))
             return
         sample_id = self._list_id_at(current_row)
         if sample_id is None:
@@ -1811,6 +1835,185 @@ class MainWindow(QMainWindow):
         folder = target if target.is_dir() else target.parent
         if folder.is_dir():
             self._settings.setValue(f"last_dir/{key}", str(folder.resolve()))
+
+    def toggle_elsa_list(self) -> None:
+        if self._block_if_training():
+            return
+        self._elsa_list = not getattr(self, "_elsa_list", False)
+        self._apply_elsa_chrome()
+        self.canvas.set_guide_hidden(self._elsa_list)
+        if not self._elsa_list:
+            self.refresh_list(self.current_id)
+            if self.current_id:
+                self.show_sample(self.current_id)
+            self.statusBar().showMessage("画像一覧に戻しました", 3000)
+            return
+        self._fill_elsa_list()
+
+    def _apply_elsa_chrome(self) -> None:
+        on = getattr(self, "_elsa_list", False)
+        self.stats_label.setVisible(not on)
+        self.stats_hint.setVisible(not on)
+        self.show_unused_chk.setVisible(not on)
+        for name in self._stats_names:
+            cell = name.parentWidget()
+            if cell is not None:
+                cell.setVisible(not on)
+        self.elsa_run_btn.setVisible(on)
+        self.elsa_delete_btn.setVisible(on)
+
+    def _elsa_skill_dir(self) -> Path:
+        return SKILLS_IMAGES_DIR / "Coronation_Elsa"
+
+    def _elsa_files(self) -> list[Path]:
+        folder = self._elsa_skill_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        return sorted(
+            (
+                path
+                for path in folder.iterdir()
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+
+    def _fill_elsa_list(self, select: Path | None = None) -> None:
+        files = self._elsa_files()
+        chosen = next((path for path in files if select is not None and path == select), None)
+        if chosen is None and files:
+            chosen = files[0]
+        self._list_filling = False
+        self._list_fill_restart = False
+        self._sync_list_columns()
+        keys = self._list_status_keys()
+        self.list_widget.blockSignals(True)
+        self.list_widget.setRowCount(len(files))
+        for row, path in enumerate(files):
+            for col in range(len(keys)):
+                item = self.list_widget.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.list_widget.setItem(row, col, item)
+                item.setText("")
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                item.setFlags(
+                    (item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    & ~Qt.ItemFlag.ItemIsEditable
+                )
+            name_item = self.list_widget.item(row, len(keys))
+            if name_item is None:
+                name_item = QTableWidgetItem()
+                self.list_widget.setItem(row, len(keys), name_item)
+            name_item.setText(path.name)
+            name_item.setForeground(QColor("#c5cad3"))
+            name_item.setData(Qt.ItemDataRole.UserRole, str(path))
+            name_item.setToolTip(str(path))
+            name_item.setFlags(
+                (name_item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                & ~Qt.ItemFlag.ItemIsEditable
+            )
+        if chosen is not None:
+            self.list_widget.setCurrentCell(files.index(chosen), 0)
+        self.list_widget.blockSignals(False)
+        self.statusBar().showMessage(f"エルサのスキル画像 {len(files)} 枚", 4000)
+        if chosen is not None:
+            self._show_elsa_file(chosen)
+        else:
+            self.current_id = None
+            self.canvas.clear_image()
+            self._set_dirty(False)
+
+    def delete_elsa_image(self) -> None:
+        if self._block_if_training() or not getattr(self, "_elsa_list", False):
+            return
+        row = self.list_widget.currentRow()
+        item = self.list_widget.item(row, 0) if row >= 0 else None
+        raw = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not raw:
+            self.statusBar().showMessage("削除する画像がありません", 3000)
+            return
+        path = Path(str(raw))
+        folder = self._elsa_skill_dir().resolve()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            self.statusBar().showMessage("削除する画像がありません", 3000)
+            return
+        if resolved.parent != folder or not resolved.is_file():
+            self.statusBar().showMessage("削除する画像がありません", 3000)
+            return
+        answer = QMessageBox.question(self, "削除", f"{resolved.name} を削除しますか？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        files = self._elsa_files()
+        index = next((i for i, item_path in enumerate(files) if item_path.resolve() == resolved), -1)
+        neighbor = None
+        if index >= 0 and index + 1 < len(files):
+            neighbor = files[index + 1]
+        elif index > 0:
+            neighbor = files[index - 1]
+        self.canvas.clear_image()
+        try:
+            resolved.unlink()
+        except OSError as exc:
+            QMessageBox.warning(self, "削除できませんでした", str(exc))
+            self._show_elsa_file(resolved)
+            return
+        self._fill_elsa_list(select=neighbor)
+        self.statusBar().showMessage(f"{resolved.name} を削除しました", 4000)
+
+    def _show_elsa_file(self, path: Path) -> None:
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            self.statusBar().showMessage("画像を開けませんでした", 3000)
+            return
+        self.current_id = None
+        self._elsa_path = path
+        self.canvas.set_guide_hidden(True)
+        self.canvas.set_image(
+            pixmap,
+            None,
+            "unlabeled",
+            regions={},
+            active_key=self._active_key,
+            pieces=[],
+        )
+        self._set_dirty(False)
+        self._refresh_region_list()
+        self.statusBar().showMessage(path.name, 3000)
+
+    def run_elsa(self) -> None:
+        if self._block_if_training() or not getattr(self, "_elsa_list", False):
+            return
+        path = getattr(self, "_elsa_path", None)
+        pixmap = self.canvas.source_pixmap()
+        if path is None or pixmap is None or pixmap.isNull():
+            self.statusBar().showMessage("画像がありません", 3000)
+            return
+        if self.predictor.piece_model is None and not self._ensure_predictor():
+            self.statusBar().showMessage("ツムのモデルがありません", 4000)
+            return
+        if self.predictor.piece_model is None:
+            self.statusBar().showMessage("ツムのモデルがありません", 4000)
+            return
+        self.statusBar().showMessage("種類を分けています")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                rgb = image.convert("RGB")
+            game = self.predictor.predict_all(path, rgb).get("game")
+            pieces = self.predictor.predict_pieces(path, game, rgb=rgb)
+            lines = elsa_three_chains(pieces, game)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "RUNできませんでした", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.canvas.set_run_mark(pieces, lines)
+        self.statusBar().showMessage(f"ツム {sum(1 for piece in pieces if str(piece.get('kind')) != 'bomb')} 個、3チェーン {len(lines)} 本", 4000)
 
     def open_files(self) -> None:
         if self._block_if_training():

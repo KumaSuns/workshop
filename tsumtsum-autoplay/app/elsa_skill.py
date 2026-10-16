@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 import time
+import types
 from collections.abc import Callable
-from pathlib import Path
 from threading import Event, Lock
 
 from PySide6.QtCore import Qt
@@ -30,6 +32,39 @@ _style_ready = False
 _style_idx: list[int] = []
 _style_mean: bytearray = bytearray()
 _style_limit = 0.0
+_run_chains_fn = None
+
+
+def _run_chains(
+    pieces: list[dict],
+    game: dict[str, int] | None,
+    locked: list[dict] | None = None,
+) -> list[dict]:
+    global _run_chains_fn
+    if _run_chains_fn is None:
+        path = (
+            APP_ROOT.parent
+            / "tsumtsum-screen-recognition"
+            / "app"
+            / "elsa_run.py"
+        )
+        stub = types.ModuleType("app.regions")
+        stub.is_tsum_kind = lambda kind: str(kind or "") in {"tsum", "big"}
+        previous = sys.modules.get("app.regions")
+        sys.modules["app.regions"] = stub
+        try:
+            spec = importlib.util.spec_from_file_location("elsa_run_skill", path)
+            if spec is None or spec.loader is None:
+                raise ImportError(str(path))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _run_chains_fn = module.elsa_freeze_most
+        finally:
+            if previous is None:
+                sys.modules.pop("app.regions", None)
+            else:
+                sys.modules["app.regions"] = previous
+    return _run_chains_fn(pieces, game, locked)
 
 
 def run_elsa_skill(
@@ -42,81 +77,129 @@ def run_elsa_skill(
     preview: Callable[[QImage], None] | None,
     draw: Callable,
     gpu_lock: Lock,
+    skill_lamp: Callable[[bool], None] | None = None,
 ) -> int:
     _load_style()
     deadline = time.time() + _SKILL_SEC
-    seen = False
-    missed = 0
+    off_run = 0
     swipes = 0
+    lit = False
+
+    def set_lamp(on: bool) -> None:
+        nonlocal lit
+        if skill_lamp is None or on == lit:
+            return
+        lit = on
+        skill_lamp(on)
+
     say("スキル中")
-    while time.time() < deadline:
-        _check_stop(stop)
-        if watch_hit is not None and watch_hit.is_set():
-            return swipes
-        try:
-            image = capture_play_frame()
-        except Exception:
-            _erase_wait(stop)
-            continue
-        if image.isNull():
-            _erase_wait(stop)
-            continue
-        if _style_idx and _outside_matches(image):
-            seen = True
-            missed = 0
-        elif seen:
-            missed += 1
-            if missed >= 3:
-                say("スキル中が終わりました")
-                return swipes
-        rgb = _rgb(image)
-        if rgb is None:
-            continue
-        with gpu_lock:
-            pieces = predict(rgb)
-        tsums = [piece for piece in pieces if _is_tsum(piece) and int(piece.get("group") or 0) > 0]
-        alive = set(range(len(tsums)))
-        bounds = _board_bounds(tsums)
-        frozen: list[dict[str, int]] = []
-        halted = False
-        while alive:
+    frozen: list[dict] = []
+    seen_ice: set[tuple[int, int]] = set()
+    locked: list[dict] = []
+    seen_lock: set[tuple[int, int]] = set()
+    just_swiped = False
+    image: QImage | None = None
+    pieces: list = []
+
+    def finish_ice() -> None:
+        nonlocal frozen, seen_ice, locked, seen_lock
+        if not frozen or image is None or image.isNull():
+            return
+        _tap_ice(frozen, pieces, image, say, stop)
+        frozen = []
+        seen_ice = set()
+        locked = []
+        seen_lock = set()
+
+    try:
+        while time.time() < deadline:
             _check_stop(stop)
             if watch_hit is not None and watch_hit.is_set():
-                halted = True
-                break
-            if time.time() >= deadline:
-                halted = True
-                break
-            picked = _pick(tsums, alive, bounds)
-            if picked is None:
-                break
-            chain, ice = picked
-            if preview is not None:
-                preview(draw(image, pieces, chain, game))
-            points = [(int(piece["x"]), int(piece["y"])) for piece in chain]
-            how = swipe_path(
-                points,
-                screen_w=image.width(),
-                screen_h=image.height(),
-                stop=stop,
-                abort=watch_hit,
-            )
-            if how in {"停止", "点が3未満", "なぞり失敗"}:
-                break
-            say(how)
-            swipes += 1
-            frozen.extend(ice)
-            alive -= {index for index, piece in enumerate(tsums) if piece in ice}
-        _tap_ice(frozen, image, say, stop)
-        if halted:
-            return swipes
-        _erase_wait(stop)
-    say("スキル中が終わりました")
-    return swipes
-
-
-def _is_tsum(piece: dict) -> bool:
-    return str(piece.get("kind") or "") in {"tsum", "big"}
+                finish_ice()
+                return swipes
+            try:
+                image = capture_play_frame()
+            except Exception:
+                _erase_wait(stop)
+                continue
+            if image.isNull():
+                _erase_wait(stop)
+                continue
+            if bool(_style_idx) and _outside_matches(image):
+                off_run = 0
+                set_lamp(False)
+            elif _style_idx:
+                off_run += 1
+                if off_run >= 3:
+                    set_lamp(True)
+            rgb = _rgb(image)
+            if rgb is None:
+                continue
+            with gpu_lock:
+                pieces = predict(rgb)
+            chains = _run_chains(pieces, game, locked)
+            halted = False
+            swiped_now = False
+            for line in chains:
+                _check_stop(stop)
+                if watch_hit is not None and watch_hit.is_set():
+                    halted = True
+                    break
+                if time.time() >= deadline:
+                    halted = True
+                    break
+                trace = line.get("trace") or []
+                if len(trace) < 3:
+                    continue
+                points = [(int(piece["x"]), int(piece["y"])) for piece in trace]
+                if preview is not None:
+                    preview(draw(image, pieces, trace, game))
+                how = swipe_path(
+                    points,
+                    screen_w=image.width(),
+                    screen_h=image.height(),
+                    stop=stop,
+                    abort=watch_hit,
+                )
+                if how in {"停止", "点が3未満", "なぞり失敗"}:
+                    break
+                say(how)
+                swipes += 1
+                swiped_now = True
+                for piece in line.get("trace") or []:
+                    key = (int(piece["x"]), int(piece["y"]))
+                    if key in seen_lock:
+                        continue
+                    seen_lock.add(key)
+                    locked.append(piece)
+                for piece in line.get("ice") or []:
+                    key = (int(piece["x"]), int(piece["y"]))
+                    if key in seen_ice:
+                        continue
+                    seen_ice.add(key)
+                    frozen.append(piece)
+            if halted:
+                finish_ice()
+                return swipes
+            if swiped_now:
+                just_swiped = True
+                continue
+            if chains:
+                continue
+            if just_swiped:
+                just_swiped = False
+                continue
+            if not frozen:
+                _erase_wait(stop)
+                continue
+            finish_ice()
+            just_swiped = False
+            _erase_wait(stop)
+        finish_ice()
+        say("スキル中が終わりました")
+        return swipes
+    finally:
+        set_lamp(False)
 
 
 def _load_style() -> None:
@@ -200,55 +283,6 @@ def _style_distance(shot: bytes, mean: bytearray, idx: list[int]) -> float:
     return total / len(idx) / 3
 
 
-def _pick(
-    tsums: list[dict[str, int]],
-    alive: set[int],
-    bounds: tuple[int, int, int, int],
-) -> tuple[list[dict[str, int]], list[dict[str, int]]] | None:
-    options = _threes(tsums, alive, bounds)
-    if not options:
-        return None
-    spacing = _spacing([tsums[index] for index in alive])
-    tol = max(spacing * 0.45, 8)
-    best: tuple[int, int, int, set[int]] | None = None
-    best_n = -1
-    for start, mid, end in options:
-        frozen = _line_ids(tsums, start, end, alive, tol)
-        count = len(frozen)
-        if count > best_n:
-            best_n = count
-            best = (start, mid, end, frozen)
-    if best is None:
-        return None
-    start, mid, end, frozen = best
-    return [tsums[start], tsums[mid], tsums[end]], [tsums[index] for index in frozen]
-
-
-def _threes(
-    tsums: list[dict[str, int]],
-    alive: set[int],
-    bounds: tuple[int, int, int, int],
-) -> list[tuple[int, int, int]]:
-    nodes = [index for index in alive]
-    if len(nodes) < 3:
-        return []
-    spacing = _spacing([tsums[index] for index in nodes])
-    if spacing <= 0:
-        return []
-    links = _links(tsums, nodes, spacing)
-    starts = _edge_ids(tsums, nodes, spacing, bounds)
-    found: list[tuple[int, int, int]] = []
-    seen: set[tuple[int, int]] = set()
-    for start in starts:
-        for mid in links.get(start, ()):
-            for end in links.get(mid, ()):
-                if end == start or (start, end) in seen:
-                    continue
-                seen.add((start, end))
-                found.append((start, mid, end))
-    return found
-
-
 def _spacing(tsums: list[dict[str, int]]) -> float:
     if len(tsums) < 2:
         return 0.0
@@ -272,87 +306,6 @@ def _spacing(tsums: list[dict[str, int]]) -> float:
     return nearest[len(nearest) // 2]
 
 
-def _links(
-    tsums: list[dict[str, int]],
-    nodes: list[int],
-    spacing: float,
-) -> dict[int, list[int]]:
-    links: dict[int, list[int]] = {index: [] for index in nodes}
-    low = spacing * 0.45
-    high = spacing * 1.6
-    for pos, left in enumerate(nodes):
-        ax, ay = int(tsums[left]["x"]), int(tsums[left]["y"])
-        group = int(tsums[left].get("group") or 0)
-        for right in nodes[pos + 1 :]:
-            if int(tsums[right].get("group") or 0) != group:
-                continue
-            dist = _dist(ax, ay, int(tsums[right]["x"]), int(tsums[right]["y"]))
-            if dist < low or dist > high:
-                continue
-            links[left].append(right)
-            links[right].append(left)
-    return links
-
-
-def _board_bounds(tsums: list[dict[str, int]]) -> tuple[int, int, int, int]:
-    if not tsums:
-        return 0, 0, 0, 0
-    xs = [int(piece["x"]) for piece in tsums]
-    ys = [int(piece["y"]) for piece in tsums]
-    return min(xs), max(xs), min(ys), max(ys)
-
-
-def _edge_ids(
-    tsums: list[dict[str, int]],
-    nodes: list[int],
-    spacing: float,
-    bounds: tuple[int, int, int, int],
-) -> list[int]:
-    min_x, max_x, min_y, max_y = bounds
-    band = spacing * 0.45
-    edges: list[int] = []
-    for index in nodes:
-        x = int(tsums[index]["x"])
-        y = int(tsums[index]["y"])
-        if x <= min_x + band or x >= max_x - band or y <= min_y + band or y >= max_y - band:
-            edges.append(index)
-    return edges
-
-
-def _line_ids(
-    tsums: list[dict[str, int]],
-    start: int,
-    end: int,
-    alive: set[int],
-    tol: float,
-) -> set[int]:
-    ax, ay = int(tsums[start]["x"]), int(tsums[start]["y"])
-    bx, by = int(tsums[end]["x"]), int(tsums[end]["y"])
-    frozen = {start, end}
-    for index in alive:
-        if index in frozen:
-            continue
-        if _on_segment(int(tsums[index]["x"]), int(tsums[index]["y"]), ax, ay, bx, by, tol):
-            frozen.add(index)
-    return frozen
-
-
-def _on_segment(px: int, py: int, ax: int, ay: int, bx: int, by: int, tol: float) -> bool:
-    abx = bx - ax
-    aby = by - ay
-    ab2 = abx * abx + aby * aby
-    if ab2 <= 0:
-        return _dist(px, py, ax, ay) <= tol
-    tee = ((px - ax) * abx + (py - ay) * aby) / ab2
-    if tee < 0:
-        tee = 0
-    elif tee > 1:
-        tee = 1
-    qx = ax + abx * tee
-    qy = ay + aby * tee
-    return _dist(px, py, qx, qy) <= tol
-
-
 def _erase_wait(stop: Event | None) -> None:
     from app.play import ERASE_WAIT, _sleep_stop
 
@@ -367,18 +320,35 @@ def _rgb(image: QImage):
 
 def _tap_ice(
     frozen: list[dict[str, int]],
+    pieces: list,
     image: QImage,
     say: Callable[[str], None],
     stop: Event | None,
 ) -> None:
-    groups = _ice_groups(frozen)
-    for group in groups:
-        _check_stop(stop)
-        cx = sum(int(piece["x"]) for piece in group) / len(group)
-        cy = sum(int(piece["y"]) for piece in group) / len(group)
-        piece = min(group, key=lambda item: _dist(int(item["x"]), int(item["y"]), cx, cy))
-        say(f"氷をタップ {int(piece['x'])},{int(piece['y'])}")
-        tap(int(piece["x"]), int(piece["y"]), screen_w=image.width(), screen_h=image.height())
+    _check_stop(stop)
+    target = _ice_still_there(frozen, pieces)
+    if target is None:
+        return
+    say(f"氷をタップ {int(target['x'])},{int(target['y'])}")
+    tap(int(target["x"]), int(target["y"]), screen_w=image.width(), screen_h=image.height())
+
+
+def _ice_still_there(frozen: list[dict], pieces: list) -> dict | None:
+    for piece in pieces:
+        if str(piece.get("kind") or "") not in {"tsum", "big"}:
+            continue
+        radius = float(piece.get("r") or 0)
+        if radius <= 0:
+            continue
+        x = float(piece["x"])
+        y = float(piece["y"])
+        limit = radius * radius
+        for old in frozen:
+            dx = x - float(old["x"])
+            dy = y - float(old["y"])
+            if dx * dx + dy * dy <= limit:
+                return piece
+    return None
 
 
 def _ice_groups(frozen: list[dict[str, int]]) -> list[list[dict[str, int]]]:

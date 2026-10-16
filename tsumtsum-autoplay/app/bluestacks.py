@@ -638,6 +638,12 @@ def _map_to_view(
     if rect is None:
         return []
     left, top, right, bottom = rect
+    border_x = int(user32.GetSystemMetrics(32)) + int(user32.GetSystemMetrics(92))
+    border_y = int(user32.GetSystemMetrics(33)) + int(user32.GetSystemMetrics(92))
+    left += border_x
+    top += border_y
+    right -= border_x
+    bottom -= border_y
     rw = right - left
     rh = bottom - top
     if rw < 50 or rh < 50:
@@ -645,7 +651,14 @@ def _map_to_view(
     scale = min(rw / screen_w, rh / screen_h)
     ox = left + (rw - screen_w * scale) / 2
     oy = top + (rh - screen_h * scale) / 2
-    return [(int(ox + x * scale), int(oy + y * scale)) for x, y in points]
+    mapped: list[tuple[int, int]] = []
+    for x, y in points:
+        px = int(ox + x * scale)
+        py = int(oy + y * scale)
+        px = min(max(px, left), right - 1)
+        py = min(max(py, top), bottom - 1)
+        mapped.append((px, py))
+    return mapped
 
 
 def reset_swipe_mouse() -> None:

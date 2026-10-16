@@ -66,7 +66,6 @@ from app.play_style import (
     record_rl_bomb,
     record_rl_skill,
     should_bomb,
-    should_skill,
     unlike_hit,
 )
 from app.play_web import append_play
@@ -113,6 +112,7 @@ class PlayWorker(QThread):
     status = Signal(str)
     preview = Signal(QImage)
     gauges = Signal(object, object, object, object, object, object, object, object, object)
+    skill_lamp = Signal(bool)
     items = Signal(str)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
@@ -186,6 +186,7 @@ class PlayWorker(QThread):
                 request_used_tsum=self._request_used_tsum if self._ask_kinds else None,
                 skill_pressed=self.skill_pressed,
                 timeup_seen=self.timeup_seen,
+                skill_lamp=self.skill_lamp.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -212,6 +213,7 @@ def run_play(
     request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
     skill_pressed: Event | None = None,
     timeup_seen: Event | None = None,
+    skill_lamp: Callable[[bool], None] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
@@ -347,8 +349,6 @@ def run_play(
     bomb_acc = 0.0
     bomb_asked = False
     bomb_asked_sit = ""
-    skill_asked = False
-    skill_asked_sit = ""
     skill_pick: tuple[str, bool] | None = None
     skill_acc = 0.0
     pending_lesson: tuple[list[int], int] | None = None
@@ -377,7 +377,7 @@ def run_play(
         nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
-        nonlocal skill_pick, skill_acc, skill_asked, skill_asked_sit
+        nonlocal skill_pick, skill_acc
         nonlocal go_at, used_items, wait_times, pieces
         game = None
         skill = None
@@ -433,8 +433,6 @@ def run_play(
         bomb_acc = 0.0
         bomb_asked = False
         bomb_asked_sit = ""
-        skill_asked = False
-        skill_asked_sit = ""
         skill_pick = None
         skill_acc = 0.0
         pending_lesson = None
@@ -582,11 +580,9 @@ def run_play(
     def settle_pending(erased: bool) -> None:
         nonlocal pending_lesson, pending_burst, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_group, pending_my_n, pending_skip, pending_used
-        nonlocal bomb_asked, bomb_asked_sit, skill_asked, skill_asked_sit
+        nonlocal bomb_asked, bomb_asked_sit
         bomb_asked = False
         bomb_asked_sit = ""
-        skill_asked = False
-        skill_asked_sit = ""
         if pending_lesson is not None:
             record_pick(pending_lesson[0], pending_lesson[1], erased)
             pending_lesson = None
@@ -628,18 +624,6 @@ def run_play(
         if not go:
             bomb_asked = True
             bomb_asked_sit = sit
-        return go
-
-    def ask_skill(has_chain: bool) -> bool:
-        nonlocal skill_asked, skill_asked_sit
-        sit = skill_sit(has_chain)
-        if skill_asked and skill_asked_sit == sit:
-            return False
-        go = should_skill(sit, True, skill_ok)
-        if not go:
-            start_skill_pick(sit, False)
-            skill_asked = True
-            skill_asked_sit = sit
         return go
 
     def start_skill_pick(sit: str, pressed: bool) -> None:
@@ -760,6 +744,7 @@ def run_play(
                     preview=preview,
                     draw=_draw_plan,
                     gpu_lock=_gpu_lock,
+                    skill_lamp=skill_lamp,
                 )
                 note_used()
                 return True
@@ -994,15 +979,13 @@ def run_play(
     skill_press_lock = Lock()
     board_bombs = [None]
 
-    def press_skill_now(point, bombs_ok: bool = False, has_chain: bool = False) -> None:
+    def press_skill_now(point, bombs_ok: bool = False) -> None:
         nonlocal fan_taps, last_fan_at
         if before_start[0] or not saw_board:
             return
         if not bombs_ok and board_bombs[0] != 0:
             return
         if point is None or skill_busy[0] or watch_hit.is_set():
-            return
-        if not ask_skill(has_chain):
             return
         now = time.time()
         with skill_press_lock:
@@ -1055,7 +1038,7 @@ def run_play(
         finally:
             skill_busy[0] = was_busy
 
-    def _press_ready_skill(has_chain: bool = False) -> None:
+    def _press_ready_skill() -> None:
         _clear_bombs_before_skill()
         button = _skill_button_square(skill)
         press_skill_now(
@@ -1066,7 +1049,6 @@ def run_play(
                 int(image.height()),
             ),
             bombs_ok=True,
-            has_chain=has_chain,
         )
 
     def about_to_fill_skill(chain: list[dict[str, int]]) -> bool:
@@ -1649,7 +1631,7 @@ def run_play(
                     latest_gauge[3],
                 )
             ):
-                _press_ready_skill(bool(found))
+                _press_ready_skill()
             if (
                 skill is not None
                 and not skill_is_gadget(used_tsum)
@@ -1657,7 +1639,7 @@ def run_play(
                 and not skill_busy[0]
                 and _skill_ready(rgb, skill, used_tsum)
             ):
-                _press_ready_skill(bool(found))
+                _press_ready_skill()
             if not found and skill_pressed is not None and skill_pressed.is_set():
                 t0 = time.perf_counter()
                 did_skill = apply_checker_skill(False)
