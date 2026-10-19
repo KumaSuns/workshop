@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QStandardPaths, Qt, QTimer, QEvent, Signal
+from PySide6.QtCore import QObject, QRectF, QSize, QStandardPaths, Qt, QTimer, QEvent, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
@@ -30,6 +30,54 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+class GaugePie(QWidget):
+    def __init__(self, extra: int = 0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._value = 0
+        self._extra = max(0, int(extra))
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def extra(self) -> int:
+        return self._extra
+
+    def setValue(self, value: int) -> None:
+        value = max(0, min(100, int(value)))
+        if value == self._value:
+            return
+        self._value = value
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        side = max(12, self.fontMetrics().height()) + self._extra
+        return QSize(side, side)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def paintEvent(self, event) -> None:
+        del event
+        side = min(self.width(), self.height())
+        if side < 2:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(
+            (self.width() - side) / 2,
+            (self.height() - side) / 2,
+            side,
+            side,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.palette().mid())
+        painter.drawEllipse(rect)
+        if self._value <= 0:
+            return
+        painter.setBrush(self.palette().highlight())
+        span = -int(round(self._value / 100 * 360 * 16))
+        painter.drawPie(rect, 90 * 16, span)
+        painter.end()
+
 
 from app.bluestacks import (
     capture_play_frame,
@@ -320,12 +368,14 @@ class MainWindow(QMainWindow):
         self._info_fever_bar.setRange(0, 100)
         self._info_fever_bar.setValue(0)
         self._info_fever_bar.setTextVisible(False)
+        self._info_fever_bar.setFixedHeight(self._info_fever_bar.sizeHint().height() + 8)
+        self._info_fever_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid palette(mid); background: palette(base); }"
+            "QProgressBar::chunk { background: palette(highlight); margin: 0px; }"
+        )
         self._info_skill = QLabel("スキル")
         self._info_skill_value = QLabel("－")
-        self._info_skill_bar = QProgressBar()
-        self._info_skill_bar.setRange(0, 100)
-        self._info_skill_bar.setValue(0)
-        self._info_skill_bar.setTextVisible(False)
+        self._info_skill_pie = GaugePie(extra=16)
         meter.addWidget(self._info_time, 0, 0)
         meter.addWidget(self._info_time_value, 0, 1)
         meter.addWidget(self._info_fever_en, 1, 0, 1, 3)
@@ -335,7 +385,7 @@ class MainWindow(QMainWindow):
         meter.addWidget(self._meter_bar_row(self._info_fever_bar), 2, 2)
         meter.addWidget(self._info_skill, 3, 0)
         meter.addWidget(self._info_skill_value, 3, 1)
-        meter.addWidget(self._meter_bar_row(self._info_skill_bar, self._info_skill_need), 3, 2)
+        meter.addWidget(self._meter_pie_row(self._info_skill_pie, self._info_skill_need), 3, 2)
         meter.setColumnStretch(2, 1)
         info.addLayout(meter)
         info_row.addWidget(info_text, 1)
@@ -631,7 +681,7 @@ class MainWindow(QMainWindow):
         self._info_fever_value.setText("－")
         self._info_fever_bar.setValue(0)
         self._info_skill_value.setText("－")
-        self._info_skill_bar.setValue(0)
+        self._info_skill_pie.setValue(0)
         self._info_skill_need.setText("－")
         self._info_count_value.setText("－")
         self._info_erase_value.setText("－")
@@ -639,16 +689,23 @@ class MainWindow(QMainWindow):
         self._set_skill_lamp(False)
         self._set_my_lamp("off")
 
-    def _meter_bar_row(self, bar: QProgressBar, tail: QLabel | None = None) -> QWidget:
+    def _meter_bar_row(self, bar: QProgressBar) -> QWidget:
         row = QWidget()
         box = QHBoxLayout(row)
         box.setContentsMargins(0, 0, 0, 0)
-        bar.setMinimumWidth(0)
-        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         box.addWidget(bar, 1)
+        box.addStretch(4)
+        return row
+
+    def _meter_pie_row(self, pie: GaugePie, tail: QLabel | None = None) -> QWidget:
+        row = QWidget()
+        box = QHBoxLayout(row)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(pie)
         if tail is not None:
             box.addWidget(tail)
-        box.addStretch(4)
+        box.addStretch(1)
         return row
 
     def _show_meters(
@@ -681,11 +738,11 @@ class MainWindow(QMainWindow):
             self._info_fever_bar.setValue(fever_pct)
         if skill_fill is None:
             self._info_skill_value.setText("－")
-            self._info_skill_bar.setValue(0)
+            self._info_skill_pie.setValue(0)
         else:
             skill_pct = max(0, min(100, round(float(skill_fill) * 100)))
             self._info_skill_value.setText(f"{skill_pct}％")
-            self._info_skill_bar.setValue(skill_pct)
+            self._info_skill_pie.setValue(skill_pct)
         if skill_need is None:
             self._info_skill_need.setText("－")
         else:
@@ -718,7 +775,7 @@ class MainWindow(QMainWindow):
             self._info_my_lamp.setStyleSheet("background: palette(mid);")
 
     def _fit_tsum_slot(self) -> None:
-        side = self._info_text.sizeHint().height()
+        side = self._info_text.sizeHint().height() - (2 * self._info_skill_pie.extra())
         if side < 1:
             return
         self._info_count.setFixedSize(side, side)
