@@ -24,7 +24,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -314,15 +316,26 @@ class MainWindow(QMainWindow):
         self._info_fever_en = QLabel("FEVER")
         self._info_fever = QLabel("フィーバー")
         self._info_fever_value = QLabel("－")
+        self._info_fever_bar = QProgressBar()
+        self._info_fever_bar.setRange(0, 100)
+        self._info_fever_bar.setValue(0)
+        self._info_fever_bar.setTextVisible(False)
         self._info_skill = QLabel("スキル")
         self._info_skill_value = QLabel("－")
+        self._info_skill_bar = QProgressBar()
+        self._info_skill_bar.setRange(0, 100)
+        self._info_skill_bar.setValue(0)
+        self._info_skill_bar.setTextVisible(False)
         meter.addWidget(self._info_time, 0, 0)
         meter.addWidget(self._info_time_value, 0, 1)
-        meter.addWidget(self._info_fever_en, 1, 0, 1, 2)
+        meter.addWidget(self._info_fever_en, 1, 0, 1, 3)
+        self._info_skill_need = QLabel("－")
         meter.addWidget(self._info_fever, 2, 0)
         meter.addWidget(self._info_fever_value, 2, 1)
+        meter.addWidget(self._meter_bar_row(self._info_fever_bar), 2, 2)
         meter.addWidget(self._info_skill, 3, 0)
         meter.addWidget(self._info_skill_value, 3, 1)
+        meter.addWidget(self._meter_bar_row(self._info_skill_bar, self._info_skill_need), 3, 2)
         meter.setColumnStretch(2, 1)
         info.addLayout(meter)
         info_row.addWidget(info_text, 1)
@@ -349,6 +362,11 @@ class MainWindow(QMainWindow):
         self._info_skill_lamp.setWordWrap(True)
         self._info_skill_lamp.setStyleSheet("background: palette(mid);")
         count_col.addWidget(self._info_skill_lamp)
+        self._info_my_lamp = QLabel("マイツム")
+        self._info_my_lamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_my_lamp.setWordWrap(True)
+        self._info_my_lamp.setStyleSheet("background: palette(mid);")
+        count_col.addWidget(self._info_my_lamp)
         count_col.addStretch(1)
         info_row.addWidget(self._info_count)
         self._info_tsum = QLabel()
@@ -611,11 +629,27 @@ class MainWindow(QMainWindow):
     def _clear_meters(self) -> None:
         self._info_time_value.setText("－")
         self._info_fever_value.setText("－")
+        self._info_fever_bar.setValue(0)
         self._info_skill_value.setText("－")
+        self._info_skill_bar.setValue(0)
+        self._info_skill_need.setText("－")
         self._info_count_value.setText("－")
         self._info_erase_value.setText("－")
         self._info_fever_en.setStyleSheet("")
         self._set_skill_lamp(False)
+        self._set_my_lamp("off")
+
+    def _meter_bar_row(self, bar: QProgressBar, tail: QLabel | None = None) -> QWidget:
+        row = QWidget()
+        box = QHBoxLayout(row)
+        box.setContentsMargins(0, 0, 0, 0)
+        bar.setMinimumWidth(0)
+        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        box.addWidget(bar, 1)
+        if tail is not None:
+            box.addWidget(tail)
+        box.addStretch(4)
+        return row
 
     def _show_meters(
         self,
@@ -628,6 +662,7 @@ class MainWindow(QMainWindow):
         _ready,
         _busy,
         _tap_at,
+        skill_need=None,
     ) -> None:
         if left is None:
             self._info_time_value.setText("－")
@@ -639,12 +674,22 @@ class MainWindow(QMainWindow):
             self._info_fever_en.setStyleSheet("")
         if fever_fill is None:
             self._info_fever_value.setText("－")
+            self._info_fever_bar.setValue(0)
         else:
-            self._info_fever_value.setText(f"{round(float(fever_fill) * 100)}％")
+            fever_pct = max(0, min(100, round(float(fever_fill) * 100)))
+            self._info_fever_value.setText(f"{fever_pct}％")
+            self._info_fever_bar.setValue(fever_pct)
         if skill_fill is None:
             self._info_skill_value.setText("－")
+            self._info_skill_bar.setValue(0)
         else:
-            self._info_skill_value.setText(f"{round(float(skill_fill) * 100)}％")
+            skill_pct = max(0, min(100, round(float(skill_fill) * 100)))
+            self._info_skill_value.setText(f"{skill_pct}％")
+            self._info_skill_bar.setValue(skill_pct)
+        if skill_need is None:
+            self._info_skill_need.setText("－")
+        else:
+            self._info_skill_need.setText(str(int(skill_need)))
         if _skill_n is None:
             self._info_count_value.setText("－")
         else:
@@ -661,6 +706,16 @@ class MainWindow(QMainWindow):
             )
         else:
             self._info_skill_lamp.setStyleSheet("background: palette(mid);")
+
+    def _set_my_lamp(self, mode: str) -> None:
+        if mode == "red":
+            self._info_my_lamp.setStyleSheet("background: red; color: white;")
+        elif mode == "on":
+            self._info_my_lamp.setStyleSheet(
+                "background: palette(highlight); color: palette(highlighted-text);"
+            )
+        else:
+            self._info_my_lamp.setStyleSheet("background: palette(mid);")
 
     def _fit_tsum_slot(self) -> None:
         side = self._info_text.sizeHint().height()
@@ -769,6 +824,7 @@ class MainWindow(QMainWindow):
         self._play.preview.connect(self._debug.set_preview)
         self._play.gauges.connect(self._show_meters)
         self._play.skill_lamp.connect(self._set_skill_lamp)
+        self._play.my_lamp.connect(self._set_my_lamp)
         self._play.failed.connect(self._on_play_fail)
         self._play.items.connect(self._show_items)
         self._play.stopped.connect(self._on_stopped)

@@ -17,8 +17,8 @@ MIN_TSUM_SAMPLES = 1
 TSUM_EPOCHS = 1
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 _BAD_DIR = re.compile(r'[<>:"/\\|?*]+')
-# Analyzer の item 画面 use_tsum 範囲。フル画面の見本だけ切る。
-_SCREEN_TSUM_RECT = (0.7791, 0.7704, 0.1163, 0.0511)
+# スタート画面の使用ツムの顔。900x1600 で (700, 1320, 100, 90)。上の青い部分は切らない。
+_SCREEN_TSUM_RECT = (700 / 900, 1320 / 1600, 100 / 900, 90 / 1600)
 
 
 def use_tsums_root() -> Path:

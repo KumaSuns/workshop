@@ -83,8 +83,9 @@ TIMEUP_SCORE = 0.70
 SKILL_GAP = 2.2
 SKILL_FILL_READY = 0.90
 SKILL_FILL_SPENT = 0.40
-GADGET_FEVER_SKILL_MIN = 0.40
+GADGET_FEVER_SKILL_MIN = 0.30
 GADGET_TIMER_SKILL = 6
+GADGET_SKILL_TSUMS = 14
 TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
@@ -111,8 +112,9 @@ class PlayWorker(QThread):
     completed = Signal()
     status = Signal(str)
     preview = Signal(QImage)
-    gauges = Signal(object, object, object, object, object, object, object, object, object)
+    gauges = Signal(object, object, object, object, object, object, object, object, object, object)
     skill_lamp = Signal(bool)
+    my_lamp = Signal(str)
     items = Signal(str)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
@@ -187,6 +189,7 @@ class PlayWorker(QThread):
                 skill_pressed=self.skill_pressed,
                 timeup_seen=self.timeup_seen,
                 skill_lamp=self.skill_lamp.emit,
+                my_lamp=self.my_lamp.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -214,10 +217,20 @@ def run_play(
     skill_pressed: Event | None = None,
     timeup_seen: Event | None = None,
     skill_lamp: Callable[[bool], None] | None = None,
+    my_lamp: Callable[[str], None] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
             report(text)
+
+    my_mode = "off"
+
+    def set_my_lamp(mode: str) -> None:
+        nonlocal my_mode
+        if my_lamp is None or mode == my_mode:
+            return
+        my_mode = mode
+        my_lamp(mode)
 
     def show_used(names: list[str] | None) -> None:
         if show_items is None:
@@ -310,6 +323,7 @@ def run_play(
     skip_after_skill = False
     skip_loss = False
     skill_busy = [False]
+    skill_ring_hold = [False]
     pooh_long = False
     bomb_after_long = False
     last_fan_at = 0.0
@@ -390,6 +404,7 @@ def run_play(
         hud_ready = False
         last_skill_at = 0.0
         skill_wait_empty = False
+        skill_ring_hold[0] = False
         skip_after_skill = False
         skip_loss = False
         skill_busy[0] = False
@@ -417,6 +432,7 @@ def run_play(
         skill_used = 0
         press_counted = False
         my_erase = 0
+        set_my_lamp("off")
         bomb_taps = 0
         fan_taps = 0
         idle_pick = None
@@ -595,6 +611,7 @@ def run_play(
         pending_my_n = 0
         pending_skip = []
         pending_used = set()
+        set_my_lamp("off")
 
     def credit_pending(after=None, by_count: bool = False) -> bool:
         nonlocal clears, skill_my_n
@@ -879,6 +896,13 @@ def run_play(
             return 0
         return len(chain)
 
+    def skill_full_n() -> int | None:
+        if skill_is_gadget(used_tsum):
+            return GADGET_SKILL_TSUMS
+        if skill_my_full is not None and int(skill_my_full) > 0:
+            return int(skill_my_full)
+        return None
+
     def skill_n_show() -> tuple[int | None, bool]:
         if not count_skill_on():
             return None, False
@@ -1016,6 +1040,17 @@ def run_play(
             last_fan_at = time.time()
         if skill_pressed is not None:
             skill_pressed.set()
+        skill_ring_hold[0] = True
+
+    def skill_ready_now(rgb_now) -> bool:
+        if skill is None or rgb_now is None:
+            return False
+        yellow, _blue = _skill_ring_yellow_blue(rgb_now, _skill_button_square(skill))
+        if skill_ring_hold[0]:
+            if yellow < SLOT_ON:
+                skill_ring_hold[0] = False
+            return False
+        return _skill_ready(rgb_now, skill, used_tsum)
 
     def _clear_bombs_before_skill() -> None:
         nonlocal bomb_taps, last_bomb_at
@@ -1158,7 +1193,7 @@ def run_play(
                 time.sleep(0.05)
                 continue
             seen = shot
-            ready = _skill_ready(rgb_now, skill, used_tsum)
+            ready = skill_ready_now(rgb_now)
             left = latest_gauge[3]
             if ready and skill_is_gadget(used_tsum) and _gadget_skill_hold(
                 _fever_playing(rgb_now, game),
@@ -1222,7 +1257,7 @@ def run_play(
                 and skill is not None
                 and not skill_busy[0]
             ):
-                ready = _skill_ready(shot_rgb, skill, used_tsum)
+                ready = skill_ready_now(shot_rgb)
                 if ready and skill_is_gadget(used_tsum) and _gadget_skill_hold(
                     fever_on, meter_fever, left
                 ):
@@ -1250,8 +1285,15 @@ def run_play(
             latest_gauge[7] = fever_hold
             if ready and not skill_is_gadget(used_tsum):
                 press_skill_now(tap_at)
+            full_n = skill_full_n()
+            meter_skill = _meter_skill_fill(shot_rgb, skill)
+            if full_n is not None and meter_skill is not None:
+                pct = max(0, min(100, round(float(meter_skill) * 100)))
+                skill_need = max(0, round(full_n * (100 - pct) / 100))
+            else:
+                skill_need = None
             gauges(
-                _meter_skill_fill(shot_rgb, skill),
+                meter_skill,
                 meter_fever,
                 fever_on,
                 left,
@@ -1260,6 +1302,7 @@ def run_play(
                 ready,
                 skill_busy[0],
                 tap_at,
+                skill_need,
             )
             time.sleep(0.2)
 
@@ -1558,7 +1601,7 @@ def run_play(
                 and not watch_hit.is_set()
                 and not skill_busy[0]
                 and time.time() >= next_skill_at[0]
-                and _skill_ready(rgb, skill, used_tsum)
+                and skill_ready_now(rgb)
             )
             if skill_now and skill_is_gadget(used_tsum) and _gadget_skill_hold(
                 _fever_playing(rgb, game),
@@ -1624,7 +1667,7 @@ def run_play(
                 and not watch_hit.is_set()
                 and not skill_busy[0]
                 and pending_spots is None
-                and _skill_ready(rgb, skill, used_tsum)
+                and skill_ready_now(rgb)
                 and not _gadget_skill_hold(
                     _fever_playing(rgb, game),
                     _meter_fever_fill(rgb, fever, skill, fan),
@@ -1637,7 +1680,7 @@ def run_play(
                 and not skill_is_gadget(used_tsum)
                 and not watch_hit.is_set()
                 and not skill_busy[0]
-                and _skill_ready(rgb, skill, used_tsum)
+                and skill_ready_now(rgb)
             ):
                 _press_ready_skill()
             if not found and skill_pressed is not None and skill_pressed.is_set():
@@ -1757,7 +1800,7 @@ def run_play(
                             if (
                                 skill is not None
                                 and not watch_hit.is_set()
-                                and _skill_ready(rgb, skill, used_tsum)
+                                and skill_ready_now(rgb)
                                 and not (
                                     skill_is_gadget(used_tsum)
                                     and _gadget_skill_hold(
@@ -1811,24 +1854,52 @@ def run_play(
                                 (int(piece["x"]), int(piece["y"])) for piece in chain
                             }
                         leftover_n = len([piece for piece in board if _is_tsum(piece)])
-                        if not _swipe_chain(
-                            chain,
-                            board,
-                            image,
-                            game,
-                            leftover_n,
-                            say,
-                            stop,
-                            None,
-                        ):
+                        already_pending = bool(spots & pending_used)
+                        added = 0 if already_pending else mytsum_in_chain(chain)
+                        counted = 0
+                        if not already_pending and my_vec is not None:
+                            counted = _count_mytsum(chain, tsums, my_vec)
+                        chain_n = added if added > 0 else counted
+                        full_n = skill_full_n()
+                        remain = None
+                        if full_n is not None and skill is not None and rgb is not None:
+                            meter_skill = _meter_skill_fill(rgb, skill)
+                            if meter_skill is not None:
+                                pct = max(0, min(100, round(float(meter_skill) * 100)))
+                                remain = max(0, round(full_n * (100 - pct) / 100))
+                        fills_full = (
+                            chain_n > 0
+                            and remain is not None
+                            and remain > 0
+                            and chain_n >= remain
+                        )
+                        if fills_full:
+                            set_my_lamp("red")
+                        elif added > 0 or counted > 0:
+                            set_my_lamp("on")
+                        else:
+                            set_my_lamp("off")
+                        try:
+                            swiped = _swipe_chain(
+                                chain,
+                                board,
+                                image,
+                                game,
+                                leftover_n,
+                                say,
+                                stop,
+                                None,
+                            )
+                        finally:
+                            set_my_lamp("off")
+                        if not swiped:
                             continue
                         swipes += 1
                         say(_counts_line(clears, swipes, coin))
-                        already_pending = bool(spots & pending_used)
-                        added = 0 if already_pending else mytsum_in_chain(chain)
                         if not already_pending:
                             my_vec = _lock_my_vec(tsums, skill_face, my_vec)
-                            my_erase += _count_mytsum(chain, tsums, my_vec)
+                            counted = _count_mytsum(chain, tsums, my_vec)
+                            my_erase += counted
                         if not already_pending:
                             burst_my_n += added
                         sure = (
@@ -2592,43 +2663,68 @@ def _meter_skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
     best = 0.0
     for scale in (0.34, 0.40):
         radius = min(width, height) * scale
-        charged: list[bool] = []
+        marks: list[str] = []
         for index in range(steps):
             ang = -math.pi / 2.0 + (2.0 * math.pi * index / steps)
             xx = int(round(cx + math.cos(ang) * radius))
             yy = int(round(cy + math.sin(ang) * radius))
             if xx < 0 or yy < 0 or xx >= width or yy >= height:
-                charged.append(False)
+                marks.append(".")
                 continue
             red, green, blue_v = pixels[xx, yy][:3]
             hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
-            on = (0.48 <= hue <= 0.58 and sat >= 0.55 and val >= 0.75) or (
+            # 白く飛んだ満タンは彩度が低く、黄にも水色にも入らない。
+            # 空いている側の白は1点だけなので、そこは溜まった方に入れない。
+            if (0.48 <= hue <= 0.58 and sat >= 0.55 and val >= 0.75) or (
                 0.06 <= hue <= 0.20 and sat >= 0.35 and val >= 0.70
-            )
-            charged.append(on)
-        start = 0
-        while start < 8 and not charged[start]:
-            start += 1
-        if start >= 8 or not charged[start]:
+            ):
+                marks.append("C")
+            elif (val >= 0.92 and sat <= 0.20) or (val >= 0.85 and sat <= 0.08):
+                marks.append("W")
+            else:
+                marks.append(".")
+        charged = []
+        for index, mark in enumerate(marks):
+            if mark == "C":
+                charged.append(True)
+                continue
+            if mark != "W":
+                charged.append(False)
+                continue
+            run = 1
+            cursor = (index - 1) % steps
+            while marks[cursor] == "W" and run < steps:
+                run += 1
+                cursor = (cursor - 1) % steps
+            cursor = (index + 1) % steps
+            while marks[cursor] == "W" and run < steps:
+                run += 1
+                cursor = (cursor + 1) % steps
+            neighbor = marks[(index - 1) % steps] == "C" or marks[(index + 1) % steps] == "C"
+            charged.append(run >= 2 or neighbor)
+        if not any(charged[:8]):
             continue
-        end = start
-        index = start
-        while index + 1 < steps:
-            if charged[index + 1]:
-                end = index + 1
-                index += 1
-                continue
-            gap = 0
-            probe = index + 1
-            while probe < steps and not charged[probe] and gap < 2:
-                gap += 1
-                probe += 1
-            if probe < steps and charged[probe] and gap <= 2:
-                end = probe
-                index = probe
-                continue
-            break
-        best = max(best, (end + 1) / steps)
+        longest = 0
+        run = 0
+        for on in charged:
+            if on:
+                longest = max(longest, run)
+                run = 0
+            else:
+                run += 1
+        longest = max(longest, run)
+        if not charged[0] and not charged[-1]:
+            head = 0
+            while head < steps and not charged[head]:
+                head += 1
+            tail = 0
+            while tail < steps and not charged[steps - 1 - tail]:
+                tail += 1
+            if head + tail < steps:
+                longest = max(longest, head + tail)
+            else:
+                longest = steps
+        best = max(best, (steps - longest) / steps)
     return best
 
 
