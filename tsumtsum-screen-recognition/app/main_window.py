@@ -523,6 +523,7 @@ class GroupStrip(QScrollArea):
 class GroupListWindow(QDialog):
     pieceClicked = Signal(int)
     pieceRemoveRequested = Signal(int)
+    tsumsClearRequested = Signal()
     groupChanged = Signal(int)
 
     def __init__(self, parent=None) -> None:
@@ -554,6 +555,9 @@ class GroupListWindow(QDialog):
         self.delete_btn = QPushButton("消す")
         self.delete_btn.setEnabled(False)
         bar.addWidget(self.delete_btn)
+        self.delete_tsum_btn = QPushButton("ツムを消す")
+        self.delete_tsum_btn.setEnabled(False)
+        bar.addWidget(self.delete_tsum_btn)
         bar.addStretch(1)
         self.close_btn = QPushButton("閉じる")
         bar.addWidget(self.close_btn)
@@ -567,6 +571,7 @@ class GroupListWindow(QDialog):
         QShortcut(QKeySequence(Qt.Key.Key_Minus), self, self._nudge_group_down)
         QShortcut(QKeySequence(Qt.Key.Key_Plus), self, self._nudge_group_up)
         self.delete_btn.clicked.connect(self._on_delete)
+        self.delete_tsum_btn.clicked.connect(self._on_delete_tsum)
         self.close_btn.clicked.connect(self.close)
 
     def set_pieces(
@@ -585,6 +590,7 @@ class GroupListWindow(QDialog):
             piece = self._pieces[selected]
         self.delete_btn.setEnabled(piece is not None)
         is_tsum = piece is not None and is_tsum_kind(str(piece.get("kind") or ""))
+        self.delete_tsum_btn.setEnabled(any(item.get("kind") == "tsum" for item in self._pieces))
         if is_tsum and piece is not None:
             group = int(piece.get("group") or 1)
             self.group_label.setText(f"No.  {group}")
@@ -626,6 +632,11 @@ class GroupListWindow(QDialog):
         if selected is None:
             return
         self.pieceRemoveRequested.emit(selected)
+
+    def _on_delete_tsum(self) -> None:
+        if not self.delete_tsum_btn.isEnabled():
+            return
+        self.tsumsClearRequested.emit()
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -2201,6 +2212,7 @@ class MainWindow(QMainWindow):
             self._group_window = GroupListWindow(self)
             self._group_window.pieceClicked.connect(self.canvas.select_piece)
             self._group_window.pieceRemoveRequested.connect(self._remove_listed_piece)
+            self._group_window.tsumsClearRequested.connect(self._clear_listed_tsums)
             self._group_window.groupChanged.connect(self.canvas.set_piece_group)
         frame = self.frameGeometry()
         width = max(1, frame.width() // 2)
@@ -2224,6 +2236,23 @@ class MainWindow(QMainWindow):
     def _remove_listed_piece(self, index: int) -> None:
         self.canvas.select_piece(index)
         self.canvas.remove_selected_piece()
+
+    def _clear_listed_tsums(self) -> None:
+        if not self.current_id:
+            return
+        self.canvas.clear_pieces_of_kind("tsum")
+        self.dataset.clear_named_region(self.current_id, "tsum")
+        sample = self.dataset.get(self.current_id)
+        saved_boxes = sample.regions if sample else {}
+        saved_pieces = sample.pieces if sample else []
+        self._set_dirty(
+            self.canvas.all_region_boxes() != saved_boxes or self.canvas.all_pieces() != saved_pieces
+        )
+        self.refresh_list(select_id=self.current_id)
+        self._refresh_region_list()
+        self._apply_sample_hint()
+        self.update_stats()
+        self.statusBar().showMessage("「ツム」を消しました", 3000)
 
     def on_group_changed(self, value: int) -> None:
         self.canvas.set_piece_group(value)
