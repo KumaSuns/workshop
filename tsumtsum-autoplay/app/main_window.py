@@ -7,12 +7,14 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 
 from PySide6.QtCore import QObject, QRectF, QSize, QStandardPaths, Qt, QTimer, QEvent, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -110,9 +113,13 @@ from app.play import (
 APP_NAME = "ツムツム オートプレイ"
 _STOP_HOTKEY = 1
 _CAPTURE_HOTKEY = 2
+_PLAY_HOTKEY = 3
+_BOARD_HOTKEY = 4
 _WM_HOTKEY = 0x0312
 _VK_Q = 0x51
+_VK_F5 = 0x74
 _VK_F8 = 0x77
+_VK_F11 = 0x7A
 _MOD_NOREPEAT = 0x4000
 _NOT_CHARM_TSUMS = frozenset(
     {
@@ -141,6 +148,50 @@ def _dim_icon(pix: QPixmap) -> QPixmap:
             color.setBlue(int(color.blue() * 0.2))
             image.setPixelColor(x, y, color)
     return QPixmap.fromImage(image)
+
+
+def _tsum_meta_path() -> Path:
+    return (
+        APP_ROOT.parent
+        / "video-frame-extractor"
+        / "app"
+        / "assets"
+        / "models"
+        / "use_tsum"
+        / "meta.json"
+    )
+
+
+def _load_tsum_meta() -> dict[str, dict[str, object]]:
+    path = _tsum_meta_path()
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    meta: dict[str, dict[str, object]] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            meta[str(key)] = value
+    return meta
+
+
+def _save_tsum_meta(folder_id: str, kind: str, charm: bool) -> None:
+    path = _tsum_meta_path()
+    meta = _load_tsum_meta()
+    meta[folder_id] = {"kind": kind, "charm": charm}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _tsum_meta_for_name(name: str) -> dict[str, object] | None:
+    folder = _used_tsum_folder(name)
+    if folder is None:
+        return None
+    return _load_tsum_meta().get(folder.name)
 
 
 def _is_not_charm_tsum(name: str) -> bool:
@@ -433,6 +484,9 @@ class MainWindow(QMainWindow):
         self.settings_btn = QPushButton("設定")
         self.settings_btn.clicked.connect(self._open_swipe_settings)
         layout.addWidget(self.settings_btn)
+        self.grab_board_btn = QPushButton("盤面を取り込む (F11)")
+        self.grab_board_btn.clicked.connect(self.on_grab_board)
+        layout.addWidget(self.grab_board_btn)
         self.capture_btn = QPushButton("消す前の盤面を取り込む (F7)")
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
@@ -444,9 +498,9 @@ class MainWindow(QMainWindow):
         self.shot_btn = QPushButton("キャプチャー (F8)")
         self.shot_btn.clicked.connect(self.on_capture_screen)
         layout.addWidget(self.shot_btn)
-        self.play_btn = QPushButton("PLAY")
-        self.play_btn.clicked.connect(self.on_play)
-        layout.addWidget(self.play_btn)
+        self.add_tsum_btn = QPushButton("ツムを追加")
+        self.add_tsum_btn.clicked.connect(self._add_tsum)
+        layout.addWidget(self.add_tsum_btn)
         self.now_btn = QPushButton("今すぐプレイ (F5)")
         self.now_btn.clicked.connect(self.on_play_now)
         layout.addWidget(self.now_btn)
@@ -482,6 +536,7 @@ class MainWindow(QMainWindow):
         self._fill_history()
         self._stop = threading.Event()
         self._save_boards = threading.Event()
+        self._board_grabs: Queue = Queue()
         self._count_skill = threading.Event()
         self._loop_play = False
         self._intro: IntroWorker | None = None
@@ -498,11 +553,17 @@ class MainWindow(QMainWindow):
         self._front_timer.setInterval(800)
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
+        self._f5_down = False
+        self._f5_hotkey = False
+        self._play_key_at = 0.0
         self._f8_down = False
+        self._f11_down = False
         self._capture_at = 0.0
+        self._grab_at = 0.0
         self._capture_key_timer = QTimer(self)
         self._capture_key_timer.setInterval(50)
         self._capture_key_timer.timeout.connect(self._poll_capture_key)
+        self._capture_key_timer.start()
         self._debug.append("待機中")
         try:
             self._debug.append(start_server())
@@ -543,8 +604,26 @@ class MainWindow(QMainWindow):
         self._debug.set_preview(image)
         self._set_status("キャプチャーしました。貼り付けできます")
 
-    def on_play(self) -> None:
-        self._begin_play(loop=False)
+    def on_grab_board(self) -> None:
+        now = time.monotonic()
+        if now - self._grab_at < 0.4:
+            return
+        self._grab_at = now
+        if self._play is None or not self._play.isRunning():
+            self._set_status("プレイ中ではありません")
+            return
+        try:
+            image = capture_play_frame()
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(str(exc))
+            return
+        if image is None or image.isNull():
+            self._set_status("画面を取れませんでした。")
+            return
+        self._board_grabs.put(image.copy())
+
+    def _add_tsum(self) -> None:
+        self._register_used_tsum(None, title="ツムを追加", allow_skip=False)
 
     def on_loop_play(self) -> None:
         self._begin_play(loop=True)
@@ -587,6 +666,10 @@ class MainWindow(QMainWindow):
         self._play_now()
 
     def _play_now(self) -> None:
+        now = time.time()
+        if now - self._play_key_at < 0.4:
+            return
+        self._play_key_at = now
         if self._is_busy():
             return
         if not tsum_is_running():
@@ -655,7 +738,6 @@ class MainWindow(QMainWindow):
         return intro_on or play_on
 
     def _set_running(self, running: bool) -> None:
-        self.play_btn.setEnabled(not running)
         self.now_btn.setEnabled(not running)
         self.loop_btn.setEnabled(not running)
         self.record_btn.setEnabled(not running)
@@ -664,11 +746,14 @@ class MainWindow(QMainWindow):
             self._front_timer.stop()
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
             self.show()
+            self._f5_down = False
             self._f8_down = False
+            self._f11_down = False
             self._register_stop_hotkey()
             self._capture_key_timer.start()
         else:
-            self._capture_key_timer.stop()
+            self._f5_down = False
+            self._f11_down = False
             self._unregister_stop_hotkey()
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
             self.show()
@@ -873,6 +958,7 @@ class MainWindow(QMainWindow):
             start_match=start_match,
             kind_count=kind_count,
             save_boards=self._save_boards.is_set,
+            board_grabs=self._board_grabs,
             count_skill=self._count_skill.is_set,
             loop=loop,
             ask_kinds=ask_kinds,
@@ -1219,9 +1305,15 @@ class MainWindow(QMainWindow):
             return None
         return self._save_used_tsum_choice(path, row.text(), None)
 
-    def _register_used_tsum(self, path: Path | None) -> str | None:
+    def _register_used_tsum(
+        self,
+        path: Path | None,
+        *,
+        title: str = "今すぐプレイ",
+        allow_skip: bool = True,
+    ) -> str | None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setWindowTitle(title)
         dialog.setModal(True)
         dialog.setMinimumWidth(320)
         layout = QVBoxLayout(dialog)
@@ -1233,6 +1325,26 @@ class MainWindow(QMainWindow):
         dir_edit = QLineEdit()
         dir_edit.setPlaceholderText("Gadget")
         layout.addWidget(dir_edit)
+        layout.addWidget(QLabel("種類"))
+        kind_group = QButtonGroup(dialog)
+        kind_buttons = (
+            ("normal", "通常ツム"),
+            ("set", "セットツム"),
+            ("pair", "ペアツム"),
+        )
+        for kind_id, label in kind_buttons:
+            button = QRadioButton(label)
+            kind_group.addButton(button)
+            button.setProperty("kind_id", kind_id)
+            layout.addWidget(button)
+        layout.addWidget(QLabel("チャームツム"))
+        charm_group = QButtonGroup(dialog)
+        charm_yes = QRadioButton("チャームツム")
+        charm_no = QRadioButton("チャームツムではない")
+        charm_group.addButton(charm_yes)
+        charm_group.addButton(charm_no)
+        layout.addWidget(charm_yes)
+        layout.addWidget(charm_no)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -1240,13 +1352,24 @@ class MainWindow(QMainWindow):
         cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
         ok_btn.setText("保存する")
         cancel_btn.setText("やめる")
-        skip_btn = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
-        skip_btn.setAutoDefault(False)
-        buttons.accepted.connect(dialog.accept)
+        skip_btn = None
+        if allow_skip:
+            skip_btn = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
+            skip_btn.setAutoDefault(False)
+            skip_btn.clicked.connect(lambda: dialog.done(2))
+        def _accept_register() -> None:
+            if kind_group.checkedButton() is None:
+                QMessageBox.information(dialog, title, "種類を選んでください。")
+                return
+            if charm_group.checkedButton() is None:
+                QMessageBox.information(dialog, title, "チャームツムかどうかを選んでください。")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(_accept_register)
         buttons.rejected.connect(dialog.reject)
-        skip_btn.clicked.connect(lambda: dialog.done(2))
         layout.addWidget(buttons)
-        name_edit.returnPressed.connect(dialog.accept)
+        name_edit.returnPressed.connect(_accept_register)
         result = dialog.exec()
         if result == 2:
             return ""
@@ -1255,12 +1378,25 @@ class MainWindow(QMainWindow):
         name = " ".join(name_edit.text().split())
         folder_id = "".join(dir_edit.text().split())
         if not name:
-            QMessageBox.information(self, "今すぐプレイ", "ツム名を入力してください。")
+            QMessageBox.information(self, title, "ツム名を入力してください。")
             return None
         if not folder_id:
-            QMessageBox.information(self, "今すぐプレイ", "フォルダ名を入力してください。")
+            QMessageBox.information(self, title, "フォルダ名を入力してください。")
             return None
-        return self._save_used_tsum_choice(path, name, folder_id)
+        kind_button = kind_group.checkedButton()
+        kind = str(kind_button.property("kind_id") or "")
+        if kind not in {"normal", "set", "pair"}:
+            QMessageBox.information(self, title, "種類を選んでください。")
+            return None
+        saved = self._save_used_tsum_choice(path, name, folder_id)
+        if saved:
+            folder = _used_tsum_folder(saved)
+            _save_tsum_meta(
+                folder.name if folder is not None else folder_id,
+                kind,
+                charm_group.checkedButton() is charm_yes,
+            )
+        return saved
 
     def _save_used_tsum_choice(
         self, path: Path | None, name: str, folder_id: str | None
@@ -1288,7 +1424,10 @@ class MainWindow(QMainWindow):
             self.on_stop()
             return
         charm = False
-        if not _is_not_charm_tsum(self._selected_used_tsum):
+        saved_meta = _tsum_meta_for_name(self._selected_used_tsum)
+        if saved_meta is not None and isinstance(saved_meta.get("charm"), bool):
+            charm = bool(saved_meta["charm"])
+        elif not _is_not_charm_tsum(self._selected_used_tsum):
             asked = self._ask_charm_tsum()
             if asked is None:
                 play.provide_kinds(None)
@@ -1337,6 +1476,7 @@ class MainWindow(QMainWindow):
             return
         self._placed = True
         QTimer.singleShot(0, self._fill_screen_height)
+        self._register_play_hotkey()
 
     def _fill_screen_height(self) -> None:
         screen = self.screen() or QApplication.primaryScreen()
@@ -1373,6 +1513,9 @@ class MainWindow(QMainWindow):
         if key == Qt.Key.Key_F8:
             self.on_capture_screen()
             return True
+        if key == Qt.Key.Key_F11:
+            self.on_grab_board()
+            return True
         return False
 
     def eventFilter(self, watched, event) -> bool:
@@ -1398,15 +1541,27 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _poll_capture_key(self) -> None:
-        if sys.platform != "win32" or not self._is_busy():
+        if sys.platform != "win32":
             return
         import ctypes
 
+        if not self._is_busy():
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F5) & 0x8000)
+            pressed = down and not self._f5_down
+            self._f5_down = down
+            if pressed:
+                self.on_play_now()
+            return
         down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F8) & 0x8000)
         pressed = down and not self._f8_down
         self._f8_down = down
         if pressed:
             self.on_capture_screen()
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F11) & 0x8000)
+        pressed = down and not self._f11_down
+        self._f11_down = down
+        if pressed:
+            self.on_grab_board()
 
     def nativeEvent(self, eventType, message):
         if sys.platform == "win32":
@@ -1422,7 +1577,23 @@ class MainWindow(QMainWindow):
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _CAPTURE_HOTKEY:
                     QTimer.singleShot(0, self.on_capture_screen)
                     return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _BOARD_HOTKEY:
+                    QTimer.singleShot(0, self.on_grab_board)
+                    return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _PLAY_HOTKEY:
+                    QTimer.singleShot(0, self.on_play_now)
+                    return True, 0
         return super().nativeEvent(eventType, message)
+
+    def _register_play_hotkey(self) -> None:
+        if sys.platform != "win32" or self._f5_hotkey:
+            return
+        import ctypes
+
+        ok = ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _PLAY_HOTKEY, _MOD_NOREPEAT, _VK_F5
+        )
+        self._f5_hotkey = bool(ok)
 
     def _register_stop_hotkey(self) -> None:
         if sys.platform != "win32":
@@ -1435,6 +1606,9 @@ class MainWindow(QMainWindow):
         ctypes.windll.user32.RegisterHotKey(
             int(self.winId()), _CAPTURE_HOTKEY, _MOD_NOREPEAT, _VK_F8
         )
+        ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _BOARD_HOTKEY, _MOD_NOREPEAT, _VK_F11
+        )
 
     def _unregister_stop_hotkey(self) -> None:
         if sys.platform != "win32":
@@ -1443,10 +1617,16 @@ class MainWindow(QMainWindow):
 
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _CAPTURE_HOTKEY)
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _BOARD_HOTKEY)
 
     def closeEvent(self, event) -> None:
         self._stop_record()
         self._unregister_stop_hotkey()
+        if sys.platform == "win32" and self._f5_hotkey:
+            import ctypes
+
+            ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _PLAY_HOTKEY)
+            self._f5_hotkey = False
         stop_server()
         super().closeEvent(event)
 

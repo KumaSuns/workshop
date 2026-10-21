@@ -144,6 +144,24 @@ def skill_is_elsa(name: str) -> bool:
     return key in {"戴冠式エルサ", "Coronation_Elsa"} or key.casefold() == "coronation_elsa"
 
 
+def skill_is_namine(name: str) -> bool:
+    key = skill_tsum_key(name)
+    return key == "ナミネ" or key.casefold() == "namine"
+
+
+def skill_is_nightmare(name: str) -> bool:
+    key = skill_tsum_key(name)
+    return key in {
+        "ナイトメアビフォアクリスマス（セット）",
+        "Nightmare_Before_Christmas",
+    } or key.casefold() == "nightmare_before_christmas"
+
+
+def skill_is_cinderella(name: str) -> bool:
+    key = skill_tsum_key(name)
+    return key in {"シンデレラ", "Cinderella"} or key.casefold() == "cinderella"
+
+
 def skill_is_pooh(name: str) -> bool:
     key = skill_tsum_key(name)
     handler = _AFTER.get(key) or _AFTER.get(key.casefold())

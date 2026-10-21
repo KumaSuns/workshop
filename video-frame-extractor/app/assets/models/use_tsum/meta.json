@@ -1,0 +1,14 @@
+{
+  "Cinderella": {
+    "kind": "normal",
+    "charm": false
+  },
+  "Nightmare_Before_Christmas": {
+    "kind": "set",
+    "charm": false
+  },
+  "namine": {
+    "kind": "normal",
+    "charm": false
+  }
+}

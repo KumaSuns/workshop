@@ -814,20 +814,12 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         left_layout.addWidget(self.progress)
-        self.copy_data_btn = QPushButton("DATAをアップ")
-        self.import_data_btn = QPushButton("DATA DOWNLOAD")
         self.server_save_btn = QPushButton("サーバーに保存")
-        self.server_load_btn = QPushButton("サーバーから開く")
-        self.server_settings_btn = QPushButton("サーバー接続")
         self.shortcut_btn = QPushButton("起動アイコン作成")
         left_grid = QGridLayout()
         left_grid.setContentsMargins(0, 0, 0, 0)
         left_buttons = (
-            self.copy_data_btn,
-            self.import_data_btn,
             self.server_save_btn,
-            self.server_load_btn,
-            self.server_settings_btn,
             self.shortcut_btn,
         )
         for i, button in enumerate(left_buttons):
@@ -1026,11 +1018,7 @@ class MainWindow(QMainWindow):
         self.delete_unused_btn.clicked.connect(self.delete_unused_images)
         self.delete_unsaved_btn.clicked.connect(self.delete_unsaved_images)
         self.show_unused_chk.toggled.connect(self.on_show_unused_toggled)
-        self.copy_data_btn.clicked.connect(self.copy_data_folder)
-        self.import_data_btn.clicked.connect(self.import_data_folder)
         self.server_save_btn.clicked.connect(self.upload_data_to_server)
-        self.server_load_btn.clicked.connect(self.download_data_from_server)
-        self.server_settings_btn.clicked.connect(self.edit_server_settings)
         self.elsa_list_btn.clicked.connect(self.toggle_elsa_list)
         self.elsa_run_btn.clicked.connect(self.run_elsa)
         self.elsa_delete_btn.clicked.connect(self.delete_elsa_image)
@@ -2606,18 +2594,10 @@ class MainWindow(QMainWindow):
             self.show_sample(next_id)
         self.statusBar().showMessage(f"保存していない画像を {len(unsaved)} 枚消しました", 4000)
 
-    def _resolved_path(self, path: Path) -> Path:
-        try:
-            return path.resolve()
-        except OSError:
-            return path.absolute()
-
-    def _is_same_or_inside(self, path: Path, root: Path) -> bool:
-        resolved = self._resolved_path(path)
-        base = self._resolved_path(root)
-        return resolved == base or base in resolved.parents
-
     def _data_sync(self):
+        analyze = str(DATA_SYNC_PATH.parents[2] / "tsumtsum-analyze")
+        if analyze not in sys.path:
+            sys.path.insert(0, analyze)
         cached = getattr(self, "_data_sync_mod", None)
         if cached is not None:
             return cached
@@ -2638,135 +2618,43 @@ class MainWindow(QMainWindow):
         self._server_sync_mod = module
         return module
 
-    def edit_server_settings(self) -> None:
-        if self._server_sync().edit_settings(self):
-            self.statusBar().showMessage("サーバー接続を保存しました", 4000)
-
     def upload_data_to_server(self) -> None:
         if self._block_if_training():
             return
-        sync = self._server_sync()
+        try:
+            model = self._data_sync().model_file(DATA_DIR)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "保存できませんでした", str(exc))
+            return
+        if not model.is_file():
+            QMessageBox.warning(self, "モデルがありません", f"送るモデルがありません。\n{model}")
+            return
         answer = QMessageBox.question(
             self,
             "サーバーに保存",
-            "今のPCの内容でサーバーを上書きします。管理画面で種類を直したあとは、先に「サーバーから開く」をしてください。続けますか？",
+            f"{model.name} を http://hokkai-syabusyabu.com/home_page/workshop/models に保存します。続けますか？",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        sync = self._server_sync()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            packed = self._pack_scene_into_data()
-            if not DATA_DIR.exists():
-                raise FileNotFoundError(f"送るフォルダがありません。\n{DATA_DIR}")
-            report = sync.run_with_progress(
+            sync.run_with_progress(
                 self,
                 "サーバーに保存しています",
-                lambda progress: sync.upload_data_dir(DATA_DIR, progress),
+                lambda progress: self._upload_model(sync, model, progress),
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "保存できませんでした", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
-        extra = f"画面の学習画像 {packed.get('images', 0)} 枚"
-        title, body = sync.format_upload_report(report, extra)
-        QMessageBox.information(self, title, body)
+        QMessageBox.information(self, "サーバーに保存しました", f"{model.name} を保存しました。")
 
-    def download_data_from_server(self) -> None:
-        if self._block_if_training():
-            return
-        answer = QMessageBox.question(
-            self,
-            "サーバーから開く",
-            "サーバーの画像・種類・モデルで、今のPCの内容を置き換えます。管理画面で直した種類も、ここで取り込まれます。続けますか？",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        if not self._confirm_discard():
-            return
-        import shutil
-        import tempfile
-
-        sync = self._server_sync()
-        tmp = Path(tempfile.mkdtemp(prefix="workshop_dl_"))
-        self.current_id = None
-        self.canvas.clear_image()
-        self.predictor.release()
-        QApplication.processEvents()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            sync.run_with_progress(
-                self,
-                "サーバーから開いています",
-                lambda progress: sync.download_data_dir(tmp, progress),
-            )
-            self._data_sync().import_data_folder(DATA_DIR, tmp)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "開けませんでした", str(exc))
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-            shutil.rmtree(tmp, ignore_errors=True)
-        self._reload_after_data_import()
-        self._notify_extractor("reload-scene")
-        QMessageBox.information(self, "開きました", "サーバーの画像とモデルを取り込みました。")
-
-    def _notify_extractor(self, action: str) -> None:
-        sock = QLocalSocket()
-        sock.connectToServer(EXTRACTOR_IPC_NAME)
-        if not sock.waitForConnected(400):
-            return
-        sock.write(json.dumps({"action": action}, ensure_ascii=False).encode("utf-8") + b"\n")
-        sock.waitForBytesWritten(800)
-        sock.disconnectFromServer()
-
-    def _pack_scene_into_data(self) -> dict[str, int]:
-        return self._data_sync().ensure_scene_packed(DATA_DIR)
-
-    def copy_data_folder(self) -> None:
-        if self._block_if_training():
-            return
-        dest_parent = QFileDialog.getExistingDirectory(self, "貼り付ける場所を選ぶ", self._dialog_dir("copy_data"))
-        if not dest_parent:
-            return
-        self._remember_dialog_dir("copy_data", dest_parent)
-        dest_parent_path = Path(dest_parent)
-        dest = dest_parent_path / DATA_DIR.name
-        if self._is_same_or_inside(dest, DATA_DIR) or self._is_same_or_inside(dest_parent_path, DATA_DIR):
-            QMessageBox.warning(
-                self,
-                "コピーできません",
-                "今使っている data と同じ場所、またはその中にはコピーできません。",
-            )
-            return
-        if dest.exists():
-            answer = QMessageBox.question(
-                self,
-                "すでにあります",
-                f"{dest}\nすでに data フォルダがあります。中身を置き換えますか？",
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            packed = self._pack_scene_into_data()
-            if not DATA_DIR.exists():
-                raise FileNotFoundError(f"コピーするフォルダがありません。\n{DATA_DIR}")
-            dest = self._data_sync().copy_data_folder(DATA_DIR, dest_parent_path)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "コピーに失敗", str(exc))
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-        extra = f"\n画面の学習画像 {packed.get('images', 0)} 枚"
-        if packed.get("missing"):
-            extra += f"（見つからない画像 {packed['missing']} 枚は除きました）"
-        self.statusBar().showMessage(f"dataをコピーしました: {dest}", 5000)
-        QMessageBox.information(
-            self,
-            "コピーしました",
-            f"ツムの data と、画面の学習データをコピーしました。\n{dest}{extra}",
-        )
+    def _upload_model(self, sync, model: Path, progress) -> None:
+        progress(0, 1, model.name)
+        sync.upload_model(model)
+        progress(1, 1, model.name)
 
     def _ensure_app_icon(self) -> Path | None:
         path = APP_ROOT / "app.ico"
@@ -2874,12 +2762,6 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
 
-    def _looks_like_data_dir(self, path: Path) -> bool:
-        return self._data_sync().looks_like_data_dir(path)
-
-    def _resolve_data_dir(self, path: Path) -> Path | None:
-        return self._data_sync().resolve_data_dir(path)
-
     def _reload_after_data_import(self) -> None:
         if self._is_training():
             return
@@ -2894,57 +2776,6 @@ class MainWindow(QMainWindow):
         self._remember_last_boxes()
         self.refresh_list()
         self.statusBar().showMessage("dataを取り込みました", 5000)
-
-    def import_data_folder(self) -> None:
-        if self._block_if_training():
-            return
-        chosen = QFileDialog.getExistingDirectory(self, "取り込む data を選ぶ", self._dialog_dir("import_data"))
-        if not chosen:
-            return
-        self._remember_dialog_dir("import_data", chosen)
-        source = self._resolve_data_dir(Path(chosen))
-        if source is None:
-            QMessageBox.warning(
-                self,
-                "dataではありません",
-                "index.json か、画像の入った images か、モデルの入った models か、画面の学習データがあるフォルダを選んでください。",
-            )
-            return
-        if self._resolved_path(source) == self._resolved_path(DATA_DIR):
-            QMessageBox.information(self, "同じ場所です", "今使っている data と同じ場所です。")
-            return
-        if self._is_same_or_inside(DATA_DIR, source):
-            QMessageBox.warning(
-                self,
-                "取り込めません",
-                "今使っている data を含むフォルダは取り込めません。",
-            )
-            return
-        answer = QMessageBox.question(
-            self,
-            "dataを取り込む",
-            "今のツムの画像・枠・モデルと、画面の学習データを、選んだ data で置き換えます。続けますか？\n"
-            "画面の学習データが入っていない古い data のときは、今の画面学習はそのまま残します。",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        if not self._confirm_discard():
-            return
-        self.current_id = None
-        self.canvas.clear_image()
-        self.predictor.release()
-        QApplication.processEvents()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            self._data_sync().import_data_folder(DATA_DIR, source)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "取り込みに失敗", str(exc))
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._reload_after_data_import()
-        self._notify_extractor("reload-scene")
-        QMessageBox.information(self, "取り込みました", "ツムの data と、画面の学習データを取り込みました。")
 
     def read_coin_number(self) -> None:
         if self._block_if_training() or not self.current_id:
@@ -3250,8 +3081,6 @@ class MainWindow(QMainWindow):
             self.delete_unused_one_btn,
             self.delete_unused_btn,
             self.delete_unsaved_btn,
-            self.copy_data_btn,
-            self.import_data_btn,
             self.shortcut_btn,
             self.video_app_btn,
             self.reuse_btn,

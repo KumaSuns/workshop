@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+_ANALYZE = str(Path(__file__).resolve().parent.parent / "tsumtsum-analyze")
+if _ANALYZE not in sys.path:
+    sys.path.insert(0, _ANALYZE)
 
 from PySide6.QtCore import QDir, QLockFile, QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -56,23 +59,6 @@ def _handoff_to_running(paths: list[str]) -> bool:
     return b'"ok"' in reply
 
 
-def _kill_pid(pid: int) -> None:
-    if pid <= 0 or pid == os.getpid():
-        return
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/F", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return
-    try:
-        os.kill(pid, 9)
-    except OSError:
-        pass
-
-
 def _lock_holder_dead(lock: QLockFile) -> bool:
     pid = _lock_holder_pid(lock)
     if pid <= 0:
@@ -82,13 +68,6 @@ def _lock_holder_dead(lock: QLockFile) -> bool:
         return False
     except OSError:
         return True
-
-
-def _kill_stale_instance(lock: QLockFile) -> None:
-    pid = _lock_holder_pid(lock)
-    _kill_pid(pid)
-    lock.removeStaleLockFile()
-    QLocalServer.removeServer(IPC_NAME)
 
 
 def _acquire_instance_lock() -> QLockFile | None:
@@ -112,18 +91,13 @@ def main() -> None:
 
     lock = _acquire_instance_lock()
     if lock is None:
-        if paths and _handoff_to_running(paths):
-            sys.exit(0)
-        stale = QLockFile(str(_lock_path()))
-        _kill_stale_instance(stale)
-        lock = _acquire_instance_lock()
-        if lock is None:
+        if not _handoff_to_running(paths):
             QMessageBox.information(
                 None,
                 "すでに起動しています",
                 "ツムツム ゲーム範囲トレーナーは、すでに開いています。",
             )
-            sys.exit(0)
+        sys.exit(0)
     app._instance_lock = lock
     QLocalServer.removeServer(IPC_NAME)
 

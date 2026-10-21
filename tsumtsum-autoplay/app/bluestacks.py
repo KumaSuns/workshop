@@ -482,6 +482,8 @@ def swipe_path(
     screen_h: int = 0,
     stop=None,
     abort=None,
+    point_s: float | None = None,
+    center_s: float | None = None,
 ) -> str:
     if stop is not None and stop.is_set():
         return "停止"
@@ -489,7 +491,7 @@ def swipe_path(
     if len(points) < 3:
         return "点が3未満"
     dense = _dense_points(points, step=14)
-    how = _swipe_mouse(dense, screen_w, screen_h, points, abort=abort)
+    how = _swipe_mouse(dense, screen_w, screen_h, points, abort=abort, point_s=point_s, center_s=center_s)
     if how:
         return how
     if stop is not None and stop.is_set():
@@ -516,6 +518,8 @@ def _swipe_mouse(
     screen_h: int,
     anchors: list[tuple[int, int]] | None = None,
     abort=None,
+    point_s: float | None = None,
+    center_s: float | None = None,
 ) -> str:
     if sys.platform != "win32" or screen_w < 2 or screen_h < 2:
         return ""
@@ -538,7 +542,7 @@ def _swipe_mouse(
     if anchors:
         held = _map_to_view(anchors, screen_w, screen_h, user32, wintypes)
         hold = {(int(x), int(y)) for x, y in held}
-    if not _send_mouse_path(user32, mapped, hold, abort):
+    if not _send_mouse_path(user32, mapped, hold, abort, point_s, center_s):
         return ""
     return f"マウス {len(dense)}点"
 
@@ -548,9 +552,11 @@ def _send_mouse_path(
     mapped: list[tuple[int, int]],
     hold: set[tuple[int, int]],
     abort=None,
+    point_s: float | None = None,
+    center_s: float | None = None,
 ) -> bool:
     with _mouse_lock:
-        return _send_mouse_path_locked(user32, mapped, hold, abort)
+        return _send_mouse_path_locked(user32, mapped, hold, abort, point_s, center_s)
 
 
 def _send_mouse_path_locked(
@@ -558,9 +564,13 @@ def _send_mouse_path_locked(
     mapped: list[tuple[int, int]],
     hold: set[tuple[int, int]],
     abort=None,
+    point_s: float | None = None,
+    center_s: float | None = None,
 ) -> bool:
     user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
     user32.SendInput.restype = ctypes.c_uint
+    point = swipe_point_s if point_s is None else point_s
+    center = swipe_center_s if center_s is None else center_s
 
     vx = user32.GetSystemMetrics(76)
     vy = user32.GetSystemMetrics(77)
@@ -593,7 +603,7 @@ def _send_mouse_path_locked(
             emit(x, y, up)
             return True
         emit(x, y, move)
-        time.sleep(swipe_center_s if (x, y) in hold else swipe_point_s)
+        time.sleep(center if (x, y) in hold else point)
     time.sleep(0.02)
     xl, yl = mapped[-1]
     emit(xl, yl, up)

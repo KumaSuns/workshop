@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 LOCAL_API = "http://localhost:8888/my_home_page/workshop_data/api.php"
 PROD_API = "https://hokkai-syabusyabu.com/home_page/workshop_data/api.php"
+MODELS_API = "http://hokkai-syabusyabu.com/home_page/workshop/models/api.php"
 DEFAULT_TOKEN = "kumadesk-workshop-local"
 SKIP_NAMES = {"__pycache__", ".DS_Store", "Thumbs.db"}
 SKIP_SUFFIXES = {".pyc", ".pyo"}
@@ -74,9 +75,16 @@ def _sha1(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _request(action: str, *, data: bytes | None = None, headers: dict | None = None, timeout: int = 60):
+def _request(
+    action: str,
+    *,
+    data: bytes | None = None,
+    headers: dict | None = None,
+    timeout: int = 60,
+    base_url: str | None = None,
+):
     query = urllib.parse.urlencode({"action": action})
-    url = f"{api_url()}?{query}"
+    url = f"{base_url or api_url()}?{query}"
     req_headers = {"X-Workshop-Token": api_token()}
     if headers:
         req_headers.update(headers)
@@ -186,6 +194,27 @@ def _multipart(fields: dict[str, str], filename: str, content: bytes) -> tuple[b
     lines.append(b"")
     body = b"\r\n".join(lines) + b"\r\n" + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
     return body, f"multipart/form-data; boundary={boundary}"
+
+
+def upload_model(path: Path) -> dict:
+    if path.suffix.lower() != ".pt" or not path.is_file():
+        raise RuntimeError(f"モデルがありません。\n{path}")
+    content = path.read_bytes()
+    body, content_type = _multipart({"action": "put", "path": path.name}, path.name, content)
+    status, raw, _ctype = _request(
+        "put",
+        data=body,
+        headers={"Content-Type": content_type},
+        timeout=600,
+        base_url=MODELS_API,
+    )
+    try:
+        payload = _json(raw)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{path.name}\n{exc}") from exc
+    if status != 200 or not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") or f"{path.name} を送れませんでした"))
+    return payload
 
 
 def upload_file(rel: str, path: Path) -> None:

@@ -9,6 +9,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event, Lock, Thread
 
 from PySide6.QtCore import QPoint, QRect, Qt, QThread, Signal
@@ -38,17 +39,26 @@ from app.intro import (
     _retry_button,
     _slow_tap,
 )
+from app.cinderella_skill import run_cinderella_skill
 from app.elsa_skill import run_elsa_skill
+from app.namine_skill import run_namine_skill
 from app.skill_tsum import (
     _cbuzz_pose_on,
     after_skill_tap,
     cbuzz_press_to_b,
     skill_breaks_bombs,
+    skill_is_cinderella,
     skill_is_cloud,
     skill_is_elsa,
     skill_is_gadget,
+    skill_is_namine,
+    skill_is_nightmare,
     skill_is_pooh,
 )
+from app.nightmare_dice import _blank as _nightmare_blank
+from app.nightmare_dice import boogie_on as _nightmare_boogie_on
+from app.nightmare_dice import dice_on as _nightmare_dice_on
+from app.nightmare_dice import nightmare_dice_step
 from app.play_style import (
     hud_net,
     hud_situation,
@@ -126,6 +136,7 @@ class PlayWorker(QThread):
         start_match: bool = False,
         kind_count: int | None = None,
         save_boards: Callable[[], bool] | None = None,
+        board_grabs: Queue | None = None,
         count_skill: Callable[[], bool] | None = None,
         loop: bool = False,
         ask_kinds: bool = False,
@@ -135,6 +146,7 @@ class PlayWorker(QThread):
         self._start_match = start_match
         self._kind_count = kind_count
         self._save_boards = save_boards
+        self._board_grabs = board_grabs
         self._count_skill = count_skill
         self._loop = loop
         self._ask_kinds = ask_kinds
@@ -182,6 +194,7 @@ class PlayWorker(QThread):
                 show_items=self.items.emit,
                 kind_count=self._kind_count,
                 save_boards=self._save_boards,
+                board_grabs=self._board_grabs,
                 count_skill=self._count_skill,
                 loop=self._loop,
                 request_kinds=self._request_kinds if self._ask_kinds else None,
@@ -210,6 +223,7 @@ def run_play(
     show_items: Callable[[str], None] | None = None,
     kind_count: int | None = None,
     save_boards: Callable[[], bool] | None = None,
+    board_grabs: Queue | None = None,
     count_skill: Callable[[], bool] | None = None,
     loop: bool = False,
     request_kinds: Callable[[], int | None] | None = None,
@@ -365,6 +379,7 @@ def run_play(
     bomb_asked_sit = ""
     skill_pick: tuple[str, bool] | None = None
     skill_acc = 0.0
+    nightmare_dice = _nightmare_blank()
     pending_lesson: tuple[list[int], int] | None = None
     pending_hud: list[tuple[str, str, bool]] = []
     last_boxes: dict[str, dict[str, int]] = {}
@@ -474,6 +489,8 @@ def run_play(
         skill_my_full = None
         skill_my_held = False
         skill_saw_empty = False
+        nightmare_dice.clear()
+        nightmare_dice.update(_nightmare_blank())
         watch_hit.clear()
         watching.clear()
         if timeup_seen is not None:
@@ -659,6 +676,8 @@ def run_play(
         sit_bomb = bomb_situation(sit, len(bombs))
         if not force and not ask_bomb(sit_bomb, True):
             return False
+        if _nightmare_live_dice():
+            return False
         if target is not None:
             cell = _piece_cell(target)
             if cell in skip_bomb_cells:
@@ -748,6 +767,26 @@ def run_play(
             skill_taps += 1
             last_skill_at = time.time()
             skill_wait_empty = True
+            if skill_is_cinderella(used_tsum):
+                if not _cinderella_ring_off(skill, stop, watch_hit):
+                    skill_ring_hold[0] = False
+                    return False
+                skip_loss = True
+                swipes += run_cinderella_skill(
+                    predict=lambda rgb: predictor.predict_pieces(
+                        Path("."), game, rgb=rgb, inner=False, assign_groups=False
+                    ),
+                    game=game,
+                    say=say,
+                    stop=stop,
+                    watch_hit=watch_hit,
+                    preview=preview,
+                    draw=_draw_plan,
+                    gpu_lock=_gpu_lock,
+                    skill_lamp=skill_lamp,
+                )
+                note_used()
+                return True
             if skill_is_elsa(used_tsum):
                 skip_loss = True
                 swipes += run_elsa_skill(
@@ -763,6 +802,34 @@ def run_play(
                     gpu_lock=_gpu_lock,
                     skill_lamp=skill_lamp,
                 )
+                note_used()
+                return True
+            if skill_is_namine(used_tsum):
+                done = run_namine_skill(
+                    predict=lambda shot: predictor.predict_pieces(
+                        Path("."), game, rgb=shot, inner=False
+                    ),
+                    game=game,
+                    my_group=my_group,
+                    before_pieces=list(pieces),
+                    say=say,
+                    stop=stop,
+                    watch_hit=watch_hit,
+                    preview=preview,
+                    draw=_draw_plan,
+                    gpu_lock=_gpu_lock,
+                    skill_lamp=skill_lamp,
+                    find_my=lambda shot, found: _mytsum_group(
+                        predictor,
+                        _qimage_rgb(shot),
+                        [piece for piece in found if _is_tsum(piece)],
+                        skill,
+                    )[0],
+                )
+                if done is None:
+                    return False
+                skip_loss = True
+                swipes += done
                 note_used()
                 return True
             if skill_is_cloud(used_tsum):
@@ -890,6 +957,8 @@ def run_play(
             skill_saw_empty = True
 
     def mytsum_in_chain(chain: list[dict[str, int]]) -> int:
+        if skill_is_nightmare(used_tsum):
+            return len(chain)
         if my_group <= 0 or not chain:
             return 0
         if int(chain[0].get("group") or 0) != my_group:
@@ -915,7 +984,24 @@ def run_play(
     def emit_gauges(_skill_fill: float | None) -> None:
         take_fever()
 
-    def _chain_pref(chain: list[dict[str, int]]) -> tuple[bool, int]:
+    def _nightmare_chain_n() -> int:
+        if used_items and "+Bomb" in used_items:
+            return 9
+        return 10
+
+    def _chain_pref(chain: list[dict[str, int]]) -> tuple:
+        if skill_is_nightmare(used_tsum):
+            aim = _nightmare_chain_n()
+            n = len(chain)
+            if n == aim:
+                band = 3
+            elif n == aim + 1:
+                band = 2
+            elif n == aim - 1:
+                band = 1
+            else:
+                band = 0
+            return (band, -abs(n - aim))
         return (
             my_group > 0 and int(chain[0].get("group") or 0) == my_group,
             len(chain),
@@ -954,6 +1040,15 @@ def run_play(
                 if len(part) >= MIN_CHAIN
             ]
         found = [item for item in raw if not _chain_too_similar(item, blocked)]
+        if skill_is_nightmare(used_tsum):
+            aim = _nightmare_chain_n()
+            trimmed = []
+            for item in found:
+                if len(item) >= aim + 2:
+                    item = item[:aim]
+                if len(item) >= MIN_CHAIN:
+                    trimmed.append(item)
+            found = trimmed
         if extra:
             extra_keys = set(extra)
             found = [item for item in found if _chain_key(item) not in extra_keys]
@@ -1003,9 +1098,38 @@ def run_play(
     skill_press_lock = Lock()
     board_bombs = [None]
 
+    def tap_cinderella_fan(frame) -> None:
+        nonlocal fan_taps, last_fan_at
+        if not skill_is_cinderella(used_tsum) or fan is None or frame is None or frame.isNull():
+            return
+        _tap_fan(fan, frame, say, stop)
+        fan_taps += 1
+        last_fan_at = time.time()
+
+    def _nightmare_live_dice() -> bool:
+        if not skill_is_nightmare(used_tsum):
+            return False
+        try:
+            shot = capture_play_frame()
+            rgb_now = _qimage_rgb(shot)
+        except Exception:
+            return True
+        if rgb_now is None or shot.isNull():
+            return True
+        play_frame[0] = shot
+        play_frame[1] = rgb_now
+        play_frame_at[0] = time.time()
+        if _nightmare_dice_on(rgb_now) or _nightmare_boogie_on(rgb_now):
+            nightmare_dice["block"] = True
+            return True
+        nightmare_dice["block"] = False
+        return False
+
     def press_skill_now(point, bombs_ok: bool = False) -> None:
         nonlocal fan_taps, last_fan_at
         if before_start[0] or not saw_board:
+            return
+        if _nightmare_live_dice():
             return
         if not bombs_ok and board_bombs[0] != 0:
             return
@@ -1029,7 +1153,10 @@ def run_play(
                 next_skill_at[0] = time.time() + 0.5
             return
         shot = play_frame[0]
-        if (
+        if skill_is_cinderella(used_tsum):
+            fan_image = shot if shot is not None and not shot.isNull() else image
+            tap_cinderella_fan(fan_image)
+        elif (
             skill_breaks_bombs(used_tsum)
             and fan is not None
             and shot is not None
@@ -1054,19 +1181,26 @@ def run_play(
 
     def _clear_bombs_before_skill() -> None:
         nonlocal bomb_taps, last_bomb_at
+        if _nightmare_live_dice():
+            return
         if not board_bombs[0]:
             return
         was_busy = skill_busy[0]
         skill_busy[0] = True
         try:
-            n = _break_bombs_until_zero(
-                predictor,
-                game,
-                say,
-                stop,
-                watch_hit,
-                seed=(image, pieces),
-            )
+            if skill_is_namine(used_tsum):
+                if int(board_bombs[0]) <= 1:
+                    return
+                n = _break_bombs_until_one(predictor, game, say, stop, watch_hit)
+            else:
+                n = _break_bombs_until_zero(
+                    predictor,
+                    game,
+                    say,
+                    stop,
+                    watch_hit,
+                    seed=(image, pieces),
+                )
             bomb_taps += n
             if n:
                 last_bomb_at = time.time()
@@ -1137,10 +1271,14 @@ def run_play(
                 now = time.time()
                 if not tapped:
                     skill_tap_at[0] = now
+                if _nightmare_live_dice():
+                    return False
                 try:
                     tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
                 except Exception:
                     return False
+                if not tapped:
+                    tap_cinderella_fan(image)
                 tapped = True
                 fill = _window_skill_fill(skill)
                 if fill is not None and fill >= SKILL_FILL_SPENT:
@@ -1307,6 +1445,13 @@ def run_play(
             time.sleep(0.2)
 
     Thread(target=_watch_checker, daemon=True).start()
+    grab_done = Event()
+    if board_grabs is not None:
+        Thread(
+            target=_grab_board_loop,
+            args=(predictor, board_grabs, stop, grab_done, say),
+            daemon=True,
+        ).start()
     next_frame = None
     try:
         while True:
@@ -1356,7 +1501,7 @@ def run_play(
                 if go_at is None:
                     go_at = time.time()
                 resumed_pause = False
-            if saw_board and pause is not None and not on_mission:
+            if saw_board and pause is not None and not on_mission and not _nightmare_dice_on(rgb):
                 say("続けるをクリックします")
                 _slow_tap(pause.center().x(), pause.center().y())
                 _sleep_stop(1.2, stop)
@@ -1507,6 +1652,12 @@ def run_play(
                     show_used(replay_items)
                 say("プレイを開始します")
                 continue
+            if (
+                saw_board
+                and skill_is_nightmare(used_tsum)
+                and nightmare_dice_step(image, rgb, nightmare_dice, say, stop, watch_hit)
+            ):
+                continue
             _check_stop(stop)
             if not saw_board:
                 start = _match_start_button(image)
@@ -1616,7 +1767,7 @@ def run_play(
                 and time.time() - pending_at < 0.5
             ):
                 continue
-            if skill_now:
+            if skill_now and not skill_is_namine(used_tsum):
                 _press_ready_skill()
                 if skill_pressed is not None and skill_pressed.is_set():
                     apply_checker_skill(False)
@@ -1777,6 +1928,8 @@ def run_play(
                             if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
                                 timeup = True
                                 break
+                            if _nightmare_live_dice():
+                                break
                             tap_bombs_after_chains(screen_swipes, screen_max)
                             if (
                                 skill_is_gadget(used_tsum)
@@ -1790,6 +1943,8 @@ def run_play(
                             except Exception:
                                 break
                             if rgb is None or image.isNull():
+                                break
+                            if skill_is_nightmare(used_tsum) and _nightmare_dice_on(rgb):
                                 break
                             play_frame[0] = image
                             play_frame[1] = rgb
@@ -1840,6 +1995,8 @@ def run_play(
                             if not queue:
                                 break
                             continue
+                        if _nightmare_live_dice():
+                            break
                         chain = queue.pop(0)
                         spots = {(int(piece["x"]), int(piece["y"])) for piece in chain}
                         if spots & used:
@@ -1898,7 +2055,10 @@ def run_play(
                         say(_counts_line(clears, swipes, coin))
                         if not already_pending:
                             my_vec = _lock_my_vec(tsums, skill_face, my_vec)
-                            counted = _count_mytsum(chain, tsums, my_vec)
+                            if skill_is_nightmare(used_tsum):
+                                counted = len(chain)
+                            else:
+                                counted = _count_mytsum(chain, tsums, my_vec)
                             my_erase += counted
                         if not already_pending:
                             burst_my_n += added
@@ -2154,7 +2314,7 @@ def run_play(
             t0 = time.perf_counter()
             did_fan = False
             fan_open = go_at is None or time.time() - go_at >= 3.0
-            if fan_open and fan_fall_n is None:
+            if fan_open and fan_fall_n is None and not _nightmare_live_dice():
                 did_fan = _press_fan(
                     fan, image, say, stop, last_fan_at, len(tsums), pending_hud, skill_sit(False)
                 )
@@ -2167,6 +2327,7 @@ def run_play(
             say(f"ツム {len(tsums)}体 / なぞれる3体以上なし")
             continue
     finally:
+        grab_done.set()
         checker_alive[0] = False
 
 
@@ -2365,6 +2526,45 @@ def _hud_boxes(game, skill, fever, timer, fan) -> dict[str, dict[str, int]]:
     return boxes
 
 
+def _grab_board_loop(predictor, grabs: Queue, stop: Event | None, done: Event, say: StatusFn) -> None:
+    while not done.is_set() and (stop is None or not stop.is_set()):
+        try:
+            image = grabs.get(timeout=0.2)
+        except Empty:
+            continue
+        if done.is_set() or (stop is not None and stop.is_set()):
+            return
+        try:
+            _import_grabbed_board(predictor, image, say)
+        except Exception:
+            say("盤面を取り込めませんでした")
+
+
+def _import_grabbed_board(predictor, image: QImage, say: StatusFn) -> None:
+    rgb = _qimage_rgb(image)
+    if rgb is None:
+        say("盤面を取り込めませんでした")
+        return
+    with _gpu_lock:
+        boxes = predictor.predict_all(Path("."), rgb=rgb)
+        game, skill, fever, timer, fan = _merge_hud(boxes, None, None, None, None, None)
+        pieces = []
+        if game is not None:
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False) or []
+    hud = dict(boxes) if isinstance(boxes, dict) else {}
+    hud.update(_hud_boxes(game, skill, fever, timer, fan))
+    try:
+        learned = save_play_board(
+            predictor, image, game, boxes=hud, pieces=pieces, rgb=rgb
+        )
+    except Exception:
+        learned = False
+    if learned:
+        say("盤面を取り込みました")
+    else:
+        say("盤面を取り込めませんでした")
+
+
 def _learn_board(
     predictor,
     image: QImage,
@@ -2449,6 +2649,30 @@ def _cbuzz_activated(
         if now >= deadline and not saw_yellow:
             return False, False
         time.sleep(0.1)
+
+
+def _cinderella_ring_off(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
+    if skill is None:
+        return False
+    limit = time.time() + SKILL_GAP
+    while time.time() < limit:
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        try:
+            image = capture_play_frame()
+        except Exception:
+            time.sleep(0.05)
+            continue
+        rgb = _qimage_rgb(image)
+        if rgb is None:
+            time.sleep(0.05)
+            continue
+        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+        if yellow < SLOT_ON:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _skill_tap_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
