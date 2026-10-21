@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -197,6 +198,16 @@ class MenuWindow(QMainWindow):
         self._model_update_check = _ModelUpdateCheck(self._model_token_value, self)
         self._model_update_check.found.connect(self._set_model_update)
         self._model_update_check.start()
+        self._app_update_check = _AppUpdateCheck(self)
+        self._app_update_check.found.connect(self._ask_app_update)
+        self._app_update_check.start()
+        self._app_allowed = None
+        self._app_use_box = None
+        if self._autoplay_button is not None:
+            self._autoplay_button.setEnabled(False)
+        self._app_use_check = _AppUseCheck(self._model_token_value, self)
+        self._app_use_check.found.connect(self._apply_app_use)
+        self._app_use_check.start()
         layout.addWidget(self._footer)
         self.setCentralWidget(root)
         self._placed = False
@@ -242,6 +253,7 @@ class MenuWindow(QMainWindow):
         sock.write(b'{"ok":true}\n')
         sock.flush()
         self._bring_to_front()
+        self._reread_app_use()
 
     def _bring_to_front(self) -> None:
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
@@ -430,6 +442,24 @@ class MenuWindow(QMainWindow):
             return
         QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
 
+    def _ask_app_update(self, available: bool) -> None:
+        if not available:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("メニュー")
+        box.setText("アプリの更新があります。更新してもよろしいですか？")
+        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+        box.setDefaultButton(no)
+        box.exec()
+        if box.clickedButton() is not yes:
+            return
+        ok, detail = _pull_app_update()
+        if ok:
+            self._set_activity("終了して、もう一度起動する")
+            return
+        self._set_activity(detail or "更新できませんでした。")
+
     def _set_model_update(self, available: bool) -> None:
         if self._update_button is None:
             return
@@ -529,7 +559,44 @@ class MenuWindow(QMainWindow):
     def _on_play_done(self) -> None:
         self._set_activity("プレイが終わりました")
 
+    def _reread_app_use(self) -> None:
+        running = self._app_use_check
+        if running is not None and running.isRunning():
+            return
+        check = _AppUseCheck(self._model_token_value, self)
+        check.found.connect(self._apply_app_use)
+        self._app_use_check = check
+        check.start()
+
+    def _apply_app_use(self, allowed: object) -> None:
+        if isinstance(allowed, tuple) and len(allowed) == 2 and allowed[0] is False:
+            self._app_allowed = False
+            if self._autoplay_button is not None:
+                self._autoplay_button.setEnabled(False)
+            if self._app_use_box is not None:
+                return
+            message = allowed[1].strip() if isinstance(allowed[1], str) else ""
+            if not message:
+                message = "ただいまメンテナンス中です。"
+            box = QMessageBox(self)
+            box.setWindowTitle("メニュー")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setText(message)
+            self._app_use_box = box
+            box.exec()
+            self._app_use_box = None
+            if not self._app_allowed:
+                QApplication.quit()
+            return
+        self._app_allowed = True
+        if self._autoplay_button is not None:
+            self._autoplay_button.setEnabled(True)
+        if self._app_use_box is not None:
+            self._app_use_box.done(0)
+
     def _on_autoplay(self) -> None:
+        if not self._app_allowed:
+            return
         self._set_activity("BlueStacks を確認しています")
         if not _bluestacks_running():
             self._set_activity("BlueStacks は起動していません。")
@@ -1089,6 +1156,31 @@ def _server_model_sha1(token: str) -> str:
     return ""
 
 
+def app_use_allowed(token: str) -> tuple[bool, str] | None:
+    if not token:
+        return None
+    query = urllib.parse.urlencode({"action": "app", "t": str(time.time_ns())})
+    request = urllib.request.Request(
+        f"{MODELS_API}?{query}",
+        headers={
+            "X-Workshop-Token": token,
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("ok") or "use" not in payload:
+        return None
+    message = payload.get("message")
+    if not isinstance(message, str) or not message.strip():
+        message = "ただいまメンテナンス中です。"
+    return bool(payload.get("use")), message
+
+
 def model_update_available(token: str) -> bool:
     local = _app_model()
     local_sha = _file_sha1(local) if local.is_file() else ""
@@ -1119,6 +1211,71 @@ def _import_server_model(token: str) -> None:
     temporary = APP_MODEL.with_suffix(".pt.part")
     temporary.write_bytes(data)
     temporary.replace(APP_MODEL)
+
+
+def _git_in_app(args: list[str]) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(
+        ["git", *args],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def app_update_available() -> bool:
+    try:
+        inside = _git_in_app(["rev-parse", "--is-inside-work-tree"])
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return False
+        fetched = _git_in_app(["fetch", "origin", "master"])
+        if fetched.returncode != 0:
+            return False
+        missing = _git_in_app(["rev-list", "--count", "HEAD..FETCH_HEAD"])
+        if missing.returncode != 0:
+            return False
+        return int(missing.stdout.strip() or "0") > 0
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+
+
+def _pull_app_update() -> tuple[bool, str]:
+    try:
+        result = _git_in_app(["pull", "origin", "master"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "更新できませんでした。").strip()
+        return False, detail
+    return True, ""
+
+
+class _AppUseCheck(QThread):
+    found = Signal(object)
+
+    def __init__(self, token: str, parent=None) -> None:
+        super().__init__(parent)
+        self._token = token
+
+    def run(self) -> None:
+        state = None
+        for _ in range(3):
+            state = app_use_allowed(self._token)
+            if state is not None:
+                break
+        self.found.emit(state)
+
+
+class _AppUpdateCheck(QThread):
+    found = Signal(bool)
+
+    def run(self) -> None:
+        self.found.emit(app_update_available())
 
 
 class _ModelUpdateCheck(QThread):
