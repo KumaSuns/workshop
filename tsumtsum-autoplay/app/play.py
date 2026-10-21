@@ -140,6 +140,7 @@ class PlayWorker(QThread):
         count_skill: Callable[[], bool] | None = None,
         loop: bool = False,
         ask_kinds: bool = False,
+        games: int | None = None,
     ) -> None:
         super().__init__(parent)
         self._stop = stop
@@ -149,6 +150,7 @@ class PlayWorker(QThread):
         self._board_grabs = board_grabs
         self._count_skill = count_skill
         self._loop = loop
+        self._games = games
         self._ask_kinds = ask_kinds
         self._kinds_gate = Event()
         self._kinds_answer: int | None = None
@@ -197,6 +199,7 @@ class PlayWorker(QThread):
                 board_grabs=self._board_grabs,
                 count_skill=self._count_skill,
                 loop=self._loop,
+                games=self._games,
                 request_kinds=self._request_kinds if self._ask_kinds else None,
                 request_used_tsum=self._request_used_tsum if self._ask_kinds else None,
                 skill_pressed=self.skill_pressed,
@@ -226,6 +229,7 @@ def run_play(
     board_grabs: Queue | None = None,
     count_skill: Callable[[], bool] | None = None,
     loop: bool = False,
+    games: int | None = None,
     request_kinds: Callable[[], int | None] | None = None,
     request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
     skill_pressed: Event | None = None,
@@ -236,6 +240,15 @@ def run_play(
     def say(text: str) -> None:
         if report is not None:
             report(text)
+
+    games_done = 0
+
+    def _continue_after_game() -> bool:
+        nonlocal games_done
+        games_done += 1
+        if games is not None:
+            return games_done < games
+        return loop
 
     my_mode = "off"
 
@@ -296,6 +309,8 @@ def run_play(
             used_tsum = seen_tsum
         if arrived in ("start", "continue"):
             ask_used_now(arrived == "start")
+        elif not tsum_asked:
+            ask_used_now(False)
         if arrived in ("start", "continue") and request_kinds is not None:
             asked = request_kinds()
             if asked is None:
@@ -1640,7 +1655,7 @@ def run_play(
                     upload=not tsum_unspecified,
                 )
                 watch_hit.clear()
-                if not loop:
+                if not _continue_after_game():
                     stop_watch.set()
                     watching.clear()
                     return
@@ -2236,7 +2251,7 @@ def run_play(
                         sorted(wait_times, reverse=True)[:3],
                         upload=not tsum_unspecified,
                     )
-                    if not loop:
+                    if not _continue_after_game():
                         stop_watch.set()
                         watching.clear()
                         return

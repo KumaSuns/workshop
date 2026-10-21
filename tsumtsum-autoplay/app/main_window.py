@@ -539,6 +539,8 @@ class MainWindow(QMainWindow):
         self._board_grabs: Queue = Queue()
         self._count_skill = threading.Event()
         self._loop_play = False
+        self._play_games = None
+        self._suppress_show = False
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
         self._record: RecordWorker | None = None
@@ -625,7 +627,8 @@ class MainWindow(QMainWindow):
     def _add_tsum(self) -> None:
         self._register_used_tsum(None, title="ツムを追加", allow_skip=False)
 
-    def on_loop_play(self) -> None:
+    def on_loop_play(self, games: int | None = None) -> None:
+        self._play_games = games if isinstance(games, int) and games > 0 else None
         self._begin_play(loop=True)
 
     def on_record_one(self) -> None:
@@ -745,7 +748,8 @@ class MainWindow(QMainWindow):
         if running:
             self._front_timer.stop()
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
-            self.show()
+            if not self._suppress_show:
+                self.show()
             self._f5_down = False
             self._f8_down = False
             self._f11_down = False
@@ -756,9 +760,10 @@ class MainWindow(QMainWindow):
             self._f11_down = False
             self._unregister_stop_hotkey()
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-            self.show()
-            self._front_timer.start()
-            self._keep_front()
+            if not self._suppress_show:
+                self.show()
+                self._front_timer.start()
+                self._keep_front()
             self._clear_meters()
 
     def _clear_meters(self) -> None:
@@ -962,6 +967,7 @@ class MainWindow(QMainWindow):
             count_skill=self._count_skill.is_set,
             loop=loop,
             ask_kinds=ask_kinds,
+            games=self._play_games if loop else None,
         )
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
@@ -1458,12 +1464,29 @@ class MainWindow(QMainWindow):
 
     def _on_ipc_connection(self) -> None:
         sock = self._ipc_server.nextPendingConnection()
+        action = "activate"
+        games = None
+        hidden = False
         if sock is not None:
+            if sock.bytesAvailable() or sock.waitForReadyRead(400):
+                try:
+                    payload = json.loads(bytes(sock.readAll()).decode("utf-8").strip() or "{}")
+                    action = str(payload.get("action") or "activate")
+                    games = payload.get("games")
+                    hidden = bool(payload.get("hidden"))
+                except (json.JSONDecodeError, UnicodeError, AttributeError):
+                    action = "activate"
+                    games = None
+                    hidden = False
             sock.disconnectFromServer()
             sock.deleteLater()
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        if not hidden:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        if action == "loop":
+            count = games if isinstance(games, int) and games > 0 else None
+            self.on_loop_play(count)
 
     def _keep_front(self) -> None:
         if QApplication.activeModalWidget() is not None:

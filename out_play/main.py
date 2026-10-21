@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDir, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QColor, QImage, QPalette, QPixmap, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,6 +22,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -26,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+MENU_IPC = "workshop-out-play-menu"
 ROOT = Path(__file__).resolve().parent
 WORKSHOP = ROOT.parent
 MODELS_API = "http://hokkai-syabusyabu.com/home_page/workshop/models/api.php"
@@ -39,6 +45,15 @@ ITEM_ICONS = (
     "Bomb.png",
     "5over4.png",
     "Combo.png",
+)
+ITEM_NAMES = (
+    "+Score",
+    "+Coin",
+    "+Exp",
+    "+Time",
+    "+Bomb",
+    "5＞4",
+    "+Combo",
 )
 ITEM_DIM = 0.6
 ITEM_MIST = 0.6
@@ -146,12 +161,31 @@ class MenuWindow(QMainWindow):
         self._slots = []
         self._item_box = None
         self._item_src = []
+        self._item_lit = []
+        self._item_active: set[int] = set()
         self._item_labels = []
         self._item_rows = []
         self._item_block = None
         self._center_slot = None
         self._center_buttons = []
+        self._autoplay_button = None
+        self._item_check = None
+        self._play_stop = threading.Event()
+        self._intro = None
+        self._play_worker = None
+        self._play_games = None
+        self._play_api = None
+        self._used_tsum_name = ""
+        self._tsum_body = None
+        self._tsum_actions = None
+        self._tsum_path: Path | None = None
+        self._tsum_list = None
+        self._tsum_prompt = None
+        self._tsum_blink_on = True
+        self._tsum_blink_timer = None
         self._center_input = None
+        self._center_blank = None
+        self._activity = None
         self._launch_button = None
         for _ in range(3):
             slot = QFrame()
@@ -160,7 +194,7 @@ class MenuWindow(QMainWindow):
             self._slots.append(slot)
         self._fill_items(self._slots[0])
         self._fill_center(self._slots[1])
-        self._model_update_check = _ModelUpdateCheck(self)
+        self._model_update_check = _ModelUpdateCheck(self._model_token_value, self)
         self._model_update_check.found.connect(self._set_model_update)
         self._model_update_check.start()
         layout.addWidget(self._footer)
@@ -174,6 +208,46 @@ class MenuWindow(QMainWindow):
             return
         self._placed = True
         QTimer.singleShot(0, self._fill_right)
+
+    def _start_ipc(self) -> None:
+        self._ipc_buffers: dict[int, bytes] = {}
+        self._ipc_server = QLocalServer(self)
+        self._ipc_server.newConnection.connect(self._on_ipc_connection)
+        if self._ipc_server.listen(MENU_IPC):
+            return
+        QLocalServer.removeServer(MENU_IPC)
+        self._ipc_server.listen(MENU_IPC)
+
+    def _on_ipc_connection(self) -> None:
+        sock = self._ipc_server.nextPendingConnection()
+        if sock is None:
+            return
+        self._ipc_buffers[id(sock)] = b""
+        sock.readyRead.connect(lambda s=sock: self._on_ipc_ready(s))
+        sock.disconnected.connect(lambda s=sock: self._ipc_buffers.pop(id(s), None))
+
+    def _on_ipc_ready(self, sock: QLocalSocket) -> None:
+        self._ipc_buffers[id(sock)] = self._ipc_buffers.get(id(sock), b"") + bytes(sock.readAll())
+        buffer = self._ipc_buffers[id(sock)]
+        if b"\n" not in buffer:
+            return
+        line, rest = buffer.split(b"\n", 1)
+        self._ipc_buffers[id(sock)] = rest
+        try:
+            json.loads(line.decode("utf-8"))
+        except Exception:
+            sock.write(b'{"ok":false}\n')
+            sock.flush()
+            return
+        sock.write(b'{"ok":true}\n')
+        sock.flush()
+        self._bring_to_front()
+
+    def _bring_to_front(self) -> None:
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _fill_right(self) -> None:
         screen = self.screen() or QApplication.primaryScreen()
@@ -258,9 +332,9 @@ class MenuWindow(QMainWindow):
             self._item_rows.append(row)
             for filename in names:
                 label = QLabel()
-                self._item_src.append(
-                    _mist_pixmap(_dim_pixmap(QPixmap(str(ICON_DIR / filename))))
-                )
+                raw = QPixmap(str(ICON_DIR / filename))
+                self._item_lit.append(raw)
+                self._item_src.append(_mist_pixmap(_dim_pixmap(raw)))
                 self._item_labels.append(label)
                 row.addWidget(label)
             block_layout.addLayout(row)
@@ -271,7 +345,11 @@ class MenuWindow(QMainWindow):
         left.setSpacing(0)
         left.addWidget(self._section_title("MODEL情報"))
         left.addStretch(1)
+        self._model_differs = False
+        self._model_fetch = None
+        self._model_token_value = _model_token()
         self._update_button = QPushButton("更新なし")
+        self._update_button.clicked.connect(self._import_model)
         self._update_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._update_button.setSizePolicy(
             QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
@@ -289,6 +367,18 @@ class MenuWindow(QMainWindow):
             "QPushButton:hover { background: #f3f7ff; }"
         )
         left.addWidget(self._update_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        right = QVBoxLayout(boxes[2])
+        right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
+        right.setSpacing(0)
+        right.addWidget(self._section_title("使用ツム"))
+        self._tsum_body = QVBoxLayout()
+        self._tsum_body.setContentsMargins(0, 0, 0, 0)
+        self._tsum_body.setSpacing(0)
+        right.addLayout(self._tsum_body, 1)
+        self._tsum_actions = QVBoxLayout()
+        self._tsum_actions.setContentsMargins(0, 0, 0, 0)
+        self._tsum_actions.setSpacing(0)
+        right.addLayout(self._tsum_actions)
 
     def _create_desktop_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(
@@ -343,7 +433,28 @@ class MenuWindow(QMainWindow):
     def _set_model_update(self, available: bool) -> None:
         if self._update_button is None:
             return
-        self._update_button.setText("更新あり" if available else "更新なし")
+        self._model_differs = available
+        self._update_button.setText("更新する" if available else "更新なし")
+        self._update_button.setEnabled(True)
+
+    def _import_model(self) -> None:
+        if not self._model_differs or self._model_fetch is not None:
+            return
+        self._update_button.setEnabled(False)
+        worker = _ModelFetch(self._model_token_value, self)
+        worker.finished_import.connect(self._on_model_imported)
+        self._model_fetch = worker
+        worker.start()
+
+    def _on_model_imported(self, ok: bool, message: str) -> None:
+        self._model_fetch = None
+        if self._update_button is None:
+            return
+        self._update_button.setEnabled(True)
+        if not ok:
+            QMessageBox.warning(self, "モデルを取り込めませんでした", message or "モデルを取り込めませんでした。")
+            return
+        self._set_model_update(False)
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
@@ -351,7 +462,12 @@ class MenuWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         holder = QWidget()
         holder.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
-        grid = QGridLayout(holder)
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        grid_host = QWidget()
+        grid_host.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        grid = QGridLayout(grid_host)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(0)
         labels = {(0, 2): "オートプレイ"}
@@ -363,6 +479,9 @@ class MenuWindow(QMainWindow):
                 button.setSizePolicy(
                     QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
                 )
+                if (row, col) == (0, 2):
+                    self._autoplay_button = button
+                    button.clicked.connect(self._on_autoplay)
                 self._center_buttons.append(button)
                 grid.addWidget(button, row, col)
         self._launch_button = QPushButton("起動アイコンをデスクトップに作成")
@@ -371,7 +490,18 @@ class MenuWindow(QMainWindow):
         )
         self._launch_button.clicked.connect(self._create_desktop_shortcut)
         self._center_buttons.append(self._launch_button)
-        grid.addWidget(self._launch_button, 2, 0, 1, 3)
+        self._center_blank = QFrame()
+        self._center_blank.setFrameShape(QFrame.Shape.Box)
+        blank_layout = QVBoxLayout(self._center_blank)
+        blank_layout.setContentsMargins(TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN)
+        blank_layout.setSpacing(0)
+        self._activity = QLabel("")
+        self._activity.setWordWrap(True)
+        self._activity.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        blank_layout.addWidget(self._activity, 1)
+        column.addWidget(grid_host, 0, Qt.AlignmentFlag.AlignLeft)
+        column.addWidget(self._center_blank, 0, Qt.AlignmentFlag.AlignLeft)
+        column.addWidget(self._launch_button, 0, Qt.AlignmentFlag.AlignLeft)
         self._center_input = QComboBox()
         self._center_input.setEditable(True)
         self._center_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -387,7 +517,292 @@ class MenuWindow(QMainWindow):
         grid.addWidget(self._center_input, 0, 3)
         outer.addStretch(1)
         outer.addWidget(holder, 0, Qt.AlignmentFlag.AlignHCenter)
-        outer.addStretch(1)
+        outer.addStretch(2)
+
+    def _set_activity(self, text: str) -> None:
+        if self._activity is None:
+            return
+        if text.startswith("LossTime "):
+            return
+        self._activity.setText(text)
+
+    def _on_play_done(self) -> None:
+        self._set_activity("プレイが終わりました")
+
+    def _on_autoplay(self) -> None:
+        self._set_activity("BlueStacks を確認しています")
+        if not _bluestacks_running():
+            self._set_activity("BlueStacks は起動していません。")
+            QMessageBox.information(self, "オートプレイ", "BlueStacks は起動していません。")
+            return
+        if self._item_check is not None:
+            return
+        if self._autoplay_button is not None:
+            self._autoplay_button.setEnabled(False)
+        self._set_activity("アイテムの画面を確認しています")
+        worker = _ItemCheck(self)
+        worker.found.connect(self._on_items_checked)
+        self._item_check = worker
+        worker.start()
+
+    def _on_items_checked(self, payload: object) -> None:
+        self._item_check = None
+        if self._autoplay_button is not None:
+            self._autoplay_button.setEnabled(True)
+        if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+            self._light_items([str(name) for name in payload["items"]])
+        ok, games = self._game_count()
+        if not ok:
+            self._set_activity("プレイするゲーム数がありません。")
+            QMessageBox.information(self, "オートプレイ", "プレイするゲーム数がありません。")
+            return
+        _start_play_here(self, games)
+
+    def _on_intro_ok(self) -> None:
+        if self._play_stop.is_set():
+            return
+        _start_match(self)
+
+    def _on_intro_fail(self, message: str) -> None:
+        self._set_activity(message)
+        QMessageBox.critical(self, "オートプレイ", message)
+
+    def _on_play_fail(self, message: str) -> None:
+        self._set_activity(message)
+        QMessageBox.critical(self, "オートプレイ", message)
+
+    def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
+        if self._play_worker is None:
+            return
+        self._tsum_path = Path(path) if path else None
+        if pick_only or not guess:
+            self._show_tsum_list("" if pick_only else guess)
+            return
+        self._show_tsum_guess(guess)
+
+    def _clear_tsum_frame(self) -> None:
+        for layout in (self._tsum_body, self._tsum_actions):
+            if layout is None:
+                continue
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                child = item.layout()
+                if widget is not None:
+                    widget.deleteLater()
+                elif child is not None:
+                    self._clear_nested(child)
+        self._tsum_list = None
+        self._tsum_prompt = None
+        if self._tsum_blink_timer is not None:
+            self._tsum_blink_timer.stop()
+
+    def _clear_nested(self, layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child is not None:
+                self._clear_nested(child)
+
+    def _add_tsum_button(self, text: str, slot) -> QPushButton:
+        button = QPushButton(text)
+        font = button.font()
+        point = font.pointSize()
+        if point < 1:
+            point = 9
+        font.setPointSize(point + 2)
+        button.setFont(font)
+        metrics = button.fontMetrics()
+        button.setMinimumWidth(metrics.horizontalAdvance(text) + metrics.height() * 2)
+        button.setMinimumHeight(metrics.height() * 2)
+        button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        button.clicked.connect(slot)
+        if self._tsum_body is not None:
+            self._tsum_body.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
+        return button
+
+    def _tsum_question(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        font = label.font()
+        point = font.pointSize()
+        if point < 1:
+            point = 9
+        self._tsum_prompt_pt = point + 4
+        font.setPointSize(self._tsum_prompt_pt)
+        font.setBold(True)
+        label.setFont(font)
+        label.setContentsMargins(0, 0, 0, label.fontMetrics().height() // 2)
+        self._tsum_prompt = label
+        self._tsum_blink_on = True
+        self._paint_tsum_prompt()
+        if self._tsum_blink_timer is None:
+            timer = QTimer(self)
+            timer.setInterval(500)
+            timer.timeout.connect(self._toggle_tsum_prompt)
+            self._tsum_blink_timer = timer
+        self._tsum_blink_timer.start()
+        return label
+
+    def _toggle_tsum_prompt(self) -> None:
+        self._tsum_blink_on = not self._tsum_blink_on
+        self._paint_tsum_prompt()
+
+    def _paint_tsum_prompt(self) -> None:
+        label = self._tsum_prompt
+        if label is None:
+            return
+        color = "#FF0000" if self._tsum_blink_on else "transparent"
+        point = getattr(self, "_tsum_prompt_pt", 13)
+        label.setStyleSheet(f"color: {color}; font-weight: 700; font-size: {point}pt;")
+
+    def _show_tsum_guess(self, guess: str) -> None:
+        self._set_activity("使用ツムの問いに答えてください")
+        self._clear_tsum_frame()
+        if self._tsum_body is None:
+            return
+        self._tsum_body.addStretch(1)
+        self._tsum_body.addWidget(self._tsum_question(f"使用ツムは {guess} ですか？"))
+        self._add_tsum_button("はい", lambda: self._accept_used_tsum(guess, None))
+        self._add_tsum_button("いいえ", lambda: self._show_tsum_list(guess))
+        self._add_tsum_button("やめる", self._cancel_used_tsum)
+        self._tsum_body.addStretch(1)
+
+    def _show_tsum_list(self, skip_name: str = "") -> None:
+        self._set_activity("使用ツムの問いに答えてください")
+        names = _used_tsum_names()
+        if skip_name:
+            names = [name for name in names if name != skip_name]
+        self._clear_tsum_frame()
+        if self._tsum_body is None:
+            return
+        question = self._tsum_question("使用ツムはどれですか？")
+        self._tsum_body.addWidget(question)
+        name_list = QListWidget()
+        pad = name_list.fontMetrics().horizontalAdvance("あ")
+        gap = question.fontMetrics().height() // 2
+        name_list.setStyleSheet(f"QListWidget::item {{ padding-left: {pad}px; }}")
+        for name in names:
+            name_list.addItem(name)
+        if names:
+            name_list.setCurrentRow(0)
+        name_list.itemDoubleClicked.connect(lambda *_: self._accept_listed_tsum())
+        self._tsum_list = name_list
+        self._tsum_body.addWidget(name_list, 1)
+        below = QWidget()
+        below.setFixedHeight(gap)
+        self._tsum_body.addWidget(below)
+        self._add_tsum_button("これにします", self._accept_listed_tsum)
+        self._add_tsum_button("やめる", self._cancel_used_tsum)
+
+    def _accept_listed_tsum(self) -> None:
+        row = self._tsum_list.currentItem() if self._tsum_list is not None else None
+        if row is None:
+            return
+        self._accept_used_tsum(row.text(), None)
+
+    def _accept_used_tsum(self, name: str, folder_id: str | None) -> None:
+        saved = self._save_used_tsum_choice(self._tsum_path, name, folder_id)
+        if not saved:
+            return
+        self._finish_used_tsum(saved)
+
+    def _finish_used_tsum(self, name: str) -> None:
+        worker = self._play_worker
+        self._used_tsum_name = name
+        self._clear_tsum_frame()
+        if self._tsum_body is not None:
+            label = QLabel(name)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._tsum_body.addWidget(label)
+        if worker is not None:
+            worker.provide_used_tsum(name)
+
+    def _cancel_used_tsum(self) -> None:
+        worker = self._play_worker
+        self._used_tsum_name = ""
+        self._clear_tsum_frame()
+        if worker is not None:
+            worker.provide_used_tsum(None)
+            self._play_stop.set()
+        self._set_activity("中止しました")
+
+    def _save_used_tsum_choice(
+        self, path: Path | None, name: str, folder_id: str | None
+    ) -> str | None:
+        try:
+            saved = _save_used_tsum(path, name, folder_id)
+        except Exception as exc:  # noqa: BLE001
+            if self._tsum_body is not None:
+                self._tsum_body.addWidget(QLabel(str(exc)))
+            return None
+        return saved or name
+
+    def _on_need_kinds(self) -> None:
+        worker = self._play_worker
+        if worker is None:
+            return
+        kinds = _read_kind_count_now()
+        if kinds not in (4, 5):
+            box = QMessageBox(self)
+            box.setWindowTitle("オートプレイ")
+            box.setText("種類は何種類ですか？")
+            four = box.addButton("4種類", QMessageBox.ButtonRole.AcceptRole)
+            five = box.addButton("5種類", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(five)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is four:
+                kinds = 4
+            elif clicked is five:
+                kinds = 5
+            else:
+                worker.provide_kinds(None)
+                self._play_stop.set()
+                return
+        charm = _charm_for_tsum(self._used_tsum_name)
+        if charm is None:
+            asked = self._ask_charm_tsum()
+            if asked is None:
+                worker.provide_kinds(None)
+                self._play_stop.set()
+                return
+            charm = asked
+        if charm:
+            kinds = max(1, int(kinds) - 1)
+        worker.provide_kinds(int(kinds))
+
+    def _ask_charm_tsum(self) -> bool | None:
+        box = QMessageBox(self)
+        box.setWindowTitle("オートプレイ")
+        box.setText("チャームツムですか？")
+        box.setInformativeText("使うと種類が1つ減ります。")
+        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is yes:
+            return True
+        if clicked is no:
+            return False
+        return None
+
+    def _game_count(self) -> tuple[bool, int | None]:
+        if self._center_input is None:
+            return False, None
+        text = self._center_input.currentText().strip()
+        if text == "∞":
+            return True, None
+        if text.isdigit() and int(text) > 0:
+            return True, int(text)
+        return False, None
 
     def _fit_center(self) -> None:
         slot = self._center_slot
@@ -408,6 +823,8 @@ class MenuWindow(QMainWindow):
             field = self._center_input.lineEdit()
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if self._center_blank is not None:
+            self._center_blank.setFixedSize(width * 6, height * 3)
 
     def _section_title(self, text: str) -> QLabel:
         title = QLabel(text)
@@ -434,7 +851,8 @@ class MenuWindow(QMainWindow):
             row.setSpacing(gap)
         if self._item_block is not None:
             self._item_block.setSpacing(gap)
-        for label, src in zip(self._item_labels, self._item_src):
+        for index, label in enumerate(self._item_labels):
+            src = self._item_lit[index] if index in self._item_active else self._item_src[index]
             if src.isNull():
                 label.clear()
                 continue
@@ -447,16 +865,185 @@ class MenuWindow(QMainWindow):
             label.setPixmap(scaled)
             label.setFixedSize(scaled.size())
 
+    def _light_items(self, names: list[str]) -> None:
+        found = {name.strip() for name in names if name.strip()}
+        self._item_active = {index for index, name in enumerate(ITEM_NAMES) if name in found}
+        self._fit_items()
+
+    def _on_play_items(self, text: str) -> None:
+        if text.strip() in {"", "－", "-"}:
+            return
+        self._light_items([part.strip() for part in text.split("、")])
+
     def _set_front(self, on: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.show()
 
 
-def _local_model() -> Path:
-    bundled = WORKSHOP / "tsumtsum-screen-recognition" / "data" / "extractor" / "scene.pt"
-    if bundled.is_file():
-        return bundled
-    return WORKSHOP / "video-frame-extractor" / "scene.pt"
+APP_MODEL = ROOT / "models" / "scene.pt"
+MODEL_NAME = "scene.pt"
+
+
+def _app_model() -> Path:
+    return APP_MODEL
+
+
+_ITEM_CHECK = r"""
+import json
+import sys
+from PySide6.QtWidgets import QApplication
+sys.path.insert(0, sys.argv[1])
+QApplication([])
+from app.bluestacks import capture_screen_path
+from app.play import _items_used_path
+try:
+    items = _items_used_path(capture_screen_path())
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+else:
+    print(json.dumps({"items": items}, ensure_ascii=False))
+"""
+
+
+def _recognized_items() -> dict:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        [sys.executable, "-c", _ITEM_CHECK, str(WORKSHOP / "tsumtsum-autoplay")],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=flags,
+    )
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        err = (result.stderr or "").strip().splitlines()
+        return {"error": err[-1] if err else "アイテムの画面を認識できませんでした。"}
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return {"error": "アイテムの画面を認識できませんでした。"}
+    return payload if isinstance(payload, dict) else {"error": "アイテムの画面を認識できませんでした。"}
+
+
+def _load_play_api():
+    root = str(WORKSHOP / "tsumtsum-autoplay")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    for key in list(sys.modules):
+        if key == "app" or key.startswith("app."):
+            del sys.modules[key]
+    from app.bluestacks import start_tsum, tsum_is_running
+    from app.intro import IntroWorker
+    from app.play import PlayWorker, read_kind_count
+
+    return start_tsum, tsum_is_running, IntroWorker, PlayWorker, read_kind_count
+
+
+def _start_play_here(window: MenuWindow, games: int | None) -> None:
+    if window._play_worker is not None and window._play_worker.isRunning():
+        return
+    if window._intro is not None and window._intro.isRunning():
+        return
+    if window._play_api is None:
+        window._play_api = _load_play_api()
+    start_tsum, tsum_is_running, _intro_cls, _play_cls, _read_kinds = window._play_api
+    window._play_games = games
+    window._play_stop.clear()
+    if not tsum_is_running():
+        desktop = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DesktopLocation
+        )
+        try:
+            start_tsum(desktop or "")
+        except Exception as exc:  # noqa: BLE001
+            window._set_activity(str(exc))
+            QMessageBox.critical(window, "オートプレイ", str(exc))
+            return
+        intro = _intro_cls(window._play_stop, window)
+        intro.status.connect(window._set_activity)
+        intro.succeeded.connect(window._on_intro_ok)
+        intro.failed.connect(window._on_intro_fail)
+        window._intro = intro
+        intro.start()
+        return
+    _start_match(window)
+
+
+def _used_tsum_names() -> list[str]:
+    from app.play import used_tsum_names
+
+    try:
+        return [str(name) for name in used_tsum_names() if str(name).strip()]
+    except Exception:
+        return []
+
+
+def _save_used_tsum(path: Path | None, name: str, folder_id: str | None) -> str:
+    from app.play import register_used_tsum_id, save_used_tsum_teach
+
+    if path is not None and path.is_file():
+        return save_used_tsum_teach(path, name, folder_id)
+    if folder_id:
+        return register_used_tsum_id(name, folder_id)
+    return name
+
+
+def _read_kind_count_now() -> int | None:
+    from app.play import read_kind_count
+
+    try:
+        found = read_kind_count()
+    except Exception:
+        return None
+    if found in (4, 5):
+        return int(found)
+    return None
+
+
+def _charm_for_tsum(name: str) -> bool | None:
+    from app.main_window import _is_not_charm_tsum, _tsum_meta_for_name
+
+    saved = _tsum_meta_for_name(name)
+    if saved is not None and isinstance(saved.get("charm"), bool):
+        return bool(saved["charm"])
+    if _is_not_charm_tsum(name):
+        return False
+    return None
+
+
+def _start_match(window: MenuWindow) -> None:
+    if window._play_api is None:
+        return
+    _start_tsum, _running, _intro_cls, play_cls, _read_kinds = window._play_api
+    worker = play_cls(
+        window._play_stop,
+        window,
+        start_match=True,
+        loop=True,
+        ask_kinds=True,
+        games=window._play_games,
+    )
+    worker.status.connect(window._set_activity)
+    worker.items.connect(window._on_play_items)
+    worker.need_used_tsum.connect(window._on_need_used_tsum)
+    worker.need_kinds.connect(window._on_need_kinds)
+    worker.failed.connect(window._on_play_fail)
+    worker.completed.connect(window._on_play_done)
+    window._play_worker = worker
+    window._used_tsum_name = ""
+    worker.start()
+
+
+def _bluestacks_running() -> bool:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq HD-Player.exe", "/FO", "CSV", "/NH"],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=flags,
+    )
+    return "HD-Player.exe" in (result.stdout or "")
 
 
 def _file_sha1(path: Path) -> str:
@@ -472,44 +1059,171 @@ def _file_sha1(path: Path) -> str:
 
 def _model_token() -> str:
     stored = str(QSettings("workshop", "WorkshopDataServer").value("api_token", "") or "").strip()
-    return stored
+    if stored:
+        return stored
+    root = str(WORKSHOP / "video-frame-extractor")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from app.server_sync import api_token
+    except Exception:
+        return ""
+    return str(api_token() or "").strip()
 
 
-def model_update_available() -> bool:
-    local = _local_model()
-    local_sha = _file_sha1(local) if local.is_file() else ""
+def _server_model_sha1(token: str) -> str:
     query = urllib.parse.urlencode({"action": "manifest"})
     request = urllib.request.Request(
         f"{MODELS_API}?{query}",
-        headers={"X-Workshop-Token": _model_token()},
+        headers={"X-Workshop-Token": token},
     )
-    try:
-        with urllib.request.urlopen(request, timeout=8) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeError):
-        return False
+    with urllib.request.urlopen(request, timeout=8) as response:
+        payload = json.loads(response.read().decode("utf-8"))
     if not isinstance(payload, dict) or not payload.get("ok"):
-        return False
-    remote_sha = ""
+        return ""
     for item in payload.get("files") or []:
         if not isinstance(item, dict):
             continue
-        if str(item.get("path") or "") == local.name:
-            remote_sha = str(item.get("sha1") or "")
-            break
+        if str(item.get("path") or "") == MODEL_NAME:
+            return str(item.get("sha1") or "")
+    return ""
+
+
+def model_update_available(token: str) -> bool:
+    local = _app_model()
+    local_sha = _file_sha1(local) if local.is_file() else ""
+    try:
+        remote_sha = _server_model_sha1(token)
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
     return bool(remote_sha) and remote_sha != local_sha
+
+
+def _import_server_model(token: str) -> None:
+    query = urllib.parse.urlencode({"action": "file", "path": MODEL_NAME})
+    request = urllib.request.Request(
+        f"{MODELS_API}?{query}",
+        headers={"X-Workshop-Token": token},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            remote_sha = str(response.headers.get("X-Workshop-Sha1") or "")
+            data = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(detail or "モデルを取り込めませんでした。") from exc
+    digest = hashlib.sha1(data).hexdigest()
+    if remote_sha and digest != remote_sha:
+        raise RuntimeError("受け取ったモデルがサーバーのモデルと違います。")
+    APP_MODEL.parent.mkdir(parents=True, exist_ok=True)
+    temporary = APP_MODEL.with_suffix(".pt.part")
+    temporary.write_bytes(data)
+    temporary.replace(APP_MODEL)
 
 
 class _ModelUpdateCheck(QThread):
     found = Signal(bool)
 
+    def __init__(self, token: str, parent=None) -> None:
+        super().__init__(parent)
+        self._token = token
+
     def run(self) -> None:
-        self.found.emit(model_update_available())
+        self.found.emit(model_update_available(self._token))
+
+
+class _ItemCheck(QThread):
+    found = Signal(object)
+
+    def run(self) -> None:
+        self.found.emit(_recognized_items())
+
+
+class _ModelFetch(QThread):
+    finished_import = Signal(bool, str)
+
+    def __init__(self, token: str, parent=None) -> None:
+        super().__init__(parent)
+        self._token = token
+
+    def run(self) -> None:
+        try:
+            _import_server_model(self._token)
+        except (OSError, RuntimeError) as exc:
+            self.finished_import.emit(False, str(exc))
+            return
+        self.finished_import.emit(True, "")
+
+
+def _lock_path() -> Path:
+    return Path(QDir.tempPath()) / f"{MENU_IPC}.lock"
+
+
+def _lock_holder_pid(lock: QLockFile) -> int:
+    try:
+        pid, _hostname, _app = lock.getLockInfo()
+    except Exception:
+        return 0
+    try:
+        return int(pid or 0)
+    except Exception:
+        return 0
+
+
+def _handoff_to_running() -> bool:
+    sock = QLocalSocket()
+    sock.connectToServer(MENU_IPC)
+    if not sock.waitForConnected(400):
+        return False
+    sock.write(b'{"raise":true}\n')
+    sock.waitForBytesWritten(800)
+    if not sock.waitForReadyRead(800):
+        sock.disconnectFromServer()
+        return False
+    reply = bytes(sock.readAll())
+    sock.disconnectFromServer()
+    return b'"ok"' in reply
+
+
+def _lock_holder_dead(lock: QLockFile) -> bool:
+    pid = _lock_holder_pid(lock)
+    if pid <= 0:
+        return True
+    try:
+        os.kill(int(pid), 0)
+        return False
+    except OSError:
+        return True
+
+
+def _acquire_instance_lock() -> QLockFile | None:
+    lock = QLockFile(str(_lock_path()))
+    if lock.tryLock(100):
+        return lock
+    if _lock_holder_dead(lock):
+        lock.removeStaleLockFile()
+        if lock.tryLock(100):
+            return lock
+    if lock.removeStaleLockFile() and lock.tryLock(100):
+        return lock
+    return None
 
 
 def main() -> None:
     app = QApplication(sys.argv)
+    lock = _acquire_instance_lock()
+    if lock is None:
+        if not _handoff_to_running():
+            QMessageBox.information(
+                None,
+                "すでに起動しています",
+                "メニューは、すでに開いています。",
+            )
+        sys.exit(0)
+    app._instance_lock = lock
+    QLocalServer.removeServer(MENU_IPC)
     window = MenuWindow()
+    window._start_ipc()
     window.show()
     sys.exit(app.exec())
 

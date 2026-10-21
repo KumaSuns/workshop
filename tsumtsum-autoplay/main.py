@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QLockFile
+from PySide6.QtCore import QDir, QLockFile, QTimer
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -37,12 +37,29 @@ def _app_icon() -> QIcon:
     return icon
 
 
-def _activate_running() -> bool:
+def _games_from_argv() -> int | None:
+    if "--games" not in sys.argv:
+        return None
+    index = sys.argv.index("--games") + 1
+    if index >= len(sys.argv):
+        return None
+    text = sys.argv[index]
+    if text.isdigit() and int(text) > 0:
+        return int(text)
+    return None
+
+
+def _activate_running(action: str = "activate", games: int | None = None, hidden: bool = False) -> bool:
     sock = QLocalSocket()
     sock.connectToServer(IPC_NAME)
     if not sock.waitForConnected(400):
         return False
-    sock.write(json.dumps({"action": "activate"}, ensure_ascii=False).encode("utf-8") + b"\n")
+    payload = {"action": action}
+    if games is not None:
+        payload["games"] = games
+    if hidden:
+        payload["hidden"] = True
+    sock.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
     sock.waitForBytesWritten(800)
     sock.disconnectFromServer()
     return True
@@ -84,8 +101,11 @@ def main() -> None:
     if not icon.isNull():
         app.setWindowIcon(icon)
     lock = _acquire_instance_lock()
+    start_loop = "--loop" in sys.argv
+    hidden = "--hidden" in sys.argv
+    games = _games_from_argv() if start_loop else None
     if lock is None:
-        if _activate_running():
+        if _activate_running("loop" if start_loop else "activate", games, hidden):
             sys.exit(0)
         QMessageBox.information(
             None,
@@ -96,7 +116,12 @@ def main() -> None:
     app._instance_lock = lock
     QLocalServer.removeServer(IPC_NAME)
     window = MainWindow()
-    window.show()
+    if hidden:
+        window.hide()
+    else:
+        window.show()
+    if start_loop:
+        QTimer.singleShot(0, lambda: window.on_loop_play(games))
     sys.exit(app.exec())
 
 
