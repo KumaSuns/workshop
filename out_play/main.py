@@ -596,6 +596,14 @@ class MenuWindow(QMainWindow):
                 self._intro.requestInterruption()
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.requestInterruption()
+        self._clear_tsum_frame()
+        worker = self._play_worker
+        if worker is not None:
+            worker.provide_used_tsum(None)
+            worker.provide_kinds(None)
+        modal = QApplication.activeModalWidget()
+        if isinstance(modal, QMessageBox):
+            modal.done(0)
         try:
             from app.bluestacks import halt_input
         except Exception:
@@ -710,7 +718,11 @@ class MenuWindow(QMainWindow):
         QMessageBox.critical(self, "オートプレイ", message)
 
     def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
-        if self._play_worker is None:
+        worker = self._play_worker
+        if worker is None:
+            return
+        if self._play_stop.is_set():
+            worker.provide_used_tsum(None)
             return
         self._tsum_path = Path(path) if path else None
         if pick_only or not guess:
@@ -883,6 +895,9 @@ class MenuWindow(QMainWindow):
     def _on_need_kinds(self) -> None:
         worker = self._play_worker
         if worker is None:
+            return
+        if self._play_stop.is_set():
+            worker.provide_kinds(None)
             return
         kinds = _read_kind_count_now()
         if kinds not in (4, 5):
