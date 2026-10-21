@@ -172,6 +172,8 @@ class MenuWindow(QMainWindow):
         self._autoplay_button = None
         self._item_check = None
         self._play_stop = threading.Event()
+        self._stop_hotkey = False
+        self._stopped_by_key = False
         self._intro = None
         self._play_worker = None
         self._play_games = None
@@ -529,7 +531,10 @@ class MenuWindow(QMainWindow):
         self._activity.setWordWrap(True)
         self._activity.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         blank_layout.addWidget(self._activity, 1)
+        stop_hint = QLabel("プレイ中の停止は Q")
+        stop_hint.setStyleSheet("color: #FF0000;")
         column.addWidget(grid_host, 0, Qt.AlignmentFlag.AlignLeft)
+        column.addWidget(stop_hint, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(self._center_blank, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(self._launch_button, 0, Qt.AlignmentFlag.AlignLeft)
         self._center_input = QComboBox()
@@ -557,7 +562,71 @@ class MenuWindow(QMainWindow):
         self._activity.setText(text)
 
     def _on_play_done(self) -> None:
+        self._unregister_stop_hotkey()
         self._set_activity("プレイが終わりました")
+
+    def _play_busy(self) -> bool:
+        intro_on = self._intro is not None and self._intro.isRunning()
+        play_on = self._play_worker is not None and self._play_worker.isRunning()
+        return intro_on or play_on
+
+    def _register_stop_hotkey(self) -> None:
+        if sys.platform != "win32" or self._stop_hotkey:
+            return
+        import ctypes
+
+        ok = ctypes.windll.user32.RegisterHotKey(int(self.winId()), 1, 0x4000, 0x51)
+        self._stop_hotkey = bool(ok)
+
+    def _unregister_stop_hotkey(self) -> None:
+        if sys.platform != "win32" or not self._stop_hotkey:
+            return
+        import ctypes
+
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), 1)
+        self._stop_hotkey = False
+
+    def _stop_play(self) -> None:
+        if not self._play_busy():
+            return
+        self._stopped_by_key = True
+        if not self._play_stop.is_set():
+            self._play_stop.set()
+            if self._intro is not None and self._intro.isRunning():
+                self._intro.requestInterruption()
+            if self._play_worker is not None and self._play_worker.isRunning():
+                self._play_worker.requestInterruption()
+        try:
+            from app.bluestacks import halt_input
+        except Exception:
+            halt_input = None
+        if halt_input is not None:
+            halt_input()
+        self._set_activity("停止しています")
+
+    def _on_play_stopped(self) -> None:
+        self._unregister_stop_hotkey()
+        if not self._stopped_by_key:
+            return
+        self._stopped_by_key = False
+        self._set_activity("停止しました")
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32" and self._stop_hotkey:
+            raw = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
+            if raw.startswith(b"windows_generic_MSG"):
+                import ctypes
+                from ctypes import wintypes
+
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0312 and int(msg.wParam) == 1:
+                    QTimer.singleShot(0, self._stop_play)
+                    return True, 0
+        return super().nativeEvent(eventType, message)
+
+    def closeEvent(self, event) -> None:
+        self._unregister_stop_hotkey()
+        super().closeEvent(event)
 
     def _reread_app_use(self) -> None:
         running = self._app_use_check
@@ -631,10 +700,12 @@ class MenuWindow(QMainWindow):
         _start_match(self)
 
     def _on_intro_fail(self, message: str) -> None:
+        self._unregister_stop_hotkey()
         self._set_activity(message)
         QMessageBox.critical(self, "オートプレイ", message)
 
     def _on_play_fail(self, message: str) -> None:
+        self._unregister_stop_hotkey()
         self._set_activity(message)
         QMessageBox.critical(self, "オートプレイ", message)
 
@@ -1030,7 +1101,9 @@ def _start_play_here(window: MenuWindow, games: int | None) -> None:
         intro.status.connect(window._set_activity)
         intro.succeeded.connect(window._on_intro_ok)
         intro.failed.connect(window._on_intro_fail)
+        intro.stopped.connect(window._on_play_stopped)
         window._intro = intro
+        window._register_stop_hotkey()
         intro.start()
         return
     _start_match(window)
@@ -1096,8 +1169,10 @@ def _start_match(window: MenuWindow) -> None:
     worker.need_kinds.connect(window._on_need_kinds)
     worker.failed.connect(window._on_play_fail)
     worker.completed.connect(window._on_play_done)
+    worker.stopped.connect(window._on_play_stopped)
     window._play_worker = worker
     window._used_tsum_name = ""
+    window._register_stop_hotkey()
     worker.start()
 
 
