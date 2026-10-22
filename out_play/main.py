@@ -411,7 +411,6 @@ class MenuWindow(QMainWindow):
         self._tsum_actions.setContentsMargins(0, 0, 0, 0)
         self._tsum_actions.setSpacing(0)
         right.addLayout(self._tsum_actions)
-        self._show_tsum_list("")
 
     def _create_desktop_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(
