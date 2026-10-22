@@ -159,6 +159,10 @@ class PlayWorker(QThread):
         self._used_answer: str | None = None
         self.skill_pressed = Event()
         self.timeup_seen = Event()
+        self.finish_after = Event()
+
+    def finish_after_this(self) -> None:
+        self.finish_after.set()
 
     def provide_kinds(self, kinds: int | None) -> None:
         self._kinds_answer = kinds
@@ -205,6 +209,7 @@ class PlayWorker(QThread):
                 request_used_tsum=self._request_used_tsum if self._ask_kinds else None,
                 skill_pressed=self.skill_pressed,
                 timeup_seen=self.timeup_seen,
+                finish_after=self.finish_after,
                 skill_lamp=self.skill_lamp.emit,
                 my_lamp=self.my_lamp.emit,
             )
@@ -235,6 +240,7 @@ def run_play(
     request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
     skill_pressed: Event | None = None,
     timeup_seen: Event | None = None,
+    finish_after: Event | None = None,
     skill_lamp: Callable[[bool], None] | None = None,
     my_lamp: Callable[[str], None] | None = None,
 ) -> None:
@@ -247,6 +253,8 @@ def run_play(
     def _continue_after_game() -> bool:
         nonlocal games_done
         games_done += 1
+        if finish_after is not None and finish_after.is_set():
+            return False
         if games is not None:
             return games_done < games
         return loop
@@ -369,6 +377,7 @@ def run_play(
     fan_fall_moved = False
     resumed_pause = False
     match_over = False
+    played_once = False
     clears = 0
     swipes = 0
     coin = 0
@@ -1529,6 +1538,8 @@ def run_play(
                     go_at = time.time()
                 resumed_pause = True
                 continue
+            if saw_board:
+                played_once = True
             if on_mission:
                 before_start[0] = True
             elif saw_board:
@@ -1542,6 +1553,11 @@ def run_play(
                 saw_board = False
                 go_at = None
                 watching.clear()
+                if played_once and finish_after is not None and finish_after.is_set():
+                    say("このプレイでやめます")
+                    stop_watch.set()
+                    watching.clear()
+                    return
             elif not saw_board and not on_pause:
                 if go_at is None:
                     with _gpu_lock:
@@ -1660,7 +1676,17 @@ def run_play(
                     stop_watch.set()
                     watching.clear()
                     return
-                _seen, replay_items = _replay_after_timeup(say, stop)
+                if finish_after is not None and finish_after.is_set():
+                    say("このプレイでやめます")
+                    stop_watch.set()
+                    watching.clear()
+                    return
+                _seen, replay_items = _replay_after_timeup(say, stop, finish_after)
+                if finish_after is not None and finish_after.is_set():
+                    say("このプレイでやめます")
+                    stop_watch.set()
+                    watching.clear()
+                    return
                 fresh_match()
                 match_over = True
                 if replay_items is not None:
@@ -1676,6 +1702,11 @@ def run_play(
                 continue
             _check_stop(stop)
             if not saw_board:
+                if played_once and finish_after is not None and finish_after.is_set():
+                    say("このプレイでやめます")
+                    stop_watch.set()
+                    watching.clear()
+                    return
                 start = _match_start_button(image)
                 if start is not None:
                     ask_used_now(True)
@@ -2256,7 +2287,17 @@ def run_play(
                         stop_watch.set()
                         watching.clear()
                         return
-                    _seen, replay_items = _replay_after_timeup(say, stop)
+                    if finish_after is not None and finish_after.is_set():
+                        say("このプレイでやめます")
+                        stop_watch.set()
+                        watching.clear()
+                        return
+                    _seen, replay_items = _replay_after_timeup(say, stop, finish_after)
+                    if finish_after is not None and finish_after.is_set():
+                        say("このプレイでやめます")
+                        stop_watch.set()
+                        watching.clear()
+                        return
                     fresh_match()
                     match_over = True
                     if replay_items is not None:
@@ -3810,10 +3851,18 @@ def _timer_still_running(rgb, timer: dict[str, int] | None) -> bool:
     return left is not None and left > 0
 
 
-def _replay_after_timeup(say: StatusFn, stop: Event | None) -> tuple[str, list[str] | None]:
+def _replay_after_timeup(
+    say: StatusFn,
+    stop: Event | None,
+    finish_after: Event | None = None,
+) -> tuple[str, list[str] | None]:
+    if finish_after is not None and finish_after.is_set():
+        return "", None
     _seen, _locked, arrived, used_name, items = _click_start_or_continue(
-        say, stop, tap_start=False, read_tsum=False
+        say, stop, tap_start=False, read_tsum=False, finish_after=finish_after
     )
+    if finish_after is not None and finish_after.is_set():
+        return "", None
     if arrived == "continue":
         _tap_continue_now(say, stop)
     return used_name, items
@@ -4318,6 +4367,7 @@ def _click_start_or_continue(
     tap_start: bool = True,
     skip_retry: bool = False,
     read_tsum: bool = True,
+    finish_after: Event | None = None,
 ) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
@@ -4326,6 +4376,8 @@ def _click_start_or_continue(
     items: list[str] | None = None
     while time.time() < deadline:
         _check_stop(stop)
+        if finish_after is not None and finish_after.is_set():
+            return kinds, locked, "stop", used_name, items
         try:
             path = capture_screen_path()
             image = QImage(str(path))
@@ -4366,6 +4418,8 @@ def _click_start_or_continue(
             return kinds, locked, "start", used_name, items
         retry = None if skip_retry else _retry_button(image)
         if retry is not None:
+            if finish_after is not None and finish_after.is_set():
+                return kinds, locked, "stop", used_name, items
             say("リトライをクリックします")
             tap(retry.center().x(), retry.center().y())
             _sleep_stop(1.2, stop)

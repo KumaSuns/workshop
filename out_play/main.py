@@ -16,6 +16,7 @@ from PySide6.QtCore import QDir, QLockFile, QRegularExpression, QSettings, QStan
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QColor,
+    QFontMetrics,
     QImage,
     QKeySequence,
     QPalette,
@@ -177,6 +178,7 @@ class MenuWindow(QMainWindow):
         self._center_slot = None
         self._center_buttons = []
         self._autoplay_button = None
+        self._end_play_button = None
         self._item_check = None
         self._play_stop = threading.Event()
         self._stop_hotkey = False
@@ -509,7 +511,7 @@ class MenuWindow(QMainWindow):
         grid = QGridLayout(grid_host)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(0)
-        labels = {(0, 2): "オートプレイ"}
+        labels = {(0, 1): "このプレイでやめる", (0, 2): "オートプレイ"}
         number = 1
         for row in range(2):
             for col in range(3):
@@ -518,9 +520,18 @@ class MenuWindow(QMainWindow):
                 button.setSizePolicy(
                     QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
                 )
+                if (row, col) == (0, 1):
+                    self._end_play_button = button
+                    self._write_button_key(button, "このプレイでやめる", "2")
+                    button.clicked.connect(self._end_after_this_play)
                 if (row, col) == (0, 2):
                     self._autoplay_button = button
+                    self._write_button_key(button, "オートプレイ", "3")
                     button.clicked.connect(self._on_autoplay)
+                    play_key = QShortcut(QKeySequence(Qt.Key.Key_3), button)
+                    play_key.setAutoRepeat(False)
+                    play_key.setContext(Qt.ShortcutContext.WindowShortcut)
+                    play_key.activated.connect(self._on_autoplay)
                 self._center_buttons.append(button)
                 grid.addWidget(button, row, col)
         self._launch_button = QPushButton("起動アイコンをデスクトップに作成")
@@ -544,14 +555,12 @@ class MenuWindow(QMainWindow):
         if hint_point < 1:
             hint_point = 9
         hint_font.setPointSize(hint_point + 2)
+        hint_font.setBold(True)
         stop_hint.setFont(hint_font)
         stop_hint.setStyleSheet("color: #FF0000;")
         stop_hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
-        blank_layout.addWidget(
-            stop_hint,
-            0,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
-        )
+        hint_metrics = stop_hint.fontMetrics()
+        stop_hint.setContentsMargins(0, 0, hint_metrics.horizontalAdvance("あ"), max(1, hint_metrics.height() // 2))
         half_char = max(1, holder.fontMetrics().height() // 2)
         column.setSpacing(half_char)
         column.addWidget(grid_host, 0, Qt.AlignmentFlag.AlignLeft)
@@ -573,6 +582,11 @@ class MenuWindow(QMainWindow):
         outer.addStretch(1)
         outer.addWidget(holder, 0, Qt.AlignmentFlag.AlignHCenter)
         outer.addStretch(2)
+        outer.addWidget(
+            stop_hint,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+        )
 
     def _set_activity(self, text: str) -> None:
         if self._activity is None:
@@ -595,7 +609,10 @@ class MenuWindow(QMainWindow):
             return
         import ctypes
 
-        ok = ctypes.windll.user32.RegisterHotKey(int(self.winId()), 1, 0x4000, 0x51)
+        user32 = ctypes.windll.user32
+        hwnd = int(self.winId())
+        ok = user32.RegisterHotKey(hwnd, 1, 0x4000, 0x51)
+        user32.RegisterHotKey(hwnd, 2, 0x4000, 0x32)
         self._stop_hotkey = bool(ok)
 
     def _unregister_stop_hotkey(self) -> None:
@@ -603,8 +620,18 @@ class MenuWindow(QMainWindow):
             return
         import ctypes
 
-        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), 1)
+        user32 = ctypes.windll.user32
+        hwnd = int(self.winId())
+        user32.UnregisterHotKey(hwnd, 1)
+        user32.UnregisterHotKey(hwnd, 2)
         self._stop_hotkey = False
+
+    def _end_after_this_play(self) -> None:
+        worker = self._play_worker
+        if worker is None or not worker.isRunning():
+            return
+        worker.finish_after_this()
+        self._set_activity("このプレイでやめます")
 
     def _stop_play(self) -> None:
         if not self._play_busy():
@@ -649,6 +676,9 @@ class MenuWindow(QMainWindow):
                 msg = wintypes.MSG.from_address(int(message))
                 if msg.message == 0x0312 and int(msg.wParam) == 1:
                     QTimer.singleShot(0, self._stop_play)
+                    return True, 0
+                if msg.message == 0x0312 and int(msg.wParam) == 2:
+                    QTimer.singleShot(0, self._end_after_this_play)
                     return True, 0
         return super().nativeEvent(eventType, message)
 
@@ -777,6 +807,25 @@ class MenuWindow(QMainWindow):
             elif child is not None:
                 self._clear_nested(child)
 
+    def _write_button_key(self, button: QPushButton, label: str, key: str) -> None:
+        metrics = button.fontMetrics()
+        space = metrics.horizontalAdvance(" ")
+        gap = max(1, metrics.horizontalAdvance("あ") // 2)
+        count = max(1, round(gap / space)) if space else 1
+        button.setText(label + (" " * count) + f"({key})")
+
+    def _tsum_button_text(self, label: str, key: str) -> str:
+        font = QApplication.font()
+        point = font.pointSize()
+        if point < 1:
+            point = 9
+        font.setPointSize(point + 2)
+        metrics = QFontMetrics(font)
+        space = metrics.horizontalAdvance(" ")
+        gap = max(1, metrics.horizontalAdvance("あ") // 2)
+        count = max(1, round(gap / space)) if space else 1
+        return label + (" " * count) + f"({key})"
+
     def _add_tsum_button(self, text: str, slot, keys=()) -> QPushButton:
         button = QPushButton(text)
         font = button.font()
@@ -789,15 +838,31 @@ class MenuWindow(QMainWindow):
         button.setMinimumWidth(metrics.horizontalAdvance(text) + metrics.height() * 2)
         button.setMinimumHeight(metrics.height() * 2)
         button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        button.clicked.connect(slot)
         button.setAutoDefault(False)
+
+        def activate(b=button, s=slot) -> None:
+            self._show_tsum_press(b, s)
+
+        button.clicked.connect(lambda _checked=False, run=activate: run())
         for key in keys:
             shortcut = QShortcut(QKeySequence(key), button)
+            shortcut.setAutoRepeat(False)
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-            shortcut.activated.connect(slot)
+            shortcut.activated.connect(activate)
         if self._tsum_body is not None:
             self._tsum_body.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
         return button
+
+    def _show_tsum_press(self, button: QPushButton, slot) -> None:
+        if button.property("pressing"):
+            return
+        button.setProperty("pressing", True)
+        button.setDown(True)
+        QTimer.singleShot(200, lambda b=button, s=slot: self._finish_tsum_press(b, s))
+
+    def _finish_tsum_press(self, button: QPushButton, slot) -> None:
+        button.setDown(False)
+        slot()
 
     def _tsum_question(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -842,17 +907,27 @@ class MenuWindow(QMainWindow):
             return
         self._tsum_body.addStretch(1)
         self._tsum_body.addWidget(self._tsum_question(f"使用ツムは {guess} ですか？"))
-        self._add_tsum_button(
-            "はい",
-            lambda: self._accept_used_tsum(guess, None),
-            (Qt.Key.Key_Return, Qt.Key.Key_Enter),
+        buttons = (
+            self._add_tsum_button(
+                self._tsum_button_text("はい", "Enter"),
+                lambda: self._accept_used_tsum(guess, None),
+                (Qt.Key.Key_Return, Qt.Key.Key_Enter),
+            ),
+            self._add_tsum_button(
+                self._tsum_button_text("いいえ", "N"),
+                lambda: self._show_tsum_list(guess),
+                (Qt.Key.Key_N,),
+            ),
+            self._add_tsum_button(
+                self._tsum_button_text("やめる", "Esc"),
+                self._cancel_used_tsum,
+                (Qt.Key.Key_Escape,),
+            ),
         )
-        self._add_tsum_button(
-            "いいえ",
-            lambda: self._show_tsum_list(guess),
-            (Qt.Key.Key_N,),
-        )
-        self._add_tsum_button("やめる", self._cancel_used_tsum, (Qt.Key.Key_Escape,))
+        width = max(button.minimumWidth() for button in buttons)
+        height = max(button.minimumHeight() for button in buttons)
+        for button in buttons:
+            button.setFixedSize(width, height)
         self._tsum_body.addStretch(1)
 
     def _show_tsum_list(self, skip_name: str = "") -> None:
@@ -879,8 +954,14 @@ class MenuWindow(QMainWindow):
         below = QWidget()
         below.setFixedHeight(gap)
         self._tsum_body.addWidget(below)
-        self._add_tsum_button("これにします", self._accept_listed_tsum)
-        self._add_tsum_button("やめる", self._cancel_used_tsum)
+        buttons = (
+            self._add_tsum_button("これにします", self._accept_listed_tsum),
+            self._add_tsum_button("やめる", self._cancel_used_tsum),
+        )
+        width = max(button.minimumWidth() for button in buttons)
+        height = max(button.minimumHeight() for button in buttons)
+        for button in buttons:
+            button.setFixedSize(width, height)
 
     def _accept_listed_tsum(self) -> None:
         row = self._tsum_list.currentItem() if self._tsum_list is not None else None
@@ -999,11 +1080,17 @@ class MenuWindow(QMainWindow):
         height = rect.height() // 8
         if width < 1 or height < 1:
             return
+        button_w = width * 3 // 2
+        end_button = self._end_play_button
+        if end_button is not None:
+            text_w = end_button.fontMetrics().horizontalAdvance(end_button.text())
+            text_w += end_button.fontMetrics().height()
+            button_w = max(button_w, text_w)
         for button in self._center_buttons:
             if self._launch_button is not None and button is self._launch_button:
                 button.setFixedSize(width * 3, height)
             else:
-                button.setFixedSize(width, height)
+                button.setFixedSize(button_w, height)
         if self._center_input is not None:
             self._center_input.setFixedSize(width, height)
             field = self._center_input.lineEdit()
