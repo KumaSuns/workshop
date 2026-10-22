@@ -1,0 +1,14 @@
+---
+description: push は workshop と auto_play の両方に送る。
+alwaysApply: true
+---
+
+# push
+
+- 今日だけの約束ではない。毎回守る。
+- push と言われたら、2つとも送る。片方だけで終わらせない。
+- 1つ目は workshop。`C:/projects/workshop` を `https://github.com/KumaSuns/workshop` の master に送る。
+- 2つ目は auto_play。`C:/projects/workshop/out_play` を `https://github.com/KumaSuns/auto_play` の master に送る。
+- out_play は workshop の中にある別のリポジトリである。workshop にコミットしても auto_play には入らない。out_play の変更は、それぞれのリポジトリでコミットしてから送る。
+- 送るのは、そのとき頼まれた変更だけ。一時ファイルや、頼まれていない差分は入れない。
+- その変更が片方に無いときは、無いほうを送ったことにしない。あるほうは送る。
