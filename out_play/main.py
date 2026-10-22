@@ -14,7 +14,15 @@ from pathlib import Path
 
 from PySide6.QtCore import QDir, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QColor, QImage, QPalette, QPixmap, QRegularExpressionValidator
+from PySide6.QtGui import (
+    QColor,
+    QImage,
+    QKeySequence,
+    QPalette,
+    QPixmap,
+    QRegularExpressionValidator,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -34,7 +42,6 @@ from PySide6.QtWidgets import (
 
 MENU_IPC = "workshop-out-play-menu"
 ROOT = Path(__file__).resolve().parent
-WORKSHOP = ROOT.parent
 MODELS_API = "http://hokkai-syabusyabu.com/home_page/workshop/models/api.php"
 LOGO_PATH = ROOT / "images" / "rogo_003.png"
 ICON_DIR = ROOT / "icons"
@@ -126,7 +133,7 @@ def _logo_source() -> QPixmap:
 class MenuWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("メニュー")
+        self.setWindowTitle("AUTO PLAY")
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -448,7 +455,7 @@ class MenuWindow(QMainWindow):
         if not available:
             return
         box = QMessageBox(self)
-        box.setWindowTitle("メニュー")
+        box.setWindowTitle("AUTO PLAY")
         box.setText("アプリの更新があります。更新してもよろしいですか？")
         yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
         no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
@@ -532,9 +539,22 @@ class MenuWindow(QMainWindow):
         self._activity.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         blank_layout.addWidget(self._activity, 1)
         stop_hint = QLabel("プレイ中の停止は Q")
+        hint_font = stop_hint.font()
+        hint_point = hint_font.pointSize()
+        if hint_point < 1:
+            hint_point = 9
+        hint_font.setPointSize(hint_point + 2)
+        stop_hint.setFont(hint_font)
         stop_hint.setStyleSheet("color: #FF0000;")
+        stop_hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+        blank_layout.addWidget(
+            stop_hint,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+        )
+        half_char = max(1, holder.fontMetrics().height() // 2)
+        column.setSpacing(half_char)
         column.addWidget(grid_host, 0, Qt.AlignmentFlag.AlignLeft)
-        column.addWidget(stop_hint, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(self._center_blank, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(self._launch_button, 0, Qt.AlignmentFlag.AlignLeft)
         self._center_input = QComboBox()
@@ -656,7 +676,7 @@ class MenuWindow(QMainWindow):
             if not message:
                 message = "ただいまメンテナンス中です。"
             box = QMessageBox(self)
-            box.setWindowTitle("メニュー")
+            box.setWindowTitle("AUTO PLAY")
             box.setIcon(QMessageBox.Icon.Information)
             box.setText(message)
             self._app_use_box = box
@@ -757,7 +777,7 @@ class MenuWindow(QMainWindow):
             elif child is not None:
                 self._clear_nested(child)
 
-    def _add_tsum_button(self, text: str, slot) -> QPushButton:
+    def _add_tsum_button(self, text: str, slot, keys=()) -> QPushButton:
         button = QPushButton(text)
         font = button.font()
         point = font.pointSize()
@@ -770,6 +790,11 @@ class MenuWindow(QMainWindow):
         button.setMinimumHeight(metrics.height() * 2)
         button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         button.clicked.connect(slot)
+        button.setAutoDefault(False)
+        for key in keys:
+            shortcut = QShortcut(QKeySequence(key), button)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(slot)
         if self._tsum_body is not None:
             self._tsum_body.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
         return button
@@ -817,9 +842,17 @@ class MenuWindow(QMainWindow):
             return
         self._tsum_body.addStretch(1)
         self._tsum_body.addWidget(self._tsum_question(f"使用ツムは {guess} ですか？"))
-        self._add_tsum_button("はい", lambda: self._accept_used_tsum(guess, None))
-        self._add_tsum_button("いいえ", lambda: self._show_tsum_list(guess))
-        self._add_tsum_button("やめる", self._cancel_used_tsum)
+        self._add_tsum_button(
+            "はい",
+            lambda: self._accept_used_tsum(guess, None),
+            (Qt.Key.Key_Return, Qt.Key.Key_Enter),
+        )
+        self._add_tsum_button(
+            "いいえ",
+            lambda: self._show_tsum_list(guess),
+            (Qt.Key.Key_N,),
+        )
+        self._add_tsum_button("やめる", self._cancel_used_tsum, (Qt.Key.Key_Escape,))
         self._tsum_body.addStretch(1)
 
     def _show_tsum_list(self, skip_name: str = "") -> None:
@@ -1061,7 +1094,7 @@ else:
 def _recognized_items() -> dict:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     result = subprocess.run(
-        [sys.executable, "-c", _ITEM_CHECK, str(WORKSHOP / "tsumtsum-autoplay")],
+        [sys.executable, "-c", _ITEM_CHECK, str(ROOT)],
         check=False,
         capture_output=True,
         text=True,
@@ -1079,7 +1112,7 @@ def _recognized_items() -> dict:
 
 
 def _load_play_api():
-    root = str(WORKSHOP / "tsumtsum-autoplay")
+    root = str(ROOT)
     if root not in sys.path:
         sys.path.insert(0, root)
     for key in list(sys.modules):
@@ -1218,9 +1251,6 @@ def _model_token() -> str:
     stored = str(QSettings("workshop", "WorkshopDataServer").value("api_token", "") or "").strip()
     if stored:
         return stored
-    root = str(WORKSHOP / "video-frame-extractor")
-    if root not in sys.path:
-        sys.path.insert(0, root)
     try:
         from app.server_sync import api_token
     except Exception:

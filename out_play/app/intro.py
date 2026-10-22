@@ -1,0 +1,843 @@
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+from threading import Event
+
+from PySide6.QtCore import QRect, QThread, Signal
+from PySide6.QtGui import QImage
+
+from app.bluestacks import capture_screen, tap, tsum_is_running
+
+SAMPLE_W = 160
+SAMPLE_H = 90
+BOOT_TIMEOUT = 120
+FLOW_TIMEOUT = 180
+PRE_CLICK_WAIT = 1.2
+TAP_GAP = 0.55
+DIALOG_STABLE = 3
+VIDEO_STABLE = 5
+START_STABLE = 3
+POPUP_GONE = 8
+POPUP_STABLE = 2
+PLAY_STABLE = 3
+
+StatusFn = Callable[[str], None]
+
+
+class Stopped(Exception):
+    pass
+
+
+def _check_stop(stop: Event | None) -> None:
+    if stop is not None and stop.is_set():
+        raise Stopped()
+
+
+class IntroWorker(QThread):
+    succeeded = Signal()
+    failed = Signal(str)
+    stopped = Signal()
+    status = Signal(str)
+
+    def __init__(self, stop: Event, parent=None) -> None:
+        super().__init__(parent)
+        self._stop = stop
+
+    def run(self) -> None:
+        try:
+            run_intro_flow(self.status.emit, self._stop)
+        except Stopped:
+            self.stopped.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit()
+
+
+def run_intro_flow(report: StatusFn | None = None, stop: Event | None = None) -> None:
+    def say(text: str) -> None:
+        if report is not None:
+            report(text)
+
+    say("画面を待っています")
+    deadline = time.time() + BOOT_TIMEOUT + FLOW_TIMEOUT
+    previous: QImage | None = None
+    motion_hits = 0
+    dialog_hits = 0
+    start_hits = 0
+    clicked_center = False
+    clicked_allow = False
+    while time.time() < deadline:
+        _check_stop(stop)
+        try:
+            image = capture_screen()
+        except Exception:
+            say("画面を待っています（起動中）")
+            time.sleep(1.2)
+            continue
+        dialog = _white_dialog(image)
+        if dialog is not None and not clicked_allow:
+            dialog_hits += 1
+            start_hits = 0
+            say(f"許可画面を検出 {dialog_hits}/{DIALOG_STABLE}")
+            if dialog_hits >= DIALOG_STABLE:
+                say("許可するをクリックします")
+                _click_allow(dialog, say)
+                clicked_allow = True
+                deadline = max(deadline, time.time() + 90)
+                say("TAP TO STARTを待っています")
+            previous = image
+            time.sleep(0.35)
+            continue
+        dialog_hits = 0
+        start_btn = _tap_to_start_button(image)
+        if start_btn is not None:
+            start_hits += 1
+            say(f"TAP TO STARTを検出 {start_hits}/{START_STABLE}")
+            if start_hits >= START_STABLE:
+                say("TAP TO STARTをクリックします")
+                _click_start(start_btn, say)
+                deadline = max(deadline, time.time() + 120)
+                _dismiss_popups(say, deadline, stop)
+                return
+            previous = image
+            time.sleep(0.35)
+            continue
+        start_hits = 0
+        if not clicked_center and not clicked_allow and tsum_is_running():
+            if _is_video_motion(previous, image):
+                motion_hits += 1
+                say(f"動画を検出 {motion_hits}/{VIDEO_STABLE}")
+            else:
+                motion_hits = 0
+                say("許可画面なし、動画を待っています")
+            if motion_hits >= VIDEO_STABLE:
+                say("画面中央をクリックします")
+                _slow_tap(image.width() // 2, image.height() // 2)
+                clicked_center = True
+                say("許可画面を待っています")
+        elif clicked_allow:
+            say("TAP TO STARTを待っています")
+        elif not tsum_is_running():
+            say("ツムツムの起動を待っています")
+        else:
+            say("許可画面を待っています")
+        previous = image
+        time.sleep(0.35)
+    raise TimeoutError("動画、許可画面、または TAP TO START を待てませんでした。")
+
+
+def _click_allow(dialog: QRect, say: StatusFn) -> None:
+    x = dialog.x() + int(dialog.width() * 0.92)
+    y = dialog.y() + int(dialog.height() * 0.92)
+    say(f"許可するをタップ ({x}, {y})")
+    _slow_tap(x, y)
+    time.sleep(0.9)
+    try:
+        still = _white_dialog(capture_screen())
+    except Exception:
+        return
+    if still is not None:
+        x = still.x() + int(still.width() * 0.92)
+        y = still.y() + int(still.height() * 0.92)
+        say(f"まだ残っているので再タップ ({x}, {y})")
+        _slow_tap(x, y)
+
+
+def _click_start(button: QRect, say: StatusFn) -> None:
+    x = button.center().x()
+    y = button.center().y()
+    say(f"TAP TO STARTをタップ ({x}, {y})")
+    _slow_tap(x, y)
+    time.sleep(0.9)
+    try:
+        still = _tap_to_start_button(capture_screen())
+    except Exception:
+        return
+    if still is not None:
+        say(f"まだ残っているので再タップ ({still.center().x()}, {still.center().y()})")
+        _slow_tap(still.center().x(), still.center().y())
+
+
+def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -> None:
+    play_hits = 0
+    popup_hits = 0
+    while time.time() < deadline:
+        _check_stop(stop)
+        try:
+            image = capture_screen()
+        except Exception:
+            say("画面を待っています")
+            time.sleep(1.0)
+            continue
+        play = _play_button(image)
+        if play is not None:
+            popup_hits = 0
+            play_hits += 1
+            say(f"プレイを検出 {play_hits}/{PLAY_STABLE}")
+            if play_hits >= PLAY_STABLE:
+                say("プレイをクリックします")
+                _slow_tap(play.center().x(), play.center().y())
+                time.sleep(0.8)
+                try:
+                    still = _play_button(capture_screen())
+                except Exception:
+                    still = None
+                if still is not None:
+                    say("プレイを再タップします")
+                    _slow_tap(still.center().x(), still.center().y())
+                say("プレイまで終わりました")
+                return
+            time.sleep(0.35)
+            continue
+        play_hits = 0
+        cancel = _cancel_button(image)
+        close = None if cancel is not None else _close_button(image)
+        target = cancel or close
+        if target is not None:
+            popup_hits += 1
+            if popup_hits < POPUP_STABLE:
+                say("ポップアップを検出")
+                time.sleep(0.35)
+                continue
+            if cancel is not None:
+                say("キャンセルをクリックします")
+            else:
+                say("とじるをクリックします")
+            _slow_tap(target.center().x(), target.center().y())
+            popup_hits = 0
+            time.sleep(0.7)
+            continue
+        popup_hits = 0
+        say("プレイを待っています")
+        time.sleep(0.35)
+    raise TimeoutError("プレイが出ませんでした。")
+
+
+def _slow_tap(x: int, y: int) -> None:
+    time.sleep(PRE_CLICK_WAIT)
+    tap(x, y)
+    time.sleep(TAP_GAP)
+    tap(x, y)
+
+
+def _is_video_motion(previous: QImage | None, current: QImage) -> bool:
+    if previous is None or previous.isNull() or current.isNull():
+        return False
+    prev = _sample(previous)
+    curr = _sample(current)
+    if _mean_luma(curr) < 28:
+        return False
+    total = 0.0
+    count = 0
+    for y, row in enumerate(curr):
+        for x, pixel in enumerate(row):
+            before = prev[y][x]
+            total += abs(pixel[0] - before[0]) + abs(pixel[1] - before[1]) + abs(pixel[2] - before[2])
+            count += 1
+    return count > 0 and (total / count) > 24
+
+
+def _white_dialog(image: QImage) -> QRect | None:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return None
+    blob = _largest_white_blob(sample)
+    if len(blob) < width * height * 0.04:
+        return None
+    area = len(blob) / (width * height)
+    if area > 0.62:
+        return None
+    xs = [p[0] for p in blob]
+    ys = [p[1] for p in blob]
+    left, right = min(xs), max(xs)
+    top, bottom = min(ys), max(ys)
+    box_w = right - left + 1
+    box_h = bottom - top + 1
+    if box_w < width * 0.22 or box_h < height * 0.12:
+        return None
+    if box_w > width * 0.95 or box_h > height * 0.80:
+        return None
+    cx = (left + right) / 2
+    cy = (top + bottom) / 2
+    if abs(cx - width / 2) > width * 0.28 or abs(cy - height / 2) > height * 0.32:
+        return None
+    scale_x = image.width() / width
+    scale_y = image.height() / height
+    return QRect(
+        int(left * scale_x),
+        int(top * scale_y),
+        int(box_w * scale_x),
+        int(box_h * scale_y),
+    )
+
+
+def _tap_to_start_button(image: QImage) -> QRect | None:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return None
+    blob = _largest_blob(sample, _is_start_yellow)
+    if len(blob) < 20:
+        return None
+    xs = [p[0] for p in blob]
+    ys = [p[1] for p in blob]
+    left, right = min(xs), max(xs)
+    top, bottom = min(ys), max(ys)
+    box_w = right - left + 1
+    box_h = bottom - top + 1
+    if box_h < 3 or box_w < box_h * 2.2:
+        return None
+    if box_w < width * 0.18 or box_w > width * 0.85:
+        return None
+    if box_h > height * 0.28:
+        return None
+    cx = (left + right) / 2
+    if abs(cx - width / 2) > width * 0.22:
+        return None
+    scale_x = image.width() / width
+    scale_y = image.height() / height
+    return QRect(
+        int(left * scale_x),
+        int(top * scale_y),
+        int(box_w * scale_x),
+        int(box_h * scale_y),
+    )
+
+
+def _yellow_pills(image: QImage, max_w_frac: float = 0.55) -> list[QRect]:
+    return _color_pills(image, _is_start_yellow, max_w_frac)
+
+
+def _pink_pills(image: QImage, max_w_frac: float = 0.85) -> list[QRect]:
+    return _color_pills(image, _is_start_pink, max_w_frac)
+
+
+def _color_pills(image: QImage, match, max_w_frac: float) -> list[QRect]:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return []
+    scale_x = image.width() / width
+    scale_y = image.height() / height
+    pills: list[QRect] = []
+    for blob in _all_blobs(sample, match):
+        if len(blob) < 12:
+            continue
+        xs = [p[0] for p in blob]
+        ys = [p[1] for p in blob]
+        left, right = min(xs), max(xs)
+        top, bottom = min(ys), max(ys)
+        box_w = right - left + 1
+        box_h = bottom - top + 1
+        if box_h < 3 or box_w < box_h * 1.6:
+            continue
+        if box_w < width * 0.08 or box_w > width * max_w_frac:
+            continue
+        if box_h > height * 0.22:
+            continue
+        pills.append(
+            QRect(
+                int(left * scale_x),
+                int(top * scale_y),
+                int(box_w * scale_x),
+                int(box_h * scale_y),
+            )
+        )
+    pills.sort(key=lambda rect: rect.x())
+    return pills
+
+
+def _is_mission_star_edge(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return (
+        90 < red < 210
+        and 30 < green < 150
+        and blue < 90
+        and red > green + 15
+        and green >= blue
+        and red + green + blue < 430
+    )
+
+
+def _is_daily_mission(image: QImage, rect: QRect) -> bool:
+    height = rect.height()
+    width = rect.width()
+    if height < 8 or width < height:
+        return False
+    top = rect.y() + int(height * 0.45)
+    bottom = rect.y() + height
+    left = rect.x() + max(2, width // 20)
+    right = rect.x() + width - max(2, width // 20)
+    if bottom - top < 4 or right - left < 4:
+        return False
+    seen = [[False] * (right - left) for _ in range(bottom - top)]
+    stars: list[tuple[int, int, int]] = []
+    for y in range(top, bottom):
+        for x in range(left, right):
+            if seen[y - top][x - left]:
+                continue
+            color = image.pixelColor(x, y)
+            if not _is_mission_star_edge((color.red(), color.green(), color.blue())):
+                continue
+            stack = [(x, y)]
+            seen[y - top][x - left] = True
+            min_x = max_x = x
+            min_y = max_y = y
+            while stack:
+                cx, cy = stack.pop()
+                if cx < min_x:
+                    min_x = cx
+                if cx > max_x:
+                    max_x = cx
+                if cy < min_y:
+                    min_y = cy
+                if cy > max_y:
+                    max_y = cy
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if nx < left or ny < top or nx >= right or ny >= bottom:
+                        continue
+                    if seen[ny - top][nx - left]:
+                        continue
+                    neighbor = image.pixelColor(nx, ny)
+                    if not _is_mission_star_edge(
+                        (neighbor.red(), neighbor.green(), neighbor.blue())
+                    ):
+                        continue
+                    seen[ny - top][nx - left] = True
+                    stack.append((nx, ny))
+            box_w = max_x - min_x + 1
+            box_h = max_y - min_y + 1
+            if min(box_w, box_h) < 4:
+                continue
+            if max(box_w, box_h) / min(box_w, box_h) > 1.2:
+                continue
+            if box_h < height * 0.22 or box_h > height * 0.45:
+                continue
+            inset = max(1, min(box_w, box_h) // 5)
+            dark = 0
+            count = 0
+            for py in range(min_y + inset, max_y + 1 - inset):
+                for px in range(min_x + inset, max_x + 1 - inset):
+                    pixel = image.pixelColor(px, py)
+                    count += 1
+                    if pixel.red() < 120 and pixel.green() < 100:
+                        dark += 1
+            if count <= 0 or dark * 100 > count * 12:
+                continue
+            stars.append(((min_x + max_x) // 2, (min_y + max_y) // 2, box_h))
+    if not (2 <= len(stars) <= 3):
+        return False
+    stars.sort(key=lambda item: item[0])
+    ys = [item[1] for item in stars]
+    hs = [item[2] for item in stars]
+    if max(ys) - min(ys) > max(hs) * 0.5:
+        return False
+    if max(hs) > min(hs) * 1.35:
+        return False
+    span = stars[-1][0] - stars[0][0]
+    if span < width * 0.12 or span > width * 0.55:
+        return False
+    return True
+
+
+def _daily_mission_button(image: QImage) -> QRect | None:
+    found = [
+        pill
+        for pill in _yellow_pills(image)
+        if _is_daily_mission(image, pill)
+    ]
+    if not found:
+        return None
+    return max(found, key=lambda rect: rect.width() * rect.height())
+
+
+def _play_button(image: QImage) -> QRect | None:
+    if (
+        _retry_button(image) is not None
+        or _pause_continue_button(image) is not None
+        or _has_highscore_plate(image)
+    ):
+        return None
+    bottom = []
+    for pill in _yellow_pills(image):
+        if pill.center().y() <= image.height() * 0.58:
+            continue
+        if pill.width() < image.width() * 0.18:
+            continue
+        if abs(pill.center().x() - image.width() / 2) > image.width() * 0.15:
+            continue
+        if _is_daily_mission(image, pill):
+            continue
+        if not _retry_is_orange(image, pill):
+            continue
+        bottom.append(pill)
+    if not bottom:
+        return None
+    play = max(bottom, key=lambda rect: rect.center().y())
+    if _menu_pair_rows(image, play.y()) >= 2:
+        return None
+    return play
+
+
+def _retry_button(image: QImage) -> QRect | None:
+    low = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() > image.height() * 0.72
+        and pill.width() >= image.width() * 0.28
+        and pill.width() <= image.width() * 0.45
+    ]
+    left = [pill for pill in low if pill.center().x() < image.width() * 0.45]
+    right = [pill for pill in low if pill.center().x() > image.width() * 0.55]
+    if not left or not right:
+        return None
+    close = max(left, key=lambda rect: rect.width() * rect.height())
+    retry = max(right, key=lambda rect: rect.width() * rect.height())
+    if abs(close.center().y() - retry.center().y()) > image.height() * 0.05:
+        return None
+    if retry.x() < close.right() - close.width() * 0.1:
+        return None
+    if not _retry_is_orange(image, retry):
+        return None
+    return retry
+
+
+def _retry_is_orange(image: QImage, rect: QRect) -> bool:
+    inset = max(2, min(rect.width(), rect.height()) // 5)
+    left = rect.x() + inset
+    top = rect.y() + inset
+    right = rect.x() + rect.width() - inset
+    bottom = rect.y() + rect.height() - inset
+    if right - left < 4 or bottom - top < 4:
+        return False
+    step_x = max(1, (right - left) // 8)
+    step_y = max(1, (bottom - top) // 8)
+    reds = 0
+    greens = 0
+    count = 0
+    for y in range(top, bottom, step_y):
+        for x in range(left, right, step_x):
+            color = image.pixelColor(x, y)
+            reds += color.red()
+            greens += color.green()
+            count += 1
+    if count <= 0:
+        return False
+    red = reds / count
+    green = greens / count
+    return red > 200 and green < red * 0.72
+
+
+def _menu_pair_rows(image: QImage, below_y: int) -> int:
+    above = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() < below_y and pill.width() >= image.width() * 0.22
+    ]
+    rows: list[list[QRect]] = []
+    for pill in above:
+        placed = False
+        for row in rows:
+            if abs(pill.center().y() - row[0].center().y()) <= image.height() * 0.04:
+                row.append(pill)
+                placed = True
+                break
+        if not placed:
+            rows.append([pill])
+    return len([row for row in rows if len(row) >= 2])
+
+
+def _mission_dialog_close(image: QImage) -> QRect | None:
+    height = image.height()
+    width = image.width()
+    if width < 2 or height < 2:
+        return None
+    pills = _yellow_pills(image)
+    left = [
+        pill
+        for pill in pills
+        if pill.center().x() < width * 0.38
+        and pill.center().y() > height * 0.78
+        and width * 0.16 <= pill.width() <= width * 0.40
+    ]
+    if not left:
+        return None
+    close = max(left, key=lambda rect: rect.width() * rect.height())
+    claim = [
+        pill
+        for pill in pills
+        if pill.center().x() > width * 0.55
+        and pill.width() >= width * 0.28
+        and pill.bottom() <= close.y() + int(close.height() * 0.15)
+        and pill.center().y() > height * 0.55
+        and pill.center().y() < close.center().y()
+    ]
+    if not claim:
+        return None
+    return close
+
+
+def _continue_button(image: QImage) -> QRect | None:
+    if _mission_dialog_close(image) is not None:
+        return None
+    if _retry_button(image) is not None or _has_highscore_plate(image):
+        return None
+    low = [
+        pill
+        for pill in _yellow_pills(image, max_w_frac=0.85)
+        if pill.center().y() > image.height() * 0.68
+        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.22
+    ]
+    if not low:
+        return None
+    button = max(low, key=lambda rect: rect.center().y())
+    if button.width() < image.width() * 0.18:
+        return None
+    if _is_daily_mission(image, button):
+        return None
+    if _menu_pair_rows(image, button.y()) >= 2:
+        return None
+    return button
+
+
+def _pause_continue_button(image: QImage) -> QRect | None:
+    resume = _continue_button(image)
+    if resume is None:
+        return None
+    above = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() < resume.y()
+        and pill.center().y() > image.height() * 0.55
+        and pill.width() >= image.width() * 0.22
+    ]
+    left = [pill for pill in above if pill.center().x() < image.width() * 0.45]
+    right = [pill for pill in above if pill.center().x() > image.width() * 0.55]
+    if not left or not right:
+        return None
+    redo = max(left, key=lambda rect: rect.width() * rect.height())
+    home = max(right, key=lambda rect: rect.width() * rect.height())
+    if abs(redo.center().y() - home.center().y()) > image.height() * 0.04:
+        return None
+    if resume.y() < max(redo.bottom(), home.bottom()) + image.height() * 0.03:
+        return None
+    return resume
+
+
+def _in_play_hud(image: QImage) -> bool:
+    yellows = _yellow_pills(image)
+    top_right = any(
+        pill.center().y() < image.height() * 0.22
+        and pill.center().x() > image.width() * 0.70
+        and pill.width() < image.width() * 0.22
+        for pill in yellows
+    )
+    bot_right = any(
+        pill.center().y() > image.height() * 0.75
+        and pill.center().x() > image.width() * 0.70
+        and pill.width() < image.width() * 0.22
+        for pill in yellows
+    )
+    return top_right and bot_right
+
+
+def _match_start_button(image: QImage) -> QRect | None:
+    low = [
+        pill
+        for pill in _pink_pills(image, max_w_frac=0.62)
+        if pill.center().y() > image.height() * 0.70
+        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.18
+        and pill.width() <= max(1, pill.height()) * 5
+    ]
+    if not low:
+        return None
+    button = max(low, key=lambda rect: rect.width() * rect.height())
+    if button.width() < image.width() * 0.18:
+        return None
+    return button
+
+
+def _cancel_button(image: QImage) -> QRect | None:
+    pills = _yellow_pills(image)
+    if len(pills) < 2:
+        return None
+    for index, left in enumerate(pills[:-1]):
+        right = pills[index + 1]
+        if abs(left.center().y() - right.center().y()) > max(left.height(), right.height()) * 0.6:
+            continue
+        if abs(left.height() - right.height()) > max(left.height(), right.height()) * 0.5:
+            continue
+        gap = right.x() - left.right()
+        if gap < -left.width() * 0.2 or gap > left.width() * 2.2:
+            continue
+        if left.width() < image.width() * 0.18 or right.width() < image.width() * 0.18:
+            continue
+        if _is_daily_mission(image, right) or _is_daily_mission(image, left):
+            continue
+        if _play_button(image) is not None:
+            return None
+        return left
+    return None
+
+
+def _has_highscore_plate(image: QImage) -> bool:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return False
+    for blob in _all_blobs(sample, _is_highscore_cyan):
+        xs = [p[0] for p in blob]
+        ys = [p[1] for p in blob]
+        box_w = max(xs) - min(xs) + 1
+        box_h = max(ys) - min(ys) + 1
+        cx = (min(xs) + max(xs)) / 2 / width
+        cy = (min(ys) + max(ys)) / 2 / height
+        if box_w < width * 0.45 or box_w > width * 0.92:
+            continue
+        if box_h > height * 0.12:
+            continue
+        if abs(cx - 0.5) > 0.18:
+            continue
+        if 0.32 <= cy <= 0.62:
+            return True
+    return False
+
+
+def _close_button(image: QImage) -> QRect | None:
+    mission_close = _mission_dialog_close(image)
+    if mission_close is not None:
+        return mission_close
+    if _has_highscore_plate(image):
+        pills = [
+            pill
+            for pill in _yellow_pills(image)
+            if image.height() * 0.62 < pill.center().y() < image.height() * 0.92
+            and abs(pill.center().x() - image.width() / 2) < image.width() * 0.18
+            and not _is_daily_mission(image, pill)
+        ]
+        if pills:
+            return max(pills, key=lambda rect: rect.width() * rect.height())
+    if (
+        _play_button(image) is not None
+        or _cancel_button(image) is not None
+        or _pause_continue_button(image) is not None
+    ):
+        return None
+    pills = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().y() > image.height() * 0.55
+        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.28
+        and not _is_daily_mission(image, pill)
+    ]
+    if not pills:
+        return None
+    if len(pills) >= 3:
+        return pills[len(pills) // 2]
+    return max(pills, key=lambda rect: rect.width() * rect.height())
+
+
+def _is_highscore_cyan(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return red < 100 and green > 150 and blue > 190 and blue >= green - 10
+
+
+def _is_start_yellow(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return red > 200 and green > 110 and blue < 70 and red >= green and green > blue + 60
+
+
+def _is_start_pink(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return (
+        red > 210
+        and 60 < green < 160
+        and 80 < blue < 180
+        and red > green + 70
+        and red > blue + 70
+        and abs(green - blue) < 50
+    )
+
+
+def _is_white(pixel: tuple[int, int, int]) -> bool:
+    return pixel[0] > 200 and pixel[1] > 200 and pixel[2] > 200
+
+
+def _largest_white_blob(sample: list[list[tuple[int, int, int]]]) -> list[tuple[int, int]]:
+    return _largest_blob(sample, _is_white)
+
+
+def _all_blobs(
+    sample: list[list[tuple[int, int, int]]],
+    match,
+) -> list[list[tuple[int, int]]]:
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    seen = [[False] * width for _ in range(height)]
+    blobs: list[list[tuple[int, int]]] = []
+    for y in range(height):
+        for x in range(width):
+            if seen[y][x] or not match(sample[y][x]):
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            cells: list[tuple[int, int]] = []
+            while stack:
+                cx, cy = stack.pop()
+                cells.append((cx, cy))
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                        continue
+                    if seen[ny][nx] or not match(sample[ny][nx]):
+                        continue
+                    seen[ny][nx] = True
+                    stack.append((nx, ny))
+            blobs.append(cells)
+    return blobs
+
+
+def _largest_blob(
+    sample: list[list[tuple[int, int, int]]],
+    match,
+) -> list[tuple[int, int]]:
+    blobs = _all_blobs(sample, match)
+    if not blobs:
+        return []
+    return max(blobs, key=len)
+
+
+_sample_cache: tuple[int, list[list[tuple[int, int, int]]]] | None = None
+
+
+def _sample(image: QImage) -> list[list[tuple[int, int, int]]]:
+    global _sample_cache
+    key = int(image.cacheKey())
+    if _sample_cache is not None and _sample_cache[0] == key:
+        return _sample_cache[1]
+    scaled = image.scaled(SAMPLE_W, SAMPLE_H)
+    rows: list[list[tuple[int, int, int]]] = []
+    for y in range(scaled.height()):
+        row: list[tuple[int, int, int]] = []
+        for x in range(scaled.width()):
+            color = scaled.pixelColor(x, y)
+            row.append((color.red(), color.green(), color.blue()))
+        rows.append(row)
+    _sample_cache = (key, rows)
+    return rows
+
+
+def _mean_luma(rows: list[list[tuple[int, int, int]]]) -> float:
+    total = 0.0
+    count = 0
+    for row in rows:
+        for pixel in row:
+            total += 0.299 * pixel[0] + 0.587 * pixel[1] + 0.114 * pixel[2]
+            count += 1
+    return total / count if count else 0.0

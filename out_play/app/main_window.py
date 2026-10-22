@@ -1,0 +1,1786 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from queue import Queue
+
+from PySide6.QtCore import QObject, QRectF, QSize, QStandardPaths, Qt, QTimer, QEvent, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
+from PySide6.QtNetwork import QLocalServer
+from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+class GaugePie(QWidget):
+    def __init__(self, extra: int = 0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._value = 0
+        self._extra = max(0, int(extra))
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def extra(self) -> int:
+        return self._extra
+
+    def setValue(self, value: int) -> None:
+        value = max(0, min(100, int(value)))
+        if value == self._value:
+            return
+        self._value = value
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        side = max(12, self.fontMetrics().height()) + self._extra
+        return QSize(side, side)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def paintEvent(self, event) -> None:
+        del event
+        side = min(self.width(), self.height())
+        if side < 2:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(
+            (self.width() - side) / 2,
+            (self.height() - side) / 2,
+            side,
+            side,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.palette().mid())
+        painter.drawEllipse(rect)
+        if self._value <= 0:
+            return
+        painter.setBrush(self.palette().highlight())
+        span = -int(round(self._value / 100 * 360 * 16))
+        painter.drawPie(rect, 90 * 16, span)
+        painter.end()
+
+
+from app.bluestacks import (
+    capture_play_frame,
+    halt_input,
+    reset_swipe_speeds,
+    set_swipe_speeds,
+    start_tsum,
+    swipe_speeds,
+    tsum_is_running,
+)
+from app.intro import IntroWorker
+from app.paths import APP_ROOT, IPC_NAME
+from app.play_style import history_text
+from app.play_web import start_server, stop_server
+from app.record_play import RecordWorker, play_video_path
+from app.skill_tsum import (
+    cbuzz_board_path,
+    cbuzz_settings,
+    reset_cbuzz_settings,
+    set_cbuzz_settings,
+)
+from app.play import (
+    PlayWorker,
+    read_kind_count,
+    register_used_tsum_id,
+    save_used_tsum_teach,
+    used_tsum_names,
+)
+
+APP_NAME = "ツムツム オートプレイ"
+_STOP_HOTKEY = 1
+_CAPTURE_HOTKEY = 2
+_PLAY_HOTKEY = 3
+_BOARD_HOTKEY = 4
+_WM_HOTKEY = 0x0312
+_VK_Q = 0x51
+_VK_F5 = 0x74
+_VK_F8 = 0x77
+_VK_F11 = 0x7A
+_MOD_NOREPEAT = 0x4000
+_NOT_CHARM_TSUMS = frozenset(
+    {
+        "ナミネ",
+        "namine",
+        "ガジェット",
+        "gadget",
+        "cバズ",
+        "c_bazu",
+        "キャプテンライトイヤー",
+        "戴冠式エルサ",
+        "coronation_elsa",
+    }
+)
+
+
+def _dim_icon(pix: QPixmap) -> QPixmap:
+    image = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            if color.alpha() == 0:
+                continue
+            color.setRed(int(color.red() * 0.2))
+            color.setGreen(int(color.green() * 0.2))
+            color.setBlue(int(color.blue() * 0.2))
+            image.setPixelColor(x, y, color)
+    return QPixmap.fromImage(image)
+
+
+def _tsum_meta_path() -> Path:
+    return (
+        APP_ROOT / "bundled" / "assets" / "models" / "use_tsum" / "meta.json"
+    )
+
+
+def _load_tsum_meta() -> dict[str, dict[str, object]]:
+    path = _tsum_meta_path()
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    meta: dict[str, dict[str, object]] = {}
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            meta[str(key)] = value
+    return meta
+
+
+def _save_tsum_meta(folder_id: str, kind: str, charm: bool) -> None:
+    path = _tsum_meta_path()
+    meta = _load_tsum_meta()
+    meta[folder_id] = {"kind": kind, "charm": charm}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _tsum_meta_for_name(name: str) -> dict[str, object] | None:
+    folder = _used_tsum_folder(name)
+    if folder is None:
+        return None
+    return _load_tsum_meta().get(folder.name)
+
+
+def _is_not_charm_tsum(name: str) -> bool:
+    raw = " ".join((name or "").split())
+    if not raw:
+        return False
+    return raw in _NOT_CHARM_TSUMS or raw.casefold() in _NOT_CHARM_TSUMS
+
+
+def _used_tsum_folder(name: str) -> Path | None:
+    cleaned = " ".join((name or "").split())
+    if not cleaned or cleaned in {"—", "－", "-"}:
+        return None
+    root = APP_ROOT / "bundled" / "assets" / "images" / "use_tsums"
+    registry_path = APP_ROOT / "bundled" / "assets" / "models" / "use_tsum" / "registry.json"
+    registry: dict[str, str] = {}
+    if registry_path.is_file():
+        try:
+            payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            registry = {str(key): str(value) for key, value in payload.items()}
+    for dir_id, display in registry.items():
+        if display == cleaned or dir_id == cleaned:
+            folder = root / dir_id
+            if folder.is_dir():
+                return folder
+    folder = root / cleaned
+    if folder.is_dir():
+        return folder
+    return None
+
+
+class _CbuzzBoard(QLabel):
+    picked = Signal(float, float)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._source = QPixmap(str(cbuzz_board_path()))
+        self._points: dict[str, tuple[float, float]] = {}
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+    def set_points(self, points: dict[str, tuple[float, float]]) -> None:
+        self._points = dict(points)
+        self._paint()
+
+    def _paint(self) -> None:
+        if self._source.isNull():
+            self.setText("画像がありません")
+            return
+        shown = self._source.scaledToHeight(640, Qt.TransformationMode.SmoothTransformation)
+        painter = QPainter(shown)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for name, (fx, fy) in self._points.items():
+            x = int(fx * shown.width())
+            y = int(fy * shown.height())
+            painter.setPen(QPen(QColor("#111111"), 3))
+            painter.setBrush(QColor("#FFFFFF"))
+            painter.drawEllipse(x - 14, y - 14, 28, 28)
+            painter.setPen(QColor("#111111"))
+            font = QFont()
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(x - 14, y - 14, 28, 28, Qt.AlignmentFlag.AlignCenter, name)
+        painter.end()
+        self.setPixmap(shown)
+        self.setFixedSize(shown.size())
+
+    def mousePressEvent(self, event) -> None:
+        pix = self.pixmap()
+        if pix is None or pix.isNull():
+            return
+        pos = event.position()
+        x = float(pos.x())
+        y = float(pos.y())
+        if x < 0 or y < 0 or x >= pix.width() or y >= pix.height():
+            return
+        self.picked.emit(x / pix.width(), y / pix.height())
+
+
+class DebugWindow(QWidget):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._preview = QLabel("なぞる経路")
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview.setMinimumHeight(280)
+        self._preview.setStyleSheet("background:#111; color:#888;")
+        layout.addWidget(self._preview)
+        self._used_tsum = QLabel("使用ツム  —")
+        self._used_tsum.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self._used_tsum)
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(400)
+        layout.addWidget(self._log, 1)
+
+    def set_preview(self, image: QImage) -> None:
+        if image.isNull():
+            return
+        width = max(200, self._preview.width())
+        pix = QPixmap.fromImage(image)
+        self._preview.setPixmap(
+            pix.scaled(
+                width,
+                max(240, self._preview.height()),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def set_used_tsum(self, name: str) -> None:
+        shown = " ".join((name or "").split()) or "—"
+        self._used_tsum.setText(f"使用ツム  {shown}")
+
+    def append(self, text: str) -> None:
+        now = datetime.now().strftime("%H:%M:%S")
+        cursor = self._log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self._log.toPlainText():
+            cursor.insertBlock()
+        normal = QTextCharFormat()
+        red = QTextCharFormat()
+        red.setForeground(QColor(220, 0, 0))
+        cursor.setCharFormat(normal)
+        cursor.insertText(f"{now}  ")
+        mark = "TIME UP"
+        rest = text
+        while mark in rest:
+            head, rest = rest.split(mark, 1)
+            if head:
+                cursor.insertText(head, normal)
+            cursor.insertText(mark, red)
+        if rest:
+            cursor.insertText(rest, normal)
+        cursor.setCharFormat(normal)
+        self._log.setTextCursor(cursor)
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+        if text.startswith("使用ツム "):
+            self.set_used_tsum(text[len("使用ツム ") :])
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("オートプレイ　コントローラー")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        icon = self._ensure_app_icon()
+        if icon is not None:
+            window_icon = QIcon()
+            window_icon.addFile(str(icon))
+            pix = QPixmap(str(icon))
+            if not pix.isNull():
+                window_icon.addPixmap(pix)
+            self.setWindowIcon(window_icon)
+            app_inst = QApplication.instance()
+            if app_inst is not None:
+                app_inst.setWindowIcon(window_icon)
+        self._refresh_desktop_shortcut()
+        root = QWidget()
+        outer = QVBoxLayout(root)
+        self._info_frame = QFrame()
+        self._info_frame.setFrameShape(QFrame.Shape.Box)
+        info_row = QHBoxLayout(self._info_frame)
+        info_text = QWidget()
+        info = QVBoxLayout(info_text)
+        info.setContentsMargins(0, 0, 0, 0)
+        self._info_mytsum = QLabel("マイツム  —")
+        self._info_mytsum.setWordWrap(True)
+        info.addWidget(self._info_mytsum)
+        self._info_items = QLabel("－")
+        self._info_items.setWordWrap(True)
+        self._info_items.hide()
+        info.addWidget(self._info_items)
+        self._item_icon_row = QWidget()
+        item_icons = QHBoxLayout(self._item_icon_row)
+        item_icons.setContentsMargins(0, 0, 0, 0)
+        icon_dir = APP_ROOT / "bundled" / "assets" / "icons"
+        self._item_icon_labels: dict[str, QLabel] = {}
+        self._item_icon_bright: dict[str, QPixmap] = {}
+        self._item_icon_dim: dict[str, QPixmap] = {}
+        for name, filename in (
+            ("+Score", "Score.png"),
+            ("+Coin", "Coin.png"),
+            ("+Exp", "Exp.png"),
+            ("+Time", "Time.png"),
+            ("+Bomb", "Bomb.png"),
+            ("5＞4", "5over4.png"),
+            ("+Combo", "Combo.png"),
+        ):
+            label = QLabel()
+            pix = QPixmap(str(icon_dir / filename))
+            if pix.isNull():
+                label.setText(name)
+            else:
+                pix = pix.scaled(
+                    pix.width() // 2,
+                    pix.height() // 2,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self._item_icon_bright[name] = pix
+                self._item_icon_dim[name] = _dim_icon(pix)
+                label.setPixmap(self._item_icon_dim[name])
+            item_icons.addWidget(label)
+            self._item_icon_labels[name] = label
+        item_icons.addStretch(1)
+        info.addWidget(self._item_icon_row)
+        heart_row = QHBoxLayout()
+        heart_row.setContentsMargins(0, 0, 0, 0)
+        self._info_label = QLabel("♥ ハート")
+        heart_row.addWidget(self._info_label)
+        heart_row.addStretch(1)
+        info.addLayout(heart_row)
+        meter = QGridLayout()
+        meter.setContentsMargins(0, 0, 0, 0)
+        self._info_time = QLabel("タイム")
+        self._info_time_value = QLabel("－")
+        self._info_fever_en = QLabel("FEVER")
+        self._info_fever = QLabel("フィーバー")
+        self._info_fever_value = QLabel("－")
+        self._info_fever_bar = QProgressBar()
+        self._info_fever_bar.setRange(0, 100)
+        self._info_fever_bar.setValue(0)
+        self._info_fever_bar.setTextVisible(False)
+        self._info_fever_bar.setFixedHeight(self._info_fever_bar.sizeHint().height() + 8)
+        self._info_fever_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid palette(mid); background: palette(base); }"
+            "QProgressBar::chunk { background: palette(highlight); margin: 0px; }"
+        )
+        self._info_skill = QLabel("スキル")
+        self._info_skill_value = QLabel("－")
+        self._info_skill_pie = GaugePie(extra=16)
+        meter.addWidget(self._info_time, 0, 0)
+        meter.addWidget(self._info_time_value, 0, 1)
+        meter.addWidget(self._info_fever_en, 1, 0, 1, 3)
+        self._info_skill_need = QLabel("－")
+        meter.addWidget(self._info_fever, 2, 0)
+        meter.addWidget(self._info_fever_value, 2, 1)
+        meter.addWidget(self._meter_bar_row(self._info_fever_bar), 2, 2)
+        meter.addWidget(self._info_skill, 3, 0)
+        meter.addWidget(self._info_skill_value, 3, 1)
+        meter.addWidget(self._meter_pie_row(self._info_skill_pie, self._info_skill_need), 3, 2)
+        meter.setColumnStretch(2, 1)
+        info.addLayout(meter)
+        info_row.addWidget(info_text, 1)
+        self._info_text = info_text
+        self._info_count = QFrame()
+        self._info_count.setFrameShape(QFrame.Shape.Box)
+        count_col = QVBoxLayout(self._info_count)
+        self._info_count_title = QLabel("スキル回数")
+        self._info_count_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_count_title.setWordWrap(True)
+        self._info_count_value = QLabel("－")
+        self._info_count_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_erase_title = QLabel("マイツムを消した数")
+        self._info_erase_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_erase_title.setWordWrap(True)
+        self._info_erase_value = QLabel("－")
+        self._info_erase_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        count_col.addWidget(self._info_count_title)
+        count_col.addWidget(self._info_count_value)
+        count_col.addWidget(self._info_erase_title)
+        count_col.addWidget(self._info_erase_value)
+        self._info_skill_lamp = QLabel("スキル中")
+        self._info_skill_lamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_skill_lamp.setWordWrap(True)
+        self._info_skill_lamp.setStyleSheet("background: palette(mid);")
+        count_col.addWidget(self._info_skill_lamp)
+        self._info_my_lamp = QLabel("マイツム")
+        self._info_my_lamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_my_lamp.setWordWrap(True)
+        self._info_my_lamp.setStyleSheet("background: palette(mid);")
+        count_col.addWidget(self._info_my_lamp)
+        count_col.addStretch(1)
+        info_row.addWidget(self._info_count)
+        self._info_tsum = QLabel()
+        self._info_tsum.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info_tsum_pix = QPixmap()
+        info_row.addWidget(self._info_tsum)
+        self._fit_tsum_slot()
+        outer.addWidget(self._info_frame)
+        columns = QHBoxLayout()
+        columns.setContentsMargins(0, 0, 0, 0)
+        left = QWidget()
+        layout = QVBoxLayout(left)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_btn = QPushButton("設定")
+        self.settings_btn.clicked.connect(self._open_swipe_settings)
+        layout.addWidget(self.settings_btn)
+        self.grab_board_btn = QPushButton("盤面を取り込む (F11)")
+        self.grab_board_btn.clicked.connect(self.on_grab_board)
+        layout.addWidget(self.grab_board_btn)
+        self.capture_btn = QPushButton("消す前の盤面を取り込む (F7)")
+        self.capture_btn.setCheckable(True)
+        self.capture_btn.toggled.connect(self._on_capture_toggled)
+        layout.addWidget(self.capture_btn)
+        self.skill_n_btn = QPushButton("スキル満タン個数")
+        self.skill_n_btn.setCheckable(True)
+        self.skill_n_btn.toggled.connect(self._on_skill_n_toggled)
+        layout.addWidget(self.skill_n_btn)
+        self.shot_btn = QPushButton("キャプチャー (F8)")
+        self.shot_btn.clicked.connect(self.on_capture_screen)
+        layout.addWidget(self.shot_btn)
+        self.add_tsum_btn = QPushButton("ツムを追加")
+        self.add_tsum_btn.clicked.connect(self._add_tsum)
+        layout.addWidget(self.add_tsum_btn)
+        self.now_btn = QPushButton("今すぐプレイ (F5)")
+        self.now_btn.clicked.connect(self.on_play_now)
+        layout.addWidget(self.now_btn)
+        self.loop_btn = QPushButton("連続プレイ (F6)")
+        self.loop_btn.clicked.connect(self.on_loop_play)
+        layout.addWidget(self.loop_btn)
+        self.record_btn = QPushButton("1プレイを録画")
+        self.record_btn.clicked.connect(self.on_record_one)
+        layout.addWidget(self.record_btn)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.on_stop)
+        layout.addWidget(self.stop_btn)
+        self.shortcut_btn = QPushButton("起動アイコン作成")
+        self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
+        layout.addWidget(self.shortcut_btn)
+        self.status_label = QLabel("待機中")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self._history = QPlainTextEdit()
+        self._history.setReadOnly(True)
+        font = QFont("MS Gothic")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self._history.setFont(font)
+        layout.addWidget(self._history, 1)
+        left.setMinimumWidth(max(1, left.sizeHint().width() * 2))
+        self._debug = DebugWindow(root)
+        self._debug.setMinimumWidth(420)
+        columns.addWidget(left, 1)
+        columns.addWidget(self._debug, 1)
+        outer.addLayout(columns, 1)
+        self.setCentralWidget(root)
+        self._fill_history()
+        self._stop = threading.Event()
+        self._save_boards = threading.Event()
+        self._board_grabs: Queue = Queue()
+        self._count_skill = threading.Event()
+        self._loop_play = False
+        self._play_games = None
+        self._suppress_show = False
+        self._intro: IntroWorker | None = None
+        self._play: PlayWorker | None = None
+        self._record: RecordWorker | None = None
+        self._want_record = False
+        self._selected_used_tsum = ""
+        self._placed = False
+        self._enter_yes = None
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self._front_timer = QTimer(self)
+        self._front_timer.setInterval(800)
+        self._front_timer.timeout.connect(self._keep_front)
+        self._front_timer.start()
+        self._f5_down = False
+        self._f5_hotkey = False
+        self._play_key_at = 0.0
+        self._f8_down = False
+        self._f11_down = False
+        self._capture_at = 0.0
+        self._grab_at = 0.0
+        self._capture_key_timer = QTimer(self)
+        self._capture_key_timer.setInterval(50)
+        self._capture_key_timer.timeout.connect(self._poll_capture_key)
+        self._capture_key_timer.start()
+        self._debug.append("待機中")
+        try:
+            self._debug.append(start_server())
+        except Exception as exc:
+            self._debug.append(str(exc))
+        self._start_ipc()
+
+    def _on_capture_toggled(self, on: bool) -> None:
+        if on:
+            self._save_boards.set()
+        else:
+            self._save_boards.clear()
+
+    def _on_skill_n_toggled(self, on: bool) -> None:
+        if on:
+            self._count_skill.set()
+        else:
+            self._count_skill.clear()
+
+    def on_capture_screen(self) -> None:
+        now = time.monotonic()
+        if now - self._capture_at < 0.4:
+            return
+        self._capture_at = now
+        try:
+            image = capture_play_frame()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "キャプチャー", str(exc))
+            return
+        if image is None or image.isNull():
+            QMessageBox.warning(self, "キャプチャー", "画面を取れませんでした。")
+            return
+        clip = QApplication.clipboard()
+        if clip is None:
+            QMessageBox.warning(self, "キャプチャー", "クリップボードにコピーできませんでした。")
+            return
+        clip.setImage(image)
+        self._debug.set_preview(image)
+        self._set_status("キャプチャーしました。貼り付けできます")
+
+    def on_grab_board(self) -> None:
+        now = time.monotonic()
+        if now - self._grab_at < 0.4:
+            return
+        self._grab_at = now
+        if self._play is None or not self._play.isRunning():
+            self._set_status("プレイ中ではありません")
+            return
+        try:
+            image = capture_play_frame()
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(str(exc))
+            return
+        if image is None or image.isNull():
+            self._set_status("画面を取れませんでした。")
+            return
+        self._board_grabs.put(image.copy())
+
+    def _add_tsum(self) -> None:
+        self._register_used_tsum(None, title="ツムを追加", allow_skip=False)
+
+    def on_loop_play(self, games: int | None = None) -> None:
+        self._play_games = games if isinstance(games, int) and games > 0 else None
+        self._begin_play(loop=True)
+
+    def on_record_one(self) -> None:
+        if self._is_busy():
+            return
+        self._want_record = True
+        if tsum_is_running():
+            self._play_now()
+        else:
+            self._begin_play(loop=False)
+        if not self._is_busy():
+            self._want_record = False
+
+    def _begin_play(self, *, loop: bool) -> None:
+        if self._is_busy():
+            return
+        self._loop_play = loop
+        self._stop.clear()
+        self._set_running(True)
+        self._set_status("連続プレイ" if loop else "PLAY")
+        if not tsum_is_running():
+            desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+            try:
+                start_tsum(desktop or "")
+            except Exception as exc:  # noqa: BLE001
+                self._set_running(False)
+                QMessageBox.critical(self, "起動できませんでした", str(exc))
+                return
+            self._set_status("起動しています")
+            self._start_intro()
+            return
+        if loop:
+            self._start_play(start_match=True, ask_kinds=True, loop=True)
+            return
+        self._start_play(loop=False)
+
+    def on_play_now(self) -> None:
+        self._play_now()
+
+    def _play_now(self) -> None:
+        now = time.time()
+        if now - self._play_key_at < 0.4:
+            return
+        self._play_key_at = now
+        if self._is_busy():
+            return
+        if not tsum_is_running():
+            QMessageBox.information(self, "今すぐプレイ", "ツムツムが起動していません。")
+            return
+        self._stop.clear()
+        self._set_running(True)
+        self._set_status("今すぐプレイ")
+        self._start_play(start_match=True, ask_kinds=True, loop=False)
+
+    def _ask_kind_count(self) -> int | None:
+        guess = read_kind_count()
+        if guess in (4, 5):
+            return guess
+        box = QMessageBox(self)
+        box.setWindowTitle("今すぐプレイ")
+        box.setText("種類は何種類ですか？")
+        four = box.addButton("4種類", QMessageBox.ButtonRole.AcceptRole)
+        five = box.addButton("5種類", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(five)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is four:
+            return 4
+        if clicked is five:
+            return 5
+        return None
+
+    def _ask_charm_tsum(self) -> bool | None:
+        box = QMessageBox(self)
+        box.setWindowTitle("今すぐプレイ")
+        box.setText("チャームツムですか？")
+        box.setInformativeText("使うと種類が1つ減ります。")
+        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is yes:
+            return True
+        if clicked is no:
+            return False
+        return None
+
+    def on_stop(self) -> None:
+        if not self._is_busy():
+            return
+        if self._stop.is_set():
+            halt_input()
+            return
+        self._stop.set()
+        if self._intro is not None:
+            self._intro.requestInterruption()
+        if self._play is not None:
+            self._play.requestInterruption()
+        if self._record is not None:
+            self._record.requestInterruption()
+        halt_input()
+        self._set_status("停止しています")
+
+    def _is_busy(self) -> bool:
+        intro_on = self._intro is not None and self._intro.isRunning()
+        play_on = self._play is not None and self._play.isRunning()
+        return intro_on or play_on
+
+    def _set_running(self, running: bool) -> None:
+        self.now_btn.setEnabled(not running)
+        self.loop_btn.setEnabled(not running)
+        self.record_btn.setEnabled(not running)
+        self.stop_btn.setEnabled(running)
+        if running:
+            self._front_timer.stop()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+            if not self._suppress_show:
+                self.show()
+            self._f5_down = False
+            self._f8_down = False
+            self._f11_down = False
+            self._register_stop_hotkey()
+            self._capture_key_timer.start()
+        else:
+            self._f5_down = False
+            self._f11_down = False
+            self._unregister_stop_hotkey()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            if not self._suppress_show:
+                self.show()
+                self._front_timer.start()
+                self._keep_front()
+            self._clear_meters()
+
+    def _clear_meters(self) -> None:
+        self._info_time_value.setText("－")
+        self._info_fever_value.setText("－")
+        self._info_fever_bar.setValue(0)
+        self._info_skill_value.setText("－")
+        self._info_skill_pie.setValue(0)
+        self._info_skill_need.setText("－")
+        self._info_count_value.setText("－")
+        self._info_erase_value.setText("－")
+        self._info_fever_en.setStyleSheet("")
+        self._set_skill_lamp(False)
+        self._set_my_lamp("off")
+
+    def _meter_bar_row(self, bar: QProgressBar) -> QWidget:
+        row = QWidget()
+        box = QHBoxLayout(row)
+        box.setContentsMargins(0, 0, 0, 0)
+        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        box.addWidget(bar, 1)
+        box.addStretch(4)
+        return row
+
+    def _meter_pie_row(self, pie: GaugePie, tail: QLabel | None = None) -> QWidget:
+        row = QWidget()
+        box = QHBoxLayout(row)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(pie)
+        if tail is not None:
+            box.addWidget(tail)
+        box.addStretch(1)
+        return row
+
+    def _show_meters(
+        self,
+        skill_fill,
+        fever_fill,
+        fever_on,
+        left,
+        _skill_n,
+        _skill_ok,
+        _ready,
+        _busy,
+        _tap_at,
+        skill_need=None,
+    ) -> None:
+        if left is None:
+            self._info_time_value.setText("－")
+        else:
+            self._info_time_value.setText(str(int(left)))
+        if fever_on:
+            self._info_fever_en.setStyleSheet("color: rgb(220, 0, 0);")
+        else:
+            self._info_fever_en.setStyleSheet("")
+        if fever_fill is None:
+            self._info_fever_value.setText("－")
+            self._info_fever_bar.setValue(0)
+        else:
+            fever_pct = max(0, min(100, round(float(fever_fill) * 100)))
+            self._info_fever_value.setText(f"{fever_pct}％")
+            self._info_fever_bar.setValue(fever_pct)
+        if skill_fill is None:
+            self._info_skill_value.setText("－")
+            self._info_skill_pie.setValue(0)
+        else:
+            skill_pct = max(0, min(100, round(float(skill_fill) * 100)))
+            self._info_skill_value.setText(f"{skill_pct}％")
+            self._info_skill_pie.setValue(skill_pct)
+        if skill_need is None:
+            self._info_skill_need.setText("－")
+        else:
+            self._info_skill_need.setText(str(int(skill_need)))
+        if _skill_n is None:
+            self._info_count_value.setText("－")
+        else:
+            self._info_count_value.setText(str(int(_skill_n)))
+        if _skill_ok is None:
+            self._info_erase_value.setText("－")
+        else:
+            self._info_erase_value.setText(str(int(_skill_ok)))
+
+    def _set_skill_lamp(self, on: bool) -> None:
+        if on:
+            self._info_skill_lamp.setStyleSheet(
+                "background: palette(highlight); color: palette(highlighted-text);"
+            )
+        else:
+            self._info_skill_lamp.setStyleSheet("background: palette(mid);")
+
+    def _set_my_lamp(self, mode: str) -> None:
+        if mode == "red":
+            self._info_my_lamp.setStyleSheet("background: red; color: white;")
+        elif mode == "on":
+            self._info_my_lamp.setStyleSheet(
+                "background: palette(highlight); color: palette(highlighted-text);"
+            )
+        else:
+            self._info_my_lamp.setStyleSheet("background: palette(mid);")
+
+    def _fit_tsum_slot(self) -> None:
+        side = self._info_text.sizeHint().height() - (2 * self._info_skill_pie.extra())
+        if side < 1:
+            return
+        self._info_count.setFixedSize(side, side)
+        self._info_tsum.setFixedSize(side, side)
+        self._paint_tsum()
+
+    def _paint_tsum(self) -> None:
+        if self._info_tsum_pix.isNull():
+            self._info_tsum.clear()
+            return
+        self._info_tsum.setPixmap(
+            self._info_tsum_pix.scaled(
+                self._info_tsum.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _mytsum_pixmap(self, name: str) -> QPixmap:
+        folder = _used_tsum_folder(name)
+        if folder is None:
+            return QPixmap()
+        files = [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+        ]
+        if not files:
+            return QPixmap()
+        target = 1600 / 900
+
+        def aspect_gap(path: Path) -> float:
+            size = QImageReader(str(path)).size()
+            if not size.isValid() or size.width() < 1:
+                return 999.0
+            return abs(size.height() / size.width() - target)
+
+        image = QImage(str(min(files, key=aspect_gap)))
+        if image.isNull():
+            return QPixmap()
+        width = image.width()
+        height = image.height()
+        left = int(width * 0.710)
+        top = int(height * 0.785)
+        crop_w = max(1, int(width * 0.254))
+        crop_h = max(1, int(height * 0.126))
+        return QPixmap.fromImage(image.copy(left, top, crop_w, crop_h))
+
+    def _set_mytsum(self, name: str) -> None:
+        shown = " ".join((name or "").split()) or "—"
+        self._info_mytsum.setText(f"マイツム  {shown}")
+        self._info_tsum_pix = self._mytsum_pixmap(shown)
+        self._fit_tsum_slot()
+
+    def _show_items(self, text: str) -> None:
+        raw = (text or "").strip()
+        names = [] if not raw or raw == "－" else [part.strip() for part in raw.split("、") if part.strip()]
+        for name, label in self._item_icon_labels.items():
+            bright = self._item_icon_bright.get(name)
+            dim = self._item_icon_dim.get(name)
+            if bright is None or dim is None:
+                continue
+            label.setPixmap(bright if name in names else dim)
+        unknown = [name for name in names if name not in self._item_icon_labels]
+        if unknown:
+            self._info_items.setText("、".join(unknown))
+            self._info_items.show()
+        else:
+            self._info_items.hide()
+        self._fit_tsum_slot()
+
+    def _start_intro(self) -> None:
+        self._intro = IntroWorker(self._stop, self)
+        self._intro.status.connect(self._set_status)
+        self._intro.succeeded.connect(self._on_intro_ok)
+        self._intro.failed.connect(self._on_intro_fail)
+        self._intro.stopped.connect(self._on_stopped)
+        self._keep_front()
+        self._intro.start()
+
+    def _start_play(
+        self,
+        start_match: bool = False,
+        kind_count: int | None = None,
+        loop: bool | None = None,
+        ask_kinds: bool = False,
+    ) -> None:
+        if loop is None:
+            loop = self._loop_play
+        self._selected_used_tsum = ""
+        self._set_mytsum("")
+        self._play = PlayWorker(
+            self._stop,
+            self,
+            start_match=start_match,
+            kind_count=kind_count,
+            save_boards=self._save_boards.is_set,
+            board_grabs=self._board_grabs,
+            count_skill=self._count_skill.is_set,
+            loop=loop,
+            ask_kinds=ask_kinds,
+            games=self._play_games if loop else None,
+        )
+        self._play.status.connect(self._set_status)
+        self._play.preview.connect(self._debug.set_preview)
+        self._play.gauges.connect(self._show_meters)
+        self._play.skill_lamp.connect(self._set_skill_lamp)
+        self._play.my_lamp.connect(self._set_my_lamp)
+        self._play.failed.connect(self._on_play_fail)
+        self._play.items.connect(self._show_items)
+        self._play.stopped.connect(self._on_stopped)
+        self._play.completed.connect(self._on_play_done)
+        if ask_kinds:
+            self._play.need_kinds.connect(self._on_need_kinds)
+            self._play.need_used_tsum.connect(self._on_need_used_tsum)
+        self._play.start()
+        if self._want_record:
+            self._start_record()
+
+    def _start_record(self) -> None:
+        self._stop_record()
+        dest = play_video_path()
+        self._want_record = True
+        self._record = RecordWorker(self._stop, dest, self)
+        self._record.failed.connect(self._on_record_fail)
+        self._record.saved.connect(self._on_record_saved)
+        self._record.start()
+        self._set_status("1プレイを録画しています")
+
+    def _stop_record(self) -> None:
+        rec = self._record
+        self._record = None
+        self._want_record = False
+        if rec is None:
+            return
+        rec.requestInterruption()
+        rec.wait(8000)
+
+    def _on_record_fail(self, message: str) -> None:
+        self._set_status(message)
+
+    def _on_record_saved(self, path: str) -> None:
+        self._set_status(f"録画しました {path}")
+
+    def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
+        play = self._play
+        if play is None:
+            return
+        screen = Path(path) if path else None
+        name = self._confirm_used_tsum(guess, screen, pick_only)
+        if name is None:
+            play.provide_used_tsum(None)
+            self.on_stop()
+            return
+        self._selected_used_tsum = name
+        play.provide_used_tsum(name)
+
+    def _confirm_used_tsum(
+        self, guess: str, path: Path | None, pick_only: bool = False
+    ) -> str | None:
+        if pick_only:
+            return self._choose_used_tsum(path)
+        dialog = QDialog()
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        layout = QVBoxLayout(dialog)
+        if guess:
+            layout.addWidget(QLabel(f"使用ツムは {guess} ですか？"))
+        else:
+            layout.addWidget(QLabel("使用ツムが分かっていません。"))
+        buttons = QDialogButtonBox()
+        yes = None
+        if guess:
+            yes = buttons.addButton("はい", QDialogButtonBox.ButtonRole.AcceptRole)
+        no = buttons.addButton("いいえ", QDialogButtonBox.ButtonRole.NoRole)
+        skip = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
+        new = buttons.addButton("新規", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel = buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
+        no.setAutoDefault(False)
+        skip.setAutoDefault(False)
+        new.setAutoDefault(False)
+        cancel.setAutoDefault(False)
+        if yes is not None:
+            yes.setAutoDefault(True)
+            yes.setDefault(True)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        no.clicked.connect(lambda: dialog.done(2))
+        skip.clicked.connect(lambda: dialog.done(4))
+        new.clicked.connect(lambda: dialog.done(3))
+        if yes is not None:
+            yes.setFocus()
+            self._enter_yes = dialog.accept
+        self._front_timer.stop()
+        self._debug.setEnabled(False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if sys.platform == "win32":
+            import ctypes
+
+            hwnd = int(dialog.winId())
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040
+            )
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        dialog.grabKeyboard()
+        try:
+            result = dialog.exec()
+        finally:
+            dialog.releaseKeyboard()
+            self._enter_yes = None
+            self._debug.setEnabled(True)
+            self._front_timer.start()
+        if yes is not None and result == QDialog.DialogCode.Accepted:
+            return self._save_used_tsum_choice(path, guess, None)
+        if result == 2:
+            return self._pick_used_tsum(guess, path)
+        if result == 3:
+            return self._register_used_tsum(path)
+        if result == 4:
+            return ""
+        return None
+
+    def _choose_used_tsum(self, path: Path | None) -> str | None:
+        names = used_tsum_names()
+        if not names:
+            return self._register_used_tsum(path)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("使用ツムはどれですか？"))
+        name_list = QListWidget()
+        for name in names:
+            name_list.addItem(name)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        buttons = QDialogButtonBox()
+        ok_btn = buttons.addButton("これにします", QDialogButtonBox.ButtonRole.AcceptRole)
+        skip_btn = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
+        new_btn = buttons.addButton("新規", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        skip_btn.setAutoDefault(False)
+        new_btn.setAutoDefault(False)
+        cancel_btn.setAutoDefault(False)
+        layout.addWidget(buttons)
+        name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        skip_btn.clicked.connect(lambda: dialog.done(3))
+        new_btn.clicked.connect(lambda: dialog.done(2))
+        result = dialog.exec()
+        if result == 2:
+            return self._register_used_tsum(path)
+        if result == 3:
+            return ""
+        if result != QDialog.DialogCode.Accepted:
+            return None
+        row = name_list.currentItem()
+        if row is None:
+            return None
+        if path is not None and path.is_file():
+            return self._save_used_tsum_choice(path, row.text(), None)
+        return row.text()
+
+    def _open_swipe_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("なぞるスピード")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("あいだの点（秒）"))
+        point_edit = QLineEdit()
+        layout.addWidget(point_edit)
+        layout.addWidget(QLabel("ツムの中心（秒）"))
+        center_edit = QLineEdit()
+        layout.addWidget(center_edit)
+
+        def show(point_s: float, center_s: float) -> None:
+            point_edit.setText(f"{point_s:.3f}")
+            center_edit.setText(f"{center_s:.3f}")
+
+        def read() -> tuple[float, float] | None:
+            try:
+                point_s = float(point_edit.text().strip())
+                center_s = float(center_edit.text().strip())
+            except ValueError:
+                return None
+            if point_s < 0 or center_s < 0:
+                return None
+            return point_s, center_s
+
+        def save() -> None:
+            speeds = read()
+            if speeds is None:
+                QMessageBox.information(dialog, "なぞるスピード", "0以上の秒数を入力してください。")
+                return
+            set_swipe_speeds(speeds[0], speeds[1])
+            dialog.accept()
+
+        def reset() -> None:
+            show(*reset_swipe_speeds())
+
+        show(*swipe_speeds())
+        cbuzz_btn = QPushButton("cバズの設定")
+        cbuzz_btn.clicked.connect(self._open_cbuzz_settings)
+        layout.addWidget(cbuzz_btn)
+        buttons = QDialogButtonBox()
+        save_btn = buttons.addButton("保存する", QDialogButtonBox.ButtonRole.AcceptRole)
+        reset_btn = buttons.addButton("リセット", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        save_btn.clicked.connect(save)
+        reset_btn.setAutoDefault(False)
+        reset_btn.clicked.connect(reset)
+        cancel_btn.clicked.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _open_cbuzz_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("cバズの設定")
+        dialog.setModal(True)
+        outer = QHBoxLayout(dialog)
+        board = _CbuzzBoard()
+        outer.addWidget(board)
+        form = QVBoxLayout()
+        form.addWidget(QLabel("A・B・C を選んで、画像をタップします"))
+        letter_row = QHBoxLayout()
+        letters: dict[str, QPushButton] = {}
+        chosen = {"letter": "A"}
+        points = {}
+        a, b, c, seconds = cbuzz_settings()
+        points["A"] = a
+        points["B"] = b
+        points["C"] = c
+
+        def select(letter: str) -> None:
+            chosen["letter"] = letter
+            for name, button in letters.items():
+                button.setStyleSheet("font-weight: bold;" if name == letter else "")
+
+        for letter in ("A", "B", "C"):
+            button = QPushButton(letter)
+            button.clicked.connect(lambda _checked=False, name=letter: select(name))
+            letters[letter] = button
+            letter_row.addWidget(button)
+        select("A")
+        form.addLayout(letter_row)
+
+        def place(fx: float, fy: float) -> None:
+            points[chosen["letter"]] = (fx, fy)
+            board.set_points(points)
+
+        board.picked.connect(place)
+        board.set_points(points)
+        labels = ("1回目 B", "2回目 A", "3回目 C", "4回目", "5回目")
+        edits: list[QLineEdit] = []
+        for label, value in zip(labels, seconds):
+            form.addWidget(QLabel(f"{label}（秒）"))
+            edit = QLineEdit(f"{value:.2f}")
+            edits.append(edit)
+            form.addWidget(edit)
+
+        def read_seconds() -> tuple[float, float, float, float, float] | None:
+            try:
+                values = tuple(float(edit.text().strip()) for edit in edits)
+            except ValueError:
+                return None
+            if len(values) != 5 or any(item < 0 for item in values):
+                return None
+            return values  # type: ignore[return-value]
+
+        def save() -> None:
+            delays = read_seconds()
+            if delays is None:
+                QMessageBox.information(dialog, "cバズの設定", "0以上の秒数を入力してください。")
+                return
+            set_cbuzz_settings(points["A"], points["B"], points["C"], delays)
+            dialog.accept()
+
+        def reset() -> None:
+            point_a, point_b, point_c, delays = reset_cbuzz_settings()
+            points["A"] = point_a
+            points["B"] = point_b
+            points["C"] = point_c
+            board.set_points(points)
+            for edit, value in zip(edits, delays):
+                edit.setText(f"{value:.2f}")
+
+        buttons = QDialogButtonBox()
+        save_btn = buttons.addButton("保存する", QDialogButtonBox.ButtonRole.AcceptRole)
+        reset_btn = buttons.addButton("リセット", QDialogButtonBox.ButtonRole.ActionRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        save_btn.clicked.connect(save)
+        reset_btn.setAutoDefault(False)
+        reset_btn.clicked.connect(reset)
+        cancel_btn.clicked.connect(dialog.reject)
+        form.addWidget(buttons)
+        side = QWidget()
+        side.setLayout(form)
+        outer.addWidget(side)
+        dialog.exec()
+
+    def _pick_used_tsum(self, guess: str, path: Path | None) -> str | None:
+        names = [name for name in used_tsum_names() if name != guess]
+        if not names:
+            QMessageBox.information(
+                self,
+                "今すぐプレイ",
+                "まだ種類がありません。「新規」で名前を付けてください。",
+            )
+            return self._register_used_tsum(path)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("どれですか？"))
+        name_list = QListWidget()
+        for name in names:
+            name_list.addItem(name)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn.setText("これに直す")
+        cancel_btn.setText("やめる")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        row = name_list.currentItem()
+        if row is None:
+            return None
+        return self._save_used_tsum_choice(path, row.text(), None)
+
+    def _register_used_tsum(
+        self,
+        path: Path | None,
+        *,
+        title: str = "今すぐプレイ",
+        allow_skip: bool = True,
+    ) -> str | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("ツム名"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("ガジェット")
+        layout.addWidget(name_edit)
+        layout.addWidget(QLabel("フォルダ名"))
+        dir_edit = QLineEdit()
+        dir_edit.setPlaceholderText("Gadget")
+        layout.addWidget(dir_edit)
+        layout.addWidget(QLabel("種類"))
+        kind_group = QButtonGroup(dialog)
+        kind_buttons = (
+            ("normal", "通常ツム"),
+            ("set", "セットツム"),
+            ("pair", "ペアツム"),
+        )
+        for kind_id, label in kind_buttons:
+            button = QRadioButton(label)
+            kind_group.addButton(button)
+            button.setProperty("kind_id", kind_id)
+            layout.addWidget(button)
+        layout.addWidget(QLabel("チャームツム"))
+        charm_group = QButtonGroup(dialog)
+        charm_yes = QRadioButton("チャームツム")
+        charm_no = QRadioButton("チャームツムではない")
+        charm_group.addButton(charm_yes)
+        charm_group.addButton(charm_no)
+        layout.addWidget(charm_yes)
+        layout.addWidget(charm_no)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn.setText("保存する")
+        cancel_btn.setText("やめる")
+        skip_btn = None
+        if allow_skip:
+            skip_btn = buttons.addButton("指定しない", QDialogButtonBox.ButtonRole.ActionRole)
+            skip_btn.setAutoDefault(False)
+            skip_btn.clicked.connect(lambda: dialog.done(2))
+        def _accept_register() -> None:
+            if kind_group.checkedButton() is None:
+                QMessageBox.information(dialog, title, "種類を選んでください。")
+                return
+            if charm_group.checkedButton() is None:
+                QMessageBox.information(dialog, title, "チャームツムかどうかを選んでください。")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(_accept_register)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_edit.returnPressed.connect(_accept_register)
+        result = dialog.exec()
+        if result == 2:
+            return ""
+        if result != QDialog.DialogCode.Accepted:
+            return None
+        name = " ".join(name_edit.text().split())
+        folder_id = "".join(dir_edit.text().split())
+        if not name:
+            QMessageBox.information(self, title, "ツム名を入力してください。")
+            return None
+        if not folder_id:
+            QMessageBox.information(self, title, "フォルダ名を入力してください。")
+            return None
+        kind_button = kind_group.checkedButton()
+        kind = str(kind_button.property("kind_id") or "")
+        if kind not in {"normal", "set", "pair"}:
+            QMessageBox.information(self, title, "種類を選んでください。")
+            return None
+        saved = self._save_used_tsum_choice(path, name, folder_id)
+        if saved:
+            folder = _used_tsum_folder(saved)
+            _save_tsum_meta(
+                folder.name if folder is not None else folder_id,
+                kind,
+                charm_group.checkedButton() is charm_yes,
+            )
+        return saved
+
+    def _save_used_tsum_choice(
+        self, path: Path | None, name: str, folder_id: str | None
+    ) -> str | None:
+        try:
+            if path is not None and path.is_file():
+                saved = save_used_tsum_teach(path, name, folder_id)
+            elif folder_id:
+                saved = register_used_tsum_id(name, folder_id)
+            else:
+                return name
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存できませんでした", str(exc))
+            return None
+        self._set_status(f"使用ツム {saved}")
+        return saved
+
+    def _on_need_kinds(self) -> None:
+        play = self._play
+        if play is None:
+            return
+        kinds = self._ask_kind_count()
+        if kinds is None:
+            play.provide_kinds(None)
+            self.on_stop()
+            return
+        charm = False
+        saved_meta = _tsum_meta_for_name(self._selected_used_tsum)
+        if saved_meta is not None and isinstance(saved_meta.get("charm"), bool):
+            charm = bool(saved_meta["charm"])
+        elif not _is_not_charm_tsum(self._selected_used_tsum):
+            asked = self._ask_charm_tsum()
+            if asked is None:
+                play.provide_kinds(None)
+                self.on_stop()
+                return
+            charm = asked
+        if charm:
+            kinds = max(1, kinds - 1)
+        play.provide_kinds(kinds)
+
+    def _set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+        self._debug.append(text)
+        if text.startswith("使用ツム "):
+            self._set_mytsum(text[len("使用ツム ") :])
+        self._fill_history()
+
+    def _fill_history(self) -> None:
+        self._history.setPlainText(history_text())
+
+    def _start_ipc(self) -> None:
+        self._ipc_server = QLocalServer(self)
+        self._ipc_server.newConnection.connect(self._on_ipc_connection)
+        if self._ipc_server.listen(IPC_NAME):
+            return
+        QLocalServer.removeServer(IPC_NAME)
+        self._ipc_server.listen(IPC_NAME)
+
+    def _on_ipc_connection(self) -> None:
+        sock = self._ipc_server.nextPendingConnection()
+        action = "activate"
+        games = None
+        hidden = False
+        if sock is not None:
+            if sock.bytesAvailable() or sock.waitForReadyRead(400):
+                try:
+                    payload = json.loads(bytes(sock.readAll()).decode("utf-8").strip() or "{}")
+                    action = str(payload.get("action") or "activate")
+                    games = payload.get("games")
+                    hidden = bool(payload.get("hidden"))
+                except (json.JSONDecodeError, UnicodeError, AttributeError):
+                    action = "activate"
+                    games = None
+                    hidden = False
+            sock.disconnectFromServer()
+            sock.deleteLater()
+        if not hidden:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        if action == "loop":
+            count = games if isinstance(games, int) and games > 0 else None
+            self.on_loop_play(count)
+
+    def _keep_front(self) -> None:
+        if QApplication.activeModalWidget() is not None:
+            return
+        self.raise_()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._placed:
+            return
+        self._placed = True
+        QTimer.singleShot(0, self._fill_screen_height)
+        self._register_play_hotkey()
+
+    def _fill_screen_height(self) -> None:
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        frame = self.frameGeometry()
+        extra = frame.height() - self.height()
+        self.resize(self.width(), max(1, area.height() - max(0, extra)))
+        frame = self.frameGeometry()
+        self.move(max(area.left(), area.right() - frame.width() + 1), area.top())
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
+            self.on_stop()
+            return
+        if self._button_key(event):
+            return
+        super().keyPressEvent(event)
+
+    def _button_key(self, event) -> bool:
+        if event.isAutoRepeat() or QApplication.activeModalWidget() is not None:
+            return False
+        key = event.key()
+        if key == Qt.Key.Key_F5:
+            self.on_play_now()
+            return True
+        if key == Qt.Key.Key_F6:
+            self.on_loop_play()
+            return True
+        if key == Qt.Key.Key_F7:
+            self.capture_btn.click()
+            return True
+        if key == Qt.Key.Key_F8:
+            self.on_capture_screen()
+            return True
+        if key == Qt.Key.Key_F11:
+            self.on_grab_board()
+            return True
+        return False
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            self._enter_yes is not None
+            and event.type()
+            in (QEvent.Type.KeyPress, QEvent.Type.ShortcutOverride)
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        ):
+            if event.isAutoRepeat():
+                return True
+            event.accept()
+            fn = self._enter_yes
+            self._enter_yes = None
+            fn()
+            return True
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Q:
+            if not event.isAutoRepeat() and self._is_busy():
+                self.on_stop()
+                return True
+        if event.type() == QEvent.Type.KeyPress and self._button_key(event):
+            return True
+        return super().eventFilter(watched, event)
+
+    def _poll_capture_key(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        if not self._is_busy():
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F5) & 0x8000)
+            pressed = down and not self._f5_down
+            self._f5_down = down
+            if pressed:
+                self.on_play_now()
+            return
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F8) & 0x8000)
+        pressed = down and not self._f8_down
+        self._f8_down = down
+        if pressed:
+            self.on_capture_screen()
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F11) & 0x8000)
+        pressed = down and not self._f11_down
+        self._f11_down = down
+        if pressed:
+            self.on_grab_board()
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32":
+            raw = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
+            if raw.startswith(b"windows_generic_MSG"):
+                import ctypes
+                from ctypes import wintypes
+
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _STOP_HOTKEY:
+                    QTimer.singleShot(0, self.on_stop)
+                    return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _CAPTURE_HOTKEY:
+                    QTimer.singleShot(0, self.on_capture_screen)
+                    return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _BOARD_HOTKEY:
+                    QTimer.singleShot(0, self.on_grab_board)
+                    return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _PLAY_HOTKEY:
+                    QTimer.singleShot(0, self.on_play_now)
+                    return True, 0
+        return super().nativeEvent(eventType, message)
+
+    def _register_play_hotkey(self) -> None:
+        if sys.platform != "win32" or self._f5_hotkey:
+            return
+        import ctypes
+
+        ok = ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _PLAY_HOTKEY, _MOD_NOREPEAT, _VK_F5
+        )
+        self._f5_hotkey = bool(ok)
+
+    def _register_stop_hotkey(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _STOP_HOTKEY, _MOD_NOREPEAT, _VK_Q
+        )
+        ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _CAPTURE_HOTKEY, _MOD_NOREPEAT, _VK_F8
+        )
+        ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _BOARD_HOTKEY, _MOD_NOREPEAT, _VK_F11
+        )
+
+    def _unregister_stop_hotkey(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _CAPTURE_HOTKEY)
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _BOARD_HOTKEY)
+
+    def closeEvent(self, event) -> None:
+        self._stop_record()
+        self._unregister_stop_hotkey()
+        if sys.platform == "win32" and self._f5_hotkey:
+            import ctypes
+
+            ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _PLAY_HOTKEY)
+            self._f5_hotkey = False
+        stop_server()
+        super().closeEvent(event)
+
+    def _on_intro_ok(self) -> None:
+        if self._stop.is_set():
+            self._on_stopped()
+            return
+        if self._loop_play:
+            self._start_play(start_match=True, ask_kinds=True, loop=True)
+            return
+        self._start_play(loop=False)
+
+    def _on_intro_fail(self, message: str) -> None:
+        self._want_record = False
+        self._set_running(False)
+        self._set_status(message)
+        QMessageBox.critical(self, "PLAY", message)
+
+    def _on_play_fail(self, message: str) -> None:
+        self._stop_record()
+        self._set_running(False)
+        self._set_status(message)
+        QMessageBox.critical(self, "PLAY", message)
+
+    def _on_play_done(self) -> None:
+        self._stop_record()
+        self._set_running(False)
+        text = self.status_label.text()
+        if "リトライ" in text:
+            return
+        if "コイン" not in text and text != "TIME UP" and not text.startswith("録画しました"):
+            self._set_status("TIME UP")
+
+    def _on_stopped(self) -> None:
+        self._stop_record()
+        self._set_running(False)
+        self._set_status("停止しました")
+
+    def create_launch_shortcut(self) -> None:
+        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+        if not desktop:
+            QMessageBox.warning(self, "デスクトップがありません", "デスクトップの場所が分かりませんでした。")
+            return
+        if sys.platform == "darwin":
+            dest = self._create_macos_launch_shortcut(Path(desktop))
+            QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{dest}")
+            return
+        lnk = Path(desktop) / f"{APP_NAME}.lnk"
+        err = self._write_launch_shortcut(lnk)
+        if err:
+            QMessageBox.critical(self, "アイコンを作れませんでした", err)
+            return
+        QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
+
+    def _refresh_desktop_shortcut(self) -> None:
+        desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
+        if not desktop or sys.platform == "darwin":
+            return
+        lnk = Path(desktop) / f"{APP_NAME}.lnk"
+        if lnk.is_file():
+            self._write_launch_shortcut(lnk)
+
+    def _write_launch_shortcut(self, lnk: Path) -> str:
+        python = Path(sys.executable)
+        pythonw = python.with_name("pythonw.exe")
+        target = pythonw if pythonw.exists() else python
+        script = APP_ROOT / "main.py"
+        icon = self._ensure_app_icon()
+
+        def ps_quote(value: str) -> str:
+            return "'" + value.replace("'", "''") + "'"
+
+        icon_line = f"$s.IconLocation = {ps_quote(str(icon) + ',0')}" if icon else ""
+        command = (
+            "$ws = New-Object -ComObject WScript.Shell\n"
+            f"$s = $ws.CreateShortcut({ps_quote(str(lnk))})\n"
+            f"$s.TargetPath = {ps_quote(str(target))}\n"
+            f"$s.Arguments = {ps_quote(chr(34) + str(script) + chr(34))}\n"
+            f"$s.WorkingDirectory = {ps_quote(str(APP_ROOT))}\n"
+            "$s.WindowStyle = 1\n"
+            f"$s.Description = {ps_quote(APP_NAME)}\n"
+            f"{icon_line}\n"
+            "$s.Save()\n"
+        )
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-Command", command],
+                check=False,
+                capture_output=True,
+                text=True,
+                creationflags=flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return str(exc)
+        if result.returncode != 0 or not lnk.exists():
+            return (result.stderr or result.stdout or "ショートカットを作れませんでした").strip()
+        return ""
+
+    def _create_macos_launch_shortcut(self, desktop: Path) -> Path:
+        app_path = desktop / f"{APP_NAME}.app"
+        contents = app_path / "Contents"
+        macos_dir = contents / "MacOS"
+        if app_path.exists():
+            import shutil
+
+            shutil.rmtree(app_path)
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        launcher = macos_dir / "launch"
+        launcher.write_text(
+            "#!/bin/bash\n"
+            f'cd "{APP_ROOT}"\n'
+            f'exec "{sys.executable}" main.py\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        (contents / "Info.plist").write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>launch</string>
+  <key>CFBundleIdentifier</key><string>workshop.tsumtsum-autoplay</string>
+  <key>CFBundleName</key><string>ツムツム オートプレイ</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>10.13</string>
+</dict>
+</plist>
+""",
+            encoding="utf-8",
+        )
+        return app_path
+
+    def _ensure_app_icon(self) -> Path | None:
+        for name in ("launch.ico", "app.ico"):
+            path = APP_ROOT / name
+            if path.is_file():
+                return path
+        return None

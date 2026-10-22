@@ -6,7 +6,13 @@
 
 https://github.com/KumaSuns/auto_play をダウンロードします。
 
-ZIP で取るときは、解凍した中のこのフォルダを使います。`git clone` で取るときも、同じフォルダです。
+ZIP で取るときは、解凍した中のこのフォルダを使います。
+
+`git clone` で取るときは、次を実行します。できた `auto_play` フォルダが、このフォルダです。
+
+```
+git clone https://github.com/KumaSuns/auto_play.git
+```
 
 ## 起動する
 
@@ -17,7 +23,7 @@ pip install PySide6
 python main.py
 ```
 
-ウィンドウの名前は「メニュー」です。もう一度起動したときは、新しい窓は出ません。開いているメニューを前に出します。
+ウィンドウの名前は「AUTO PLAY」です。もう一度起動したときは、新しい窓は出ません。開いているメニューを前に出します。
 
 ## デスクトップのアイコン
 

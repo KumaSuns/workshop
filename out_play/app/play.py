@@ -1,0 +1,5002 @@
+from __future__ import annotations
+
+import colorsys
+import json
+import math
+import random
+import sys
+import tempfile
+import time
+from collections.abc import Callable
+from pathlib import Path
+from queue import Empty, Queue
+from threading import Event, Lock, Thread
+
+from PySide6.QtCore import QPoint, QRect, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
+
+from app.bluestacks import (
+    adb,
+    capture_play_frame,
+    capture_screen_path,
+    capture_window_frame,
+    reset_swipe_mouse,
+    swipe_path,
+    tap,
+    tap_skill,
+)
+from app.intro import (
+    Stopped,
+    _cancel_button,
+    _check_stop,
+    _close_button,
+    _continue_button,
+    _daily_mission_button,
+    _in_play_hud,
+    _match_start_button,
+    _pause_continue_button,
+    _play_button,
+    _retry_button,
+    _slow_tap,
+)
+from app.cinderella_skill import run_cinderella_skill
+from app.elsa_skill import run_elsa_skill
+from app.namine_skill import run_namine_skill
+from app.skill_tsum import (
+    _cbuzz_pose_on,
+    after_skill_tap,
+    cbuzz_press_to_b,
+    skill_breaks_bombs,
+    skill_is_cinderella,
+    skill_is_cloud,
+    skill_is_elsa,
+    skill_is_gadget,
+    skill_is_namine,
+    skill_is_nightmare,
+    skill_is_pooh,
+)
+from app.nightmare_dice import _blank as _nightmare_blank
+from app.nightmare_dice import boogie_on as _nightmare_boogie_on
+from app.nightmare_dice import dice_on as _nightmare_dice_on
+from app.nightmare_dice import nightmare_dice_step
+from app.play_style import (
+    hud_net,
+    hud_situation,
+    bomb_situation,
+    load_unlike,
+    order_found,
+    rank,
+    play_coin,
+    record_hud,
+    record_pick,
+    record_play,
+    record_rl_length,
+    record_rl_wait,
+    flush_style,
+    record_rl_bomb,
+    record_rl_skill,
+    should_bomb,
+    unlike_hit,
+)
+from app.play_web import append_play
+from app.paths import APP_ROOT
+from app.trainer_bridge import (
+    TRAINER_ROOT,
+    load_play_tools,
+    save_erase_lesson,
+    save_play_board,
+)
+
+MIN_CHAIN = 3
+BOARD_TSUMS = 8
+BOARD_READY = 40
+TIMEUP_SCORE = 0.70
+SKILL_GAP = 2.2
+SKILL_FILL_READY = 0.90
+SKILL_FILL_SPENT = 0.40
+GADGET_FEVER_SKILL_MIN = 0.30
+GADGET_TIMER_SKILL = 6
+GADGET_SKILL_TSUMS = 14
+TIME_BOMB_NUMBER = 9
+BOMB_MANY = 3
+SKIP_TTL = 4.0
+ERASE_WAIT = 0.15
+FAN_GAP = 2.0
+_gpu_lock = Lock()
+
+StatusFn = Callable[[str], None]
+
+
+def time_bomb_number(items: list[str] | None) -> int:
+    if items and "+Bomb" in items:
+        return 8
+    return TIME_BOMB_NUMBER
+
+
+def _is_tsum(piece: dict) -> bool:
+    return str(piece.get("kind") or "") in {"tsum", "big"}
+
+
+class PlayWorker(QThread):
+    failed = Signal(str)
+    stopped = Signal()
+    completed = Signal()
+    status = Signal(str)
+    preview = Signal(QImage)
+    gauges = Signal(object, object, object, object, object, object, object, object, object, object)
+    skill_lamp = Signal(bool)
+    my_lamp = Signal(str)
+    items = Signal(str)
+    need_kinds = Signal()
+    need_used_tsum = Signal(str, str, bool)
+
+    def __init__(
+        self,
+        stop: Event,
+        parent=None,
+        start_match: bool = False,
+        kind_count: int | None = None,
+        save_boards: Callable[[], bool] | None = None,
+        board_grabs: Queue | None = None,
+        count_skill: Callable[[], bool] | None = None,
+        loop: bool = False,
+        ask_kinds: bool = False,
+        games: int | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._stop = stop
+        self._start_match = start_match
+        self._kind_count = kind_count
+        self._save_boards = save_boards
+        self._board_grabs = board_grabs
+        self._count_skill = count_skill
+        self._loop = loop
+        self._games = games
+        self._ask_kinds = ask_kinds
+        self._kinds_gate = Event()
+        self._kinds_answer: int | None = None
+        self._used_gate = Event()
+        self._used_answer: str | None = None
+        self.skill_pressed = Event()
+        self.timeup_seen = Event()
+
+    def provide_kinds(self, kinds: int | None) -> None:
+        self._kinds_answer = kinds
+        self._kinds_gate.set()
+
+    def provide_used_tsum(self, name: str | None) -> None:
+        self._used_answer = name
+        self._used_gate.set()
+
+    def _request_kinds(self) -> int | None:
+        self._kinds_gate.clear()
+        self._kinds_answer = None
+        self.need_kinds.emit()
+        while not self._kinds_gate.wait(timeout=0.2):
+            _check_stop(self._stop)
+        return self._kinds_answer
+
+    def _request_used_tsum(
+        self, guess: str, path: Path | None, pick_only: bool
+    ) -> str | None:
+        self._used_gate.clear()
+        self._used_answer = None
+        self.need_used_tsum.emit(guess, str(path) if path is not None else "", pick_only)
+        while not self._used_gate.wait(timeout=0.2):
+            _check_stop(self._stop)
+        return self._used_answer
+
+    def run(self) -> None:
+        try:
+            run_play(
+                self.status.emit,
+                self._stop,
+                start_match=self._start_match,
+                preview=self.preview.emit,
+                gauges=self.gauges.emit,
+                show_items=self.items.emit,
+                kind_count=self._kind_count,
+                save_boards=self._save_boards,
+                board_grabs=self._board_grabs,
+                count_skill=self._count_skill,
+                loop=self._loop,
+                games=self._games,
+                request_kinds=self._request_kinds if self._ask_kinds else None,
+                request_used_tsum=self._request_used_tsum if self._ask_kinds else None,
+                skill_pressed=self.skill_pressed,
+                timeup_seen=self.timeup_seen,
+                skill_lamp=self.skill_lamp.emit,
+                my_lamp=self.my_lamp.emit,
+            )
+        except Stopped:
+            self.stopped.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit()
+        finally:
+            flush_style()
+
+
+def run_play(
+    report: StatusFn | None,
+    stop: Event | None,
+    start_match: bool = False,
+    preview: Callable[[QImage], None] | None = None,
+    gauges: Callable[..., None] | None = None,
+    show_items: Callable[[str], None] | None = None,
+    kind_count: int | None = None,
+    save_boards: Callable[[], bool] | None = None,
+    board_grabs: Queue | None = None,
+    count_skill: Callable[[], bool] | None = None,
+    loop: bool = False,
+    games: int | None = None,
+    request_kinds: Callable[[], int | None] | None = None,
+    request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
+    skill_pressed: Event | None = None,
+    timeup_seen: Event | None = None,
+    skill_lamp: Callable[[bool], None] | None = None,
+    my_lamp: Callable[[str], None] | None = None,
+) -> None:
+    def say(text: str) -> None:
+        if report is not None:
+            report(text)
+
+    games_done = 0
+
+    def _continue_after_game() -> bool:
+        nonlocal games_done
+        games_done += 1
+        if games is not None:
+            return games_done < games
+        return loop
+
+    my_mode = "off"
+
+    def set_my_lamp(mode: str) -> None:
+        nonlocal my_mode
+        if my_lamp is None or mode == my_mode:
+            return
+        my_mode = mode
+        my_lamp(mode)
+
+    def show_used(names: list[str] | None) -> None:
+        if show_items is None:
+            return
+        show_items("、".join(names) if names else "－")
+
+    arrived = ""
+    used_tsum = ""
+    tsum_unspecified = False
+    start_items: list[str] | None = None
+    tsum_asked = request_used_tsum is None
+
+    def ask_used_now(at_start: bool) -> None:
+        nonlocal used_tsum, tsum_asked, start_items, tsum_unspecified
+        if tsum_asked or request_used_tsum is None:
+            return
+        if at_start:
+            try:
+                path = capture_screen_path()
+            except Exception:
+                path = None
+            guess = used_tsum
+            if not guess and path is not None:
+                guess = _read_used_tsum(path)
+            if guess and not used_tsum:
+                say(f"使用ツム {guess}")
+            if path is not None and not start_items:
+                start_items = _items_used_path(path) or start_items
+            confirmed = request_used_tsum(guess, path, False)
+        else:
+            confirmed = request_used_tsum("", None, True)
+        if confirmed is None:
+            raise Stopped()
+        tsum_asked = True
+        if confirmed:
+            used_tsum = confirmed
+            tsum_unspecified = False
+            say(f"使用ツム {confirmed}")
+        else:
+            used_tsum = ""
+            tsum_unspecified = True
+            say("使用ツム —")
+
+    if start_match:
+        _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
+            say, stop, tap_start=False
+        )
+        if seen_tsum:
+            used_tsum = seen_tsum
+        if arrived in ("start", "continue"):
+            ask_used_now(arrived == "start")
+        elif not tsum_asked:
+            ask_used_now(False)
+        if arrived in ("start", "continue") and request_kinds is not None:
+            asked = request_kinds()
+            if asked is None:
+                raise Stopped()
+            kind_count = asked
+
+    say("モデルを読み込み中")
+    try:
+        predictor, candidates = load_play_tools()
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "画面認識に必要なライブラリがありません。画面認識アプリと同じ Python で起動してください。"
+        ) from exc
+    if getattr(predictor, "piece_model", None) is None:
+        raise RuntimeError("ツムの〇モデルがありません。画面認識アプリで学習してください。")
+    if getattr(predictor, "type_model", None) is None:
+        raise RuntimeError("ツム種類のモデルがありません。画面認識アプリで学習してください。")
+    if getattr(predictor, "scene_model", None) is None:
+        raise RuntimeError("TIME UP のモデルがありません。")
+
+    say("プレイを開始します")
+    say(f"予測デバイス {predictor.device}")
+    reset_swipe_mouse()
+    unlike = load_unlike()
+    skip_chains: list[frozenset[tuple[int, int]]] = []
+    skip_born: dict[frozenset[tuple[int, int]], float] = {}
+    saved_boards: set[tuple[tuple[int, int], ...]] = set()
+    game = None
+    skill = None
+    fever = None
+    fever_full_w = None
+    fever_seen = None
+    fever_cache = None
+    timer = None
+    fan = None
+    hud_ready = False
+    last_skill_at = 0.0
+    skill_wait_empty = False
+    skip_after_skill = False
+    skip_loss = False
+    skill_busy = [False]
+    skill_ring_hold = [False]
+    pooh_long = False
+    bomb_after_long = False
+    last_fan_at = 0.0
+    last_bomb_at = 0.0
+    skip_bomb_cells: set[tuple[int, int]] = set()
+    last_skill_look = -2.0
+    last_save_at = 0.0
+    ignore_start_until = 0.0
+    saw_board = False
+    saw_timer = False
+    hud_gone_seen = False
+    fan_fall_n: int | None = None
+    fan_fall_moved = False
+    resumed_pause = False
+    match_over = False
+    clears = 0
+    swipes = 0
+    coin = 0
+    skill_taps = 0
+    skill_ok = 0
+    skill_used = 0
+    press_counted = False
+    my_erase = 0
+    bomb_taps = 0
+    fan_taps = 0
+    idle_pick: tuple[list[int], int] | None = None
+    idle_acc = 0.0
+    idle_since: float | None = None
+    idle_cap = 0.0
+    idle_pred = 0.0
+    idle_heat = 0.0
+    idle_type = 0.0
+    idle_find = 0.0
+    idle_act = 0.0
+    wait_times: list[float] = []
+    bomb_pick: tuple[str, bool] | None = None
+    bomb_acc = 0.0
+    bomb_asked = False
+    bomb_asked_sit = ""
+    skill_pick: tuple[str, bool] | None = None
+    skill_acc = 0.0
+    nightmare_dice = _nightmare_blank()
+    pending_lesson: tuple[list[int], int] | None = None
+    pending_hud: list[tuple[str, str, bool]] = []
+    last_boxes: dict[str, dict[str, int]] = {}
+    pending_spots: list[tuple[int, int, int, tuple[float, float, float] | None]] | None = None
+    pending_key: frozenset[tuple[int, int]] | None = None
+    pending_n = 0
+    pending_at = 0.0
+    pending_burst = 1
+    pending_group = 0
+    pending_my_n = 0
+    pending_skip: list[frozenset[tuple[int, int]]] = []
+    pending_used: set[tuple[int, int]] = set()
+    match_picks: list[tuple[list[int], int]] = []
+    pieces: list[dict[str, int]] = []
+
+    def fresh_match() -> None:
+        nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
+        nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
+        nonlocal ignore_start_until, saw_board, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
+        nonlocal clears, swipes, coin, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
+        nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
+        nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
+        nonlocal my_group, skill_face, my_vec, match_picks, idle_pick, idle_acc, idle_since
+        nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty
+        nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
+        nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
+        nonlocal skill_pick, skill_acc
+        nonlocal go_at, used_items, wait_times, pieces
+        game = None
+        skill = None
+        fever = None
+        fever_full_w = None
+        fever_seen = None
+        fever_cache = None
+        timer = None
+        fan = None
+        hud_ready = False
+        last_skill_at = 0.0
+        skill_wait_empty = False
+        skill_ring_hold[0] = False
+        skip_after_skill = False
+        skip_loss = False
+        skill_busy[0] = False
+        pooh_long = False
+        bomb_after_long = False
+        last_fan_at = 0.0
+        last_bomb_at = 0.0
+        skip_bomb_cells = set()
+        last_skill_look = -2.0
+        last_save_at = 0.0
+        ignore_start_until = time.time() + 6
+        saw_board = False
+        saw_timer = False
+        hud_gone_seen = False
+        fan_fall_n = None
+        fan_fall_moved = False
+        resumed_pause = False
+        pieces = []
+        watching.clear()
+        clears = 0
+        swipes = 0
+        coin = 0
+        skill_taps = 0
+        skill_ok = 0
+        skill_used = 0
+        press_counted = False
+        my_erase = 0
+        set_my_lamp("off")
+        bomb_taps = 0
+        fan_taps = 0
+        idle_pick = None
+        idle_acc = 0.0
+        idle_since = None
+        idle_cap = 0.0
+        idle_pred = 0.0
+        idle_heat = 0.0
+        idle_type = 0.0
+        idle_find = 0.0
+        idle_act = 0.0
+        wait_times = []
+        bomb_pick = None
+        bomb_acc = 0.0
+        bomb_asked = False
+        bomb_asked_sit = ""
+        skill_pick = None
+        skill_acc = 0.0
+        pending_lesson = None
+        pending_hud = []
+        last_boxes = {}
+        pending_spots = None
+        pending_key = None
+        pending_n = 0
+        pending_at = 0.0
+        pending_burst = 1
+        pending_group = 0
+        pending_my_n = 0
+        pending_skip = []
+        pending_used = set()
+        match_picks = []
+        skip_chains = []
+        skip_born = {}
+        saved_boards = set()
+        my_group = 0
+        skill_face = None
+        my_vec = None
+        skill_my_n = 0
+        skill_my_full = None
+        skill_my_held = False
+        skill_saw_empty = False
+        nightmare_dice.clear()
+        nightmare_dice.update(_nightmare_blank())
+        watch_hit.clear()
+        watching.clear()
+        if timeup_seen is not None:
+            timeup_seen.clear()
+        go_at = None
+        used_items = None
+
+    def close_idle() -> None:
+        nonlocal idle_acc, idle_since, bomb_acc, skill_acc
+        if idle_since is not None:
+            dt = time.time() - idle_since
+            idle_acc += dt
+            bomb_acc += dt
+            skill_acc += dt
+            idle_since = None
+
+    def note_idle(on: bool) -> None:
+        nonlocal idle_since
+        if on:
+            if idle_since is None:
+                idle_since = time.time()
+            return
+        close_idle()
+
+    def note_found(has_chain: bool) -> None:
+        note_idle(bool(saw_board and not has_chain))
+
+    def add_idle(name: str, dt: float) -> None:
+        nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
+        if idle_since is None:
+            return
+        if name == "cap":
+            idle_cap += dt
+        elif name == "pred":
+            idle_pred += dt
+        elif name == "heat":
+            idle_heat += dt
+        elif name == "type":
+            idle_type += dt
+        elif name == "find":
+            idle_find += dt
+        else:
+            idle_act += dt
+
+    def clear_idle_parts() -> None:
+        nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
+        idle_cap = 0.0
+        idle_pred = 0.0
+        idle_heat = 0.0
+        idle_type = 0.0
+        idle_find = 0.0
+        idle_act = 0.0
+
+    def load_hud() -> None:
+        nonlocal last_boxes, skill, game, fever, timer, fan, hud_ready
+        nonlocal last_skill_at, skill_wait_empty
+        if hud_ready:
+            return
+        with _gpu_lock:
+            boxes = predictor.predict_all(Path("."), rgb=rgb)
+        last_boxes = boxes
+        game, found_skill, fever, timer, fan = _merge_hud(
+            boxes, game, None, fever, timer, fan, meters=True
+        )
+        if found_skill is not None:
+            skill = found_skill
+        if skill is None:
+            return
+        hud_ready = True
+        last_skill_at = 0.0
+        skill_wait_empty = False
+
+    def flush_idle(keep: bool = False) -> None:
+        nonlocal idle_acc, idle_pick, skip_loss
+        close_idle()
+        if idle_pick is not None:
+            record_rl_wait(idle_pick[0], idle_pick[1], idle_acc)
+            if keep and not skip_loss:
+                wait_times.append(round(max(0.0, float(idle_acc)), 1))
+                rest = max(
+                    0.0,
+                    float(idle_acc) - idle_cap - idle_heat - idle_type - idle_find - idle_act,
+                )
+                say(
+                    f"LossTime {idle_acc:.1f}s / "
+                    f"画面 {idle_cap:.1f}s / "
+                    f"位置 {idle_heat:.1f}s / "
+                    f"種類 {idle_type:.1f}s / "
+                    f"つなぎ {idle_find:.1f}s / "
+                    f"スキルボム扇 {idle_act:.1f}s / "
+                    f"ほか {rest:.1f}s"
+                )
+        skip_loss = False
+        idle_acc = 0.0
+        idle_pick = None
+        clear_idle_parts()
+
+    def flush_bomb() -> None:
+        nonlocal bomb_acc, bomb_pick
+        close_idle()
+        if bomb_pick is not None:
+            record_rl_bomb(bomb_pick[0], bomb_pick[1], bomb_acc)
+        bomb_acc = 0.0
+        bomb_pick = None
+
+    def flush_skill() -> None:
+        nonlocal skill_acc, skill_pick
+        close_idle()
+        if skill_pick is not None:
+            record_rl_skill(skill_pick[0], skill_pick[1], skill_acc)
+        skill_acc = 0.0
+        skill_pick = None
+
+    def start_bomb_pick(sit: str, pressed: bool) -> None:
+        nonlocal bomb_pick, bomb_acc
+        flush_bomb()
+        bomb_pick = (sit, pressed)
+        bomb_acc = 0.0
+
+    def settle_pending(erased: bool) -> None:
+        nonlocal pending_lesson, pending_burst, pending_spots, pending_key
+        nonlocal pending_n, pending_at, pending_group, pending_my_n, pending_skip, pending_used
+        nonlocal bomb_asked, bomb_asked_sit
+        bomb_asked = False
+        bomb_asked_sit = ""
+        if pending_lesson is not None:
+            record_pick(pending_lesson[0], pending_lesson[1], erased)
+            pending_lesson = None
+        pending_burst = 1
+        pending_spots = None
+        pending_key = None
+        pending_n = 0
+        pending_at = 0.0
+        pending_group = 0
+        pending_my_n = 0
+        pending_skip = []
+        pending_used = set()
+        set_my_lamp("off")
+
+    def credit_pending(after=None, by_count: bool = False) -> bool:
+        nonlocal clears, skill_my_n
+        if pending_spots is None:
+            return False
+        if by_count:
+            gone = pending_n > 0 and len(tsums) <= pending_n - MIN_CHAIN
+        else:
+            if after is None:
+                return False
+            gone = not _spots_lingered(after, pending_spots)
+        if not gone:
+            return False
+        clears += max(1, int(pending_burst))
+        if skill_saw_empty and pending_my_n > 0:
+            skill_my_n += pending_my_n
+        settle_pending(True)
+        say(_counts_line(clears, swipes, coin))
+        return True
+
+    def ask_bomb(sit: str, default: bool) -> bool:
+        nonlocal bomb_asked, bomb_asked_sit
+        if bomb_asked and bomb_asked_sit == sit:
+            return False
+        go = should_bomb(sit, default)
+        start_bomb_pick(sit, go)
+        if not go:
+            bomb_asked = True
+            bomb_asked_sit = sit
+        return go
+
+    def start_skill_pick(sit: str, pressed: bool) -> None:
+        nonlocal skill_pick, skill_acc
+        flush_skill()
+        skill_pick = (sit, pressed)
+        skill_acc = 0.0
+
+    def try_bomb(sit: str, force: bool = False, target: dict[str, int] | None = None) -> bool:
+        nonlocal last_bomb_at, bomb_taps
+        bombs = _bombs_on_board(pieces, game)
+        if not bombs:
+            return False
+        live = {_piece_cell(piece) for piece in bombs}
+        skip_bomb_cells.intersection_update(live)
+        sit_bomb = bomb_situation(sit, len(bombs))
+        if not force and not ask_bomb(sit_bomb, True):
+            return False
+        if _nightmare_live_dice():
+            return False
+        if target is not None:
+            cell = _piece_cell(target)
+            if cell in skip_bomb_cells:
+                return False
+            say(f"ボムをタップ {int(target['x'])},{int(target['y'])}")
+            tap(
+                int(target["x"]),
+                int(target["y"]),
+                screen_w=image.width(),
+                screen_h=image.height(),
+            )
+            did = True
+        else:
+            did, cell = _tap_biggest_bomb(
+                pieces, image, say, stop, game, skip_bomb_cells
+            )
+        if not did:
+            return False
+        if cell is not None:
+            skip_bomb_cells.add(cell)
+        bomb_taps += 1
+        last_bomb_at = time.time()
+        pending_hud.append((sit, "bomb", True))
+        return True
+
+    def tap_bombs_after_chains(swipes_n: int, longest: int) -> None:
+        if swipes_n < 2 and longest < time_bomb_number(used_items):
+            if swipes_n >= 1:
+                try_bomb(skill_sit(False), force=False)
+            return
+        if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+            return
+        sit = skill_sit(False)
+        while True:
+            left = [
+                piece
+                for piece in _bombs_on_board(pieces, game)
+                if _piece_cell(piece) not in skip_bomb_cells
+            ]
+            if not (len(left) >= BOMB_MANY or len(left) == 1):
+                return
+            if not try_bomb(sit, force=True):
+                return
+            if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                return
+
+    def break_to_one() -> bool:
+        nonlocal bomb_taps, last_bomb_at, bomb_after_long, skip_bomb_cells
+        bombs = _bombs_on_board(pieces, game)
+        if len(bombs) < BOMB_MANY:
+            return False
+        taps = _break_bombs_until_one(predictor, game, say, stop, watch_hit)
+        if taps:
+            bomb_taps += taps
+            last_bomb_at = time.time()
+            skip_bomb_cells.clear()
+            bomb_after_long = False
+        return taps > 0
+
+    def apply_checker_skill(has_chain: bool) -> bool:
+        nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps, skill_used, press_counted
+        nonlocal bomb_taps, last_bomb_at, skip_loss, pooh_long, swipes
+        nonlocal skill_my_n, skill_saw_empty
+
+        def note_used() -> None:
+            nonlocal skill_used, press_counted
+            skill_used += 1
+            press_counted = True
+
+        if skill_pressed is None or not skill_pressed.is_set():
+            return False
+        skill_pressed.clear()
+        if watch_hit.is_set() or skill is None:
+            return False
+        if skill_wait_empty:
+            fill = _skill_fill(rgb, skill)
+            if fill is not None and fill < SKILL_FILL_SPENT:
+                skill_ok += 1
+                skill_my_n = 0
+                skill_saw_empty = True
+                skill_wait_empty = False
+        skill_busy[0] = True
+        try:
+            pending_hud.append((skill_sit(has_chain), "skill", True))
+            flush_idle(True)
+            start_skill_pick(skill_sit(has_chain), True)
+            skill_taps += 1
+            last_skill_at = time.time()
+            skill_wait_empty = True
+            if skill_is_cinderella(used_tsum):
+                if not _cinderella_ring_off(skill, stop, watch_hit):
+                    skill_ring_hold[0] = False
+                    return False
+                skip_loss = True
+                swipes += run_cinderella_skill(
+                    predict=lambda rgb: predictor.predict_pieces(
+                        Path("."), game, rgb=rgb, inner=False, assign_groups=False
+                    ),
+                    game=game,
+                    say=say,
+                    stop=stop,
+                    watch_hit=watch_hit,
+                    preview=preview,
+                    draw=_draw_plan,
+                    gpu_lock=_gpu_lock,
+                    skill_lamp=skill_lamp,
+                )
+                note_used()
+                return True
+            if skill_is_elsa(used_tsum):
+                skip_loss = True
+                swipes += run_elsa_skill(
+                    predict=lambda shot: predictor.predict_pieces(
+                        Path("."), game, rgb=shot, inner=False
+                    ),
+                    game=game,
+                    say=say,
+                    stop=stop,
+                    watch_hit=watch_hit,
+                    preview=preview,
+                    draw=_draw_plan,
+                    gpu_lock=_gpu_lock,
+                    skill_lamp=skill_lamp,
+                )
+                note_used()
+                return True
+            if skill_is_namine(used_tsum):
+                done = run_namine_skill(
+                    predict=lambda shot: predictor.predict_pieces(
+                        Path("."), game, rgb=shot, inner=False
+                    ),
+                    game=game,
+                    my_group=my_group,
+                    before_pieces=list(pieces),
+                    say=say,
+                    stop=stop,
+                    watch_hit=watch_hit,
+                    preview=preview,
+                    draw=_draw_plan,
+                    gpu_lock=_gpu_lock,
+                    skill_lamp=skill_lamp,
+                    find_my=lambda shot, found: _mytsum_group(
+                        predictor,
+                        _qimage_rgb(shot),
+                        [piece for piece in found if _is_tsum(piece)],
+                        skill,
+                    )[0],
+                )
+                if done is None:
+                    return False
+                skip_loss = True
+                swipes += done
+                note_used()
+                return True
+            if skill_is_cloud(used_tsum):
+                skip_loss = True
+                note_used()
+                return True
+            if skill_breaks_bombs(used_tsum):
+                start = skill_tap_at[0] or time.time()
+                activated, pose_seen = _cbuzz_activated(skill, start, stop, watch_hit)
+                if not activated:
+                    return False
+                skip_loss = True
+                _sleep_stop(0.12, stop)
+                if not tsum_unspecified:
+                    after_skill_tap(
+                        used_tsum,
+                        image,
+                        rgb,
+                        say,
+                        stop,
+                        watch_hit=watch_hit,
+                        game=game,
+                        started_at=start,
+                        pose_seen=pose_seen,
+                    )
+                n = _break_bombs_until_two(predictor, game, say, stop, watch_hit)
+                bomb_taps += n
+                if n:
+                    last_bomb_at = time.time()
+                note_used()
+                return True
+            spent_ok = _skill_tap_spent(skill, stop, watch_hit)
+            if not spent_ok:
+                return False
+            skip_loss = True
+            if not tsum_unspecified:
+                after_skill_tap(
+                    used_tsum, image, rgb, say, stop, watch_hit=watch_hit, game=game
+                )
+            if skill_is_pooh(used_tsum):
+                pooh_long = True
+            note_used()
+            return True
+        finally:
+            skill_busy[0] = False
+
+    def take_timer() -> int | None:
+        with _gpu_lock:
+            return _read_timer(predictor, rgb, timer)
+
+    def take_fever() -> float | None:
+        nonlocal fever_full_w, fever_seen, fever_cache
+        if fever_seen is rgb:
+            return fever_cache
+        fill, fever_full_w = _read_fever(rgb, fever, skill, fan, fever_full_w)
+        fever_seen = rgb
+        fever_cache = fill
+        return fill
+
+    def skill_sit(has_chain: bool) -> str:
+        fever_fill = take_fever() or 0.0
+        fever_on = _fever_playing(rgb, game)
+        has_bomb = any(str(piece.get("kind") or "") == "bomb" for piece in pieces)
+        return hud_situation(
+            fever_on,
+            fever_fill,
+            has_chain,
+            has_bomb,
+            len(tsums) >= BOARD_TSUMS,
+        )
+
+    my_group = 0
+    skill_face = None
+    my_vec = None
+    skill_my_n = 0
+    skill_my_full: int | None = None
+    skill_my_held = False
+    skill_saw_empty = False
+    kinds = 5
+
+    def count_skill_on() -> bool:
+        return count_skill is not None and count_skill()
+
+    def look_mytsum() -> None:
+        nonlocal my_group, skill_face, last_skill_look
+        if my_group > 0 or skill is None:
+            return
+        now_look = time.time()
+        if now_look - last_skill_look < 2.0:
+            return
+        last_skill_look = now_look
+        t0 = time.perf_counter()
+        with _gpu_lock:
+            looked, face = _mytsum_group(predictor, rgb, tsums, skill)
+        add_idle("pred", time.perf_counter() - t0)
+        if face is not None:
+            skill_face = face
+        if looked > 0:
+            my_group = looked
+
+    def tick_skill_count() -> None:
+        nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty, skill_wait_empty
+        if skill is None or rgb is None:
+            return
+        fill = _meter_skill_fill(rgb, skill)
+        if fill is not None and fill >= SKILL_FILL_READY:
+            yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+            if yellow >= SLOT_ON and skill_saw_empty and skill_my_n > 0:
+                if skill_my_full != skill_my_n:
+                    skill_my_full = skill_my_n
+                    skill_my_held = True
+                    if count_skill_on():
+                        say(f"スキル満タン {skill_my_full}個")
+                skill_saw_empty = False
+            if yellow >= SLOT_ON:
+                return
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            if not skill_saw_empty:
+                skill_my_n = 0
+                if skill_wait_empty:
+                    skill_wait_empty = False
+                else:
+                    skill_my_full = None
+                    skill_my_held = False
+            skill_saw_empty = True
+
+    def mytsum_in_chain(chain: list[dict[str, int]]) -> int:
+        if skill_is_nightmare(used_tsum):
+            return len(chain)
+        if my_group <= 0 or not chain:
+            return 0
+        if int(chain[0].get("group") or 0) != my_group:
+            return 0
+        return len(chain)
+
+    def skill_full_n() -> int | None:
+        if skill_is_gadget(used_tsum):
+            return GADGET_SKILL_TSUMS
+        if skill_my_full is not None and int(skill_my_full) > 0:
+            return int(skill_my_full)
+        return None
+
+    def skill_n_show() -> tuple[int | None, bool]:
+        if not count_skill_on():
+            return None, False
+        if skill_my_full is not None and skill_my_full > 0:
+            return skill_my_full, True
+        if skill_saw_empty and skill_my_n > 0:
+            return skill_my_n, False
+        return None, False
+
+    def emit_gauges(_skill_fill: float | None) -> None:
+        take_fever()
+
+    def _nightmare_chain_n() -> int:
+        if used_items and "+Bomb" in used_items:
+            return 9
+        return 10
+
+    def _chain_pref(chain: list[dict[str, int]]) -> tuple:
+        if skill_is_nightmare(used_tsum):
+            aim = _nightmare_chain_n()
+            n = len(chain)
+            if n == aim:
+                band = 3
+            elif n == aim + 1:
+                band = 2
+            elif n == aim - 1:
+                band = 1
+            else:
+                band = 0
+            return (band, -abs(n - aim))
+        return (
+            my_group > 0 and int(chain[0].get("group") or 0) == my_group,
+            len(chain),
+        )
+
+    def list_found(
+        pieces: list[dict[str, int]],
+        tsums: list[dict[str, int]],
+        extra: list[frozenset[tuple[int, int]]] | None = None,
+        used_spots: set[tuple[int, int]] | None = None,
+    ) -> list[list[dict[str, int]]]:
+        gone = set(used_spots or ())
+        live = [
+            piece
+            for piece in pieces
+            if not _is_tsum(piece) or (int(piece["x"]), int(piece["y"])) not in gone
+        ]
+        live_tsums = [piece for piece in live if _is_tsum(piece)]
+        if pooh_long and rgb is not None:
+            live = [dict(piece) for piece in live]
+            live_tsums = [piece for piece in live if _is_tsum(piece)]
+            for piece in live_tsums:
+                if _piece_is_yellow(rgb, piece):
+                    piece["group"] = 99
+        if len(live_tsums) < MIN_CHAIN:
+            return []
+        blocked = skip_chains
+        chained = candidates(live, 8)
+        if pooh_long:
+            raw = [item for item in chained if len(item) >= MIN_CHAIN]
+        else:
+            raw = [
+                part
+                for item in chained
+                for part in _parts_without_unlike(item, unlike)
+                if len(part) >= MIN_CHAIN
+            ]
+        found = [item for item in raw if not _chain_too_similar(item, blocked)]
+        if skill_is_nightmare(used_tsum):
+            aim = _nightmare_chain_n()
+            trimmed = []
+            for item in found:
+                if len(item) >= aim + 2:
+                    item = item[:aim]
+                if len(item) >= MIN_CHAIN:
+                    trimmed.append(item)
+            found = trimmed
+        if extra:
+            extra_keys = set(extra)
+            found = [item for item in found if _chain_key(item) not in extra_keys]
+        found.sort(key=len, reverse=True)
+        if pooh_long:
+            return found
+        found.sort(key=_chain_pref, reverse=True)
+        return found
+    kinds_locked = False
+    used_items: list[str] | None = start_items
+    go_at: float | None = None
+    if kind_count is not None and int(kind_count) >= 1:
+        kinds = int(kind_count)
+        kinds_locked = True
+        say(f"種類 {kinds}")
+    if start_items is not None:
+        show_used(start_items)
+    if used_items:
+        say("アイテム " + "、".join(used_items))
+    if start_match and arrived == "start":
+        found_items = _tap_start_now(say, stop)
+        if found_items is not None:
+            used_items = found_items
+            show_used(found_items)
+    elif start_match and arrived == "continue":
+        resumed_pause = _tap_continue_now(say, stop)
+        if resumed_pause:
+            saw_board = True
+            kinds_locked = True
+            if go_at is None:
+                go_at = time.time()
+    watching = Event()
+    watch_hit = Event()
+    stop_watch = Event()
+    watcher = Thread(
+        target=_watch_timeup,
+        args=(predictor, stop_watch, watching, watch_hit, stop),
+        daemon=True,
+    )
+    watcher.start()
+    if resumed_pause:
+        watching.set()
+    checker_alive = [True]
+    before_start = [False]
+    next_skill_at = [0.0]
+    skill_tap_at = [0.0]
+    skill_press_lock = Lock()
+    board_bombs = [None]
+
+    def tap_cinderella_fan(frame) -> None:
+        nonlocal fan_taps, last_fan_at
+        if not skill_is_cinderella(used_tsum) or fan is None or frame is None or frame.isNull():
+            return
+        _tap_fan(fan, frame, say, stop)
+        fan_taps += 1
+        last_fan_at = time.time()
+
+    def _nightmare_live_dice() -> bool:
+        if not skill_is_nightmare(used_tsum):
+            return False
+        try:
+            shot = capture_play_frame()
+            rgb_now = _qimage_rgb(shot)
+        except Exception:
+            return True
+        if rgb_now is None or shot.isNull():
+            return True
+        play_frame[0] = shot
+        play_frame[1] = rgb_now
+        play_frame_at[0] = time.time()
+        if _nightmare_dice_on(rgb_now) or _nightmare_boogie_on(rgb_now):
+            nightmare_dice["block"] = True
+            return True
+        nightmare_dice["block"] = False
+        return False
+
+    def press_skill_now(point, bombs_ok: bool = False) -> None:
+        nonlocal fan_taps, last_fan_at
+        if before_start[0] or not saw_board:
+            return
+        if _nightmare_live_dice():
+            return
+        if not bombs_ok and board_bombs[0] != 0:
+            return
+        if point is None or skill_busy[0] or watch_hit.is_set():
+            return
+        now = time.time()
+        with skill_press_lock:
+            if now < next_skill_at[0]:
+                return
+            next_skill_at[0] = now + SKILL_GAP
+        skill_tap_at[0] = now
+        try:
+            tap_skill(
+                int(point[0]),
+                int(point[1]),
+                screen_w=int(point[2]),
+                screen_h=int(point[3]),
+            )
+        except Exception:
+            with skill_press_lock:
+                next_skill_at[0] = time.time() + 0.5
+            return
+        shot = play_frame[0]
+        if skill_is_cinderella(used_tsum):
+            fan_image = shot if shot is not None and not shot.isNull() else image
+            tap_cinderella_fan(fan_image)
+        elif (
+            skill_breaks_bombs(used_tsum)
+            and fan is not None
+            and shot is not None
+            and not shot.isNull()
+        ):
+            _tap_fan(fan, shot, say, stop)
+            fan_taps += 1
+            last_fan_at = time.time()
+        if skill_pressed is not None:
+            skill_pressed.set()
+        skill_ring_hold[0] = True
+
+    def skill_ready_now(rgb_now) -> bool:
+        if skill is None or rgb_now is None:
+            return False
+        yellow, _blue = _skill_ring_yellow_blue(rgb_now, _skill_button_square(skill))
+        if skill_ring_hold[0]:
+            if yellow < SLOT_ON:
+                skill_ring_hold[0] = False
+            return False
+        return _skill_ready(rgb_now, skill, used_tsum)
+
+    def _clear_bombs_before_skill() -> None:
+        nonlocal bomb_taps, last_bomb_at
+        if _nightmare_live_dice():
+            return
+        if not board_bombs[0]:
+            return
+        was_busy = skill_busy[0]
+        skill_busy[0] = True
+        try:
+            if skill_is_namine(used_tsum):
+                if int(board_bombs[0]) <= 1:
+                    return
+                n = _break_bombs_until_one(predictor, game, say, stop, watch_hit)
+            else:
+                n = _break_bombs_until_zero(
+                    predictor,
+                    game,
+                    say,
+                    stop,
+                    watch_hit,
+                    seed=(image, pieces),
+                )
+            bomb_taps += n
+            if n:
+                last_bomb_at = time.time()
+        finally:
+            skill_busy[0] = was_busy
+
+    def _press_ready_skill() -> None:
+        _clear_bombs_before_skill()
+        button = _skill_button_square(skill)
+        press_skill_now(
+            (
+                int(button["x"] + max(1, int(button["w"])) / 2),
+                int(button["y"] + max(1, int(button["h"])) / 2),
+                int(image.width()),
+                int(image.height()),
+            ),
+            bombs_ok=True,
+        )
+
+    def about_to_fill_skill(chain: list[dict[str, int]]) -> bool:
+        if skill_is_gadget(used_tsum) or skill_breaks_bombs(used_tsum):
+            return False
+        added = mytsum_in_chain(chain)
+        if skill is None or added <= 0 or not skill_saw_empty or watch_hit.is_set():
+            return False
+        if skill_my_full is None or skill_my_full <= 0 or not skill_my_held:
+            return False
+        if skill_my_n + added < skill_my_full:
+            return False
+        fill = _meter_skill_fill(rgb, skill)
+        if fill is None or fill < SKILL_FILL_SPENT or fill >= SKILL_FILL_READY:
+            return False
+        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+        return yellow < SLOT_ON
+
+    def mash_skill_until_on(sure: bool) -> bool:
+        nonlocal skill_my_n, skill_saw_empty
+        if skill is None or not sure or skill_breaks_bombs(used_tsum):
+            return False
+        if time.time() < next_skill_at[0]:
+            return False
+        fill_now = _meter_skill_fill(rgb, skill)
+        if fill_now is None or fill_now < SKILL_FILL_SPENT or fill_now >= SKILL_FILL_READY:
+            return False
+        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+        if yellow >= SLOT_ON:
+            return False
+        skill_my_n = 0
+        skill_saw_empty = False
+        button = _skill_button_square(skill)
+        point = (
+            int(button["x"] + max(1, int(button["w"])) / 2),
+            int(button["y"] + max(1, int(button["h"])) / 2),
+            int(image.width()),
+            int(image.height()),
+        )
+        skill_busy[0] = True
+        say("スキルを連打します")
+        base = _window_skill_fill(skill)
+        seen_charged = base is not None and base >= SKILL_FILL_SPENT
+        tapped = False
+        still = 0
+        try:
+            while True:
+                _check_stop(stop)
+                if watch_hit.is_set():
+                    return False
+                now = time.time()
+                if not tapped:
+                    skill_tap_at[0] = now
+                if _nightmare_live_dice():
+                    return False
+                try:
+                    tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
+                except Exception:
+                    return False
+                if not tapped:
+                    tap_cinderella_fan(image)
+                tapped = True
+                fill = _window_skill_fill(skill)
+                if fill is not None and fill >= SKILL_FILL_SPENT:
+                    seen_charged = True
+                    if base is None or fill > base:
+                        still = 0
+                        base = fill
+                if seen_charged and fill is not None and fill < SKILL_FILL_SPENT:
+                    with skill_press_lock:
+                        next_skill_at[0] = time.time() + SKILL_GAP
+                    return True
+                if fill is not None and fill >= SKILL_FILL_READY:
+                    with skill_press_lock:
+                        next_skill_at[0] = time.time() + SKILL_GAP
+                    return True
+                if (
+                    not sure
+                    and not seen_charged
+                    and tapped
+                    and fill is not None
+                    and fill < SKILL_FILL_READY
+                    and (base is None or fill <= base)
+                ):
+                    still += 1
+                    if still >= 2:
+                        return False
+        finally:
+            skill_busy[0] = False
+
+    latest_gauge = [None, None, False, None, 0, False, None, False]
+    play_frame = [None, None]
+    play_frame_at = [0.0]
+
+    def _watch_skill_window() -> None:
+        seen = None
+        while checker_alive[0] and (stop is None or not stop.is_set()):
+            shot = play_frame[0]
+            rgb_now = play_frame[1]
+            if (
+                not saw_board
+                or before_start[0]
+                or watch_hit.is_set()
+                or skill is None
+                or skill_busy[0]
+                or shot is None
+                or shot is seen
+                or rgb_now is None
+                or shot.isNull()
+            ):
+                time.sleep(0.05)
+                continue
+            seen = shot
+            ready = skill_ready_now(rgb_now)
+            left = latest_gauge[3]
+            if ready and skill_is_gadget(used_tsum) and _gadget_skill_hold(
+                _fever_playing(rgb_now, game),
+                _meter_fever_fill(rgb_now, fever, skill, fan),
+                left,
+            ):
+                ready = False
+            if ready and not skill_is_gadget(used_tsum) and not skill_busy[0]:
+                button = _skill_button_square(skill)
+                press_skill_now(
+                    (
+                        int(button["x"] + max(1, int(button["w"])) / 2),
+                        int(button["y"] + max(1, int(button["h"])) / 2),
+                        int(shot.width()),
+                        int(shot.height()),
+                    )
+                )
+            time.sleep(0.2)
+
+    Thread(target=_watch_skill_window, daemon=True).start()
+
+    def _watch_checker() -> None:
+        nonlocal skill_used, press_counted
+        full_w = None
+        last_left = None
+        seen = None
+        while checker_alive[0] and (stop is None or not stop.is_set()):
+            if gauges is None:
+                return
+            shot = play_frame[0]
+            shot_rgb = play_frame[1]
+            if shot is None or shot_rgb is None or shot is seen:
+                time.sleep(0.05)
+                continue
+            seen = shot
+            if shot.isNull():
+                time.sleep(0.05)
+                continue
+            skill_fill = _skill_fill(shot_rgb, skill)
+            fever_fill, full_w = _read_fever(shot_rgb, fever, skill, fan, full_w)
+            fever_on = _fever_playing(shot_rgb, game)
+            meter_fever = _meter_fever_fill(shot_rgb, fever, skill, fan)
+            left = _read_timer(predictor, shot_rgb, timer)
+            if left is None:
+                left = last_left
+            else:
+                last_left = left
+            if (
+                skill_wait_empty
+                and not press_counted
+                and not skill_busy[0]
+            ):
+                spent = _skill_fill(shot_rgb, skill)
+                if spent is not None and spent < SKILL_FILL_SPENT:
+                    skill_used += 1
+                    press_counted = True
+            ready = False
+            if (
+                saw_board
+                and not watch_hit.is_set()
+                and skill is not None
+                and not skill_busy[0]
+            ):
+                ready = skill_ready_now(shot_rgb)
+                if ready and skill_is_gadget(used_tsum) and _gadget_skill_hold(
+                    fever_on, meter_fever, left
+                ):
+                    ready = False
+            tap_at = None
+            if skill is not None and shot is not None and not shot.isNull():
+                button = _skill_button_square(skill)
+                tap_at = (
+                    int(button["x"] + max(1, int(button["w"])) / 2),
+                    int(button["y"] + max(1, int(button["h"])) / 2),
+                    int(shot.width()),
+                    int(shot.height()),
+                )
+            fever_hold = bool(
+                skill_is_gadget(used_tsum)
+                and _gadget_skill_hold(fever_on, meter_fever, left)
+            )
+            latest_gauge[0] = skill_fill
+            latest_gauge[1] = fever_fill
+            latest_gauge[2] = fever_on
+            latest_gauge[3] = left
+            latest_gauge[4] = skill_used
+            latest_gauge[5] = my_erase
+            latest_gauge[6] = tap_at
+            latest_gauge[7] = fever_hold
+            if ready and not skill_is_gadget(used_tsum):
+                press_skill_now(tap_at)
+            full_n = skill_full_n()
+            meter_skill = _meter_skill_fill(shot_rgb, skill)
+            if full_n is not None and meter_skill is not None:
+                pct = max(0, min(100, round(float(meter_skill) * 100)))
+                skill_need = max(0, round(full_n * (100 - pct) / 100))
+            else:
+                skill_need = None
+            gauges(
+                meter_skill,
+                meter_fever,
+                fever_on,
+                left,
+                skill_used,
+                my_erase,
+                ready,
+                skill_busy[0],
+                tap_at,
+                skill_need,
+            )
+            time.sleep(0.2)
+
+    Thread(target=_watch_checker, daemon=True).start()
+    grab_done = Event()
+    if board_grabs is not None:
+        Thread(
+            target=_grab_board_loop,
+            args=(predictor, board_grabs, stop, grab_done, say),
+            daemon=True,
+        ).start()
+    next_frame = None
+    try:
+        while True:
+            _check_stop(stop)
+            if next_frame is not None:
+                image, rgb = next_frame
+                next_frame = None
+            else:
+                t0 = time.perf_counter()
+                try:
+                    image = capture_play_frame()
+                    rgb = _qimage_rgb(image)
+                except Exception:
+                    add_idle("cap", time.perf_counter() - t0)
+                    if not saw_board:
+                        say("画面を待っています")
+                        _sleep_stop(0.25, stop)
+                    continue
+                add_idle("cap", time.perf_counter() - t0)
+            board_bombs[0] = None
+            play_frame[0] = image
+            play_frame[1] = rgb
+            play_frame_at[0] = time.time()
+            if rgb is None or image.isNull():
+                if not saw_board:
+                    say("画面を待っています")
+                    _sleep_stop(0.25, stop)
+                continue
+            on_board = (
+                saw_board
+                and image is not None
+                and not image.isNull()
+                and _in_play_hud(image)
+            )
+            if on_board:
+                on_mission = False
+                pause = None
+            else:
+                on_mission = _daily_mission_button(image) is not None
+                pause = _pause_continue_button(image)
+            on_pause = pause is not None
+            if resumed_pause and not on_pause and not on_mission:
+                saw_board = True
+                match_over = False
+                kinds_locked = True
+                watching.set()
+                if go_at is None:
+                    go_at = time.time()
+                resumed_pause = False
+            if saw_board and pause is not None and not on_mission and not _nightmare_dice_on(rgb):
+                say("続けるをクリックします")
+                _slow_tap(pause.center().x(), pause.center().y())
+                _sleep_stop(1.2, stop)
+                saw_board = True
+                match_over = False
+                kinds_locked = True
+                watching.set()
+                if go_at is None:
+                    go_at = time.time()
+                resumed_pause = True
+                continue
+            if on_mission:
+                before_start[0] = True
+            elif saw_board:
+                before_start[0] = False
+            else:
+                on_start = _match_start_button(image) is not None
+                on_home = _play_button(image) is not None
+                on_close = _close_button(image) is not None
+                before_start[0] = on_start or on_home or on_close
+            if before_start[0]:
+                saw_board = False
+                go_at = None
+                watching.clear()
+            elif not saw_board and not on_pause:
+                if go_at is None:
+                    with _gpu_lock:
+                        scene, _score = _scene_top(predictor, rgb)
+                    if scene == "go":
+                        go_at = time.time()
+                if go_at is not None or _in_play_hud(image):
+                    saw_board = True
+                    match_over = False
+                    kinds_locked = True
+                    watching.set()
+                    if go_at is None:
+                        go_at = time.time()
+            if saw_board and not watch_hit.is_set() and apply_checker_skill(False):
+                skip_after_skill = True
+                continue
+            if saw_board and skill is None:
+                with _gpu_lock:
+                    boxes = predictor.predict_all(Path("."), rgb=rgb)
+                last_boxes = boxes
+                game, skill, fever, timer, fan = _merge_hud(
+                    boxes, game, skill, fever, timer, fan
+                )
+            timer_left = _read_timer(None, rgb, timer) if saw_board else None
+            timer_running = timer_left is not None and timer_left > 0
+            if timer_running:
+                saw_timer = True
+            if timer_running and watch_hit.is_set():
+                watch_hit.clear()
+            play_hud = bool(
+                saw_board
+                and image is not None
+                and not image.isNull()
+                and _in_play_hud(image)
+            )
+            retry_now = (
+                saw_board
+                and image is not None
+                and not image.isNull()
+                and _retry_button(image) is not None
+            )
+            board_left = (
+                saw_board
+                and saw_timer
+                and not on_pause
+                and not play_hud
+                and not timer_running
+            )
+            model_hit = False
+            if (
+                saw_board
+                and not timer_running
+                and not retry_now
+                and (timer_left == 0 or board_left)
+            ):
+                with _gpu_lock:
+                    model_hit, _score = _timeup_hit(predictor, rgb)
+                if model_hit:
+                    watch_hit.set()
+            if board_left and hud_gone_seen:
+                watch_hit.set()
+            hud_gone_seen = board_left
+            timeup_now = saw_board and not timer_running and (
+                (model_hit and (saw_timer or timer_left == 0))
+                or (watch_hit.is_set() and (timer_left == 0 or board_left))
+            )
+            if retry_now or timeup_now:
+                credit_pending(rgb)
+                ended = _end_on_timeup(
+                    predictor,
+                    image,
+                    rgb,
+                    pending_spots,
+                    clears,
+                    swipes,
+                    pieces if saw_board else None,
+                    game,
+                    say,
+                    stop,
+                    timer,
+                    saw_board,
+                    last_boxes,
+                )
+            else:
+                ended = False
+            if not ended and timeup_now:
+                say("TIME UP / " + _counts_line(clears, swipes, coin))
+                ended = True
+            if ended:
+                credit_pending(rgb)
+                flush_idle(True)
+                flush_bomb()
+                flush_skill()
+                _note_match_end(
+                    predictor,
+                    rgb,
+                    last_boxes,
+                    clears,
+                    swipes,
+                    skill_taps,
+                    skill_ok,
+                    skill_wait_empty,
+                    skill,
+                    bomb_taps,
+                    fan_taps,
+                    match_picks,
+                    coin,
+                    used_tsum,
+                    used_items,
+                    None if go_at is None else max(0, int(round(time.time() - go_at))),
+                    sorted(wait_times, reverse=True)[:3],
+                    upload=not tsum_unspecified,
+                )
+                watch_hit.clear()
+                if not _continue_after_game():
+                    stop_watch.set()
+                    watching.clear()
+                    return
+                _seen, replay_items = _replay_after_timeup(say, stop)
+                fresh_match()
+                match_over = True
+                if replay_items is not None:
+                    used_items = replay_items
+                    show_used(replay_items)
+                say("プレイを開始します")
+                continue
+            if (
+                saw_board
+                and skill_is_nightmare(used_tsum)
+                and nightmare_dice_step(image, rgb, nightmare_dice, say, stop, watch_hit)
+            ):
+                continue
+            _check_stop(stop)
+            if not saw_board:
+                start = _match_start_button(image)
+                if start is not None:
+                    ask_used_now(True)
+                    if _start_hearts(image) == 0:
+                        _wait_for_heart(say, stop)
+                        continue
+                    found_items = _items_used_pil(rgb)
+                    if found_items is not None:
+                        used_items = found_items
+                        show_used(found_items)
+                        if found_items:
+                            say("アイテム " + "、".join(used_items))
+                    _say_heart_mail(say, rgb or image)
+                    say("スタートをクリックします")
+                    _slow_tap(start.center().x(), start.center().y())
+                    _sleep_stop(1.2, stop)
+                    continue
+            if not kinds_locked:
+                used = _five_to_four_used_pil(rgb)
+                if used is not None:
+                    kinds = 4 if used else 5
+                    kinds_locked = True
+                    say(f"5＞4 {'使用' if used else '未使用'} / 種類 {kinds}")
+            if not saw_board:
+                retry = None if image.isNull() else _retry_button(image)
+                if retry is not None and _match_start_button(image) is None:
+                    say("リトライをクリックします")
+                    tap(retry.center().x(), retry.center().y())
+                    _sleep_stop(1.2, stop)
+                    continue
+                if on_mission:
+                    play = None if image.isNull() else _play_button(image)
+                    if play is not None:
+                        say("プレイをクリックします")
+                        _slow_tap(play.center().x(), play.center().y())
+                        _sleep_stop(2.0, stop)
+                    continue
+                if match_over:
+                    close = None if image.isNull() else _close_button(image)
+                    if close is not None:
+                        say("とじるをクリックします")
+                        _slow_tap(close.center().x(), close.center().y())
+                        _sleep_stop(1.2, stop)
+                        continue
+                start = None if image.isNull() else _match_start_button(image)
+                if start is not None:
+                    found_items = _items_used_pil(rgb)
+                    if found_items is not None:
+                        used_items = found_items
+                        show_used(found_items)
+                if time.time() >= ignore_start_until:
+                    if _match_start_button(image) is not None:
+                        ask_used_now(True)
+                    if _match_start_button(image) is not None and _start_hearts(image) == 0:
+                        _wait_for_heart(say, stop)
+                        continue
+                    if pause is not None:
+                        say("続けるをクリックします")
+                        _slow_tap(pause.center().x(), pause.center().y())
+                        _sleep_stop(1.2, stop)
+                        saw_board = True
+                        match_over = False
+                        kinds_locked = True
+                        watching.set()
+                        if go_at is None:
+                            go_at = time.time()
+                        resumed_pause = True
+                        continue
+                    if _tap_start_or_continue(image, say, stop):
+                        continue
+                play = None if image.isNull() else _play_button(image)
+                if play is not None:
+                    say("プレイをクリックします")
+                    _slow_tap(play.center().x(), play.center().y())
+                    _sleep_stop(2.0, stop)
+                    continue
+                close = None if image.isNull() else _close_button(image)
+                if close is not None:
+                    say("とじるをクリックします")
+                    _slow_tap(close.center().x(), close.center().y())
+                    _sleep_stop(1.2, stop)
+                    continue
+                continue
+            erased_now = False
+            if credit_pending(rgb):
+                erased_now = True
+            skill_now = (
+                saw_board
+                and skill is not None
+                and not watch_hit.is_set()
+                and not skill_busy[0]
+                and time.time() >= next_skill_at[0]
+                and skill_ready_now(rgb)
+            )
+            if skill_now and skill_is_gadget(used_tsum) and _gadget_skill_hold(
+                _fever_playing(rgb, game),
+                _meter_fever_fill(rgb, fever, skill, fan),
+                latest_gauge[3],
+            ):
+                skill_now = False
+            elif (
+                skill_now
+                and skill_is_gadget(used_tsum)
+                and pending_spots is not None
+                and time.time() - pending_at < 0.5
+            ):
+                continue
+            if skill_now and not skill_is_namine(used_tsum):
+                _press_ready_skill()
+                if skill_pressed is not None and skill_pressed.is_set():
+                    apply_checker_skill(False)
+                    continue
+            t0 = time.perf_counter()
+            heat_s = 0.0
+            type_s = 0.0
+            with _gpu_lock:
+                pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+                heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
+                type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
+            tsums = [piece for piece in pieces if _is_tsum(piece)]
+            add_idle("pred", time.perf_counter() - t0)
+            add_idle("heat", heat_s)
+            add_idle("type", type_s)
+            _check_stop(stop)
+            if credit_pending(by_count=True):
+                erased_now = True
+            fan_fall_n, fan_fall_moved, _fall_settled = _note_fall(
+                len(tsums), erased_now, fan_fall_n, fan_fall_moved
+            )
+            now = time.time()
+            skip_chains = [
+                key for key in skip_chains if now - skip_born.get(key, 0) < SKIP_TTL
+            ]
+            skip_chains = _prune_skip(skip_chains, tsums)
+            look_mytsum()
+            tick_skill_count()
+            pick_opts: list[int] = []
+            pick_n = 0
+            t0 = time.perf_counter()
+            found = list_found(pieces, tsums)
+            if found:
+                if pooh_long:
+                    pick_opts = [len(item) for item in found]
+                    pick_n = pick_opts[0]
+                else:
+                    found, pick_opts, pick_n = order_found(found)
+                    if found:
+                        found.sort(key=_chain_pref, reverse=True)
+                        pick_n = len(found[0])
+                        pick_opts = [len(item) for item in found]
+            add_idle("find", time.perf_counter() - t0)
+            board_bombs[0] = len(_bombs_on_board(pieces, game))
+            if (
+                skill_is_gadget(used_tsum)
+                and skill is not None
+                and not watch_hit.is_set()
+                and not skill_busy[0]
+                and pending_spots is None
+                and skill_ready_now(rgb)
+                and not _gadget_skill_hold(
+                    _fever_playing(rgb, game),
+                    _meter_fever_fill(rgb, fever, skill, fan),
+                    latest_gauge[3],
+                )
+            ):
+                _press_ready_skill()
+            if (
+                skill is not None
+                and not skill_is_gadget(used_tsum)
+                and not watch_hit.is_set()
+                and not skill_busy[0]
+                and skill_ready_now(rgb)
+            ):
+                _press_ready_skill()
+            if not found and skill_pressed is not None and skill_pressed.is_set():
+                t0 = time.perf_counter()
+                did_skill = apply_checker_skill(False)
+                add_idle("act", time.perf_counter() - t0)
+                if did_skill:
+                    skip_after_skill = True
+                continue
+            if found:
+                say("候補 " + " / ".join(str(len(item)) for item in found))
+                looked_after_skill = skip_after_skill
+                skip_after_skill = False
+                t0 = time.perf_counter()
+                armed = (
+                    not looked_after_skill
+                    and skill_pressed is not None
+                    and skill_pressed.is_set()
+                )
+                did_skill = armed and apply_checker_skill(True)
+                add_idle("act", time.perf_counter() - t0)
+                if did_skill or armed:
+                    if did_skill:
+                        skip_after_skill = True
+                    continue
+                skill_fill = _skill_fill(rgb, skill)
+                emit_gauges(skill_fill)
+                wait_save = None
+                if pick_n >= MIN_CHAIN:
+                    close_idle()
+                    if idle_pick is not None:
+                        wait_save = (
+                            list(idle_pick[0]),
+                            int(idle_pick[1]),
+                            float(idle_acc),
+                            not skip_loss,
+                            float(idle_cap),
+                            float(idle_heat),
+                            float(idle_type),
+                            float(idle_find),
+                            float(idle_act),
+                        )
+                    skip_loss = False
+                    idle_pick = (list(pick_opts), int(pick_n))
+                    idle_acc = 0.0
+                    clear_idle_parts()
+                note_idle(False)
+                last_chain: list[dict[str, int]] | None = None
+                burst = 0
+                burst_my_n = 0
+                burst_max = 0
+                screen_swipes = 0
+                screen_max = 0
+                burst_skip: list[frozenset[tuple[int, int]]] = []
+                timeup = False
+                timeup_ended = False
+                check = image
+                check_rgb = rgb
+                length_pick = False
+                used: set[tuple[int, int]] = set()
+                watching.set()
+                try:
+                    queue = list(found)
+                    seen_keys = {_chain_key(item) for item in found}
+                    picked0 = found[0] if found else None
+                    board = pieces
+                    need_more = False
+                    while queue or need_more:
+                        skill_busy[0] = True
+                        _check_stop(stop)
+                        if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                            timeup = True
+                            break
+                        if not queue:
+                            need_more = False
+                            leftover_tsums = [
+                                piece for piece in board if _is_tsum(piece)
+                            ]
+                            if len(leftover_tsums) >= MIN_CHAIN:
+                                more = list_found(
+                                    board,
+                                    leftover_tsums,
+                                    extra=burst_skip,
+                                    used_spots=used,
+                                )
+                                for item in more:
+                                    key = _chain_key(item)
+                                    if key in seen_keys:
+                                        continue
+                                    seen_keys.add(key)
+                                    queue.append(item)
+                            if queue:
+                                continue
+                            if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                                timeup = True
+                                break
+                            if _nightmare_live_dice():
+                                break
+                            tap_bombs_after_chains(screen_swipes, screen_max)
+                            if (
+                                skill_is_gadget(used_tsum)
+                                and pending_spots is not None
+                                and time.time() - pending_at < 0.5
+                            ):
+                                break
+                            try:
+                                image = capture_play_frame()
+                                rgb = _qimage_rgb(image)
+                            except Exception:
+                                break
+                            if rgb is None or image.isNull():
+                                break
+                            if skill_is_nightmare(used_tsum) and _nightmare_dice_on(rgb):
+                                break
+                            play_frame[0] = image
+                            play_frame[1] = rgb
+                            play_frame_at[0] = time.time()
+                            if not _in_play_hud(image):
+                                break
+                            skill_busy[0] = False
+                            if (
+                                skill is not None
+                                and not watch_hit.is_set()
+                                and skill_ready_now(rgb)
+                                and not (
+                                    skill_is_gadget(used_tsum)
+                                    and _gadget_skill_hold(
+                                        _fever_playing(rgb, game),
+                                        _meter_fever_fill(rgb, fever, skill, fan),
+                                        latest_gauge[3],
+                                    )
+                                )
+                            ):
+                                _press_ready_skill()
+                                if skill_pressed is not None and skill_pressed.is_set():
+                                    skill_busy[0] = True
+                                    skip_after_skill = True
+                                    break
+                            skill_busy[0] = True
+                            with _gpu_lock:
+                                pieces = predictor.predict_pieces(
+                                    Path("."), game, rgb=rgb, inner=False
+                                )
+                            tsums = [piece for piece in pieces if _is_tsum(piece)]
+                            board = pieces
+                            pending_used |= used
+                            used = set()
+                            seen_keys = set()
+                            burst_skip = []
+                            screen_swipes = 0
+                            screen_max = 0
+                            more = list_found(board, tsums)
+                            if more and not pooh_long:
+                                more, _opts, _pick_n = order_found(more)
+                            if more:
+                                more.sort(key=_chain_pref, reverse=True)
+                            for item in more:
+                                key = _chain_key(item)
+                                seen_keys.add(key)
+                                queue.append(item)
+                            if not queue:
+                                break
+                            continue
+                        if _nightmare_live_dice():
+                            break
+                        chain = queue.pop(0)
+                        spots = {(int(piece["x"]), int(piece["y"])) for piece in chain}
+                        if spots & used:
+                            chain = [
+                                piece
+                                for piece in chain
+                                if (int(piece["x"]), int(piece["y"])) not in used
+                            ]
+                            if len(chain) < MIN_CHAIN:
+                                continue
+                            spots = {
+                                (int(piece["x"]), int(piece["y"])) for piece in chain
+                            }
+                        leftover_n = len([piece for piece in board if _is_tsum(piece)])
+                        already_pending = bool(spots & pending_used)
+                        added = 0 if already_pending else mytsum_in_chain(chain)
+                        counted = 0
+                        if not already_pending and my_vec is not None:
+                            counted = _count_mytsum(chain, tsums, my_vec)
+                        chain_n = added if added > 0 else counted
+                        full_n = skill_full_n()
+                        remain = None
+                        if full_n is not None and skill is not None and rgb is not None:
+                            meter_skill = _meter_skill_fill(rgb, skill)
+                            if meter_skill is not None:
+                                pct = max(0, min(100, round(float(meter_skill) * 100)))
+                                remain = max(0, round(full_n * (100 - pct) / 100))
+                        fills_full = (
+                            chain_n > 0
+                            and remain is not None
+                            and remain > 0
+                            and chain_n >= remain
+                        )
+                        if fills_full:
+                            set_my_lamp("red")
+                        elif added > 0 or counted > 0:
+                            set_my_lamp("on")
+                        else:
+                            set_my_lamp("off")
+                        try:
+                            swiped = _swipe_chain(
+                                chain,
+                                board,
+                                image,
+                                game,
+                                leftover_n,
+                                say,
+                                stop,
+                                None,
+                            )
+                        finally:
+                            set_my_lamp("off")
+                        if not swiped:
+                            continue
+                        swipes += 1
+                        say(_counts_line(clears, swipes, coin))
+                        if not already_pending:
+                            my_vec = _lock_my_vec(tsums, skill_face, my_vec)
+                            if skill_is_nightmare(used_tsum):
+                                counted = len(chain)
+                            else:
+                                counted = _count_mytsum(chain, tsums, my_vec)
+                            my_erase += counted
+                        if not already_pending:
+                            burst_my_n += added
+                        sure = (
+                            skill_my_full is not None
+                            and skill_my_full > 0
+                            and skill_my_n + added >= skill_my_full
+                        )
+                        if (
+                            not already_pending
+                            and about_to_fill_skill(chain)
+                            and sure
+                        ):
+                            _clear_bombs_before_skill()
+                        if (
+                            not already_pending
+                            and about_to_fill_skill(chain)
+                            and mash_skill_until_on(sure)
+                        ):
+                            if skill_pressed is not None:
+                                skill_pressed.set()
+                            apply_checker_skill(True)
+                            skip_after_skill = True
+                            break
+                        burst += 1
+                        burst_max = max(burst_max, len(chain))
+                        screen_swipes += 1
+                        screen_max = max(screen_max, len(chain))
+                        used |= spots
+                        last_chain = chain
+                        burst_skip.append(_chain_key(chain))
+                        if chain is picked0 and pick_n >= MIN_CHAIN:
+                            length_pick = True
+                        board = [
+                            piece
+                            for piece in pieces
+                            if not _is_tsum(piece)
+                            or (int(piece["x"]), int(piece["y"])) not in used
+                        ]
+                        need_more = True
+                finally:
+                    skill_busy[0] = False
+                    if not saw_board:
+                        watching.clear()
+                if wait_save is not None:
+                    record_rl_wait(wait_save[0], wait_save[1], wait_save[2])
+                    if wait_save[3]:
+                        acc = wait_save[2]
+                        rest = max(
+                            0.0,
+                            acc
+                            - wait_save[4]
+                            - wait_save[5]
+                            - wait_save[6]
+                            - wait_save[7]
+                            - wait_save[8],
+                        )
+                        wait_times.append(round(max(0.0, acc), 1))
+                        say(
+                            f"LossTime {acc:.1f}s / "
+                            f"画面 {wait_save[4]:.1f}s / "
+                            f"位置 {wait_save[5]:.1f}s / "
+                            f"種類 {wait_save[6]:.1f}s / "
+                            f"つなぎ {wait_save[7]:.1f}s / "
+                            f"スキルボム扇 {wait_save[8]:.1f}s / "
+                            f"ほか {rest:.1f}s"
+                        )
+                if length_pick and not pooh_long:
+                    record_rl_length(pick_opts, pick_n)
+                if burst:
+                    pooh_long = False
+                if last_chain is not None:
+                    extra = burst
+                    extra_my = burst_my_n
+                    if pending_spots is not None:
+                        extra = pending_burst + burst
+                        extra_my = pending_my_n + burst_my_n
+                    pending_spots = _chain_spots(rgb, last_chain)
+                    pending_key = _chain_key(last_chain)
+                    pending_n = len(tsums)
+                    pending_burst = extra
+                    pending_group = int(last_chain[0].get("group") or 0)
+                    pending_my_n = extra_my
+                    pending_lesson = ([len(item) for item in found], len(last_chain))
+                    pending_at = time.time()
+                    pending_used |= used
+                    bomb_asked = False
+                    bomb_asked_sit = ""
+                    fan_fall_n = len(tsums)
+                    fan_fall_moved = False
+                if last_chain is not None and preview is not None:
+                    preview(_draw_plan(image, pieces, last_chain, game))
+                if timeup:
+                    timeup = True
+                    if not timeup_ended:
+                        try:
+                            check = capture_play_frame()
+                            check_rgb = _qimage_rgb(check)
+                        except Exception:
+                            check = image
+                            check_rgb = rgb
+                        retry_on_check = (
+                            check is not None
+                            and not check.isNull()
+                            and _retry_button(check) is not None
+                        )
+                        if retry_on_check:
+                            if not _end_on_timeup(
+                                predictor,
+                                check,
+                                check_rgb,
+                                pending_spots,
+                                clears,
+                                swipes,
+                                pieces,
+                                game,
+                                say,
+                                stop,
+                                timer,
+                                True,
+                                last_boxes,
+                            ):
+                                with _gpu_lock:
+                                    coin = _read_coin(predictor, check_rgb, last_boxes)
+                                say("TIME UP / " + _counts_line(clears, swipes, coin))
+                        elif _timer_still_running(check_rgb, timer):
+                            timeup = False
+                            watch_hit.clear()
+                            next_frame = (check, check_rgb)
+                        elif not (
+                            check is not None
+                            and not check.isNull()
+                            and check_rgb is not None
+                            and _end_on_timeup(
+                                predictor,
+                                check,
+                                check_rgb,
+                                pending_spots,
+                                clears,
+                                swipes,
+                                pieces,
+                                game,
+                                say,
+                                stop,
+                                timer,
+                                True,
+                                last_boxes,
+                            )
+                        ):
+                            with _gpu_lock:
+                                coin = _read_coin(predictor, check_rgb, last_boxes)
+                            say("TIME UP / " + _counts_line(clears, swipes, coin))
+                if timeup:
+                    credit_pending(check_rgb)
+                    flush_idle(True)
+                    flush_bomb()
+                    flush_skill()
+                    _note_match_end(
+                        predictor,
+                        check_rgb,
+                        last_boxes,
+                        clears,
+                        swipes,
+                        skill_taps,
+                        skill_ok,
+                        skill_wait_empty,
+                        skill,
+                        bomb_taps,
+                        fan_taps,
+                        match_picks,
+                        coin,
+                        used_tsum,
+                        used_items,
+                        None if go_at is None else max(0, int(round(time.time() - go_at))),
+                        sorted(wait_times, reverse=True)[:3],
+                        upload=not tsum_unspecified,
+                    )
+                    if not _continue_after_game():
+                        stop_watch.set()
+                        watching.clear()
+                        return
+                    _seen, replay_items = _replay_after_timeup(say, stop)
+                    fresh_match()
+                    match_over = True
+                    if replay_items is not None:
+                        used_items = replay_items
+                        show_used(replay_items)
+                    say("プレイを開始します")
+                    continue
+                last_save_at = _learn_board(
+                    predictor,
+                    image,
+                    rgb,
+                    game,
+                    skill,
+                    fever,
+                    timer,
+                    fan,
+                    last_boxes,
+                    pieces,
+                    tsums,
+                    saved_boards,
+                    last_save_at,
+                    save_boards,
+                    say,
+                )
+                if burst >= 2 or burst_max >= time_bomb_number(used_items):
+                    bomb_after_long = True
+                note_idle(True)
+                continue
+            note_found(False)
+            emit_gauges(_skill_fill(rgb, skill))
+            if my_group <= 0 and skill is not None and now - last_skill_look >= 2.0:
+                last_skill_look = now
+                t0 = time.perf_counter()
+                with _gpu_lock:
+                    looked, face = _mytsum_group(predictor, rgb, tsums, skill)
+                add_idle("pred", time.perf_counter() - t0)
+                if face is not None:
+                    skill_face = face
+                if looked > 0:
+                    my_group = looked
+                    t0 = time.perf_counter()
+                    found = list_found(pieces, tsums)
+                    add_idle("find", time.perf_counter() - t0)
+                    if found:
+                        continue
+            if pending_hud:
+                fever_on = _fever_playing(rgb, game)
+                for old_sit, kind, pressed in pending_hud:
+                    ok = erased_now or fever_on or (kind == "fan" and bool(found))
+                    record_hud(old_sit, kind, pressed, ok)
+                pending_hud = []
+            t0 = time.perf_counter()
+            did_skill = apply_checker_skill(False)
+            add_idle("act", time.perf_counter() - t0)
+            if did_skill:
+                skip_after_skill = True
+                continue
+            t0 = time.perf_counter()
+            if break_to_one():
+                add_idle("act", time.perf_counter() - t0)
+                continue
+            near_bomb = _my_tsum_near_bomb(pieces, my_group, game)
+            if near_bomb is not None:
+                did_bomb = try_bomb(skill_sit(False), force=True, target=near_bomb)
+            else:
+                did_bomb = try_bomb(skill_sit(False), force=True)
+            add_idle("act", time.perf_counter() - t0)
+            if did_bomb:
+                bomb_after_long = False
+                continue
+            t0 = time.perf_counter()
+            did_fan = False
+            fan_open = go_at is None or time.time() - go_at >= 3.0
+            if fan_open and fan_fall_n is None and not _nightmare_live_dice():
+                did_fan = _press_fan(
+                    fan, image, say, stop, last_fan_at, len(tsums), pending_hud, skill_sit(False)
+                )
+            add_idle("act", time.perf_counter() - t0)
+            if did_fan:
+                last_fan_at = time.time()
+                fan_taps += 1
+                skip_chains = []
+                continue
+            say(f"ツム {len(tsums)}体 / なぞれる3体以上なし")
+            continue
+    finally:
+        grab_done.set()
+        checker_alive[0] = False
+
+
+def _note_fall(
+    count: int,
+    erased: bool,
+    fall_n: int | None,
+    moved: bool,
+) -> tuple[int | None, bool, bool]:
+    if fall_n is None:
+        return None, False, False
+    if erased or count != fall_n:
+        return count, True, False
+    if moved:
+        return None, False, True
+    return fall_n, moved, False
+
+
+def _swipe_chain(
+    chain: list[dict[str, int]],
+    pieces: list[dict[str, int]],
+    image: QImage,
+    game: dict[str, int] | None,
+    tsum_count: int,
+    say: StatusFn,
+    stop: Event | None,
+    preview: Callable[[QImage], None] | None,
+    abort: Event | None = None,
+) -> bool:
+    points = [(int(piece["x"]), int(piece["y"])) for piece in chain]
+    cells = {(x // 24, y // 24) for x, y in points}
+    if len(points) < MIN_CHAIN or len(cells) < MIN_CHAIN:
+        say("同じ位置に重なっているので見送り")
+        return False
+    route = " → ".join(f"{x},{y}" for x, y in points)
+    say(f"ツム {tsum_count}体 / チェーン {len(chain)}体")
+    say(f"経路 {route}")
+    say("なぞっています")
+    _check_stop(stop)
+    how = swipe_path(
+        points,
+        screen_w=image.width(),
+        screen_h=image.height(),
+        stop=stop,
+        abort=abort,
+    )
+    if preview is not None:
+        preview(_draw_plan(image, pieces, chain, game))
+    say(how)
+    return True
+
+
+def _chain_spots(rgb, chain: list[dict[str, int]]) -> list[tuple[int, int, int, tuple[float, float, float] | None]]:
+    spots: list[tuple[int, int, int, tuple[float, float, float] | None]] = []
+    for piece in chain:
+        x, y = int(piece["x"]), int(piece["y"])
+        radius = max(6, int(piece.get("r") or 12))
+        spots.append((x, y, radius, _spot_mean(rgb, x, y, radius)))
+    return spots
+
+
+def _spots_lingered(
+    after,
+    spots: list[tuple[int, int, int, tuple[float, float, float] | None]],
+) -> bool:
+    hits = 0
+    for x, y, radius, old in spots:
+        if old is None:
+            continue
+        new = _spot_mean(after, x, y, radius)
+        if new is None:
+            continue
+        dist = sum((a - b) ** 2 for a, b in zip(old, new)) ** 0.5
+        if dist < 36:
+            hits += 1
+    return hits >= MIN_CHAIN
+
+
+def _piece_is_yellow(image, piece: dict[str, int]) -> bool:
+    x, y = int(piece["x"]), int(piece["y"])
+    radius = max(6, int(piece.get("r") or 12))
+    mean = _spot_mean(image, x, y, radius)
+    if mean is None:
+        return False
+    red, green, blue = mean
+    hue, sat, val = colorsys.rgb_to_hsv(
+        red / 255.0, green / 255.0, blue / 255.0
+    )
+    return 0.06 <= hue <= 0.18 and sat >= 0.35 and val >= 0.45
+
+
+def _spot_mean(image, x: int, y: int, radius: int) -> tuple[float, float, float] | None:
+    span = max(4, radius // 2)
+    box = (x - span, y - span, x + span + 1, y + span + 1)
+    crop = image.crop(box)
+    pixels = list(crop.getdata())
+    if not pixels:
+        return None
+    count = len(pixels)
+    return (
+        sum(pixel[0] for pixel in pixels) / count,
+        sum(pixel[1] for pixel in pixels) / count,
+        sum(pixel[2] for pixel in pixels) / count,
+    )
+
+
+def _unlike_from_chain(
+    chain: list[dict[str, int]],
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    vecs = [piece.get("_vec") for piece in chain]
+    if any(vec is None for vec in vecs) or len(chain) < 2:
+        return None
+    cut = _weakest_cut(chain)
+    left_v, right_v = vecs[cut - 1], vecs[cut]
+    if left_v is None or right_v is None:
+        return None
+    left = [vecs[index] for index in range(cut)]
+    right = [vecs[index] for index in range(cut, len(vecs))]
+    if not left or not right:
+        return None
+    return (_mean_vec(left), _mean_vec(right))
+
+
+def _weakest_cut(chain: list[dict[str, int]]) -> int:
+    vecs = [piece.get("_vec") for piece in chain]
+    cut = 1
+    worst = 2.0
+    for index in range(1, len(chain)):
+        left, right = vecs[index - 1], vecs[index]
+        if left is None or right is None:
+            continue
+        sim = _cosine(left, right)
+        if sim < worst:
+            worst = sim
+            cut = index
+    return cut
+
+
+def _mean_vec(vecs: list[tuple[float, ...]]) -> tuple[float, ...]:
+    dim = len(vecs[0])
+    count = len(vecs)
+    return tuple(sum(vec[index] for vec in vecs) / count for index in range(dim))
+
+
+def _remember_mixed(predictor, image: QImage, game, pieces, chain) -> None:
+    from tempfile import gettempdir
+
+    path = Path(gettempdir()) / "tsum_autoplay_mixed.png"
+    if not image.save(str(path), "PNG"):
+        return
+    cut = _weakest_cut(chain)
+    chain_ids = {id(piece) for piece in chain}
+    labeled: list[dict[str, int]] = []
+    for piece in pieces:
+        item = {
+            key: value
+            for key, value in piece.items()
+            if key in {"x", "y", "r", "kind", "group"}
+        }
+        if id(piece) in chain_ids:
+            index = next(i for i, member in enumerate(chain) if id(member) == id(piece))
+            item["group"] = 1 if index < cut else 2
+        labeled.append(item)
+    try:
+        save_erase_lesson(predictor, path, game, labeled)
+    except Exception:
+        return
+
+
+def _merge_hud(boxes, game, skill, fever, timer, fan, meters: bool = False):
+    if game is None and boxes.get("game"):
+        game = boxes["game"]
+    if skill is None and boxes.get("skill"):
+        skill = boxes["skill"]
+    if (fever is None or meters) and boxes.get("fever"):
+        fever = boxes["fever"]
+    if (timer is None or meters) and boxes.get("timer"):
+        timer = boxes["timer"]
+    if (fan is None or meters) and boxes.get("fan"):
+        fan = boxes["fan"]
+    return game, skill, fever, timer, fan
+
+
+def _hud_boxes(game, skill, fever, timer, fan) -> dict[str, dict[str, int]]:
+    boxes: dict[str, dict[str, int]] = {}
+    if game is not None:
+        boxes["game"] = game
+    if skill is not None:
+        boxes["skill"] = skill
+    if fever is not None:
+        boxes["fever"] = fever
+    if timer is not None:
+        boxes["timer"] = timer
+    if fan is not None:
+        boxes["fan"] = fan
+    return boxes
+
+
+def _grab_board_loop(predictor, grabs: Queue, stop: Event | None, done: Event, say: StatusFn) -> None:
+    while not done.is_set() and (stop is None or not stop.is_set()):
+        try:
+            image = grabs.get(timeout=0.2)
+        except Empty:
+            continue
+        if done.is_set() or (stop is not None and stop.is_set()):
+            return
+        try:
+            _import_grabbed_board(predictor, image, say)
+        except Exception:
+            say("盤面を取り込めませんでした")
+
+
+def _import_grabbed_board(predictor, image: QImage, say: StatusFn) -> None:
+    rgb = _qimage_rgb(image)
+    if rgb is None:
+        say("盤面を取り込めませんでした")
+        return
+    with _gpu_lock:
+        boxes = predictor.predict_all(Path("."), rgb=rgb)
+        game, skill, fever, timer, fan = _merge_hud(boxes, None, None, None, None, None)
+        pieces = []
+        if game is not None:
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False) or []
+    hud = dict(boxes) if isinstance(boxes, dict) else {}
+    hud.update(_hud_boxes(game, skill, fever, timer, fan))
+    try:
+        learned = save_play_board(
+            predictor, image, game, boxes=hud, pieces=pieces, rgb=rgb
+        )
+    except Exception:
+        learned = False
+    if learned:
+        say("盤面を取り込みました")
+    else:
+        say("盤面を取り込めませんでした")
+
+
+def _learn_board(
+    predictor,
+    image: QImage,
+    rgb,
+    game,
+    skill,
+    fever,
+    timer,
+    fan,
+    last_boxes: dict[str, dict[str, int]],
+    pieces: list[dict[str, int]],
+    tsums: list[dict[str, int]],
+    saved_boards: set[tuple[tuple[int, int], ...]],
+    last_save_at: float,
+    save_boards: Callable[[], bool] | None,
+    say: StatusFn,
+    sample: bool = False,
+) -> float:
+    toggle = save_boards is not None and save_boards()
+    if not toggle and not sample:
+        return last_save_at
+    if not tsums:
+        return last_save_at
+    board = _board_key(tsums)
+    if board in saved_boards:
+        return last_save_at
+    if not toggle and time.time() - last_save_at < 2.5:
+        return last_save_at
+    if not toggle and random.randrange(len(saved_boards) + 3) != 0:
+        return last_save_at
+    saved_boards.add(board)
+    boxes = dict(last_boxes)
+    boxes.update(_hud_boxes(game, skill, fever, timer, fan))
+    try:
+        learned = save_play_board(
+            predictor, image, game, boxes=boxes, pieces=pieces or [], rgb=rgb
+        )
+    except Exception:
+        learned = False
+    if learned:
+        say("消す前の盤面を取り込みました")
+    return time.time()
+
+
+def _cbuzz_activated(
+    skill: dict[str, int], started_at: float, stop: Event | None, watch_hit
+) -> tuple[bool, bool]:
+    del watch_hit
+    deadline = float(started_at) + cbuzz_press_to_b()
+    limit = float(started_at) + 5.0
+    saw_yellow = False
+    while True:
+        _check_stop(stop)
+        now = time.time()
+        yellow = None
+        fill = None
+        try:
+            shot = capture_play_frame()
+        except Exception:
+            shot = None
+        if shot is not None and not shot.isNull() and _cbuzz_pose_on(shot):
+            return True, True
+        rgb = None if shot is None or shot.isNull() else _qimage_rgb(shot)
+        if rgb is not None:
+            button = _skill_button_square(skill)
+            yellow, _blue = _skill_ring_yellow_blue(rgb, button)
+            fill = _skill_fill(rgb, skill)
+        if yellow is not None and yellow >= SLOT_ON:
+            saw_yellow = True
+        elif saw_yellow and yellow is not None:
+            return True, False
+        if (
+            not saw_yellow
+            and yellow is not None
+            and yellow < SLOT_ON
+            and fill is not None
+            and fill < SKILL_FILL_SPENT
+        ):
+            return True, False
+        if now >= limit:
+            return False, False
+        if now >= deadline and not saw_yellow:
+            return False, False
+        time.sleep(0.1)
+
+
+def _cinderella_ring_off(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
+    if skill is None:
+        return False
+    limit = time.time() + SKILL_GAP
+    while time.time() < limit:
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        try:
+            image = capture_play_frame()
+        except Exception:
+            time.sleep(0.05)
+            continue
+        rgb = _qimage_rgb(image)
+        if rgb is None:
+            time.sleep(0.05)
+            continue
+        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+        if yellow < SLOT_ON:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _skill_tap_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
+    if skill is None:
+        return False
+    for _ in range(2):
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        try:
+            image = capture_play_frame()
+        except Exception:
+            return False
+        fill = _skill_fill(_qimage_rgb(image), skill)
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            return True
+    return False
+
+
+def _press_skill(
+    skill: dict[str, int] | None,
+    image: QImage,
+    rgb,
+    say: StatusFn,
+    stop: Event | None,
+    last_skill_at: float,
+    wait_empty: bool,
+    pending_hud: list[tuple[str, str, bool]],
+    sit: str,
+    carry: bool = False,
+    force: bool = False,
+    used_tsum: str = "",
+) -> tuple[bool, bool, bool]:
+    if skill is None:
+        if not carry and not force:
+            say("スキル枠がありません")
+        return False, wait_empty, False
+    spent = False
+    if wait_empty:
+        fill = _skill_fill(rgb, skill)
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            wait_empty = False
+            spent = True
+        elif time.time() - last_skill_at < SKILL_GAP:
+            return False, wait_empty, False
+        else:
+            wait_empty = False
+    if time.time() - last_skill_at < SKILL_GAP:
+        return False, wait_empty, spent
+    if not _skill_ready(rgb, skill, used_tsum):
+        return False, wait_empty, spent
+    pending_hud.append((sit, "skill", True))
+    _tap_skill(skill, image, say, stop)
+    return True, True, spent
+
+
+def _skill_ready(rgb, skill: dict[str, int], used_tsum: str = "") -> bool:
+    if rgb is None:
+        return False
+    button = _skill_button_square(skill)
+    yellow, _blue = _skill_ring_yellow_blue(rgb, button)
+    if yellow >= SLOT_ON:
+        return True
+    if skill_breaks_bombs(used_tsum):
+        return False
+    fill = _skill_fill(rgb, skill)
+    return fill is not None and fill >= SKILL_FILL_READY
+
+
+def _skill_ring_yellow_blue(image, box: dict[str, int]) -> tuple[float, float]:
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(image.width, left + max(1, int(box["w"])))
+    bottom = min(image.height, top + max(1, int(box["h"])))
+    if right - left < 8 or bottom - top < 8:
+        return 0.0, 0.0
+    crop = image.crop((left, top, right, bottom))
+    width, height = crop.size
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    radius = min(width, height) / 2.0
+    pixels = crop.load()
+    total = 0
+    yellow = 0
+    blue = 0
+    step = max(1, min(width, height) // 24)
+    for yy in range(0, height, step):
+        for xx in range(0, width, step):
+            dx = xx - cx
+            dy = yy - cy
+            dist = (dx * dx + dy * dy) ** 0.5 / radius
+            if dist < 0.50 or dist > 0.92:
+                continue
+            red, green, blue_v = pixels[xx, yy][:3]
+            hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
+            total += 1
+            if 0.08 <= hue <= 0.18 and sat >= 0.30 and val >= 0.45:
+                yellow += 1
+            elif 0.42 <= hue <= 0.72 and sat >= 0.22 and val >= 0.25:
+                blue += 1
+    if total <= 0:
+        return 0.0, 0.0
+    return yellow / total, blue / total
+
+
+def _skill_button_square(box: dict[str, int]) -> dict[str, int]:
+    x = int(box["x"])
+    y = int(box["y"])
+    width = max(1, int(box["w"]))
+    height = max(1, int(box["h"]))
+    if height > width:
+        return {"x": x, "y": y, "w": width, "h": width}
+    if width > height:
+        return {"x": x, "y": y, "w": height, "h": height}
+    return {"x": x, "y": y, "w": width, "h": height}
+
+
+def _skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
+    if rgb is None or skill is None:
+        return None
+    box = _skill_button_square(skill)
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(rgb.width, left + max(1, int(box["w"])))
+    bottom = min(rgb.height, top + max(1, int(box["h"])))
+    if right - left < 8 or bottom - top < 8:
+        return 0.0
+    crop = rgb.crop((left, top, right, bottom))
+    width, height = crop.size
+    pixels = crop.load()
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    radius = min(width, height) / 2.0
+    filled = 0
+    empty = 0
+    for frac in (0.60,):
+        ring = radius * frac
+        for index in range(72):
+            ang = -math.pi / 2.0 + (2.0 * math.pi * index / 72.0)
+            xx = int(round(cx + math.cos(ang) * ring))
+            yy = int(round(cy + math.sin(ang) * ring))
+            if xx < 0 or yy < 0 or xx >= width or yy >= height:
+                continue
+            red, green, blue_v = pixels[xx, yy][:3]
+            hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
+            if 0.05 <= hue <= 0.20 and sat >= 0.22 and val >= 0.50:
+                filled += 1
+            elif 0.48 <= hue <= 0.58 and sat >= 0.45 and val >= 0.75:
+                filled += 1
+            elif val < 0.42:
+                empty += 1
+            elif 0.55 <= hue <= 0.72 and sat >= 0.22 and val < 0.75:
+                empty += 1
+            elif sat < 0.25 and val < 0.60:
+                empty += 1
+    if filled + empty <= 0:
+        return 0.0
+    return filled / (filled + empty)
+
+
+def _window_skill_box(skill: dict[str, int]):
+    from app import bluestacks
+
+    size = bluestacks._last_cap_size
+    if size is None:
+        return None, None
+    screen_w, screen_h = size
+    if screen_w < 2 or screen_h < 2:
+        return None, None
+    image = capture_window_frame()
+    if image is None or image.isNull():
+        return None, None
+    rgb = _qimage_rgb(image)
+    if rgb is None:
+        return None, None
+    button = _skill_button_square(skill)
+    scale = min(rgb.width / screen_w, rgb.height / screen_h)
+    ox = (rgb.width - screen_w * scale) / 2
+    oy = (rgb.height - screen_h * scale) / 2
+    mapped = {
+        "x": int(ox + int(button["x"]) * scale),
+        "y": int(oy + int(button["y"]) * scale),
+        "w": max(1, int(int(button["w"]) * scale)),
+        "h": max(1, int(int(button["h"]) * scale)),
+    }
+    return rgb, mapped
+
+
+def _window_skill_fill(skill: dict[str, int]) -> float | None:
+    rgb, mapped = _window_skill_box(skill)
+    if rgb is None or mapped is None:
+        return None
+    return _skill_fill(rgb, mapped)
+
+
+def _meter_skill_fill(rgb, skill: dict[str, int] | None) -> float | None:
+    if rgb is None or skill is None:
+        return None
+    box = _skill_button_square(skill)
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(rgb.width, left + max(1, int(box["w"])))
+    bottom = min(rgb.height, top + max(1, int(box["h"])))
+    if right - left < 8 or bottom - top < 8:
+        return None
+    crop = rgb.crop((left, top, right, bottom))
+    width, height = crop.size
+    pixels = crop.load()
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    steps = 72
+    best = 0.0
+    for scale in (0.34, 0.40):
+        radius = min(width, height) * scale
+        marks: list[str] = []
+        for index in range(steps):
+            ang = -math.pi / 2.0 + (2.0 * math.pi * index / steps)
+            xx = int(round(cx + math.cos(ang) * radius))
+            yy = int(round(cy + math.sin(ang) * radius))
+            if xx < 0 or yy < 0 or xx >= width or yy >= height:
+                marks.append(".")
+                continue
+            red, green, blue_v = pixels[xx, yy][:3]
+            hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
+            # 白く飛んだ満タンは彩度が低く、黄にも水色にも入らない。
+            # 空いている側の白は1点だけなので、そこは溜まった方に入れない。
+            if (0.48 <= hue <= 0.58 and sat >= 0.55 and val >= 0.75) or (
+                0.06 <= hue <= 0.20 and sat >= 0.35 and val >= 0.70
+            ):
+                marks.append("C")
+            elif (val >= 0.92 and sat <= 0.20) or (val >= 0.85 and sat <= 0.08):
+                marks.append("W")
+            else:
+                marks.append(".")
+        charged = []
+        for index, mark in enumerate(marks):
+            if mark == "C":
+                charged.append(True)
+                continue
+            if mark != "W":
+                charged.append(False)
+                continue
+            run = 1
+            cursor = (index - 1) % steps
+            while marks[cursor] == "W" and run < steps:
+                run += 1
+                cursor = (cursor - 1) % steps
+            cursor = (index + 1) % steps
+            while marks[cursor] == "W" and run < steps:
+                run += 1
+                cursor = (cursor + 1) % steps
+            neighbor = marks[(index - 1) % steps] == "C" or marks[(index + 1) % steps] == "C"
+            charged.append(run >= 2 or neighbor)
+        if not any(charged[:8]):
+            continue
+        longest = 0
+        run = 0
+        for on in charged:
+            if on:
+                longest = max(longest, run)
+                run = 0
+            else:
+                run += 1
+        longest = max(longest, run)
+        if not charged[0] and not charged[-1]:
+            head = 0
+            while head < steps and not charged[head]:
+                head += 1
+            tail = 0
+            while tail < steps and not charged[steps - 1 - tail]:
+                tail += 1
+            if head + tail < steps:
+                longest = max(longest, head + tail)
+            else:
+                longest = steps
+        best = max(best, (steps - longest) / steps)
+    return best
+
+
+def _press_fan(
+    fan: dict[str, int] | None,
+    image: QImage,
+    say: StatusFn,
+    stop: Event | None,
+    last_fan_at: float,
+    tsum_count: int,
+    pending_hud: list[tuple[str, str, bool]],
+    sit: str,
+) -> bool:
+    if fan is None:
+        say("扇風機の枠がありません")
+        return False
+    if tsum_count < BOARD_TSUMS:
+        return False
+    if time.time() - last_fan_at < FAN_GAP:
+        return False
+    pending_hud.append((sit, "fan", True))
+    x = int(fan["x"] + max(1, int(fan["w"])) / 2)
+    y = int(fan["y"] + max(1, int(fan["h"])) / 2)
+    for _ in range(3):
+        say(f"扇風機をタップ {x},{y}")
+        tap(x, y, screen_w=image.width(), screen_h=image.height())
+    return True
+
+
+def _tap_skill(
+    skill: dict[str, int],
+    image: QImage,
+    say: StatusFn,
+    stop: Event | None,
+) -> None:
+    button = _skill_button_square(skill)
+    x = int(button["x"] + max(1, int(button["w"])) / 2)
+    y = int(button["y"] + max(1, int(button["h"])) / 2)
+    say(f"スキルをタップ {x},{y}")
+    tap(x, y, screen_w=image.width(), screen_h=image.height())
+
+
+def _tap_fan(
+    fan: dict[str, int],
+    image: QImage,
+    say: StatusFn,
+    stop: Event | None,
+) -> None:
+    x = int(fan["x"] + max(1, int(fan["w"])) / 2)
+    y = int(fan["y"] + max(1, int(fan["h"])) / 2)
+    say(f"扇風機をタップ {x},{y}")
+    tap(x, y, screen_w=image.width(), screen_h=image.height())
+
+
+def _fever_class(red: int, green: int, blue: int) -> tuple[bool, bool, bool]:
+    hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+    trough = 0.45 <= hue <= 0.62 and sat >= 0.25 and 0.28 <= val < 0.80
+    hot = (
+        red > green
+        and val >= 0.45
+        and sat >= 0.25
+        and not (0.28 <= hue <= 0.70)
+    )
+    remain = hot or (
+        val >= 0.50 and not (0.40 <= hue <= 0.70 and sat >= 0.18)
+    )
+    return hot, remain, trough
+
+
+def _fever_region(fever, skill, fan) -> dict[str, int] | None:
+    if fever is not None:
+        return fever
+    if skill is None or fan is None:
+        return None
+    left = int(skill["x"]) + max(1, int(skill["w"]))
+    right = int(fan["x"])
+    top = max(int(skill["y"]), int(fan["y"]))
+    bottom = min(
+        int(skill["y"]) + max(1, int(skill["h"])),
+        int(fan["y"]) + max(1, int(fan["h"])),
+    )
+    if bottom - top < 8:
+        top = min(int(skill["y"]), int(fan["y"]))
+        bottom = max(
+            int(skill["y"]) + max(1, int(skill["h"])),
+            int(fan["y"]) + max(1, int(fan["h"])),
+        )
+    if right - left < 8 or bottom - top < 8:
+        return None
+    return {"x": left, "y": top, "w": right - left, "h": bottom - top}
+
+
+def _fever_flag_runs(flags: list[bool]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start = None
+    last = -1
+    for index, on in enumerate(flags):
+        if on:
+            if start is None:
+                start = index
+            last = index
+            continue
+        if start is not None:
+            runs.append((start, last))
+            start = None
+    if start is not None:
+        runs.append((start, last))
+    return runs
+
+
+def _meter_fever_fill(image, fever, skill=None, fan=None) -> float | None:
+    region = _fever_region(fever, skill, fan)
+    if image is None or region is None:
+        return None
+    left = max(0, int(region["x"]))
+    top = max(0, int(region["y"]))
+    right = min(image.width, left + max(1, int(region["w"])))
+    bottom = min(image.height, top + max(1, int(region["h"])))
+    if right - left < 8 or bottom - top < 4:
+        return None
+    crop = image.crop((left, top, right, bottom))
+    width, height = crop.size
+    pixels = crop.load()
+    y = height // 2
+    marks: list[str] = []
+    for x in range(width):
+        red, green, blue = pixels[x, y][:3]
+        hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+        yellow = 0.08 <= hue <= 0.22 and sat >= 0.35 and val >= 0.72
+        white = val >= 0.88 and sat <= 0.42
+        blue_empty = 0.45 <= hue <= 0.70 and sat >= 0.45 and val < 0.78
+        dark = val < 0.42
+        if yellow or white:
+            marks.append("F")
+        elif blue_empty or dark:
+            marks.append("E")
+        else:
+            marks.append(".")
+    body = "".join(marks[int(width * 0.08) : int(width * 0.92)])
+    start = body.find("F")
+    if start < 0:
+        return 0.0
+    last = max(index for index, mark in enumerate(body) if mark in ("F", "E"))
+    end = start
+    empty_run = 0
+    for index in range(start, len(body)):
+        mark = body[index]
+        if mark == "F":
+            end = index
+            empty_run = 0
+        elif mark == "E":
+            empty_run += 1
+            if empty_run >= 10:
+                break
+        else:
+            empty_run = 0
+    span = last - start + 1
+    if span < 8:
+        return 0.0
+    return (end - start + 1) / span
+
+
+def _read_fever(
+    image, fever, skill=None, fan=None, full_w: int | None = None
+) -> tuple[float | None, int | None]:
+    region = _fever_region(fever, skill, fan)
+    if image is None or region is None:
+        return None, full_w
+    left = max(0, int(region["x"]))
+    top = max(0, int(region["y"]))
+    right = min(image.width, left + max(1, int(region["w"])))
+    bottom = min(image.height, top + max(1, int(region["h"])))
+    if right - left < 8 or bottom - top < 4:
+        return None, full_w
+    height = bottom - top
+    mid_y = (top + bottom) // 2
+    band = max(6, min(16, height // 4))
+    y0 = max(top, mid_y - band)
+    y1 = min(bottom, mid_y + band + 1)
+    step_y = max(1, (y1 - y0) // 10)
+    step_x = 1 if right - left <= 480 else 2
+    pixels = image.load()
+    mid_x = (left + right) / 2
+    charge: tuple[int, int, int, int] | None = None
+    empty: tuple[int, int, int, int] | None = None
+    gold: tuple[int, int, int, int] | None = None
+    for y in range(y0, y1, step_y):
+        filled_hot: list[bool] = []
+        filled_remain: list[bool] = []
+        trough: list[bool] = []
+        bar: list[bool] = []
+        for x in range(left, right, step_x):
+            red, green, blue = pixels[x, y][:3]
+            is_hot, is_remain, is_trough = _fever_class(red, green, blue)
+            filled_hot.append(is_hot)
+            filled_remain.append(is_remain)
+            trough.append(is_trough)
+            bar.append(is_hot or is_remain or is_trough)
+        runs = [item for item in _fever_flag_runs(bar) if item[1] - item[0] >= 4]
+        if not runs:
+            continue
+        chosen = None
+        for start, end in runs:
+            x0 = left + start * step_x
+            x1 = left + end * step_x
+            if x0 <= mid_x <= x1:
+                chosen = (start, end)
+                break
+        if chosen is None:
+            chosen = max(runs, key=lambda item: item[1] - item[0])
+        start, end = chosen
+        hot_n = sum(1 for index in range(start, end + 1) if filled_hot[index])
+        remain_n = sum(1 for index in range(start, end + 1) if filled_remain[index])
+        trough_n = sum(1 for index in range(start, end + 1) if trough[index])
+        if trough_n > 0 and hot_n > 0:
+            row = (hot_n, trough_n, start, end)
+            if charge is None or hot_n > charge[0]:
+                charge = row
+        elif trough_n > 0:
+            row = (0, trough_n, start, end)
+            if empty is None or trough_n > empty[1]:
+                empty = row
+        elif remain_n > 0:
+            row = (remain_n, 0, start, end)
+            if gold is None or remain_n > gold[0]:
+                gold = row
+    chosen_row = charge if charge is not None else gold if gold is not None else empty
+    if chosen_row is None:
+        return None, full_w
+    fill_n, trough_n, start, end = chosen_row
+    if trough_n > 0:
+        return fill_n / (fill_n + trough_n), None
+    gold_w = (end - start + 1) * step_x
+    stored = gold_w if full_w is None or gold_w > full_w else full_w
+    return gold_w / stored, stored
+
+
+def _gadget_skill_hold(fever_on: bool, fever_fill: float | None, left: int | None) -> bool:
+    if left is not None and int(left) <= GADGET_TIMER_SKILL:
+        return False
+    if not fever_on or fever_fill is None:
+        return False
+    return float(fever_fill) <= GADGET_FEVER_SKILL_MIN
+
+
+def _fever_playing(image, box: dict[str, int] | None) -> bool:
+    if image is None or box is None:
+        return False
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(image.width, left + max(1, int(box["w"])))
+    bottom = min(image.height, top + max(1, int(box["h"])))
+    if right - left < 8 or bottom - top < 8:
+        return False
+    crop = image.crop((left, top, right, bottom))
+    width, height = crop.size
+    step_x = max(1, width // 32)
+    step_y = max(1, height // 32)
+    pixels = crop.load()
+    dark = 0
+    cyan = 0
+    for yy in range(0, height, step_y):
+        for xx in range(0, width, step_x):
+            red, green, blue = pixels[xx, yy][:3]
+            hue, sat, val = colorsys.rgb_to_hsv(
+                red / 255.0, green / 255.0, blue / 255.0
+            )
+            if val < 0.22:
+                dark += 1
+            elif 0.42 <= hue <= 0.58 and sat >= 0.08 and val >= 0.40:
+                cyan += 1
+    return dark > cyan
+
+
+def _tap_biggest_bomb(
+    pieces: list[dict[str, int]],
+    image: QImage,
+    say: StatusFn,
+    stop: Event | None,
+    game: dict[str, int] | None = None,
+    skip_cells: set[tuple[int, int]] | None = None,
+) -> tuple[bool, tuple[int, int] | None]:
+    bombs = _bombs_on_board(pieces, game)
+    if skip_cells:
+        bombs = [piece for piece in bombs if _piece_cell(piece) not in skip_cells]
+    if not bombs:
+        return False, None
+    bomb = max(bombs, key=lambda piece: int(piece.get("r") or 0))
+    say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+    tap(int(bomb["x"]), int(bomb["y"]), screen_w=image.width(), screen_h=image.height())
+    return True, _piece_cell(bomb)
+
+
+def _piece_cell(piece: dict[str, int]) -> tuple[int, int]:
+    return (int(piece["x"]) // 16, int(piece["y"]) // 16)
+
+
+def _my_tsum_near_bomb(
+    pieces: list[dict[str, int]],
+    my_group: int,
+    game: dict[str, int] | None,
+) -> dict[str, int] | None:
+    bombs = _bombs_on_board(pieces, game)
+    if my_group <= 0 or not bombs:
+        return None
+    mine = [
+        piece
+        for piece in pieces
+        if _is_tsum(piece) and int(piece.get("group") or 0) == my_group
+    ]
+    if not mine:
+        return None
+    radii = [max(4, int(piece.get("r") or 12)) for piece in mine]
+    reach = sorted(radii)[len(radii) // 2] * 2.6
+    best: dict[str, int] | None = None
+    best_d: float | None = None
+    for bomb in bombs:
+        bx = int(bomb["x"])
+        by = int(bomb["y"])
+        for piece in mine:
+            dist = math.hypot(int(piece["x"]) - bx, int(piece["y"]) - by)
+            if dist > reach:
+                continue
+            if best_d is None or dist < best_d:
+                best = bomb
+                best_d = dist
+    return best
+
+
+def _bombs_on_board(
+    pieces: list[dict[str, int]],
+    game: dict[str, int] | None,
+) -> list[dict[str, int]]:
+    if game is None:
+        return []
+    left = int(game["x"])
+    top = int(game["y"])
+    right = left + max(1, int(game["w"]))
+    bottom = top + max(1, int(game["h"]))
+    found: list[dict[str, int]] = []
+    for piece in pieces:
+        if str(piece.get("kind") or "") != "bomb":
+            continue
+        x = int(piece["x"])
+        y = int(piece["y"])
+        if x < left or y < top or x >= right or y >= bottom:
+            continue
+        found.append(piece)
+    return found
+
+
+def _break_bombs_until_one(
+    predictor,
+    game: dict[str, int] | None,
+    say: StatusFn,
+    stop: Event | None,
+    watch_hit: Event,
+) -> int:
+    if game is None:
+        return 0
+    skip: set[tuple[int, int]] = set()
+    taps = 0
+    while True:
+        _check_stop(stop)
+        if watch_hit.is_set():
+            return taps
+        try:
+            image = capture_play_frame()
+            rgb = _qimage_rgb(image)
+        except Exception:
+            _sleep_stop(ERASE_WAIT, stop)
+            continue
+        if rgb is None or image.isNull():
+            _sleep_stop(ERASE_WAIT, stop)
+            continue
+        with _gpu_lock:
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+        bombs = _bombs_on_board(pieces, game)
+        n = len(bombs)
+        if n <= 1:
+            return taps
+        extra = [
+            piece
+            for piece in sorted(
+                bombs, key=lambda piece: int(piece.get("r") or 0), reverse=True
+            )
+            if _piece_cell(piece) not in skip
+        ][: n - 1]
+        if not extra:
+            return taps
+        say(f"ボム {n}")
+        for bomb in extra:
+            _check_stop(stop)
+            if watch_hit.is_set():
+                return taps
+            say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+            tap(
+                int(bomb["x"]),
+                int(bomb["y"]),
+                hold_ms=40,
+                screen_w=image.width(),
+                screen_h=image.height(),
+            )
+            skip.add(_piece_cell(bomb))
+            taps += 1
+        _sleep_stop(ERASE_WAIT, stop)
+
+
+def _break_bombs_until_zero(
+    predictor,
+    game: dict[str, int] | None,
+    say: StatusFn,
+    stop: Event | None,
+    watch_hit: Event,
+    seed: tuple | None = None,
+) -> int:
+    if game is None:
+        return 0
+    skip: set[tuple[int, int]] = set()
+    taps = 0
+    while True:
+        _check_stop(stop)
+        if watch_hit.is_set():
+            return taps
+        if seed is not None:
+            image, pieces = seed
+            seed = None
+            rgb = None if image is None else _qimage_rgb(image)
+        else:
+            try:
+                image = capture_play_frame()
+                rgb = _qimage_rgb(image)
+            except Exception:
+                _sleep_stop(ERASE_WAIT, stop)
+                continue
+            if rgb is None or image.isNull():
+                _sleep_stop(ERASE_WAIT, stop)
+                continue
+            with _gpu_lock:
+                pieces = predictor.predict_pieces(
+                    Path("."), game, rgb=rgb, inner=False, assign_groups=False
+                )
+        bombs = _bombs_on_board(pieces, game)
+        if not bombs:
+            return taps
+        extra = [
+            piece
+            for piece in sorted(
+                bombs, key=lambda piece: int(piece.get("r") or 0), reverse=True
+            )
+            if _piece_cell(piece) not in skip
+        ]
+        if not extra:
+            return taps
+        say(f"ボム {len(bombs)}")
+        for bomb in extra:
+            _check_stop(stop)
+            if watch_hit.is_set():
+                return taps
+            say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+            tap(
+                int(bomb["x"]),
+                int(bomb["y"]),
+                hold_ms=40,
+                screen_w=image.width(),
+                screen_h=image.height(),
+            )
+            skip.add(_piece_cell(bomb))
+            taps += 1
+        _sleep_stop(ERASE_WAIT, stop)
+
+
+def _break_bombs_until_two(
+    predictor,
+    game: dict[str, int] | None,
+    say: StatusFn,
+    stop: Event | None,
+    watch_hit: Event,
+) -> int:
+    if game is None:
+        return 0
+    skip: set[tuple[int, int]] = set()
+    taps = 0
+    while True:
+        _check_stop(stop)
+        if watch_hit.is_set():
+            return taps
+        try:
+            image = capture_play_frame()
+            rgb = _qimage_rgb(image)
+        except Exception:
+            _sleep_stop(ERASE_WAIT, stop)
+            continue
+        if rgb is None or image.isNull():
+            _sleep_stop(ERASE_WAIT, stop)
+            continue
+        with _gpu_lock:
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+        bombs = _bombs_on_board(pieces, game)
+        n = len(bombs)
+        tsums = [piece for piece in pieces if _is_tsum(piece)]
+        if n > 1:
+            say(f"cバズ ボム {n}")
+            extra = [
+                piece
+                for piece in sorted(bombs, key=lambda piece: int(piece["y"]))
+                if _piece_cell(piece) not in skip
+            ][: n - 1]
+            if not extra:
+                return taps
+            for bomb in extra:
+                _check_stop(stop)
+                if watch_hit.is_set():
+                    return taps
+                say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+                tap(
+                    int(bomb["x"]),
+                    int(bomb["y"]),
+                    hold_ms=40,
+                    screen_w=image.width(),
+                    screen_h=image.height(),
+                )
+                skip.add(_piece_cell(bomb))
+                taps += 1
+            _sleep_stop(0.05, stop)
+            continue
+        if len(tsums) >= BOARD_READY:
+            return taps
+        skip.clear()
+        _sleep_stop(ERASE_WAIT, stop)
+
+
+def _remaining_after_erase(
+    pieces: list[dict[str, int]],
+    chain: list[dict[str, int]],
+) -> list[dict[str, int]]:
+    gone = {id(piece) for piece in chain}
+    leftover = [dict(piece) for piece in pieces if id(piece) not in gone]
+    _drop_down(leftover, pieces)
+    return leftover
+
+
+def _drop_down(remaining: list[dict[str, int]], before: list[dict[str, int]]) -> None:
+    origins = [
+        piece
+        for piece in before
+        if _is_tsum(piece) or str(piece.get("kind") or "") == "bomb"
+    ]
+    movers = [
+        piece
+        for piece in remaining
+        if _is_tsum(piece) or str(piece.get("kind") or "") == "bomb"
+    ]
+    tsums = [piece for piece in origins if _is_tsum(piece)]
+    spacing = _median_spacing(tsums or origins)
+    if spacing <= 0 or not movers or not origins:
+        return
+    col_w = spacing * 0.5
+    centers: list[float] = []
+    orig_cols: list[list[dict[str, int]]] = []
+    for piece in origins:
+        x = float(piece["x"])
+        best_i = None
+        best_d = col_w
+        for index, cx in enumerate(centers):
+            dist = abs(x - cx)
+            if dist < best_d:
+                best_d = dist
+                best_i = index
+        if best_i is None:
+            centers.append(x)
+            orig_cols.append([piece])
+            continue
+        orig_cols[best_i].append(piece)
+        count = len(orig_cols[best_i])
+        centers[best_i] += (x - centers[best_i]) / count
+    rest_cols: list[list[dict[str, int]]] = [[] for _ in centers]
+    for piece in movers:
+        x = float(piece["x"])
+        best_i = min(range(len(centers)), key=lambda index: abs(x - centers[index]))
+        rest_cols[best_i].append(piece)
+    for orig, kept in zip(orig_cols, rest_cols):
+        if not kept:
+            continue
+        ys = sorted(int(piece["y"]) for piece in orig)
+        bottom = ys[-1]
+        gaps = [ys[index + 1] - ys[index] for index in range(len(ys) - 1) if ys[index + 1] > ys[index]]
+        step = gaps[len(gaps) // 2] if gaps else int(round(spacing))
+        if step < 1:
+            step = max(1, int(round(spacing)))
+        kept.sort(key=lambda piece: int(piece["y"]))
+        for index, piece in enumerate(reversed(kept)):
+            piece["y"] = int(round(bottom - index * step))
+
+
+def _median_spacing(tsums: list[dict[str, int]]) -> float:
+    if len(tsums) < 2:
+        return 0.0
+    nearest: list[float] = []
+    for index, left in enumerate(tsums):
+        ax, ay = int(left["x"]), int(left["y"])
+        best = 1e18
+        for other, right in enumerate(tsums):
+            if other == index:
+                continue
+            dx = ax - int(right["x"])
+            dy = ay - int(right["y"])
+            dist = dx * dx + dy * dy
+            if dist < best:
+                best = dist
+        if best < 1e18:
+            nearest.append(best ** 0.5)
+    if not nearest:
+        return 0.0
+    nearest.sort()
+    return nearest[len(nearest) // 2]
+
+
+def _qimage_rgb(image: QImage):
+    from PIL import Image as PILImage
+
+    if image.isNull():
+        return None
+    converted = image.convertToFormat(QImage.Format.Format_RGB888)
+    width = converted.width()
+    height = converted.height()
+    stride = converted.bytesPerLine()
+    ptr = converted.constBits()
+    size = converted.sizeInBytes()
+    try:
+        mv = memoryview(ptr)[:size]
+    except TypeError:
+        mv = bytes(ptr[:size])
+    try:
+        import numpy as np
+
+        raw = np.frombuffer(mv, dtype=np.uint8)
+        if stride == width * 3:
+            arr = raw.reshape((height, width, 3)).copy()
+        else:
+            arr = raw.reshape((height, stride))[:, : width * 3].copy()
+            arr = arr.reshape((height, width, 3))
+        return PILImage.fromarray(arr, "RGB")
+    except Exception:
+        buf = bytes(mv) if not isinstance(mv, (bytes, bytearray)) else mv
+        if stride == width * 3:
+            return PILImage.frombytes("RGB", (width, height), buf)
+        rows = [buf[row * stride : row * stride + width * 3] for row in range(height)]
+        return PILImage.frombytes("RGB", (width, height), b"".join(rows))
+
+
+def _watch_timeup(
+    predictor,
+    stop_watch: Event,
+    watching: Event,
+    hit: Event,
+    stop: Event | None,
+) -> None:
+    while not stop_watch.is_set():
+        if stop is not None and stop.is_set():
+            return
+        if not watching.is_set() or hit.is_set():
+            time.sleep(0.02)
+            continue
+        image = capture_window_frame()
+        if not watching.is_set() or stop_watch.is_set() or hit.is_set():
+            continue
+        if image is None or image.isNull():
+            time.sleep(0.05)
+            continue
+        rgb = _qimage_rgb(image)
+        if rgb is None:
+            time.sleep(0.05)
+            continue
+        if not watching.is_set() or stop_watch.is_set() or hit.is_set():
+            continue
+        got_gpu = _gpu_lock.acquire(blocking=False)
+        if not got_gpu:
+            time.sleep(0.02)
+            continue
+        try:
+            if not watching.is_set() or stop_watch.is_set() or hit.is_set():
+                continue
+            seen, _score = _timeup_hit(predictor, rgb)
+        finally:
+            _gpu_lock.release()
+        if seen:
+            hit.set()
+        else:
+            time.sleep(0.35)
+
+
+def _end_on_timeup(
+    predictor,
+    image: QImage,
+    rgb,
+    pending_spots,
+    clears: int,
+    swipes: int,
+    pieces: list[dict[str, int]] | None,
+    game: dict[str, int] | None,
+    say: StatusFn,
+    stop: Event | None,
+    timer: dict[str, int] | None = None,
+    saw_board: bool = False,
+    boxes: dict[str, dict[str, int]] | None = None,
+) -> bool:
+    retry = (
+        saw_board
+        and image is not None
+        and not image.isNull()
+        and _retry_button(image) is not None
+    )
+    extra = 0
+    if pending_spots is not None and not _spots_lingered(rgb, pending_spots):
+        extra = 1
+    if retry:
+        with _gpu_lock:
+            coin = _read_coin(predictor, rgb, boxes)
+        say(f"TIME UP / {_counts_line(clears + extra, swipes, coin)}")
+        return True
+    with _gpu_lock:
+        hit, score = _timeup_hit(predictor, rgb)
+        coin = ""
+        if hit:
+            coin = _read_coin(predictor, rgb, boxes)
+    if _timer_still_running(rgb, timer):
+        return False
+    if not hit:
+        return False
+    say(f"TIME UP {score:.0%} / {_counts_line(clears + extra, swipes, coin)}")
+    return True
+
+
+def _note_match_end(
+    predictor,
+    rgb,
+    boxes: dict[str, dict[str, int]] | None,
+    clears: int,
+    swipes: int,
+    skill_taps: int,
+    skill_ok: int,
+    skill_wait_empty: bool,
+    skill: dict[str, int] | None,
+    bomb_taps: int,
+    fan_taps: int,
+    match_picks: list[tuple[list[int], int]],
+    coin,
+    used_tsum: str = "",
+    items: list[str] | None = None,
+    duration: int | None = None,
+    waits: list[float] | None = None,
+    upload: bool = True,
+) -> None:
+    if skill_wait_empty:
+        fill = _skill_fill(rgb, skill)
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            skill_ok += 1
+    got = coin
+    if not got:
+        got = _read_coin(predictor, rgb, boxes)
+    coin_n = None
+    if got:
+        coin_n = play_coin(got)
+    record_play(clears, swipes, skill_taps, skill_ok, bomb_taps, fan_taps, coin_n, waits)
+    append_play(
+        clears,
+        swipes,
+        skill_taps,
+        skill_ok,
+        coin_n,
+        used_tsum,
+        items,
+        duration,
+        waits,
+        upload,
+    )
+
+
+def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
+    text = f"消し {clears}回 / なぞり {swipes}回"
+    kept = play_coin(coin) if coin else None
+    if kept is not None:
+        text += f" / コイン {kept}"
+    return text
+
+
+def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
+    if rgb is None or not boxes:
+        return ""
+    predict = getattr(predictor, "predict_coin_digits", None)
+    if predict is None:
+        return ""
+    width, height = rgb.size
+    for key in ("coin", "result_coin"):
+        box = boxes.get(key)
+        if not box:
+            continue
+        left = max(0, int(box["x"]))
+        top = max(0, int(box["y"]))
+        right = min(width, left + max(1, int(box["w"])))
+        bottom = min(height, top + max(1, int(box["h"])))
+        if right - left < 4 or bottom - top < 4:
+            continue
+        crop = rgb.crop((left, top, right, bottom))
+        try:
+            raw = str(predict(crop, key) or "")
+        except Exception:
+            continue
+        digits = "".join(char for char in raw if char.isdigit())
+        if digits:
+            return digits
+    return ""
+
+
+def _read_timer(predictor, rgb, timer: dict[str, int] | None) -> int | None:
+    del predictor
+    if timer is None or rgb is None:
+        return None
+    width, height = rgb.size
+    left = max(0, int(timer["x"]))
+    top = max(0, int(timer["y"]))
+    right = min(width, left + max(1, int(timer["w"])))
+    bottom = min(height, top + max(1, int(timer["h"])))
+    if right - left < 4 or bottom - top < 4:
+        return None
+    crop = rgb.crop((left, top, right, bottom))
+    from app.timer_digits import read_timer_digits
+
+    text = read_timer_digits(crop)
+    if not text or not text.isdigit():
+        return None
+    return int(text)
+
+
+def _timer_is_zero(predictor, rgb, timer: dict[str, int] | None) -> bool:
+    left = _read_timer(predictor, rgb, timer)
+    return left is not None and left == 0
+
+
+def _timer_still_running(rgb, timer: dict[str, int] | None) -> bool:
+    left = _read_timer(None, rgb, timer)
+    return left is not None and left > 0
+
+
+def _replay_after_timeup(say: StatusFn, stop: Event | None) -> tuple[str, list[str] | None]:
+    _seen, _locked, arrived, used_name, items = _click_start_or_continue(
+        say, stop, tap_start=False, read_tsum=False
+    )
+    if arrived == "continue":
+        _tap_continue_now(say, stop)
+    return used_name, items
+
+
+def _tap_point(image: QImage, x: int, y: int) -> None:
+    xi, yi = str(int(x)), str(int(y))
+    result = adb(["shell", "input", "tap", xi, yi], timeout=6)
+    if result.returncode != 0:
+        tap(x, y, screen_w=image.width(), screen_h=image.height())
+
+
+def _scene_top(predictor, rgb) -> tuple[str, float]:
+    model = getattr(predictor, "scene_model", None)
+    transform = getattr(predictor, "_scene_transform", None)
+    if model is None or transform is None or rgb is None:
+        return "other", 0.0
+    import torch
+
+    view = _portrait_frame(rgb)
+    tensor = transform(view).unsqueeze(0).to(predictor.device)
+    with torch.no_grad():
+        probs = torch.softmax(model(tensor), dim=1)[0]
+    classes = getattr(predictor, "scene_classes", None) or ("other", "go", "timeup")
+    index = int(probs.argmax().item())
+    name = classes[index] if 0 <= index < len(classes) else "other"
+    return name, float(probs[index].item())
+
+
+def _timeup_hit(predictor, rgb) -> tuple[bool, float]:
+    score, top = _timeup_read(predictor, rgb)
+    return (top and score >= TIMEUP_SCORE), score
+
+
+def _timeup_read(predictor, rgb) -> tuple[float, bool]:
+    model = getattr(predictor, "scene_model", None)
+    transform = getattr(predictor, "_scene_transform", None)
+    if model is None or transform is None or rgb is None:
+        return 0.0, False
+    import torch
+
+    view = _portrait_frame(rgb)
+    tensor = transform(view).unsqueeze(0).to(predictor.device)
+    with torch.no_grad():
+        probs = torch.softmax(model(tensor), dim=1)[0]
+    classes = getattr(predictor, "scene_classes", None) or ("other", "go", "timeup")
+    if "timeup" in classes:
+        index = classes.index("timeup")
+    elif probs.numel() >= 3:
+        index = 2
+    else:
+        return 0.0, False
+    if index < 0 or index >= int(probs.numel()):
+        return 0.0, False
+    score = float(probs[index].item())
+    top = int(probs.argmax().item()) == index
+    return score, top
+
+
+def _timeup_score(predictor, rgb) -> float:
+    score, _top = _timeup_read(predictor, rgb)
+    return score
+
+
+def _portrait_frame(image: Image.Image) -> Image.Image:
+    width, height = image.size
+    if width <= height:
+        return image
+    sample_w = min(160, width)
+    sample_h = max(1, int(round(height * sample_w / width)))
+    sample = image.resize((sample_w, sample_h))
+    left_s = 0
+    while left_s < sample_w - 1 and _column_luma(sample, left_s) < 14:
+        left_s += 1
+    right_s = sample_w - 1
+    while right_s > left_s and _column_luma(sample, right_s) < 14:
+        right_s -= 1
+    scale = width / sample_w
+    left = int(left_s * scale)
+    right = min(width, int((right_s + 1) * scale))
+    if right - left < height * 0.35:
+        strip_w = max(1, int(height * 9 / 16))
+        left = max(0, (width - strip_w) // 2)
+        right = min(width, left + strip_w)
+    return image.crop((left, 0, right, height))
+
+
+def _column_luma(image: Image.Image, x: int) -> float:
+    height = image.size[1]
+    total = 0.0
+    for y in range(height):
+        red, green, blue = image.getpixel((x, y))[:3]
+        total += 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    return total / max(height, 1)
+
+
+def _sleep_stop(seconds: float, stop: Event | None) -> None:
+    end = time.time() + seconds
+    while time.time() < end:
+        _check_stop(stop)
+        time.sleep(min(0.2, max(0.0, end - time.time())))
+
+
+_ANALYZE_ROOT = APP_ROOT / "bundled" / "analyze"
+_TSUM_READER = None
+
+
+def _used_tsum_reader():
+    global _TSUM_READER
+    if _TSUM_READER is not None:
+        return _TSUM_READER
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import TsumReader
+
+    _TSUM_READER = TsumReader()
+    return _TSUM_READER
+
+
+def _read_used_tsum(path: Path) -> str:
+    from PIL import Image
+
+    try:
+        reader = _used_tsum_reader()
+        from tsumtsum_analyze.item_teach import (
+            _crop_screen_tsum,
+            _image_to_feature,
+            _l1_distance,
+            shown_tsum_name,
+        )
+
+        with Image.open(path) as opened:
+            view = _portrait_frame(opened.convert("RGB"))
+            target = _image_to_feature(_crop_screen_tsum(view))
+        best_id = ""
+        best_dist = math.inf
+        for tsum_id, proto_list in reader._prototypes.items():
+            dist = min(_l1_distance(target, proto) for proto in proto_list)
+            if dist < best_dist:
+                best_dist = dist
+                best_id = tsum_id
+        if not best_id or best_dist > 0.12:
+            return ""
+        return shown_tsum_name(reader._display.get(best_id, best_id))
+    except Exception:
+        return ""
+
+
+def used_tsum_names() -> list[str]:
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import tsum_class_names
+
+    return tsum_class_names()
+
+
+def save_used_tsum_teach(path: Path, name: str, folder_id: str | None = None) -> str:
+    from PIL import Image
+
+    global _TSUM_READER
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import save_tsum_screen
+
+    with Image.open(path) as opened:
+        view = _portrait_frame(opened.convert("RGB"))
+    dest = Path(tempfile.gettempdir()) / "tsum_used_teach.png"
+    view.save(str(dest), format="PNG")
+    _count, saved = save_tsum_screen(dest, name, folder_id=folder_id)
+    _TSUM_READER = None
+    return saved
+
+
+def register_used_tsum_id(name: str, folder_id: str) -> str:
+    global _TSUM_READER
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import (
+        _dir_name,
+        _ensure_gitkeep,
+        _load_registry,
+        _name_only,
+        _rebuild_tsum_model,
+        _save_registry,
+        tsum_display_name,
+        use_tsums_root,
+    )
+
+    cleaned = _name_only(name)
+    if not cleaned:
+        raise ValueError("ツムの名前を入力してください")
+    tsum_id = _dir_name(folder_id)
+    if not tsum_id:
+        raise ValueError("フォルダ名を入力してください")
+    folder = use_tsums_root() / tsum_id
+    folder.mkdir(parents=True, exist_ok=True)
+    _ensure_gitkeep(folder)
+    registry = _load_registry()
+    registry[tsum_id] = cleaned
+    _save_registry(registry)
+    _rebuild_tsum_model(tsum_id)
+    _TSUM_READER = None
+    return tsum_display_name(tsum_id)
+
+
+def _heart_mail_pink(red: int, green: int, blue: int) -> bool:
+    return (
+        red > 170
+        and 30 < green < 180
+        and 50 < blue < 200
+        and red > green + 50
+        and red > blue + 20
+    )
+
+
+def _heart_mail_red(red: int, green: int, blue: int) -> bool:
+    return red > 180 and green < 100 and blue < 110 and red > green + 80 and red > blue + 70
+
+
+def _heart_mail_blobs(image, match, min_pixels: int) -> list[tuple[int, int, int, int]]:
+    width, height = image.size
+    pixels = image.load()
+    seen = [[False] * width for _ in range(height)]
+    found: list[tuple[int, int, int, int]] = []
+    for y in range(height):
+        for x in range(width):
+            if seen[y][x] or not match(*pixels[x, y][:3]):
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            points: list[tuple[int, int]] = []
+            while stack:
+                cx, cy = stack.pop()
+                points.append((cx, cy))
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if (
+                        0 <= nx < width
+                        and 0 <= ny < height
+                        and not seen[ny][nx]
+                        and match(*pixels[nx, ny][:3])
+                    ):
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if len(points) < min_pixels:
+                continue
+            xs = [pt[0] for pt in points]
+            ys = [pt[1] for pt in points]
+            box_w = max(xs) - min(xs) + 1
+            box_h = max(ys) - min(ys) + 1
+            if box_w < 4 or box_h < 4:
+                continue
+            if not (0.55 <= box_w / box_h <= 1.8):
+                continue
+            if len(points) < box_w * box_h * 0.35:
+                continue
+            found.append((min(xs), min(ys), max(xs) + 1, max(ys) + 1))
+    return found
+
+
+def _heart_mail_plus(glyph) -> bool:
+    width, height = glyph.size
+    if width < 4 or height < 4:
+        return False
+    if height > width * 1.8 or width > height * 1.8:
+        return False
+    pixels = glyph.load()
+    row = sum(1 for x in range(width) if pixels[x, height // 2] > 128) / width
+    col = sum(1 for y in range(height) if pixels[width // 2, y] > 128) / height
+    corners = (
+        pixels[1, 1],
+        pixels[width - 2, 1],
+        pixels[1, height - 2],
+        pixels[width - 2, height - 2],
+    )
+    empty = sum(1 for value in corners if value < 128)
+    return row > 0.45 and col > 0.45 and empty >= 3
+
+
+def _heart_mail_glyphs(mask: list[list[bool]]):
+    from PIL import Image
+
+    from app.timer_digits import _MAX_DIST, _SAMPLES, _bits
+
+    height = len(mask)
+    width = len(mask[0]) if height else 0
+    counts = [sum(1 for y in range(height) if mask[y][x]) for x in range(width)]
+    spans: list[tuple[int, int]] = []
+    x = 0
+    while x < width:
+        if counts[x] == 0:
+            x += 1
+            continue
+        start = x
+        while x < width and counts[x] > 0:
+            x += 1
+        if x - start >= 2:
+            spans.append((start, x))
+    chars: list[str] = []
+    for start, end in spans:
+        ys = [y for y in range(height) for xx in range(start, end) if mask[y][xx]]
+        if not ys:
+            continue
+        top, bottom = min(ys), max(ys) + 1
+        if bottom - top < 4:
+            continue
+        glyph = Image.new("L", (end - start, bottom - top), 0)
+        target = glyph.load()
+        for y in range(top, bottom):
+            for xx in range(start, end):
+                if mask[y][xx]:
+                    target[xx - start, y - top] = 255
+        if _heart_mail_plus(glyph):
+            chars.append("+")
+            continue
+        row = _bits(glyph)
+        best = ""
+        dist = _MAX_DIST + 1
+        for digit, samples in _SAMPLES.items():
+            for sample in samples:
+                score = sum(left != right for left, right in zip(row, sample))
+                if score < dist:
+                    dist = score
+                    best = digit
+        if best and dist <= _MAX_DIST:
+            chars.append(best)
+    return "".join(chars)
+
+
+def _heart_mail_text(image, box: tuple[int, int, int, int], ink) -> str:
+    left, top, right, bottom = box
+    left = max(0, left)
+    top = max(0, top)
+    right = min(image.width, right)
+    bottom = min(image.height, bottom)
+    if right - left < 4 or bottom - top < 4:
+        return ""
+    pixels = image.load()
+    mask = [
+        [ink(*pixels[x, y][:3]) for x in range(left, right)]
+        for y in range(top, bottom)
+    ]
+    return _heart_mail_glyphs(mask)
+
+
+def _read_heart_mail(image) -> tuple[int, str, str] | None:
+    from PIL import Image
+
+    view = _portrait_frame(image)
+    width, _height = view.size
+    scale = 220 / max(width, 1)
+    small = view.resize(
+        (max(1, int(width * scale)), max(1, int(view.size[1] * scale))),
+        Image.Resampling.BOX,
+    )
+    hearts = _heart_mail_blobs(small, _heart_mail_pink, 12)
+    badges = [
+        box
+        for box in _heart_mail_blobs(small, _heart_mail_red, 8)
+        if (box[2] - box[0]) <= small.size[0] * 0.12
+    ]
+    best: tuple[int, list[tuple[int, int, int, int]], tuple[int, int, int, int]] | None = None
+    for badge in badges:
+        band = [
+            heart
+            for heart in hearts
+            if heart[2] < badge[0] and heart[1] < badge[3] + 8 and heart[3] > badge[1] - 8
+        ]
+        if not band:
+            continue
+        band.sort(key=lambda item: item[0])
+        heights = [item[3] - item[1] for item in band]
+        median = sorted(heights)[len(heights) // 2]
+        row = [
+            item
+            for item in band
+            if abs((item[3] - item[1]) - median) <= max(2, median * 0.45)
+        ]
+        if not row:
+            continue
+        cy = sum((item[1] + item[3]) / 2 for item in row) / len(row)
+        row = [item for item in row if abs((item[1] + item[3]) / 2 - cy) <= median]
+        if row and (best is None or len(row) > best[0]):
+            best = (len(row), row, badge)
+    if best is None:
+        return None
+    count, row, badge = best
+    inv = 1 / scale
+    heart_right = int(row[-1][2] * inv)
+    top = int(min(item[1] for item in row) * inv)
+    bottom = int(max(item[3] for item in row) * inv)
+    badge_box = tuple(int(value * inv) for value in badge)
+
+    def number_ink(red: int, green: int, blue: int) -> bool:
+        luma = 0.3 * red + 0.59 * green + 0.11 * blue
+        return luma > 175 and blue > 150 and green > 140
+
+    def badge_ink(red: int, green: int, blue: int) -> bool:
+        return red > 200 and green > 160 and blue > 160
+
+    number = _heart_mail_text(view, (heart_right + 2, top, badge_box[0] - 2, bottom), number_ink)
+    mail = _heart_mail_text(view, badge_box, badge_ink)
+    return count, number, mail
+
+
+def _filled_heart_count(image) -> int | None:
+    from PIL import Image
+
+    if isinstance(image, QImage):
+        image = _qimage_rgb(image)
+    if not isinstance(image, Image.Image):
+        return None
+    view = _portrait_frame(image)
+    width, height = view.size
+    scale = 220 / max(width, 1)
+    small = view.resize(
+        (max(1, int(width * scale)), max(1, int(height * scale))),
+        Image.Resampling.BOX,
+    )
+    sw, sh = small.size
+    if sw < 2 or sh < 2:
+        return None
+    row = []
+    for box in _heart_mail_blobs(small, _heart_mail_pink, 12):
+        cx = (box[0] + box[2]) / 2 / sw
+        cy = (box[1] + box[3]) / 2 / sh
+        if 0.14 <= cy <= 0.30 and cx <= 0.55:
+            row.append(box)
+    if not row:
+        return 0
+    row.sort(key=lambda box: (box[1] + box[3]) / 2)
+    cy = (row[0][1] + row[0][3]) / 2
+    same = [box for box in row if abs((box[1] + box[3]) / 2 - cy) <= (box[3] - box[1])]
+    return len(same)
+
+
+def _start_hearts(image: QImage) -> int | None:
+    if image is None or image.isNull() or _match_start_button(image) is None:
+        return None
+    rgb = _qimage_rgb(image)
+    if rgb is None:
+        return 0
+    count = _filled_heart_count(rgb)
+    if count is None:
+        return 0
+    return count
+
+
+def _wait_for_heart(say: StatusFn, stop: Event | None) -> None:
+    said = False
+    while True:
+        _check_stop(stop)
+        try:
+            shot = capture_play_frame()
+        except Exception:
+            shot = None
+        if shot is None or shot.isNull():
+            _sleep_stop(5, stop)
+            continue
+        if _match_start_button(shot) is None:
+            return
+        hearts = _start_hearts(shot)
+        if hearts is None or hearts <= 0:
+            if not said:
+                say("ハートが 0 なので待ちます")
+                said = True
+            _sleep_stop(5, stop)
+            continue
+        if said:
+            say(f"ハート {hearts}")
+        return
+
+
+def _say_heart_mail(say: StatusFn, image) -> None:
+    from PIL import Image
+
+    if isinstance(image, QImage):
+        image = _qimage_rgb(image)
+    if not isinstance(image, Image.Image):
+        return
+    found = _read_heart_mail(image)
+    if found is None:
+        hearts = _filled_heart_count(image)
+        if hearts is not None:
+            say(f"ハート {hearts}")
+        return
+    hearts, number, mail = found
+    parts = [f"ハート {hearts}"]
+    if number:
+        parts.append(number)
+    if mail:
+        parts.append(f"メール {mail}")
+    say(" / ".join(parts))
+
+
+def _click_start_or_continue(
+    say: StatusFn,
+    stop: Event | None,
+    tap_start: bool = True,
+    skip_retry: bool = False,
+    read_tsum: bool = True,
+) -> tuple[int, bool, str, str, list[str] | None]:
+    deadline = time.time() + 12
+    kinds = 5
+    locked = False
+    used_name = ""
+    items: list[str] | None = None
+    while time.time() < deadline:
+        _check_stop(stop)
+        try:
+            path = capture_screen_path()
+            image = QImage(str(path))
+        except Exception:
+            say("画面を待っています")
+            _sleep_stop(0.8, stop)
+            continue
+        if image.isNull():
+            _sleep_stop(0.4, stop)
+            continue
+        used = _five_to_four_used_path(path)
+        if used is not None:
+            kinds = 4 if used else 5
+            locked = True
+        start = _match_start_button(image)
+        if start is not None:
+            if read_tsum:
+                name = _read_used_tsum(path)
+                if name:
+                    used_name = name
+                    say(f"使用ツム {name}")
+            found_items = _items_used_path(path)
+            if found_items is not None:
+                items = found_items
+            if items:
+                say("アイテム " + "、".join(items))
+            _say_heart_mail(say, image)
+            if _start_hearts(image) == 0:
+                _wait_for_heart(say, stop)
+                deadline = time.time() + 12
+                continue
+            if tap_start:
+                say("スタートをクリックします")
+                _slow_tap(start.center().x(), start.center().y())
+                _sleep_stop(1.2, stop)
+            else:
+                say("スタートを検出しました")
+            return kinds, locked, "start", used_name, items
+        retry = None if skip_retry else _retry_button(image)
+        if retry is not None:
+            say("リトライをクリックします")
+            tap(retry.center().x(), retry.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        if _daily_mission_button(image) is not None:
+            play = _play_button(image)
+            if play is not None:
+                say("プレイをクリックします")
+                _slow_tap(play.center().x(), play.center().y())
+                _sleep_stop(1.2, stop)
+                deadline = max(deadline, time.time() + 12)
+            else:
+                say("プレイを待っています")
+                _sleep_stop(0.4, stop)
+            continue
+        pause = _pause_continue_button(image)
+        if pause is not None:
+            if tap_start:
+                say("続けるをクリックします")
+                _slow_tap(pause.center().x(), pause.center().y())
+                _sleep_stop(1.2, stop)
+            else:
+                say("続けるを検出しました")
+            return kinds, locked, "continue", used_name, items
+        cancel = _cancel_button(image)
+        if cancel is not None:
+            say("キャンセルをクリックします")
+            _slow_tap(cancel.center().x(), cancel.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        close = _close_button(image)
+        if close is not None:
+            say("とじるをクリックします")
+            _slow_tap(close.center().x(), close.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        if (
+            _in_play_hud(image)
+            and _play_button(image) is None
+            and _match_start_button(image) is None
+            and _close_button(image) is None
+        ):
+            return kinds, locked, "", used_name, items
+        play = _play_button(image)
+        if play is not None:
+            say("プレイをクリックします")
+            _slow_tap(play.center().x(), play.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        resume = _continue_button(image)
+        if resume is not None:
+            if tap_start:
+                say("続けるをクリックします")
+                _slow_tap(resume.center().x(), resume.center().y())
+                _sleep_stop(1.2, stop)
+            else:
+                say("続けるを検出しました")
+            return kinds, locked, "continue", used_name, items
+        say("画面の最上部をタップします")
+        _slow_tap(image.width() // 2, 1)
+        _sleep_stop(1.2, stop)
+        deadline = max(deadline, time.time() + 12)
+    return kinds, locked, "", used_name, items
+
+
+def _tap_start_now(say: StatusFn, stop: Event | None) -> list[str] | None:
+    try:
+        path = capture_screen_path()
+        image = QImage(str(path))
+    except Exception:
+        return None
+    if image.isNull():
+        return None
+    items = _items_used_path(path)
+    start = _match_start_button(image)
+    if start is None:
+        return items
+    if _start_hearts(image) == 0:
+        _wait_for_heart(say, stop)
+        return items
+    _say_heart_mail(say, image)
+    say("スタートをクリックします")
+    _slow_tap(start.center().x(), start.center().y())
+    _sleep_stop(1.2, stop)
+    return items
+
+
+def _tap_continue_now(say: StatusFn, stop: Event | None) -> bool:
+    try:
+        path = capture_screen_path()
+        image = QImage(str(path))
+    except Exception:
+        return False
+    if image.isNull():
+        return False
+    resume = _pause_continue_button(image) or _continue_button(image)
+    if resume is None:
+        return False
+    say("続けるをクリックします")
+    _slow_tap(resume.center().x(), resume.center().y())
+    _sleep_stop(1.2, stop)
+    return True
+
+
+def _tap_start_or_continue(image: QImage, say: StatusFn, stop: Event | None) -> bool:
+    if image.isNull():
+        return False
+    start = _match_start_button(image)
+    resume = _pause_continue_button(image) or _continue_button(image)
+    if start is not None:
+        if _start_hearts(image) == 0:
+            _wait_for_heart(say, stop)
+            return False
+        _say_heart_mail(say, image)
+        say("スタートをクリックします")
+        _slow_tap(start.center().x(), start.center().y())
+        _sleep_stop(1.2, stop)
+        return True
+    if resume is not None:
+        say("続けるをクリックします")
+        _slow_tap(resume.center().x(), resume.center().y())
+        _sleep_stop(1.2, stop)
+        return True
+    return False
+
+
+def _wait_and_tap_start(say: StatusFn, stop: Event | None) -> bool:
+    say("スタートを待っています")
+    deadline = time.time() + 90
+    hits = 0
+    while time.time() < deadline:
+        _check_stop(stop)
+        try:
+            image = capture_play_frame()
+        except Exception:
+            hits = 0
+            _sleep_stop(0.4, stop)
+            continue
+        if image is None or image.isNull():
+            hits = 0
+            _sleep_stop(0.4, stop)
+            continue
+        start = _match_start_button(image)
+        if start is None:
+            hits = 0
+            _sleep_stop(0.4, stop)
+            continue
+        hits += 1
+        if hits < 4:
+            _sleep_stop(0.4, stop)
+            continue
+        if _start_hearts(image) == 0:
+            _wait_for_heart(say, stop)
+            hits = 0
+            deadline = time.time() + 90
+            continue
+        _say_heart_mail(say, image)
+        say("スタートをクリックします")
+        _tap_point(image, start.center().x(), start.center().y())
+        return True
+    say("スタートが出ませんでした")
+    return False
+
+
+_ITEM_SLOTS: dict[str, tuple[dict[str, int], int, int]] | None | bool = False
+SLOT_ON = 0.28
+_ITEM_ORDER = (
+    ("score_plus", "+Score"),
+    ("coin_plus", "+Coin"),
+    ("exp_plus", "+Exp"),
+    ("time_plus", "+Time"),
+    ("bomb_plus", "+Bomb"),
+    ("5to4", "5＞4"),
+    ("combo_plus", "+Combo"),
+)
+
+
+def _item_slots() -> dict[str, tuple[dict[str, int], int, int]]:
+    global _ITEM_SLOTS
+    if _ITEM_SLOTS is not False:
+        return _ITEM_SLOTS or {}
+    path = TRAINER_ROOT / "data" / "item_slots.json"
+    loaded: dict[str, tuple[dict[str, int], int, int]] = {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for key, _label in _ITEM_ORDER:
+            for item in payload.get(key) or []:
+                box = item.get("box")
+                width = int(item.get("width") or 0)
+                height = int(item.get("height") or 0)
+                if not box or width <= 0 or height <= 0:
+                    continue
+                loaded[key] = (
+                    {
+                        "x": int(box["x"]),
+                        "y": int(box["y"]),
+                        "w": max(1, int(box["w"])),
+                        "h": max(1, int(box["h"])),
+                    },
+                    width,
+                    height,
+                )
+                break
+    except Exception:
+        loaded = {}
+    _ITEM_SLOTS = loaded if loaded else None
+    return loaded
+
+
+def _five_to_four_slot() -> tuple[dict[str, int], int, int] | None:
+    return _item_slots().get("5to4")
+
+
+def _five_to_four_used_path(path: Path) -> bool | None:
+    from PIL import Image
+
+    with Image.open(path) as board:
+        return _five_to_four_used_pil(board.convert("RGB"))
+
+
+def _items_used_path(path: Path) -> list[str] | None:
+    from PIL import Image
+
+    with Image.open(path) as board:
+        return _items_used_pil(board.convert("RGB"))
+
+
+def _five_to_four_used_pil(image) -> bool | None:
+    slot = _five_to_four_slot()
+    if slot is None:
+        return None
+    box, src_w, src_h = slot
+    view = _portrait_frame(image)
+    scaled = _scale_item_box(box, src_w, src_h, view.size[0], view.size[1])
+    yellow, blue = _slot_yellow_blue(view, scaled)
+    if yellow + blue < SLOT_ON:
+        return None
+    return yellow > blue
+
+
+def _items_used_pil(image) -> list[str] | None:
+    slots = _item_slots()
+    if not slots:
+        return None
+    view = _portrait_frame(image)
+    vw, vh = view.size
+    seen_panel = False
+    used: list[str] = []
+    for key, label in _ITEM_ORDER:
+        slot = slots.get(key)
+        if slot is None:
+            continue
+        box, src_w, src_h = slot
+        scaled = _scale_item_box(box, src_w, src_h, vw, vh)
+        yellow, blue = _slot_yellow_blue(view, scaled)
+        if yellow + blue < SLOT_ON:
+            continue
+        seen_panel = True
+        if yellow > blue:
+            used.append(label)
+    if not seen_panel:
+        return None
+    return used
+
+
+def read_kind_count() -> int | None:
+    try:
+        path = capture_screen_path()
+    except Exception:
+        return None
+    used = _five_to_four_used_path(path)
+    if used is None:
+        return None
+    return 4 if used else 5
+
+
+def _scale_item_box(
+    box: dict[str, int], src_w: int, src_h: int, dst_w: int, dst_h: int
+) -> dict[str, int]:
+    sx = dst_w / max(src_w, 1)
+    sy = dst_h / max(src_h, 1)
+    x = int(round(int(box["x"]) * sx))
+    y = int(round(int(box["y"]) * sy))
+    w = max(1, int(round(int(box["w"]) * sx)))
+    h = max(1, int(round(int(box["h"]) * sy)))
+    x = max(0, min(x, max(dst_w - 1, 0)))
+    y = max(0, min(y, max(dst_h - 1, 0)))
+    w = min(w, max(dst_w - x, 1))
+    h = min(h, max(dst_h - y, 1))
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _slot_yellow_blue(image, box: dict[str, int]) -> tuple[float, float]:
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(image.width, left + max(1, int(box["w"])))
+    bottom = min(image.height, top + max(1, int(box["h"])))
+    crop = image.crop((left, top, right, bottom))
+    width, height = crop.size
+    if width < 2 or height < 2:
+        return 0.0, 0.0
+    inset_x = max(1, int(width * 0.2))
+    inset_y = max(1, int(height * 0.2))
+    inner = crop.crop((inset_x, inset_y, width - inset_x, height - inset_y))
+    iw, ih = inner.size
+    step_x = max(1, iw // 24)
+    step_y = max(1, ih // 24)
+    pixels = inner.load()
+    total = 0
+    yellow = 0
+    blue = 0
+    for yy in range(0, ih, step_y):
+        for xx in range(0, iw, step_x):
+            red, green, blue_v = pixels[xx, yy][:3]
+            hue, sat, val = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue_v / 255.0)
+            total += 1
+            if 0.10 <= hue <= 0.18 and sat >= 0.30 and val >= 0.35:
+                yellow += 1
+            elif 0.52 <= hue <= 0.72 and sat >= 0.28 and val >= 0.25:
+                blue += 1
+    if total <= 0:
+        return 0.0, 0.0
+    return yellow / total, blue / total
+
+
+def _group_sizes(tsums: list[dict[str, int]]) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for piece in tsums:
+        group = int(piece.get("group") or 0)
+        if group <= 0:
+            continue
+        counts[group] = counts.get(group, 0) + 1
+    return counts
+
+
+def _group_counts_line(tsums: list[dict[str, int]]) -> str:
+    counts = _group_sizes(tsums)
+    if not counts:
+        return "この盤面の種類は分かっていません"
+    sizes = [counts[group] for group in sorted(counts)]
+    kinds = len(sizes)
+    bodies = "、".join(f"{n}体" for n in sizes)
+    return f"この盤面は{kinds}種類に分けた（多い順 {bodies}）"
+
+
+def _pick_chain(
+    predictor,
+    rgb,
+    pieces: list[dict[str, int]],
+    candidates,
+    unlike,
+    skip_chains: set[tuple[tuple[int, int], ...]],
+    say: StatusFn,
+) -> tuple[list[dict[str, int]], list[int]]:
+    found = [chain for chain in candidates(pieces, 8) if len(chain) >= MIN_CHAIN]
+    found = [chain for chain in found if _chain_key(chain) not in skip_chains]
+    if not found:
+        return [], []
+    say("候補 " + " / ".join(str(len(chain)) for chain in found))
+    options = [len(item) for item in found]
+    return max(found, key=len), options
+
+
+def _chain_key(chain: list[dict[str, int]]) -> tuple[tuple[int, int], ...]:
+    return tuple(sorted((int(piece["x"]) // 8, int(piece["y"]) // 8) for piece in chain))
+
+
+def _chain_has_unlike(chain: list[dict[str, int]], unlike) -> bool:
+    if not unlike:
+        return False
+    for index in range(1, len(chain)):
+        if unlike_hit(chain[index - 1].get("_vec"), chain[index].get("_vec"), unlike):
+            return True
+    return False
+
+
+def _parts_without_unlike(
+    chain: list[dict[str, int]],
+    unlike,
+) -> list[list[dict[str, int]]]:
+    if not unlike or len(chain) < MIN_CHAIN:
+        return [chain]
+    parts: list[list[dict[str, int]]] = []
+    current = [chain[0]]
+    for index in range(1, len(chain)):
+        if unlike_hit(
+            chain[index - 1].get("_vec"),
+            chain[index].get("_vec"),
+            unlike,
+        ):
+            if len(current) >= MIN_CHAIN:
+                parts.append(current)
+            current = [chain[index]]
+        else:
+            current.append(chain[index])
+    if len(current) >= MIN_CHAIN:
+        parts.append(current)
+    return parts
+
+
+def _leftover_len(
+    pieces: list[dict[str, int]],
+    chain: list[dict[str, int]],
+    candidates,
+) -> int:
+    leftover = _remaining_after_erase(pieces, chain)
+    group = int(chain[0].get("group") or 0) if chain else 0
+    others = [
+        piece
+        for piece in leftover
+        if not _is_tsum(piece)
+        or int(piece.get("group") or 0) != group
+    ]
+    found = [item for item in candidates(others, 1) if len(item) >= MIN_CHAIN]
+    return max((len(item) for item in found), default=0)
+
+
+def _board_key(tsums: list[dict[str, int]]) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        sorted((int(piece["x"]) // 12, int(piece["y"]) // 12) for piece in tsums)
+    )
+
+
+def _skill_face(skill: dict[str, int]) -> dict[str, int]:
+    width = max(1, int(skill["w"]))
+    height = max(1, int(skill["h"]))
+    return {
+        "x": int(skill["x"] + width / 2),
+        "y": int(skill["y"] + height / 2),
+        "r": max(4, min(width, height) // 2),
+        "kind": "tsum",
+        "group": 0,
+    }
+
+
+def _group_means(tsums: list[dict[str, int]]) -> dict[int, tuple[float, ...]]:
+    buckets: dict[int, list[tuple[float, ...]]] = {}
+    for piece in tsums:
+        group = int(piece.get("group") or 0)
+        vec = piece.get("_vec")
+        if group <= 0 or not vec:
+            continue
+        buckets.setdefault(group, []).append(tuple(float(value) for value in vec))
+    means: dict[int, tuple[float, ...]] = {}
+    for group, vecs in buckets.items():
+        dim = len(vecs[0])
+        total = [0.0] * dim
+        used = 0
+        for vec in vecs:
+            if len(vec) != dim:
+                continue
+            for index, value in enumerate(vec):
+                total[index] += value
+            used += 1
+        if used <= 0:
+            continue
+        scale = sum(value * value for value in total) ** 0.5 or 1.0
+        means[group] = tuple(value / scale for value in total)
+    return means
+
+
+def _lock_my_vec(tsums: list[dict[str, int]], face, my_vec):
+    if face is None:
+        return my_vec
+    means = _group_means(tsums)
+    if not means:
+        return my_vec
+    best = max(means, key=lambda group: _cosine(face, means[group]))
+    sim = _cosine(face, means[best])
+    if my_vec is None or sim > _cosine(face, my_vec):
+        return means[best]
+    return my_vec
+
+
+def _count_mytsum(chain: list[dict[str, int]], tsums: list[dict[str, int]], my_vec) -> int:
+    if my_vec is None or not chain:
+        return 0
+    means = _group_means(tsums)
+    if len(means) < 2:
+        return 0
+    mine = max(means, key=lambda group: _cosine(my_vec, means[group]))
+    mean = means[mine]
+    counted = 0
+    for piece in chain:
+        vec = piece.get("_vec")
+        group = int(piece.get("group") or 0)
+        if vec is None or group != mine:
+            continue
+        sim = _cosine(vec, mean)
+        if any(_cosine(vec, other) >= sim for other_group, other in means.items() if other_group != mine):
+            continue
+        counted += 1
+    return counted
+
+
+def _mytsum_group(predictor, rgb, tsums: list[dict[str, int]], skill):
+    if skill is None or not tsums:
+        return 0, None
+    reps: list[dict[str, int]] = []
+    groups: list[int] = []
+    seen: set[int] = set()
+    for piece in tsums:
+        group = int(piece.get("group") or 0)
+        if group <= 0 or group in seen:
+            continue
+        seen.add(group)
+        groups.append(group)
+        reps.append(piece)
+    if not reps:
+        return 0, None
+    vecs = _type_vectors(predictor, rgb, reps + [_skill_face(skill)])
+    if not vecs or len(vecs) != len(reps) + 1:
+        return 0, None
+    skill_vec = vecs[-1]
+    best_group = 0
+    best_sim: float | None = None
+    for group, vec in zip(groups, vecs[:-1]):
+        sim = _cosine(skill_vec, vec)
+        if best_sim is None or sim > best_sim:
+            best_sim = sim
+            best_group = group
+    return best_group, skill_vec
+
+
+def _attach_type_vecs(
+    predictor,
+    rgb,
+    pieces: list[dict[str, int]],
+) -> None:
+    tsums = [piece for piece in pieces if _is_tsum(piece)]
+    if not tsums:
+        return
+    vecs = _type_vectors(predictor, rgb, tsums)
+    if vecs is None:
+        return
+    for piece, vec in zip(tsums, vecs):
+        piece["_vec"] = vec
+
+
+def _type_vectors(predictor, rgb, pieces: list[dict[str, int]]):
+    if not pieces or getattr(predictor, "type_model", None) is None:
+        return None
+    embed = getattr(predictor, "_tsum_embeddings", None)
+    if embed is None or rgb is None:
+        return None
+    return embed(rgb, pieces)
+
+
+def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    return sum(a * b for a, b in zip(left, right))
+
+
+def _draw_plan(
+    image: QImage,
+    pieces: list[dict[str, int]],
+    chain: list[dict[str, int]],
+    game: dict[str, int] | None,
+) -> QImage:
+    if image.isNull():
+        return image
+    left = top = 0
+    board = image
+    if game is not None:
+        left = max(0, int(game["x"]))
+        top = max(0, int(game["y"]))
+        width = max(1, int(game["w"]))
+        height = max(1, int(game["h"]))
+        cropped = image.copy(QRect(left, top, min(width, image.width() - left), min(height, image.height() - top)))
+        if not cropped.isNull():
+            board = cropped
+    painted = board.copy()
+    painter = QPainter(painted)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    chain_ids = {id(piece) for piece in chain}
+    for piece in pieces:
+        x = int(piece["x"]) - left
+        y = int(piece["y"]) - top
+        radius = max(6, int(piece.get("r") or 12))
+        if id(piece) in chain_ids:
+            continue
+        if str(piece.get("kind") or "") == "bomb":
+            painter.setPen(QPen(QColor("#FF5C5C"), 2))
+        else:
+            painter.setPen(QPen(QColor("#FFE066"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPoint(x, y), radius, radius)
+    points = [(int(piece["x"]) - left, int(piece["y"]) - top, max(8, int(piece.get("r") or 16))) for piece in chain]
+    if len(points) >= 2:
+        painter.setPen(QPen(QColor("#7CFF7C"), max(4, points[0][2] // 3)))
+        for (x0, y0, _r0), (x1, y1, _r1) in zip(points, points[1:]):
+            painter.drawLine(x0, y0, x1, y1)
+    font = QFont()
+    font.setBold(True)
+    painter.setFont(font)
+    for index, (x, y, radius) in enumerate(points, start=1):
+        painter.setPen(QPen(QColor("#7CFF7C"), max(3, radius // 5)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPoint(x, y), radius, radius)
+        painter.setPen(QColor("#1A1A1A"))
+        painter.drawText(QRect(x - radius, y - radius, radius * 2, radius * 2), Qt.AlignmentFlag.AlignCenter, str(index))
+    painter.end()
+    return painted
+
+
+def _chain_key(chain: list[dict[str, int]]) -> frozenset[tuple[int, int]]:
+    return frozenset(_chain_cells(chain))
+
+
+def _chain_cells(chain: list[dict[str, int]]) -> set[tuple[int, int]]:
+    return {(int(piece["x"]) // 16, int(piece["y"]) // 16) for piece in chain}
+
+
+def _chain_too_similar(
+    chain: list[dict[str, int]],
+    used_keys: list[frozenset[tuple[int, int]]],
+) -> bool:
+    key = _chain_key(chain)
+    for old in used_keys:
+        if key == old or key <= old or old <= key:
+            return True
+    return False
+
+
+def _prune_skip(
+    skip_chains: list[frozenset[tuple[int, int]]],
+    tsums: list[dict[str, int]],
+) -> list[frozenset[tuple[int, int]]]:
+    occupied = _chain_cells(tsums)
+    return [key for key in skip_chains if key & occupied]
+
