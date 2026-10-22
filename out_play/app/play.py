@@ -4,6 +4,7 @@ import colorsys
 import json
 import math
 import random
+import subprocess
 import sys
 import tempfile
 import time
@@ -34,6 +35,7 @@ from app.intro import (
     _daily_mission_button,
     _in_play_hud,
     _match_start_button,
+    _home_play_button,
     _pause_continue_button,
     _play_button,
     _retry_button,
@@ -223,6 +225,61 @@ class PlayWorker(QThread):
             flush_style()
 
 
+def _python_for_pip() -> str:
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        console = exe.with_name("python.exe")
+        if console.is_file():
+            return str(console)
+    return str(exe)
+
+
+def _pip_run(args: list[str]) -> subprocess.CompletedProcess[str]:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(
+        [_python_for_pip(), "-m", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=flags,
+    )
+
+
+def _pip_tail(result: subprocess.CompletedProcess[str]) -> str:
+    text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-8:])
+
+
+def _install_screen_libs() -> str:
+    probe = _pip_run(["pip", "--version"])
+    if probe.returncode != 0:
+        _pip_run(["ensurepip", "--upgrade"])
+    pillow = _pip_run(["pip", "install", "--disable-pip-version-check", "Pillow"])
+    if pillow.returncode != 0:
+        return _pip_tail(pillow) or "Pillow を入れられませんでした。"
+    torch = _pip_run(
+        [
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "torch",
+            "torchvision",
+            "--index-url",
+            "https://download.pytorch.org/whl/cpu",
+        ]
+    )
+    if torch.returncode != 0:
+        torch = _pip_run(
+            ["pip", "install", "--disable-pip-version-check", "torch", "torchvision"]
+        )
+    if torch.returncode != 0:
+        return _pip_tail(torch) or "torch を入れられませんでした。"
+    return ""
+
+
 def run_play(
     report: StatusFn | None,
     stop: Event | None,
@@ -327,12 +384,24 @@ def run_play(
             kind_count = asked
 
     say("モデルを読み込み中")
-    try:
-        predictor, candidates = load_play_tools()
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "画面認識に必要なライブラリがありません。画面認識アプリと同じ Python で起動してください。"
-        ) from exc
+    tried_libs = False
+    while True:
+        try:
+            predictor, candidates = load_play_tools()
+            break
+        except ModuleNotFoundError as exc:
+            missing = (exc.name or "").split(".", 1)[0]
+            if tried_libs or missing not in {"PIL", "torch", "torchvision"}:
+                raise RuntimeError(
+                    f"画面認識に必要なライブラリがありません。（{missing or exc}）"
+                ) from exc
+            tried_libs = True
+            say("画面認識のライブラリを入れています")
+            detail = _install_screen_libs()
+            if detail:
+                raise RuntimeError(
+                    "画面認識のライブラリを入れられませんでした。\n" + detail
+                ) from exc
     if getattr(predictor, "piece_model", None) is None:
         raise RuntimeError("ツムの〇モデルがありません。画面認識アプリで学習してください。")
     if getattr(predictor, "type_model", None) is None:
@@ -378,6 +447,7 @@ def run_play(
     resumed_pause = False
     match_over = False
     played_once = False
+    last_close_at: tuple[int, int] | None = None
     clears = 0
     swipes = 0
     coin = 0
@@ -1546,7 +1616,7 @@ def run_play(
                 before_start[0] = False
             else:
                 on_start = _match_start_button(image) is not None
-                on_home = _play_button(image) is not None
+                on_home = _home_play_button(image) is not None
                 on_close = _close_button(image) is not None
                 before_start[0] = on_start or on_home or on_close
             if before_start[0]:
@@ -1738,17 +1808,29 @@ def run_play(
                     _sleep_stop(1.2, stop)
                     continue
                 if on_mission:
-                    play = None if image.isNull() else _play_button(image)
+                    play = None if image.isNull() else _home_play_button(image)
                     if play is not None:
                         say("プレイをクリックします")
+                        last_close_at = None
                         _slow_tap(play.center().x(), play.center().y())
                         _sleep_stop(2.0, stop)
                     continue
                 if match_over:
                     close = None if image.isNull() else _close_button(image)
                     if close is not None:
+                        point = (close.center().x(), close.center().y())
+                        same_close = (
+                            last_close_at is not None
+                            and abs(point[0] - last_close_at[0]) < image.width() * 0.08
+                            and abs(point[1] - last_close_at[1]) < image.height() * 0.08
+                        )
+                        if same_close:
+                            say("プレイを待っています")
+                            _sleep_stop(0.4, stop)
+                            continue
                         say("とじるをクリックします")
-                        _slow_tap(close.center().x(), close.center().y())
+                        _slow_tap(point[0], point[1])
+                        last_close_at = point
                         _sleep_stop(1.2, stop)
                         continue
                 start = None if image.isNull() else _match_start_button(image)
@@ -1777,18 +1859,15 @@ def run_play(
                         continue
                     if _tap_start_or_continue(image, say, stop):
                         continue
-                play = None if image.isNull() else _play_button(image)
+                play = None if image.isNull() else _home_play_button(image)
                 if play is not None:
                     say("プレイをクリックします")
+                    last_close_at = None
                     _slow_tap(play.center().x(), play.center().y())
                     _sleep_stop(2.0, stop)
                     continue
-                close = None if image.isNull() else _close_button(image)
-                if close is not None:
-                    say("とじるをクリックします")
-                    _slow_tap(close.center().x(), close.center().y())
-                    _sleep_stop(1.2, stop)
-                    continue
+                say("プレイを待っています")
+                _sleep_stop(0.35, stop)
                 continue
             erased_now = False
             if credit_pending(rgb):
@@ -4445,17 +4524,10 @@ def _click_start_or_continue(
             else:
                 say("続けるを検出しました")
             return kinds, locked, "continue", used_name, items
-        cancel = _cancel_button(image)
-        if cancel is not None:
-            say("キャンセルをクリックします")
-            _slow_tap(cancel.center().x(), cancel.center().y())
-            _sleep_stop(1.2, stop)
-            deadline = max(deadline, time.time() + 12)
-            continue
-        close = _close_button(image)
-        if close is not None:
-            say("とじるをクリックします")
-            _slow_tap(close.center().x(), close.center().y())
+        play = _home_play_button(image)
+        if play is not None:
+            say("プレイをクリックします")
+            _slow_tap(play.center().x(), play.center().y())
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue

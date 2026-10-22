@@ -16,10 +16,10 @@ git clone https://github.com/KumaSuns/auto_play.git
 
 ## 起動する
 
-Python 3.10 以降と、PySide6 が必要です。
+Python 3.10 以降と、PySide6 と、Pillow が必要です。
 
 ```
-pip install PySide6
+pip install PySide6 Pillow
 python main.py
 ```
 

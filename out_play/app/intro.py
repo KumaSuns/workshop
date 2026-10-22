@@ -7,7 +7,7 @@ from threading import Event
 from PySide6.QtCore import QRect, QThread, Signal
 from PySide6.QtGui import QImage
 
-from app.bluestacks import capture_screen, tap, tsum_is_running
+from app.bluestacks import capture_screen, launch_tsum_package, tap, tsum_is_running
 
 SAMPLE_W = 160
 SAMPLE_H = 90
@@ -64,10 +64,13 @@ def run_intro_flow(report: StatusFn | None = None, stop: Event | None = None) ->
     deadline = time.time() + BOOT_TIMEOUT + FLOW_TIMEOUT
     previous: QImage | None = None
     motion_hits = 0
+    still_hits = 0
     dialog_hits = 0
     start_hits = 0
+    play_hits = 0
     clicked_center = False
     clicked_allow = False
+    launched_package = False
     while time.time() < deadline:
         _check_stop(stop)
         try:
@@ -80,6 +83,7 @@ def run_intro_flow(report: StatusFn | None = None, stop: Event | None = None) ->
         if dialog is not None and not clicked_allow:
             dialog_hits += 1
             start_hits = 0
+            play_hits = 0
             say(f"許可画面を検出 {dialog_hits}/{DIALOG_STABLE}")
             if dialog_hits >= DIALOG_STABLE:
                 say("許可するをクリックします")
@@ -94,6 +98,7 @@ def run_intro_flow(report: StatusFn | None = None, stop: Event | None = None) ->
         start_btn = _tap_to_start_button(image)
         if start_btn is not None:
             start_hits += 1
+            play_hits = 0
             say(f"TAP TO STARTを検出 {start_hits}/{START_STABLE}")
             if start_hits >= START_STABLE:
                 say("TAP TO STARTをクリックします")
@@ -105,22 +110,45 @@ def run_intro_flow(report: StatusFn | None = None, stop: Event | None = None) ->
             time.sleep(0.35)
             continue
         start_hits = 0
-        if not clicked_center and not clicked_allow and tsum_is_running():
+        play = _home_play_button(image)
+        if play is not None:
+            play_hits += 1
+            motion_hits = 0
+            still_hits = 0
+            say(f"プレイを検出 {play_hits}/{PLAY_STABLE}")
+            if play_hits >= PLAY_STABLE:
+                _press_play(play, say)
+                return
+            previous = image
+            time.sleep(0.35)
+            continue
+        play_hits = 0
+        if not clicked_center and not clicked_allow:
+            if not launched_package and not tsum_is_running():
+                launched_package = True
+                try:
+                    launch_tsum_package()
+                except FileNotFoundError:
+                    pass
+                say("ツムツムを起動します")
             if _is_video_motion(previous, image):
                 motion_hits += 1
+                still_hits = 0
                 say(f"動画を検出 {motion_hits}/{VIDEO_STABLE}")
             else:
                 motion_hits = 0
+                still_hits += 1
                 say("許可画面なし、動画を待っています")
             if motion_hits >= VIDEO_STABLE:
                 say("画面中央をクリックします")
                 _slow_tap(image.width() // 2, image.height() // 2)
                 clicked_center = True
                 say("許可画面を待っています")
+            elif still_hits >= VIDEO_STABLE:
+                _dismiss_popups(say, deadline, stop)
+                return
         elif clicked_allow:
             say("TAP TO STARTを待っています")
-        elif not tsum_is_running():
-            say("ツムツムの起動を待っています")
         else:
             say("許可画面を待っています")
         previous = image
@@ -160,6 +188,20 @@ def _click_start(button: QRect, say: StatusFn) -> None:
         _slow_tap(still.center().x(), still.center().y())
 
 
+def _press_play(play: QRect, say: StatusFn) -> None:
+    say("プレイをクリックします")
+    _slow_tap(play.center().x(), play.center().y())
+    time.sleep(0.8)
+    try:
+        still = _home_play_button(capture_screen())
+    except Exception:
+        still = None
+    if still is not None:
+        say("プレイを再タップします")
+        _slow_tap(still.center().x(), still.center().y())
+    say("プレイまで終わりました")
+
+
 def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -> None:
     play_hits = 0
     popup_hits = 0
@@ -171,44 +213,17 @@ def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -
             say("画面を待っています")
             time.sleep(1.0)
             continue
-        play = _play_button(image)
+        play = _home_play_button(image)
         if play is not None:
             popup_hits = 0
             play_hits += 1
             say(f"プレイを検出 {play_hits}/{PLAY_STABLE}")
             if play_hits >= PLAY_STABLE:
-                say("プレイをクリックします")
-                _slow_tap(play.center().x(), play.center().y())
-                time.sleep(0.8)
-                try:
-                    still = _play_button(capture_screen())
-                except Exception:
-                    still = None
-                if still is not None:
-                    say("プレイを再タップします")
-                    _slow_tap(still.center().x(), still.center().y())
-                say("プレイまで終わりました")
+                _press_play(play, say)
                 return
             time.sleep(0.35)
             continue
         play_hits = 0
-        cancel = _cancel_button(image)
-        close = None if cancel is not None else _close_button(image)
-        target = cancel or close
-        if target is not None:
-            popup_hits += 1
-            if popup_hits < POPUP_STABLE:
-                say("ポップアップを検出")
-                time.sleep(0.35)
-                continue
-            if cancel is not None:
-                say("キャンセルをクリックします")
-            else:
-                say("とじるをクリックします")
-            _slow_tap(target.center().x(), target.center().y())
-            popup_hits = 0
-            time.sleep(0.7)
-            continue
         popup_hits = 0
         say("プレイを待っています")
         time.sleep(0.35)
@@ -458,6 +473,111 @@ def _daily_mission_button(image: QImage) -> QRect | None:
 
 
 def _play_button(image: QImage) -> QRect | None:
+    found = _home_play_button(image)
+    if found is None:
+        return None
+    if not _retry_is_orange(image, found):
+        return None
+    if _menu_pair_rows(image, found.y()) >= 2:
+        return None
+    return found
+
+
+def _is_play_fill(pixel: tuple[int, int, int]) -> bool:
+    if _is_start_yellow(pixel):
+        return True
+    red, green, blue = pixel
+    return (
+        red > 190
+        and green > 40
+        and blue < 110
+        and red > green
+        and red > blue + 50
+        and green + 40 > blue
+    )
+
+
+def _yellow_pair_left(image: QImage) -> QRect | None:
+    pills = _yellow_pills(image)
+    if len(pills) < 2:
+        return None
+    for index, left in enumerate(pills[:-1]):
+        right = pills[index + 1]
+        if abs(left.center().y() - right.center().y()) > max(left.height(), right.height()) * 0.6:
+            continue
+        if abs(left.height() - right.height()) > max(left.height(), right.height()) * 0.5:
+            continue
+        gap = right.x() - left.right()
+        if gap < -left.width() * 0.2 or gap > left.width() * 2.2:
+            continue
+        if left.width() < image.width() * 0.18 or right.width() < image.width() * 0.18:
+            continue
+        if _is_daily_mission(image, right) or _is_daily_mission(image, left):
+            continue
+        return left
+    return None
+
+
+def _wide_bottom_play(image: QImage) -> QRect | None:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width < 8 or height < 8:
+        return None
+    y0 = int(height * 0.68)
+    y1 = min(height, int(height * 0.96))
+    x0 = int(width * 0.12)
+    x1 = int(width * 0.88)
+    need = max(8, int(width * 0.12))
+    min_span = int(width * 0.28)
+    rows: list[tuple[int, int, int]] = []
+    for y in range(y0, y1):
+        xs = [x for x in range(x0, x1) if _is_play_fill(sample[y][x])]
+        if len(xs) < need:
+            continue
+        left, right = min(xs), max(xs)
+        if right - left + 1 < min_span:
+            continue
+        center = (left + right) / 2
+        if abs(center - width / 2) > width * 0.16:
+            continue
+        rows.append((y, left, right))
+    if len(rows) < 2:
+        return None
+    groups: list[list[tuple[int, int, int]]] = [[rows[0]]]
+    for row in rows[1:]:
+        if row[0] <= groups[-1][-1][0] + 2:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+    band = max(groups, key=lambda group: group[-1][0])
+    if len(band) < 2:
+        return None
+    top = band[0][0]
+    bottom = band[-1][0]
+    left = min(row[1] for row in band)
+    right = max(row[2] for row in band)
+    if right - left + 1 < min_span:
+        return None
+    scale_x = image.width() / width
+    scale_y = image.height() / height
+    rect = QRect(
+        int(left * scale_x),
+        int(top * scale_y),
+        max(1, int((right - left + 1) * scale_x)),
+        max(1, int((bottom - top + 1) * scale_y)),
+    )
+    if _is_daily_mission(image, rect):
+        return None
+    return rect
+
+
+def _home_play_button(image: QImage) -> QRect | None:
+    if _yellow_pair_left(image) is not None:
+        return None
+    wide = _wide_bottom_play(image)
+    if wide is not None:
+        return wide
     if (
         _retry_button(image) is not None
         or _pause_continue_button(image) is not None
@@ -465,7 +585,7 @@ def _play_button(image: QImage) -> QRect | None:
     ):
         return None
     bottom = []
-    for pill in _yellow_pills(image):
+    for pill in _yellow_pills(image, max_w_frac=0.85):
         if pill.center().y() <= image.height() * 0.58:
             continue
         if pill.width() < image.width() * 0.18:
@@ -474,15 +594,10 @@ def _play_button(image: QImage) -> QRect | None:
             continue
         if _is_daily_mission(image, pill):
             continue
-        if not _retry_is_orange(image, pill):
-            continue
         bottom.append(pill)
     if not bottom:
         return None
-    play = max(bottom, key=lambda rect: rect.center().y())
-    if _menu_pair_rows(image, play.y()) >= 2:
-        return None
-    return play
+    return max(bottom, key=lambda rect: rect.center().y())
 
 
 def _retry_button(image: QImage) -> QRect | None:
@@ -664,26 +779,9 @@ def _match_start_button(image: QImage) -> QRect | None:
 
 
 def _cancel_button(image: QImage) -> QRect | None:
-    pills = _yellow_pills(image)
-    if len(pills) < 2:
+    if _play_button(image) is not None:
         return None
-    for index, left in enumerate(pills[:-1]):
-        right = pills[index + 1]
-        if abs(left.center().y() - right.center().y()) > max(left.height(), right.height()) * 0.6:
-            continue
-        if abs(left.height() - right.height()) > max(left.height(), right.height()) * 0.5:
-            continue
-        gap = right.x() - left.right()
-        if gap < -left.width() * 0.2 or gap > left.width() * 2.2:
-            continue
-        if left.width() < image.width() * 0.18 or right.width() < image.width() * 0.18:
-            continue
-        if _is_daily_mission(image, right) or _is_daily_mission(image, left):
-            continue
-        if _play_button(image) is not None:
-            return None
-        return left
-    return None
+    return _yellow_pair_left(image)
 
 
 def _has_highscore_plate(image: QImage) -> bool:
@@ -724,24 +822,7 @@ def _close_button(image: QImage) -> QRect | None:
         ]
         if pills:
             return max(pills, key=lambda rect: rect.width() * rect.height())
-    if (
-        _play_button(image) is not None
-        or _cancel_button(image) is not None
-        or _pause_continue_button(image) is not None
-    ):
-        return None
-    pills = [
-        pill
-        for pill in _yellow_pills(image)
-        if pill.center().y() > image.height() * 0.55
-        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.28
-        and not _is_daily_mission(image, pill)
-    ]
-    if not pills:
-        return None
-    if len(pills) >= 3:
-        return pills[len(pills) // 2]
-    return max(pills, key=lambda rect: rect.width() * rect.height())
+    return None
 
 
 def _is_highscore_cyan(pixel: tuple[int, int, int]) -> bool:

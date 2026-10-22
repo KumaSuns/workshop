@@ -368,6 +368,15 @@ class MenuWindow(QMainWindow):
         left.setSpacing(0)
         left.addWidget(self._section_title("MODEL情報"))
         left.addStretch(1)
+        mark_font = self.font()
+        mark_font.setBold(True)
+        mark_font.setPointSize(TITLE_POINT)
+        for text in ("Version : 0.00.01", "2026/10/22"):
+            mark = QLabel(text)
+            mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            mark.setFont(mark_font)
+            left.addWidget(mark)
+        left.addStretch(1)
         self._model_differs = False
         self._model_fetch = None
         self._model_token_value = _model_token()
@@ -402,6 +411,7 @@ class MenuWindow(QMainWindow):
         self._tsum_actions.setContentsMargins(0, 0, 0, 0)
         self._tsum_actions.setSpacing(0)
         right.addLayout(self._tsum_actions)
+        self._show_tsum_list("")
 
     def _create_desktop_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(
@@ -409,6 +419,10 @@ class MenuWindow(QMainWindow):
         )
         if not desktop:
             QMessageBox.warning(self, "デスクトップがありません", "デスクトップの場所が分かりませんでした。")
+            return
+        if sys.platform == "darwin":
+            dest = self._create_macos_shortcut(Path(desktop))
+            QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{dest}")
             return
         lnk = Path(desktop) / "AUTO PLAY.lnk"
         old = Path(desktop) / "メニュー.lnk"
@@ -452,6 +466,41 @@ class MenuWindow(QMainWindow):
             QMessageBox.critical(self, "アイコンを作れませんでした", err)
             return
         QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{lnk}")
+
+    def _create_macos_shortcut(self, desktop: Path) -> Path:
+        import shutil
+
+        app_path = desktop / "AUTO PLAY.app"
+        contents = app_path / "Contents"
+        macos_dir = contents / "MacOS"
+        if app_path.exists():
+            shutil.rmtree(app_path)
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        launcher = macos_dir / "launch"
+        launcher.write_text(
+            "#!/bin/bash\n"
+            f'cd "{ROOT}"\n'
+            f'exec "{sys.executable}" "{ROOT / "main.py"}"\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        (contents / "Info.plist").write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>launch</string>
+  <key>CFBundleIdentifier</key><string>workshop.auto-play</string>
+  <key>CFBundleName</key><string>AUTO PLAY</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>10.13</string>
+</dict>
+</plist>
+""",
+            encoding="utf-8",
+        )
+        return app_path
 
     def _ask_app_update(self, available: bool) -> None:
         if not available:
@@ -775,6 +824,9 @@ class MenuWindow(QMainWindow):
             worker.provide_used_tsum(None)
             return
         self._tsum_path = Path(path) if path else None
+        if self._used_tsum_name:
+            worker.provide_used_tsum(self._used_tsum_name)
+            return
         if pick_only or not guess:
             self._show_tsum_list("" if pick_only else guess)
             return
@@ -1245,12 +1297,15 @@ def _start_play_here(window: MenuWindow, games: int | None) -> None:
 
 
 def _used_tsum_names() -> list[str]:
-    from app.play import used_tsum_names
-
+    path = ROOT / "bundled" / "assets" / "models" / "use_tsum" / "registry.json"
     try:
-        return [str(name) for name in used_tsum_names() if str(name).strip()]
-    except Exception:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
         return []
+    if not isinstance(payload, dict):
+        return []
+    names = [str(value).strip() for value in payload.values() if str(value).strip()]
+    return sorted(set(names), key=lambda value: value.casefold())
 
 
 def _save_used_tsum(path: Path | None, name: str, folder_id: str | None) -> str:
@@ -1306,7 +1361,6 @@ def _start_match(window: MenuWindow) -> None:
     worker.completed.connect(window._on_play_done)
     worker.stopped.connect(window._on_play_stopped)
     window._play_worker = worker
-    window._used_tsum_name = ""
     window._register_stop_hotkey()
     worker.start()
 
@@ -1341,8 +1395,8 @@ def _model_token() -> str:
     try:
         from app.server_sync import api_token
     except Exception:
-        return ""
-    return str(api_token() or "").strip()
+        return "kumadesk-workshop-local"
+    return str(api_token() or "").strip() or "kumadesk-workshop-local"
 
 
 def _server_model_sha1(token: str) -> str:
@@ -1573,8 +1627,45 @@ def _acquire_instance_lock() -> QLockFile | None:
     return None
 
 
+def _python_for_pip() -> Path:
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        console = exe.with_name("python.exe")
+        if console.is_file():
+            return console
+    return exe
+
+
+def _ensure_pillow() -> None:
+    try:
+        import PIL.Image  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        sys.modules.pop("PIL", None)
+    exe = _python_for_pip()
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.run(
+        [str(exe), "-m", "pip", "install", "Pillow"],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=flags,
+    )
+    sys.modules.pop("PIL", None)
+
+
 def main() -> None:
+    _ensure_pillow()
     app = QApplication(sys.argv)
+    try:
+        import PIL.Image  # noqa: F401
+    except ModuleNotFoundError:
+        exe = _python_for_pip()
+        QMessageBox.critical(
+            None,
+            "Pillow",
+            "Pillow が入っていません。\n" + f'"{exe}" -m pip install Pillow',
+        )
     lock = _acquire_instance_lock()
     if lock is None:
         if not _handoff_to_running():
