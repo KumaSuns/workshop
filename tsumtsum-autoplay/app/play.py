@@ -309,8 +309,6 @@ def run_play(
             used_tsum = seen_tsum
         if arrived in ("start", "continue"):
             ask_used_now(arrived == "start")
-        elif not tsum_asked:
-            ask_used_now(False)
         if arrived in ("start", "continue") and request_kinds is not None:
             asked = request_kinds()
             if asked is None:
@@ -4427,10 +4425,7 @@ def _click_start_or_continue(
             else:
                 say("続けるを検出しました")
             return kinds, locked, "continue", used_name, items
-        say("画面の最上部をタップします")
-        _slow_tap(image.width() // 2, 1)
-        _sleep_stop(1.2, stop)
-        deadline = max(deadline, time.time() + 12)
+        _sleep_stop(0.4, stop)
     return kinds, locked, "", used_name, items
 
 
