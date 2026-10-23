@@ -463,9 +463,6 @@ class MenuWindow(QMainWindow):
         above.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         above.setSpacing(0)
         above.addWidget(self._section_title("使用ツム"))
-        self._used_tsum_label = QLabel("")
-        self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        above.addWidget(self._used_tsum_label)
         self._used_tsum_icon = QLabel()
         self._used_tsum_icon.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self._used_tsum_icon.setMinimumWidth(0)
@@ -474,6 +471,9 @@ class MenuWindow(QMainWindow):
         )
         self._used_tsum_icon.setFixedHeight(0)
         above.addWidget(self._used_tsum_icon)
+        self._used_tsum_label = QLabel("")
+        self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        above.addWidget(self._used_tsum_label)
         above.addStretch(1)
         right = QVBoxLayout(right_box)
         right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
@@ -1309,8 +1309,12 @@ class MenuWindow(QMainWindow):
         width = label.width()
         if width <= 1 and self._tsum_box is not None:
             width = self._tsum_box.contentsRect().width()
-        if width > 1 and pixmap.width() > width:
-            pixmap = pixmap.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+        shown = pixmap.width()
+        if width > 1 and shown > width:
+            shown = width
+        half = shown // 2
+        if half >= 1 and half < pixmap.width():
+            pixmap = pixmap.scaledToWidth(half, Qt.TransformationMode.SmoothTransformation)
         label.setPixmap(pixmap)
         label.setFixedHeight(pixmap.height())
 
