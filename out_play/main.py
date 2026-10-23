@@ -377,28 +377,33 @@ class MenuWindow(QMainWindow):
             mark.setFont(mark_font)
             left.addWidget(mark)
         left.addStretch(1)
-        self._model_differs = False
+        self._model_differs: dict[str, bool] = {}
         self._model_fetch = None
+        self._model_fetch_name = ""
         self._model_token_value = _model_token()
-        self._update_button = QPushButton("更新なし")
-        self._update_button.clicked.connect(self._import_model)
-        self._update_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._update_button.setSizePolicy(
-            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
-        )
-        self._update_button.setStyleSheet(
-            "QPushButton {"
-            " background: #ffffff;"
-            " color: #2c4a7a;"
-            " font-weight: 700;"
-            " font-size: 10pt;"
-            " border: 1px solid #8eb4ee;"
-            " border-radius: 6px;"
-            " padding: 3px 26px;"
-            "}"
-            "QPushButton:hover { background: #f3f7ff; }"
-        )
-        left.addWidget(self._update_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._update_buttons: dict[str, QPushButton] = {}
+        for name, label, _dest in MODEL_BUTTONS:
+            button = QPushButton(f"{label} 更新なし")
+            button.clicked.connect(
+                lambda _checked=False, model_name=name: self._import_model(model_name)
+            )
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+            button.setStyleSheet(
+                "QPushButton {"
+                " background: #ffffff;"
+                " color: #2c4a7a;"
+                " font-weight: 700;"
+                " font-size: 10pt;"
+                " border: 1px solid #8eb4ee;"
+                " border-radius: 6px;"
+                " padding: 3px 26px;"
+                "}"
+                "QPushButton:hover { background: #f3f7ff; }"
+            )
+            self._update_buttons[name] = button
+            self._model_differs[name] = False
+            left.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
         right = QVBoxLayout(boxes[2])
         right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         right.setSpacing(0)
@@ -519,31 +524,44 @@ class MenuWindow(QMainWindow):
             return
         self._set_activity(detail or "更新できませんでした。")
 
-    def _set_model_update(self, available: bool) -> None:
-        if self._update_button is None:
-            return
-        self._model_differs = available
-        self._update_button.setText("更新する" if available else "更新なし")
-        self._update_button.setEnabled(True)
+    def _set_model_update(self, available: object) -> None:
+        flags = available if isinstance(available, dict) else {}
+        for name, label, _dest in MODEL_BUTTONS:
+            button = self._update_buttons.get(name)
+            if button is None:
+                continue
+            differs = bool(flags.get(name))
+            self._model_differs[name] = differs
+            button.setText(f"{label} 更新する" if differs else f"{label} 更新なし")
+            button.setEnabled(True)
 
-    def _import_model(self) -> None:
-        if not self._model_differs or self._model_fetch is not None:
+    def _import_model(self, name: str) -> None:
+        if not self._model_differs.get(name) or self._model_fetch is not None:
             return
-        self._update_button.setEnabled(False)
-        worker = _ModelFetch(self._model_token_value, self)
+        dest = next(path for key, _label, path in MODEL_BUTTONS if key == name)
+        button = self._update_buttons.get(name)
+        if button is not None:
+            button.setEnabled(False)
+        self._model_fetch_name = name
+        worker = _ModelFetch(self._model_token_value, name, dest, self)
         worker.finished_import.connect(self._on_model_imported)
         self._model_fetch = worker
         worker.start()
 
     def _on_model_imported(self, ok: bool, message: str) -> None:
+        name = self._model_fetch_name
         self._model_fetch = None
-        if self._update_button is None:
-            return
-        self._update_button.setEnabled(True)
+        self._model_fetch_name = ""
+        button = self._update_buttons.get(name)
+        if button is not None:
+            button.setEnabled(True)
         if not ok:
             QMessageBox.warning(self, "モデルを取り込めませんでした", message or "モデルを取り込めませんでした。")
             return
-        self._set_model_update(False)
+        self._model_differs[name] = False
+        if button is not None:
+            label = next(text for key, text, _path in MODEL_BUTTONS if key == name)
+            button.setText(f"{label} 更新なし")
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
@@ -823,9 +841,6 @@ class MenuWindow(QMainWindow):
             worker.provide_used_tsum(None)
             return
         self._tsum_path = Path(path) if path else None
-        if self._used_tsum_name:
-            worker.provide_used_tsum(self._used_tsum_name)
-            return
         if pick_only or not guess:
             self._show_tsum_list("" if pick_only else guess)
             return
@@ -1204,12 +1219,24 @@ class MenuWindow(QMainWindow):
         self.show()
 
 
+SCREEN_MODELS = ROOT / "bundled" / "screen" / "data" / "models"
 APP_MODEL = ROOT / "models" / "scene.pt"
-MODEL_NAME = "scene.pt"
-
-
-def _app_model() -> Path:
-    return APP_MODEL
+MODEL_BUTTONS: list[tuple[str, str, Path]] = [
+    ("pieces.pt", "〇", SCREEN_MODELS / "pieces.pt"),
+    ("tsum_types.pt", "ツムの種類", SCREEN_MODELS / "tsum_types.pt"),
+    ("game_region.pt", "ゲーム範囲", SCREEN_MODELS / "game_region.pt"),
+    ("score.pt", "スコア", SCREEN_MODELS / "score.pt"),
+    ("coin.pt", "コイン", SCREEN_MODELS / "coin.pt"),
+    ("coin_digits.pt", "コインの数字", SCREEN_MODELS / "coin_digits.pt"),
+    ("result_coin.pt", "リザルトのコイン", SCREEN_MODELS / "result_coin.pt"),
+    ("result_coin_digits.pt", "リザルトの数字", SCREEN_MODELS / "result_coin_digits.pt"),
+    ("timer.pt", "タイマー", SCREEN_MODELS / "timer.pt"),
+    ("skill.pt", "スキル", SCREEN_MODELS / "skill.pt"),
+    ("fan.pt", "扇風機", SCREEN_MODELS / "fan.pt"),
+    ("fever.pt", "フィーバー", SCREEN_MODELS / "fever.pt"),
+    ("pause.pt", "一時停止", SCREEN_MODELS / "pause.pt"),
+    ("scene.pt", "シーン", APP_MODEL),
+]
 
 
 _ITEM_CHECK = r"""
@@ -1359,6 +1386,7 @@ def _start_match(window: MenuWindow) -> None:
     worker.failed.connect(window._on_play_fail)
     worker.completed.connect(window._on_play_done)
     worker.stopped.connect(window._on_play_stopped)
+    window._used_tsum_name = ""
     window._play_worker = worker
     window._register_stop_hotkey()
     worker.start()
@@ -1398,7 +1426,7 @@ def _model_token() -> str:
     return str(api_token() or "").strip() or "kumadesk-workshop-local"
 
 
-def _server_model_sha1(token: str) -> str:
+def _server_model_shas(token: str) -> dict[str, str]:
     query = urllib.parse.urlencode({"action": "manifest"})
     request = urllib.request.Request(
         f"{MODELS_API}?{query}",
@@ -1407,13 +1435,16 @@ def _server_model_sha1(token: str) -> str:
     with urllib.request.urlopen(request, timeout=8) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not isinstance(payload, dict) or not payload.get("ok"):
-        return ""
+        return {}
+    found: dict[str, str] = {}
     for item in payload.get("files") or []:
         if not isinstance(item, dict):
             continue
-        if str(item.get("path") or "") == MODEL_NAME:
-            return str(item.get("sha1") or "")
-    return ""
+        name = str(item.get("path") or "")
+        sha = str(item.get("sha1") or "")
+        if name and sha:
+            found[name] = sha
+    return found
 
 
 def app_use_allowed(token: str) -> tuple[bool, str] | None:
@@ -1441,18 +1472,21 @@ def app_use_allowed(token: str) -> tuple[bool, str] | None:
     return bool(payload.get("use")), message
 
 
-def model_update_available(token: str) -> bool:
-    local = _app_model()
-    local_sha = _file_sha1(local) if local.is_file() else ""
+def model_updates(token: str) -> dict[str, bool]:
     try:
-        remote_sha = _server_model_sha1(token)
+        remote = _server_model_shas(token)
     except (OSError, json.JSONDecodeError, UnicodeError):
-        return False
-    return bool(remote_sha) and remote_sha != local_sha
+        return {name: False for name, _label, _dest in MODEL_BUTTONS}
+    flags: dict[str, bool] = {}
+    for name, _label, dest in MODEL_BUTTONS:
+        remote_sha = remote.get(name, "")
+        local_sha = _file_sha1(dest) if dest.is_file() else ""
+        flags[name] = bool(remote_sha) and remote_sha != local_sha
+    return flags
 
 
-def _import_server_model(token: str) -> None:
-    query = urllib.parse.urlencode({"action": "file", "path": MODEL_NAME})
+def _import_server_model(token: str, name: str, dest: Path) -> None:
+    query = urllib.parse.urlencode({"action": "file", "path": name})
     request = urllib.request.Request(
         f"{MODELS_API}?{query}",
         headers={"X-Workshop-Token": token},
@@ -1467,10 +1501,10 @@ def _import_server_model(token: str) -> None:
     digest = hashlib.sha1(data).hexdigest()
     if remote_sha and digest != remote_sha:
         raise RuntimeError("受け取ったモデルがサーバーのモデルと違います。")
-    APP_MODEL.parent.mkdir(parents=True, exist_ok=True)
-    temporary = APP_MODEL.with_suffix(".pt.part")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dest.with_suffix(".pt.part")
     temporary.write_bytes(data)
-    temporary.replace(APP_MODEL)
+    temporary.replace(dest)
 
 
 def _git_in_app(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -1539,14 +1573,14 @@ class _AppUpdateCheck(QThread):
 
 
 class _ModelUpdateCheck(QThread):
-    found = Signal(bool)
+    found = Signal(object)
 
     def __init__(self, token: str, parent=None) -> None:
         super().__init__(parent)
         self._token = token
 
     def run(self) -> None:
-        self.found.emit(model_update_available(self._token))
+        self.found.emit(model_updates(self._token))
 
 
 class _ItemCheck(QThread):
@@ -1559,13 +1593,15 @@ class _ItemCheck(QThread):
 class _ModelFetch(QThread):
     finished_import = Signal(bool, str)
 
-    def __init__(self, token: str, parent=None) -> None:
+    def __init__(self, token: str, name: str, dest: Path, parent=None) -> None:
         super().__init__(parent)
         self._token = token
+        self._name = name
+        self._dest = dest
 
     def run(self) -> None:
         try:
-            _import_server_model(self._token)
+            _import_server_model(self._token, self._name, self._dest)
         except (OSError, RuntimeError) as exc:
             self.finished_import.emit(False, str(exc))
             return
