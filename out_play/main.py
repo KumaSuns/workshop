@@ -1081,7 +1081,9 @@ class MenuWindow(QMainWindow):
     def _tsum_question(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         font = label.font()
         point = font.pointSize()
         if point < 1:
@@ -1355,7 +1357,22 @@ class MenuWindow(QMainWindow):
     def _light_items(self, names: list[str]) -> None:
         found = {name.strip() for name in names if name.strip()}
         self._item_active = {index for index, name in enumerate(ITEM_NAMES) if name in found}
-        self._fit_items()
+        if not self._item_labels or self._item_labels[0].width() <= 1:
+            self._fit_items()
+            return
+        for index, label in enumerate(self._item_labels):
+            src = self._item_lit[index] if index in self._item_active else self._item_src[index]
+            if src.isNull():
+                label.clear()
+                continue
+            side = max(label.width(), label.height())
+            scaled = src.scaled(
+                side,
+                side,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(scaled)
 
     def _on_play_items(self, text: str) -> None:
         if text.strip() in {"", "－", "-"}:
