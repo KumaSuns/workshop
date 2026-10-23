@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -230,6 +231,7 @@ class MenuWindow(QMainWindow):
             return
         self._placed = True
         QTimer.singleShot(0, self._fill_right)
+        QTimer.singleShot(0, self._fit_model_buttons)
 
     def _start_ipc(self) -> None:
         self._ipc_buffers: dict[int, bytes] = {}
@@ -329,14 +331,24 @@ class MenuWindow(QMainWindow):
         frames = QHBoxLayout()
         frames.setContentsMargins(0, 0, 0, 0)
         frames.setSpacing(0)
-        boxes = []
-        for _ in range(3):
-            box = QFrame()
-            box.setFrameShape(QFrame.Shape.Box)
-            frames.addWidget(box, 1)
-            boxes.append(box)
+        model_box = QFrame()
+        model_box.setFrameShape(QFrame.Shape.Box)
+        frames.addWidget(model_box, 1)
+        stack_host = QWidget()
+        stack = QVBoxLayout(stack_host)
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(0)
+        tsum_box = QFrame()
+        tsum_box.setFrameShape(QFrame.Shape.Box)
+        self._item_box = QFrame()
+        self._item_box.setFrameShape(QFrame.Shape.Box)
+        stack.addWidget(tsum_box, 1)
+        stack.addWidget(self._item_box, 1)
+        frames.addWidget(stack_host, 1)
+        right_box = QFrame()
+        right_box.setFrameShape(QFrame.Shape.Box)
+        frames.addWidget(right_box, 1)
         column.addLayout(frames, 1)
-        self._item_box = boxes[1]
         inner = QVBoxLayout(self._item_box)
         inner.setContentsMargins(0, 0, 0, 0)
         inner.setSpacing(0)
@@ -363,51 +375,58 @@ class MenuWindow(QMainWindow):
             block_layout.addLayout(row)
         inner.addWidget(block, 0, Qt.AlignmentFlag.AlignHCenter)
         inner.addStretch(1)
-        left = QVBoxLayout(boxes[0])
+        left = QVBoxLayout(model_box)
         left.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         left.setSpacing(0)
         left.addWidget(self._section_title("MODEL情報"))
         left.addStretch(1)
         mark_font = self.font()
         mark_font.setBold(True)
-        mark_font.setPointSize(TITLE_POINT)
+        mark_font.setPointSize(10)
         for text in ("Version : 0.00.01", "2026/10/22"):
             mark = QLabel(text)
             mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
             mark.setFont(mark_font)
             left.addWidget(mark)
-        left.addStretch(1)
+        left.addStretch(2)
         self._model_differs: dict[str, bool] = {}
         self._model_fetch = None
+        self._model_progress = None
         self._model_fetch_name = ""
         self._model_token_value = _model_token()
         self._update_buttons: dict[str, QPushButton] = {}
-        for name, label, _dest in MODEL_BUTTONS:
+        model_grid = QGridLayout()
+        model_grid.setContentsMargins(4, 4, 4, 4)
+        model_grid.setHorizontalSpacing(4)
+        model_grid.setVerticalSpacing(4)
+        model_grid.setColumnStretch(0, 1)
+        model_grid.setColumnStretch(1, 1)
+        for index, (name, label, _dest) in enumerate(MODEL_BUTTONS):
             button = QPushButton(f"{label} 更新なし")
             button.clicked.connect(
                 lambda _checked=False, model_name=name: self._import_model(model_name)
             )
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-            button.setStyleSheet(
-                "QPushButton {"
-                " background: #ffffff;"
-                " color: #2c4a7a;"
-                " font-weight: 700;"
-                " font-size: 10pt;"
-                " border: 1px solid #8eb4ee;"
-                " border-radius: 6px;"
-                " padding: 3px 26px;"
-                "}"
-                "QPushButton:hover { background: #f3f7ff; }"
-            )
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._paint_model_button(button, False)
             self._update_buttons[name] = button
             self._model_differs[name] = False
-            left.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
-        right = QVBoxLayout(boxes[2])
+            model_grid.addWidget(
+                button,
+                index // 2,
+                index % 2,
+                Qt.AlignmentFlag.AlignHCenter,
+            )
+        left.addLayout(model_grid)
+        self._fit_model_buttons()
+        above = QVBoxLayout(tsum_box)
+        above.setContentsMargins(0, 0, 0, TITLE_MARGIN)
+        above.setSpacing(0)
+        above.addWidget(self._section_title("使用ツム"))
+        above.addStretch(1)
+        right = QVBoxLayout(right_box)
         right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         right.setSpacing(0)
-        right.addWidget(self._section_title("使用ツム"))
         self._tsum_body = QVBoxLayout()
         self._tsum_body.setContentsMargins(0, 0, 0, 0)
         self._tsum_body.setSpacing(0)
@@ -524,6 +543,60 @@ class MenuWindow(QMainWindow):
             return
         self._set_activity(detail or "更新できませんでした。")
 
+    def _fit_model_buttons(self) -> None:
+        buttons = [button for button in self._update_buttons.values() if button is not None]
+        if not buttons:
+            return
+        saved = [(button, button.text()) for button in buttons]
+        for button in buttons:
+            button.ensurePolished()
+        width = 0
+        for name, label, _dest in MODEL_BUTTONS:
+            button = self._update_buttons.get(name)
+            if button is None:
+                continue
+            for suffix in ("更新する", "更新なし"):
+                button.setText(f"{label} {suffix}")
+                width = max(width, button.sizeHint().width())
+        for button, text in saved:
+            button.setText(text)
+        host = buttons[0].parentWidget()
+        span = host.width() if host is not None else 0
+        if span > 1:
+            width = max(1, span // 3)
+        if width <= 0:
+            return
+        for button in buttons:
+            button.setFixedWidth(width)
+
+    def _paint_model_button(self, button: QPushButton, differs: bool) -> None:
+        if differs:
+            button.setStyleSheet(
+                "QPushButton {"
+                " background: #e10600;"
+                " color: #ffffff;"
+                " font-weight: 700;"
+                " font-size: 8pt;"
+                " border: 1px solid #a10400;"
+                " border-radius: 6px;"
+                " padding: 2px;"
+                "}"
+                "QPushButton:hover { background: #c10500; }"
+            )
+            return
+        button.setStyleSheet(
+            "QPushButton {"
+            " background: #ffffff;"
+            " color: #2c4a7a;"
+            " font-weight: 700;"
+                " font-size: 8pt;"
+                " border: 1px solid #8eb4ee;"
+                " border-radius: 6px;"
+                " padding: 2px;"
+            "}"
+            "QPushButton:hover { background: #f3f7ff; }"
+        )
+
     def _set_model_update(self, available: object) -> None:
         flags = available if isinstance(available, dict) else {}
         for name, label, _dest in MODEL_BUTTONS:
@@ -533,25 +606,45 @@ class MenuWindow(QMainWindow):
             differs = bool(flags.get(name))
             self._model_differs[name] = differs
             button.setText(f"{label} 更新する" if differs else f"{label} 更新なし")
+            self._paint_model_button(button, differs)
             button.setEnabled(True)
 
     def _import_model(self, name: str) -> None:
         if not self._model_differs.get(name) or self._model_fetch is not None:
             return
-        dest = next(path for key, _label, path in MODEL_BUTTONS if key == name)
+        label = next(text for key, text, _path in MODEL_BUTTONS if key == name)
+        dest = next(path for key, _text, path in MODEL_BUTTONS if key == name)
         button = self._update_buttons.get(name)
         if button is not None:
             button.setEnabled(False)
+        dialog = QProgressDialog(f"{label} を取り込んでいます。", None, 0, 0, self)
+        dialog.setWindowTitle("モデルを取り込み")
+        dialog.setCancelButton(None)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+        self._model_progress = dialog
+        QApplication.processEvents()
         self._model_fetch_name = name
         worker = _ModelFetch(self._model_token_value, name, dest, self)
         worker.finished_import.connect(self._on_model_imported)
         self._model_fetch = worker
         worker.start()
 
+    def _close_model_progress(self) -> None:
+        dialog = self._model_progress
+        self._model_progress = None
+        if dialog is not None:
+            dialog.close()
+
     def _on_model_imported(self, ok: bool, message: str) -> None:
         name = self._model_fetch_name
+        label = next(text for key, text, _path in MODEL_BUTTONS if key == name)
         self._model_fetch = None
         self._model_fetch_name = ""
+        self._close_model_progress()
         button = self._update_buttons.get(name)
         if button is not None:
             button.setEnabled(True)
@@ -560,8 +653,9 @@ class MenuWindow(QMainWindow):
             return
         self._model_differs[name] = False
         if button is not None:
-            label = next(text for key, text, _path in MODEL_BUTTONS if key == name)
             button.setText(f"{label} 更新なし")
+            self._paint_model_button(button, False)
+        QMessageBox.information(self, "モデルを取り込みました", f"{label} を取り込みました。")
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
@@ -570,36 +664,31 @@ class MenuWindow(QMainWindow):
         holder = QWidget()
         holder.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
         column = QVBoxLayout(holder)
-        column.setContentsMargins(0, 0, 0, 0)
+        column.setContentsMargins(0, 10, 0, 0)
         column.setSpacing(0)
         grid_host = QWidget()
         grid_host.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
         grid = QGridLayout(grid_host)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(0)
-        labels = {(0, 1): "このプレイでやめる", (0, 2): "オートプレイ"}
-        number = 1
-        for row in range(2):
-            for col in range(3):
-                button = QPushButton(labels.get((row, col), str(number)))
-                number += 1
-                button.setSizePolicy(
-                    QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-                )
-                if (row, col) == (0, 1):
-                    self._end_play_button = button
-                    self._write_button_key(button, "このプレイでやめる", "2")
-                    button.clicked.connect(self._end_after_this_play)
-                if (row, col) == (0, 2):
-                    self._autoplay_button = button
-                    self._write_button_key(button, "オートプレイ", "3")
-                    button.clicked.connect(self._on_autoplay)
-                    play_key = QShortcut(QKeySequence(Qt.Key.Key_3), button)
-                    play_key.setAutoRepeat(False)
-                    play_key.setContext(Qt.ShortcutContext.WindowShortcut)
-                    play_key.activated.connect(self._on_autoplay)
-                self._center_buttons.append(button)
-                grid.addWidget(button, row, col)
+        end_button = QPushButton("このプレイでやめる")
+        end_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._end_play_button = end_button
+        self._write_button_key(end_button, "このプレイでやめる", "F2")
+        end_button.clicked.connect(self._end_after_this_play)
+        self._center_buttons.append(end_button)
+        grid.addWidget(end_button, 0, 1)
+        play_button = QPushButton("オートプレイ")
+        play_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._autoplay_button = play_button
+        self._write_button_key(play_button, "オートプレイ", "F3")
+        play_button.clicked.connect(self._on_autoplay)
+        play_key = QShortcut(QKeySequence(Qt.Key.Key_F3), play_button)
+        play_key.setAutoRepeat(False)
+        play_key.setContext(Qt.ShortcutContext.WindowShortcut)
+        play_key.activated.connect(self._on_autoplay)
+        self._center_buttons.append(play_button)
+        grid.addWidget(play_button, 0, 2)
         self._launch_button = QPushButton("起動アイコンをデスクトップに作成")
         self._launch_button.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
@@ -629,8 +718,8 @@ class MenuWindow(QMainWindow):
         stop_hint.setContentsMargins(0, 0, hint_metrics.horizontalAdvance("あ"), max(1, hint_metrics.height() // 2))
         half_char = max(1, holder.fontMetrics().height() // 2)
         column.setSpacing(half_char)
-        column.addWidget(grid_host, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(self._center_blank, 0, Qt.AlignmentFlag.AlignLeft)
+        column.addWidget(grid_host, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(self._launch_button, 0, Qt.AlignmentFlag.AlignLeft)
         self._center_input = QComboBox()
         self._center_input.setEditable(True)
@@ -678,7 +767,7 @@ class MenuWindow(QMainWindow):
         user32 = ctypes.windll.user32
         hwnd = int(self.winId())
         ok = user32.RegisterHotKey(hwnd, 1, 0x4000, 0x51)
-        user32.RegisterHotKey(hwnd, 2, 0x4000, 0x32)
+        user32.RegisterHotKey(hwnd, 2, 0x4000, 0x71)
         self._stop_hotkey = bool(ok)
 
     def _unregister_stop_hotkey(self) -> None:
