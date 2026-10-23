@@ -136,7 +136,7 @@ def _logo_source() -> QPixmap:
     )
 
 
-def _game_record_line(item: dict) -> str:
+def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
     names = item.get("items") or []
     if isinstance(names, str):
         items_text = names
@@ -146,16 +146,18 @@ def _game_record_line(item: dict) -> str:
     play_text = "" if play_time is None else f"{int(play_time)}秒"
     coin = item.get("coin")
     result = item.get("result_coin")
-    return "  ".join(
-        [
-            str(item.get("started") or ""),
-            f"使用ツム {item.get('tsum') or ''}",
-            f"使用アイテム {items_text}",
-            f"プレイ時間 {play_text}",
-            f"獲得コイン {'' if coin is None else int(coin)}",
-            f"リザルトコイン {'' if result is None else int(result)}",
-        ]
-    )
+    tsum = item.get("tsum") or ""
+    return [
+        (str(item.get("started") or ""), False),
+        (f"  使用ツム {tsum}", False),
+        (f"  使用アイテム {items_text}", False),
+        ("  プレイ時間 ", False),
+        (play_text, True),
+        ("  獲得コイン ", False),
+        ("" if coin is None else str(int(coin)), True),
+        ("  リザルトコイン ", False),
+        ("" if result is None else str(int(result)), True),
+    ]
 
 
 class MenuWindow(QMainWindow):
@@ -728,19 +730,70 @@ class MenuWindow(QMainWindow):
         for item in load_game_records():
             self._show_game_record(item)
 
+    def _record_row(self, parts: list[tuple[str, bool]]) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        labels = []
+        for text, right in parts:
+            label = QLabel(text)
+            align = Qt.AlignmentFlag.AlignRight if right else Qt.AlignmentFlag.AlignLeft
+            label.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+            labels.append(label)
+            layout.addWidget(label)
+        layout.addStretch(1)
+        row._record_labels = labels
+        return row
+
+    def _align_game_records(self) -> None:
+        game_list = self._game_list
+        if game_list is None:
+            return
+        metrics = QFontMetrics(game_list.font())
+        rows = []
+        widest: list[int] = []
+        for index in range(game_list.count()):
+            listed = game_list.item(index)
+            if listed is None:
+                continue
+            widget = game_list.itemWidget(listed)
+            labels = getattr(widget, "_record_labels", None) if widget is not None else None
+            if not labels:
+                continue
+            rows.append((listed, widget, labels))
+            for label_index, label in enumerate(labels):
+                width = metrics.horizontalAdvance(label.text())
+                if label_index >= len(widest):
+                    widest.append(width)
+                elif width > widest[label_index]:
+                    widest[label_index] = width
+        for listed, widget, labels in rows:
+            for label_index, label in enumerate(labels):
+                label.setFixedWidth(widest[label_index])
+            listed.setSizeHint(widget.sizeHint())
+
     def _show_game_record(self, item: object) -> None:
         if not isinstance(item, dict) or self._game_list is None:
             return
         record_id = item.get("id")
-        line = _game_record_line(item)
+        parts = _game_record_parts(item)
         for row in range(self._game_list.count()):
             listed = self._game_list.item(row)
-            if listed is not None and listed.data(Qt.ItemDataRole.UserRole) == record_id:
-                listed.setText(line)
-                return
-        entry = QListWidgetItem(line)
+            if listed is None or listed.data(Qt.ItemDataRole.UserRole) != record_id:
+                continue
+            widget = self._game_list.itemWidget(listed)
+            labels = getattr(widget, "_record_labels", None) if widget is not None else None
+            if labels is not None:
+                for label, (text, _right) in zip(labels, parts):
+                    label.setText(text)
+            self._align_game_records()
+            return
+        entry = QListWidgetItem()
         entry.setData(Qt.ItemDataRole.UserRole, record_id)
         self._game_list.insertItem(0, entry)
+        self._game_list.setItemWidget(entry, self._record_row(parts))
+        self._align_game_records()
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
