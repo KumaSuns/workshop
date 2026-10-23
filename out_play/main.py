@@ -206,6 +206,11 @@ class MenuWindow(QMainWindow):
         self._item_check = None
         self._play_stop = threading.Event()
         self._stop_hotkey = False
+        self._tsum_hotkey = False
+        self._tsum_hot_ids: list[int] = []
+        self._tsum_hot_yes = None
+        self._tsum_hot_no = None
+        self._tsum_hot_cancel = None
         self._stopped_by_key = False
         self._intro = None
         self._play_worker = None
@@ -881,7 +886,7 @@ class MenuWindow(QMainWindow):
         self._set_activity("停止しました")
 
     def nativeEvent(self, eventType, message):
-        if sys.platform == "win32" and self._stop_hotkey:
+        if sys.platform == "win32" and (self._stop_hotkey or self._tsum_hotkey):
             raw = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
             if raw.startswith(b"windows_generic_MSG"):
                 import ctypes
@@ -894,11 +899,56 @@ class MenuWindow(QMainWindow):
                 if msg.message == 0x0312 and int(msg.wParam) == 2:
                     QTimer.singleShot(0, self._end_after_this_play)
                     return True, 0
+                if self._tsum_hotkey and msg.message == 0x0312:
+                    action = {
+                        3: self._tsum_hot_yes,
+                        4: self._tsum_hot_no,
+                        5: self._tsum_hot_cancel,
+                    }.get(int(msg.wParam))
+                    if action is not None:
+                        QTimer.singleShot(0, action)
+                        return True, 0
         return super().nativeEvent(eventType, message)
 
     def closeEvent(self, event) -> None:
+        self._unregister_tsum_hotkeys()
         self._unregister_stop_hotkey()
         super().closeEvent(event)
+
+    def _register_tsum_hotkeys(self, yes, no, cancel) -> None:
+        self._unregister_tsum_hotkeys()
+        self._tsum_hot_yes = yes
+        self._tsum_hot_no = no
+        self._tsum_hot_cancel = cancel
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = int(self.winId())
+        registered = []
+        for hot_id, virtual_key in ((3, 0x0D), (4, 0x4E), (5, 0x1B)):
+            if user32.RegisterHotKey(hwnd, hot_id, 0x4000, virtual_key):
+                registered.append(hot_id)
+        self._tsum_hot_ids = registered
+        self._tsum_hotkey = bool(registered)
+
+    def _unregister_tsum_hotkeys(self) -> None:
+        self._tsum_hot_yes = None
+        self._tsum_hot_no = None
+        self._tsum_hot_cancel = None
+        if sys.platform != "win32" or not self._tsum_hotkey:
+            self._tsum_hot_ids = []
+            self._tsum_hotkey = False
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = int(self.winId())
+        for hot_id in self._tsum_hot_ids:
+            user32.UnregisterHotKey(hwnd, hot_id)
+        self._tsum_hot_ids = []
+        self._tsum_hotkey = False
 
     def _reread_app_use(self) -> None:
         running = self._app_use_check
@@ -995,6 +1045,7 @@ class MenuWindow(QMainWindow):
         self._show_tsum_guess(guess)
 
     def _clear_tsum_frame(self) -> None:
+        self._unregister_tsum_hotkeys()
         for layout in (self._tsum_body, self._tsum_actions):
             if layout is None:
                 continue
@@ -1145,6 +1196,7 @@ class MenuWindow(QMainWindow):
         for button in buttons:
             button.setFixedSize(width, height)
         self._tsum_body.addStretch(1)
+        self._register_tsum_hotkeys(buttons[0].click, buttons[1].click, buttons[2].click)
 
     def _show_tsum_list(self, skip_name: str = "") -> None:
         self._set_activity("使用ツムの問いに答えてください")
