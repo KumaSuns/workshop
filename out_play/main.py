@@ -564,7 +564,16 @@ class MenuWindow(QMainWindow):
             return
         ok, detail = _pull_app_update()
         if ok:
-            self._set_activity("終了して、もう一度起動する")
+            try:
+                _schedule_relaunch()
+            except OSError:
+                self._set_activity("終了して、もう一度起動する")
+                return
+            server = getattr(self, "_ipc_server", None)
+            if server is not None:
+                server.close()
+            QLocalServer.removeServer(MENU_IPC)
+            QApplication.quit()
             return
         self._set_activity(detail or "更新できませんでした。")
 
@@ -1691,6 +1700,36 @@ def _restore_update_files() -> subprocess.CompletedProcess[str] | None:
     if not blocked:
         return None
     return _git_in_app(["checkout", "HEAD", "--", *blocked])
+
+
+def _schedule_relaunch() -> None:
+    exe = str(sys.executable)
+    main = str(ROOT / "main.py")
+    pid = os.getpid()
+    code = (
+        "import os,subprocess,time\n"
+        f"pid={pid}\n"
+        "while True:\n"
+        "    try:\n"
+        "        os.kill(pid, 0)\n"
+        "    except OSError:\n"
+        "        break\n"
+        "    time.sleep(0.2)\n"
+        f"subprocess.Popen([{exe!r}, {main!r}], cwd={str(ROOT)!r})\n"
+    )
+    flags = 0
+    if sys.platform == "win32":
+        flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    subprocess.Popen(
+        [exe, "-c", code],
+        cwd=str(ROOT),
+        creationflags=flags,
+        close_fds=True,
+    )
 
 
 def _pull_app_update() -> tuple[bool, str]:
