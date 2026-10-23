@@ -48,6 +48,9 @@ ROOT = Path(__file__).resolve().parent
 MODELS_API = "http://hokkai-syabusyabu.com/home_page/workshop/models/api.php"
 LOGO_PATH = ROOT / "images" / "rogo_003.png"
 ICON_DIR = ROOT / "icons"
+TSUM_ICON_DIR = ROOT / "tsum_icons"
+TSUM_ICON_LIST_URL = "https://hokkai-syabusyabu.com/home_page/admin/tsumtsum_icon_list.php"
+TSUM_ICON_FILE_URL = "https://hokkai-syabusyabu.com/home_page/tsumtsum/icon/"
 ITEM_ICONS = (
     "Score.png",
     "Coin.png",
@@ -218,6 +221,7 @@ class MenuWindow(QMainWindow):
         self._play_api = None
         self._used_tsum_name = ""
         self._tsum_body = None
+        self._used_tsum_label = None
         self._tsum_actions = None
         self._tsum_path: Path | None = None
         self._tsum_list = None
@@ -453,6 +457,9 @@ class MenuWindow(QMainWindow):
         above.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         above.setSpacing(0)
         above.addWidget(self._section_title("使用ツム"))
+        self._used_tsum_label = QLabel("")
+        self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        above.addWidget(self._used_tsum_label)
         above.addStretch(1)
         right = QVBoxLayout(right_box)
         right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
@@ -1247,10 +1254,9 @@ class MenuWindow(QMainWindow):
         worker = self._play_worker
         self._used_tsum_name = name
         self._clear_tsum_frame()
-        if self._tsum_body is not None:
-            label = QLabel(name)
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._tsum_body.addWidget(label)
+        if self._used_tsum_label is not None:
+            self._used_tsum_label.setText(name)
+        threading.Thread(target=_fetch_used_tsum_icon, args=(name,), daemon=True).start()
         if worker is not None:
             worker.provide_used_tsum(name)
 
@@ -1258,6 +1264,8 @@ class MenuWindow(QMainWindow):
         worker = self._play_worker
         self._used_tsum_name = ""
         self._clear_tsum_frame()
+        if self._used_tsum_label is not None:
+            self._used_tsum_label.setText("")
         if worker is not None:
             worker.provide_used_tsum(None)
             self._play_stop.set()
@@ -1549,6 +1557,87 @@ def _used_tsum_names() -> list[str]:
         return []
     names = [str(value).strip() for value in payload.values() if str(value).strip()]
     return sorted(set(names), key=lambda value: value.casefold())
+
+
+_TSUM_ICON_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+
+
+def _used_tsum_icon_name(name: str) -> str:
+    cleaned = name.strip()
+    if not cleaned or Path(cleaned).name != cleaned:
+        return ""
+    return cleaned
+
+
+def _used_tsum_icon_present(name: str) -> bool:
+    if not TSUM_ICON_DIR.is_dir():
+        return False
+    for path in TSUM_ICON_DIR.iterdir():
+        if path.is_file() and path.stem == name and path.suffix.lower() in _TSUM_ICON_EXTS:
+            return True
+    return False
+
+
+def _tsum_icon_filename(payload: object, name: str) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    icons = payload.get("icons")
+    if not isinstance(icons, list):
+        return ""
+    for item in icons:
+        if not isinstance(item, dict):
+            continue
+        matched = False
+        names = item.get("tsum_names")
+        if isinstance(names, list) and name in {str(value) for value in names}:
+            matched = True
+        if not matched:
+            links = item.get("links")
+            if isinstance(links, list):
+                for link in links:
+                    if isinstance(link, dict) and str(link.get("name") or "") == name:
+                        matched = True
+                        break
+        if not matched:
+            continue
+        filename = Path(str(item.get("filename") or "")).name
+        if filename and filename not in {".", ".."}:
+            return filename
+    return ""
+
+
+def _fetch_used_tsum_icon(name: str) -> None:
+    safe = _used_tsum_icon_name(name)
+    if not safe or _used_tsum_icon_present(safe):
+        return
+    try:
+        request = urllib.request.Request(TSUM_ICON_LIST_URL)
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        filename = _tsum_icon_filename(payload, safe)
+        if not filename:
+            return
+        ext = Path(filename).suffix.lower()
+        if ext not in _TSUM_ICON_EXTS:
+            return
+        image_url = TSUM_ICON_FILE_URL + urllib.parse.quote(filename)
+        image_request = urllib.request.Request(image_url)
+        with urllib.request.urlopen(image_request, timeout=20) as response:
+            data = response.read()
+            content_type = str(response.headers.get("Content-Type") or "")
+        if not data:
+            return
+        if content_type and not content_type.lower().startswith("image/"):
+            return
+        if _used_tsum_icon_present(safe):
+            return
+        TSUM_ICON_DIR.mkdir(parents=True, exist_ok=True)
+        dest = TSUM_ICON_DIR / f"{safe}{ext}"
+        temporary = dest.with_name(dest.name + ".part")
+        temporary.write_bytes(data)
+        temporary.replace(dest)
+    except (OSError, json.JSONDecodeError, UnicodeError, urllib.error.URLError, TimeoutError):
+        return
 
 
 def _save_used_tsum(path: Path | None, name: str, folder_id: str | None) -> str:
