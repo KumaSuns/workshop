@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -80,6 +81,7 @@ from app.play_style import (
     should_bomb,
     unlike_hit,
 )
+from app.game_record import append_game_record, set_result_coin
 from app.play_web import append_play
 from app.paths import APP_ROOT
 from app.trainer_bridge import (
@@ -131,6 +133,7 @@ class PlayWorker(QThread):
     items = Signal(str)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
+    recorded = Signal(object)
 
     def __init__(
         self,
@@ -214,6 +217,7 @@ class PlayWorker(QThread):
                 finish_after=self.finish_after,
                 skill_lamp=self.skill_lamp.emit,
                 my_lamp=self.my_lamp.emit,
+                notify_record=self.recorded.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -300,6 +304,7 @@ def run_play(
     finish_after: Event | None = None,
     skill_lamp: Callable[[bool], None] | None = None,
     my_lamp: Callable[[str], None] | None = None,
+    notify_record: Callable[[dict], None] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
@@ -449,6 +454,10 @@ def run_play(
     clears = 0
     swipes = 0
     coin = 0
+    earned_coin: int | None = None
+    coin_read_at = 0.0
+    last_record_id: list[int | None] = [None]
+    last_has_result = [False]
     skill_taps = 0
     skill_ok = 0
     skill_used = 0
@@ -492,7 +501,7 @@ def run_play(
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
         nonlocal ignore_start_until, saw_board, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
-        nonlocal clears, swipes, coin, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
+        nonlocal clears, swipes, coin, earned_coin, coin_read_at, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
         nonlocal my_group, skill_face, my_vec, match_picks, idle_pick, idle_acc, idle_since
@@ -535,6 +544,8 @@ def run_play(
         clears = 0
         swipes = 0
         coin = 0
+        earned_coin = None
+        coin_read_at = 0.0
         skill_taps = 0
         skill_ok = 0
         skill_used = 0
@@ -1545,6 +1556,48 @@ def run_play(
             args=(predictor, board_grabs, stop, grab_done, say),
             daemon=True,
         ).start()
+
+    def read_earned(frame_rgb, boxes) -> None:
+        nonlocal earned_coin
+        if frame_rgb is None or not boxes:
+            return
+        try:
+            with _gpu_lock:
+                text = _read_coin_key(predictor, frame_rgb, boxes, "coin")
+        except Exception:
+            return
+        kept = _kept_coin(text)
+        if kept is not None:
+            earned_coin = kept
+
+    def publish(item: dict) -> None:
+        record_id = item.get("id")
+        last_record_id[0] = int(record_id) if record_id is not None else None
+        last_has_result[0] = item.get("result_coin") is not None
+        if notify_record is not None:
+            notify_record(item)
+
+    def take_result(image: QImage) -> None:
+        if last_has_result[0] or last_record_id[0] is None or image is None or image.isNull():
+            return
+        frame = _qimage_rgb(image)
+        text = ""
+        try:
+            with _gpu_lock:
+                found = predictor.predict_all(Path("."), rgb=frame)
+                text = _read_coin_key(predictor, frame, found, "result_coin")
+        except Exception:
+            return
+        kept = _kept_coin(text)
+        if kept is None:
+            return
+        updated = set_result_coin(last_record_id[0], kept)
+        if updated is None:
+            return
+        last_has_result[0] = True
+        if notify_record is not None:
+            notify_record(updated)
+
     next_frame = None
     try:
         while True:
@@ -1661,6 +1714,9 @@ def run_play(
                 and not image.isNull()
                 and _in_play_hud(image)
             )
+            if play_hud and time.time() >= coin_read_at:
+                coin_read_at = time.time() + 1.0
+                read_earned(rgb, last_boxes)
             retry_now = (
                 saw_board
                 and image is not None
@@ -1719,6 +1775,8 @@ def run_play(
                 flush_idle(True)
                 flush_bomb()
                 flush_skill()
+                if play_hud and not retry_now:
+                    read_earned(rgb, last_boxes)
                 _note_match_end(
                     predictor,
                     rgb,
@@ -1738,6 +1796,10 @@ def run_play(
                     None if go_at is None else max(0, int(round(time.time() - go_at))),
                     sorted(wait_times, reverse=True)[:3],
                     upload=not tsum_unspecified,
+                    started="" if go_at is None else datetime.fromtimestamp(go_at).strftime("%Y/%m/%d/%H/%M"),
+                    earned=earned_coin,
+                    on_result=retry_now,
+                    notify_record=publish,
                 )
                 watch_hit.clear()
                 if not _continue_after_game():
@@ -1749,7 +1811,7 @@ def run_play(
                     stop_watch.set()
                     watching.clear()
                     return
-                _seen, replay_items = _replay_after_timeup(say, stop, finish_after)
+                _seen, replay_items = _replay_after_timeup(say, stop, finish_after, on_retry=take_result)
                 if finish_after is not None and finish_after.is_set():
                     say("このプレイでやめます")
                     stop_watch.set()
@@ -2340,6 +2402,8 @@ def run_play(
                     flush_idle(True)
                     flush_bomb()
                     flush_skill()
+                    if check is not None and not check.isNull() and _in_play_hud(check) and not retry_on_check:
+                        read_earned(check_rgb, last_boxes)
                     _note_match_end(
                         predictor,
                         check_rgb,
@@ -2359,6 +2423,10 @@ def run_play(
                         None if go_at is None else max(0, int(round(time.time() - go_at))),
                         sorted(wait_times, reverse=True)[:3],
                         upload=not tsum_unspecified,
+                        started="" if go_at is None else datetime.fromtimestamp(go_at).strftime("%Y/%m/%d/%H/%M"),
+                        earned=earned_coin,
+                        on_result=retry_on_check,
+                        notify_record=publish,
                     )
                     if not _continue_after_game():
                         stop_watch.set()
@@ -2369,7 +2437,7 @@ def run_play(
                         stop_watch.set()
                         watching.clear()
                         return
-                    _seen, replay_items = _replay_after_timeup(say, stop, finish_after)
+                    _seen, replay_items = _replay_after_timeup(say, stop, finish_after, on_retry=take_result)
                     if finish_after is not None and finish_after.is_set():
                         say("このプレイでやめます")
                         stop_watch.set()
@@ -3836,6 +3904,10 @@ def _note_match_end(
     duration: int | None = None,
     waits: list[float] | None = None,
     upload: bool = True,
+    started: str = "",
+    earned: int | None = None,
+    on_result: bool = False,
+    notify_record: Callable[[dict], None] | None = None,
 ) -> None:
     if skill_wait_empty:
         fill = _skill_fill(rgb, skill)
@@ -3860,6 +3932,27 @@ def _note_match_end(
         waits,
         upload,
     )
+    result_n = None
+    if on_result and rgb is not None:
+        try:
+            with _gpu_lock:
+                found = predictor.predict_all(Path("."), rgb=rgb)
+                result_text = _read_coin_key(predictor, rgb, found, "result_coin")
+            result_n = _kept_coin(result_text)
+        except Exception:
+            result_n = None
+    recorded = append_game_record(started, used_tsum, items, duration, earned, result_n)
+    if notify_record is not None:
+        notify_record(recorded)
+
+
+def _kept_coin(value) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
@@ -3870,29 +3963,33 @@ def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
     return text
 
 
-def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
+def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
     if rgb is None or not boxes:
         return ""
     predict = getattr(predictor, "predict_coin_digits", None)
     if predict is None:
         return ""
+    box = boxes.get(key)
+    if not box:
+        return ""
     width, height = rgb.size
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(width, left + max(1, int(box["w"])))
+    bottom = min(height, top + max(1, int(box["h"])))
+    if right - left < 4 or bottom - top < 4:
+        return ""
+    crop = rgb.crop((left, top, right, bottom))
+    try:
+        raw = str(predict(crop, key) or "")
+    except Exception:
+        return ""
+    return "".join(char for char in raw if char.isdigit())
+
+
+def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
     for key in ("coin", "result_coin"):
-        box = boxes.get(key)
-        if not box:
-            continue
-        left = max(0, int(box["x"]))
-        top = max(0, int(box["y"]))
-        right = min(width, left + max(1, int(box["w"])))
-        bottom = min(height, top + max(1, int(box["h"])))
-        if right - left < 4 or bottom - top < 4:
-            continue
-        crop = rgb.crop((left, top, right, bottom))
-        try:
-            raw = str(predict(crop, key) or "")
-        except Exception:
-            continue
-        digits = "".join(char for char in raw if char.isdigit())
+        digits = _read_coin_key(predictor, rgb, boxes, key)
         if digits:
             return digits
     return ""
@@ -3932,11 +4029,12 @@ def _replay_after_timeup(
     say: StatusFn,
     stop: Event | None,
     finish_after: Event | None = None,
+    on_retry: Callable[[QImage], None] | None = None,
 ) -> tuple[str, list[str] | None]:
     if finish_after is not None and finish_after.is_set():
         return "", None
     _seen, _locked, arrived, used_name, items = _click_start_or_continue(
-        say, stop, tap_start=False, read_tsum=False, finish_after=finish_after
+        say, stop, tap_start=False, read_tsum=False, finish_after=finish_after, on_retry=on_retry
     )
     if finish_after is not None and finish_after.is_set():
         return "", None
@@ -4445,6 +4543,7 @@ def _click_start_or_continue(
     skip_retry: bool = False,
     read_tsum: bool = True,
     finish_after: Event | None = None,
+    on_retry: Callable[[QImage], None] | None = None,
 ) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
@@ -4497,6 +4596,8 @@ def _click_start_or_continue(
         if retry is not None:
             if finish_after is not None and finish_after.is_set():
                 return kinds, locked, "stop", used_name, items
+            if on_retry is not None:
+                on_retry(image)
             say("リトライをクリックします")
             tap(retry.center().x(), retry.center().y())
             _sleep_stop(1.2, stop)

@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -132,6 +133,28 @@ def _logo_source() -> QPixmap:
     )
 
 
+def _game_record_line(item: dict) -> str:
+    names = item.get("items") or []
+    if isinstance(names, str):
+        items_text = names
+    else:
+        items_text = "、".join(str(name) for name in names if str(name))
+    play_time = item.get("play_time")
+    play_text = "" if play_time is None else f"{int(play_time)}秒"
+    coin = item.get("coin")
+    result = item.get("result_coin")
+    return "  ".join(
+        [
+            str(item.get("started") or ""),
+            f"使用ツム {item.get('tsum') or ''}",
+            f"使用アイテム {items_text}",
+            f"プレイ時間 {play_text}",
+            f"獲得コイン {'' if coin is None else int(coin)}",
+            f"リザルトコイン {'' if result is None else int(result)}",
+        ]
+    )
+
+
 class MenuWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -200,6 +223,7 @@ class MenuWindow(QMainWindow):
         self._center_blank = None
         self._activity = None
         self._launch_button = None
+        self._game_list = None
         for _ in range(3):
             slot = QFrame()
             slot.setFrameShape(QFrame.Shape.Box)
@@ -207,6 +231,7 @@ class MenuWindow(QMainWindow):
             self._slots.append(slot)
         self._fill_items(self._slots[0])
         self._fill_center(self._slots[1])
+        self._fill_records(self._slots[2])
         self._model_update_check = _ModelUpdateCheck(self._model_token_value, self)
         self._model_update_check.found.connect(self._set_model_update)
         self._model_update_check.start()
@@ -656,6 +681,31 @@ class MenuWindow(QMainWindow):
             button.setText(f"{label} 更新なし")
             self._paint_model_button(button, False)
         QMessageBox.information(self, "モデルを取り込みました", f"{label} を取り込みました。")
+
+    def _fill_records(self, slot: QFrame) -> None:
+        from app.game_record import load_game_records
+
+        column = QVBoxLayout(slot)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        self._game_list = QListWidget()
+        column.addWidget(self._game_list, 1)
+        for item in load_game_records():
+            self._show_game_record(item)
+
+    def _show_game_record(self, item: object) -> None:
+        if not isinstance(item, dict) or self._game_list is None:
+            return
+        record_id = item.get("id")
+        line = _game_record_line(item)
+        for row in range(self._game_list.count()):
+            listed = self._game_list.item(row)
+            if listed is not None and listed.data(Qt.ItemDataRole.UserRole) == record_id:
+                listed.setText(line)
+                return
+        entry = QListWidgetItem(line)
+        entry.setData(Qt.ItemDataRole.UserRole, record_id)
+        self._game_list.insertItem(0, entry)
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
@@ -1469,6 +1519,7 @@ def _start_match(window: MenuWindow) -> None:
         games=window._play_games,
     )
     worker.status.connect(window._set_activity)
+    worker.recorded.connect(window._show_game_record)
     worker.items.connect(window._on_play_items)
     worker.need_used_tsum.connect(window._on_need_used_tsum)
     worker.need_kinds.connect(window._on_need_kinds)
