@@ -1538,8 +1538,31 @@ def app_update_available() -> bool:
         return False
 
 
+def _names_from_git(result: subprocess.CompletedProcess[str]) -> set[str]:
+    if result.returncode != 0:
+        return set()
+    return {line.strip().replace("\\", "/") for line in result.stdout.splitlines() if line.strip()}
+
+
+def _restore_update_files() -> subprocess.CompletedProcess[str] | None:
+    local = _git_in_app(["diff", "--name-only", "HEAD"])
+    incoming = _git_in_app(["diff", "--name-only", "HEAD", "FETCH_HEAD"])
+    blocked = sorted(_names_from_git(local) & _names_from_git(incoming))
+    if not blocked:
+        return None
+    return _git_in_app(["checkout", "HEAD", "--", *blocked])
+
+
 def _pull_app_update() -> tuple[bool, str]:
     try:
+        fetched = _git_in_app(["fetch", "origin", "master"])
+        if fetched.returncode != 0:
+            detail = (fetched.stderr or fetched.stdout or "更新できませんでした。").strip()
+            return False, detail
+        restored = _restore_update_files()
+        if restored is not None and restored.returncode != 0:
+            detail = (restored.stderr or restored.stdout or "更新できませんでした。").strip()
+            return False, detail
         result = _git_in_app(["pull", "origin", "master"])
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
