@@ -159,8 +159,11 @@ def _game_record_line(item: dict) -> str:
 
 
 class MenuWindow(QMainWindow):
+    tsum_icon_ready = Signal(str)
+
     def __init__(self) -> None:
         super().__init__()
+        self.tsum_icon_ready.connect(self._on_tsum_icon_ready)
         self.setWindowTitle("AUTO PLAY")
         root = QWidget()
         layout = QVBoxLayout(root)
@@ -222,6 +225,8 @@ class MenuWindow(QMainWindow):
         self._used_tsum_name = ""
         self._tsum_body = None
         self._used_tsum_label = None
+        self._used_tsum_icon = None
+        self._tsum_box = None
         self._tsum_actions = None
         self._tsum_path: Path | None = None
         self._tsum_list = None
@@ -374,6 +379,7 @@ class MenuWindow(QMainWindow):
         stack.setSpacing(0)
         tsum_box = QFrame()
         tsum_box.setFrameShape(QFrame.Shape.Box)
+        self._tsum_box = tsum_box
         self._item_box = QFrame()
         self._item_box.setFrameShape(QFrame.Shape.Box)
         stack.addWidget(tsum_box, 1)
@@ -460,6 +466,14 @@ class MenuWindow(QMainWindow):
         self._used_tsum_label = QLabel("")
         self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         above.addWidget(self._used_tsum_label)
+        self._used_tsum_icon = QLabel()
+        self._used_tsum_icon.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self._used_tsum_icon.setMinimumWidth(0)
+        self._used_tsum_icon.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
+        self._used_tsum_icon.setFixedHeight(0)
+        above.addWidget(self._used_tsum_icon)
         above.addStretch(1)
         right = QVBoxLayout(right_box)
         right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
@@ -1256,7 +1270,12 @@ class MenuWindow(QMainWindow):
         self._clear_tsum_frame()
         if self._used_tsum_label is not None:
             self._used_tsum_label.setText(name)
-        threading.Thread(target=_fetch_used_tsum_icon, args=(name,), daemon=True).start()
+        self._show_used_tsum_icon(name)
+        threading.Thread(
+            target=_fetch_used_tsum_icon,
+            args=(name, self.tsum_icon_ready.emit),
+            daemon=True,
+        ).start()
         if worker is not None:
             worker.provide_used_tsum(name)
 
@@ -1266,10 +1285,34 @@ class MenuWindow(QMainWindow):
         self._clear_tsum_frame()
         if self._used_tsum_label is not None:
             self._used_tsum_label.setText("")
+        self._show_used_tsum_icon("")
         if worker is not None:
             worker.provide_used_tsum(None)
             self._play_stop.set()
         self._set_activity("中止しました")
+
+    def _on_tsum_icon_ready(self, name: str) -> None:
+        if name != self._used_tsum_name:
+            return
+        self._show_used_tsum_icon(name)
+
+    def _show_used_tsum_icon(self, name: str) -> None:
+        label = self._used_tsum_icon
+        if label is None:
+            return
+        path = _used_tsum_icon_file(name) if name else None
+        pixmap = QPixmap(str(path)) if path is not None else QPixmap()
+        if pixmap.isNull():
+            label.clear()
+            label.setFixedHeight(0)
+            return
+        width = label.width()
+        if width <= 1 and self._tsum_box is not None:
+            width = self._tsum_box.contentsRect().width()
+        if width > 1 and pixmap.width() > width:
+            pixmap = pixmap.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+        label.setPixmap(pixmap)
+        label.setFixedHeight(pixmap.height())
 
     def _save_used_tsum_choice(
         self, path: Path | None, name: str, folder_id: str | None
@@ -1569,13 +1612,18 @@ def _used_tsum_icon_name(name: str) -> str:
     return cleaned
 
 
-def _used_tsum_icon_present(name: str) -> bool:
-    if not TSUM_ICON_DIR.is_dir():
-        return False
+def _used_tsum_icon_file(name: str) -> Path | None:
+    safe = _used_tsum_icon_name(name)
+    if not safe or not TSUM_ICON_DIR.is_dir():
+        return None
     for path in TSUM_ICON_DIR.iterdir():
-        if path.is_file() and path.stem == name and path.suffix.lower() in _TSUM_ICON_EXTS:
-            return True
-    return False
+        if path.is_file() and path.stem == safe and path.suffix.lower() in _TSUM_ICON_EXTS:
+            return path
+    return None
+
+
+def _used_tsum_icon_present(name: str) -> bool:
+    return _used_tsum_icon_file(name) is not None
 
 
 def _tsum_icon_filename(payload: object, name: str) -> str:
@@ -1606,7 +1654,7 @@ def _tsum_icon_filename(payload: object, name: str) -> str:
     return ""
 
 
-def _fetch_used_tsum_icon(name: str) -> None:
+def _fetch_used_tsum_icon(name: str, on_saved=None) -> None:
     safe = _used_tsum_icon_name(name)
     if not safe or _used_tsum_icon_present(safe):
         return
@@ -1636,6 +1684,8 @@ def _fetch_used_tsum_icon(name: str) -> None:
         temporary = dest.with_name(dest.name + ".part")
         temporary.write_bytes(data)
         temporary.replace(dest)
+        if on_saved is not None:
+            on_saved(safe)
     except (OSError, json.JSONDecodeError, UnicodeError, urllib.error.URLError, TimeoutError):
         return
 
