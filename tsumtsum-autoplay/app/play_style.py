@@ -565,6 +565,25 @@ def record_rl_skill_coin(skill_n: int, coin: int) -> None:
     _save(data)
 
 
+def record_last_coin(coin: int, skill_ok: int) -> None:
+    kept = play_coin(coin)
+    if kept is None:
+        return
+    data = _load()
+    plays = list(data.get("plays") or [])
+    if not plays or not isinstance(plays[-1], dict):
+        return
+    last = dict(plays[-1])
+    if last.get("coin") is not None:
+        return
+    last["coin"] = kept
+    plays[-1] = last
+    data["plays"] = plays
+    _save(data)
+    record_rl_skill_coin(skill_ok, kept)
+    flush_style()
+
+
 def record_play(
     clears: int,
     swipes: int,

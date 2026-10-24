@@ -4,6 +4,7 @@ import colorsys
 import json
 import math
 import random
+import subprocess
 import sys
 import tempfile
 import time
@@ -68,6 +69,7 @@ from app.play_style import (
     rank,
     play_coin,
     record_hud,
+    record_last_coin,
     record_pick,
     record_play,
     record_rl_length,
@@ -123,6 +125,8 @@ class PlayWorker(QThread):
     status = Signal(str)
     preview = Signal(QImage)
     gauges = Signal(object, object, object, object, object, object, object, object, object, object)
+    money = Signal(object, object)
+    timeup_lamp = Signal(bool)
     skill_lamp = Signal(bool)
     my_lamp = Signal(str)
     items = Signal(str)
@@ -201,11 +205,13 @@ class PlayWorker(QThread):
                 loop=self._loop,
                 games=self._games,
                 request_kinds=self._request_kinds if self._ask_kinds else None,
-                request_used_tsum=self._request_used_tsum if self._ask_kinds else None,
+                request_used_tsum=self._request_used_tsum,
                 skill_pressed=self.skill_pressed,
                 timeup_seen=self.timeup_seen,
                 skill_lamp=self.skill_lamp.emit,
                 my_lamp=self.my_lamp.emit,
+                money=self.money.emit,
+                timeup_lamp=self.timeup_lamp.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -214,6 +220,7 @@ class PlayWorker(QThread):
         else:
             self.completed.emit()
         finally:
+            _stop_timeup_app()
             flush_style()
 
 
@@ -236,6 +243,8 @@ def run_play(
     timeup_seen: Event | None = None,
     skill_lamp: Callable[[bool], None] | None = None,
     my_lamp: Callable[[str], None] | None = None,
+    money: Callable[[object, object], None] | None = None,
+    timeup_lamp: Callable[[bool], None] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
@@ -374,6 +383,10 @@ def run_play(
     clears = 0
     swipes = 0
     coin = 0
+    shown_money = {"coin": "", "result": ""}
+    earned_now = [""]
+    timeup_lit = [False]
+    watcher_told = [False]
     skill_taps = 0
     skill_ok = 0
     skill_used = 0
@@ -460,6 +473,9 @@ def run_play(
         clears = 0
         swipes = 0
         coin = 0
+        shown_money["coin"] = ""
+        if money is not None:
+            money(shown_money["coin"], shown_money["result"])
         skill_taps = 0
         skill_ok = 0
         skill_used = 0
@@ -511,6 +527,8 @@ def run_play(
         nightmare_dice.update(_nightmare_blank())
         watch_hit.clear()
         watching.clear()
+        _watcher_timeup[0] = False
+        watcher_told[0] = False
         if timeup_seen is not None:
             timeup_seen.clear()
         go_at = None
@@ -809,7 +827,7 @@ def run_play(
                 skip_loss = True
                 swipes += run_elsa_skill(
                     predict=lambda shot: predictor.predict_pieces(
-                        Path("."), game, rgb=shot, inner=False
+                        Path("."), game, rgb=shot
                     ),
                     game=game,
                     say=say,
@@ -825,7 +843,7 @@ def run_play(
             if skill_is_namine(used_tsum):
                 done = run_namine_skill(
                     predict=lambda shot: predictor.predict_pieces(
-                        Path("."), game, rgb=shot, inner=False
+                        Path("."), game, rgb=shot
                     ),
                     game=game,
                     my_group=my_group,
@@ -1101,14 +1119,20 @@ def run_play(
     watching = Event()
     watch_hit = Event()
     stop_watch = Event()
-    watcher = Thread(
-        target=_watch_timeup,
-        args=(predictor, stop_watch, watching, watch_hit, stop),
-        daemon=True,
-    )
-    watcher.start()
-    if resumed_pause:
+
+    def arm_timeup() -> None:
+        _ensure_timeup_app(watch_hit, watching)
         watching.set()
+
+    def show_timeup(on: bool) -> None:
+        if timeup_lamp is None or timeup_lit[0] == on:
+            return
+        timeup_lit[0] = on
+        timeup_lamp(on)
+
+    _timeup_lamp[0] = show_timeup
+    if resumed_pause:
+        arm_timeup()
     checker_alive = [True]
     before_start = [False]
     next_skill_at = [0.0]
@@ -1194,6 +1218,10 @@ def run_play(
         if skill_ring_hold[0]:
             if yellow < SLOT_ON:
                 skill_ring_hold[0] = False
+            elif time.time() >= next_skill_at[0]:
+                fill = _skill_fill(rgb_now, skill)
+                if fill is not None and fill >= SKILL_FILL_READY:
+                    skill_ring_hold[0] = False
             return False
         return _skill_ready(rgb_now, skill, used_tsum)
 
@@ -1393,7 +1421,10 @@ def run_play(
             fever_on = _fever_playing(shot_rgb, game)
             meter_fever = _meter_fever_fill(shot_rgb, fever, skill, fan)
             left = _read_timer(predictor, shot_rgb, timer)
-            if left is None:
+            if _watcher_timeup[0] or watch_hit.is_set():
+                left = 0
+                last_left = 0
+            elif left is None:
                 left = last_left
             else:
                 last_left = left
@@ -1477,6 +1508,60 @@ def run_play(
             ),
             daemon=True,
         ).start()
+    def _note_result_path(path) -> None:
+        if money is None:
+            return
+        from PIL import Image
+
+        try:
+            with Image.open(path) as image:
+                frame = image.convert("RGB")
+            with _gpu_lock:
+                boxes = predictor.predict_all(Path("."), rgb=frame)
+                text = _read_coin_key(predictor, frame, boxes, "result_coin")
+        except Exception:
+            return
+        if not text:
+            return
+        shown_money["result"] = text
+        earned_now[0] = text
+        money(shown_money["coin"], shown_money["result"])
+
+    def _catch_result() -> None:
+        if money is None:
+            return
+        deadline = time.time() + 12
+        found: list[str] = []
+        while time.time() < deadline and len(found) < 5:
+            _check_stop(stop)
+            try:
+                frame = _qimage_rgb(capture_play_frame())
+            except Exception:
+                frame = None
+            text = ""
+            if frame is not None:
+                try:
+                    with _gpu_lock:
+                        boxes = predictor.predict_all(Path("."), rgb=frame)
+                        text = _read_coin_key(predictor, frame, boxes, "result_coin")
+                except Exception:
+                    text = ""
+            if not text:
+                if not found:
+                    _sleep_stop(0.4, stop)
+                continue
+            found.append(text)
+            shown_money["result"] = text
+            earned_now[0] = text
+            money(shown_money["coin"], shown_money["result"])
+        if not found:
+            return
+        earned_now[0] = max(set(found), key=found.count)
+        shown_money["result"] = earned_now[0]
+        money(shown_money["coin"], shown_money["result"])
+
+    _money_note[0] = _note_result_path
+    money_at = [0.0]
     next_frame = None
     try:
         while True:
@@ -1522,7 +1607,7 @@ def run_play(
                 saw_board = True
                 match_over = False
                 kinds_locked = True
-                watching.set()
+                arm_timeup()
                 if go_at is None:
                     go_at = time.time()
                 resumed_pause = False
@@ -1533,7 +1618,7 @@ def run_play(
                 saw_board = True
                 match_over = False
                 kinds_locked = True
-                watching.set()
+                arm_timeup()
                 if go_at is None:
                     go_at = time.time()
                 resumed_pause = True
@@ -1558,10 +1643,11 @@ def run_play(
                     if scene == "go":
                         go_at = time.time()
                 if go_at is not None or _in_play_hud(image):
+                    ask_used_now(True)
                     saw_board = True
                     match_over = False
                     kinds_locked = True
-                    watching.set()
+                    arm_timeup()
                     if go_at is None:
                         go_at = time.time()
             if saw_board and not watch_hit.is_set() and apply_checker_skill(False):
@@ -1578,14 +1664,33 @@ def run_play(
             timer_running = timer_left is not None and timer_left > 0
             if timer_running:
                 saw_timer = True
-            if timer_running and watch_hit.is_set():
-                watch_hit.clear()
+            if timer_running and not _watcher_timeup[0]:
+                if watch_hit.is_set():
+                    watch_hit.clear()
+                show_timeup(False)
+            if _watcher_timeup[0] and not watcher_told[0]:
+                watcher_told[0] = True
+                say("TIME UP")
+                if timeup_seen is not None:
+                    timeup_seen.set()
             play_hud = bool(
                 saw_board
                 and image is not None
                 and not image.isNull()
                 and _in_play_hud(image)
             )
+            if play_hud and money is not None and time.time() >= money_at[0]:
+                money_at[0] = time.time() + 1.0
+                text = ""
+                if last_boxes:
+                    try:
+                        with _gpu_lock:
+                            text = _read_coin_key(predictor, rgb, last_boxes, "coin")
+                    except Exception:
+                        text = ""
+                if text:
+                    shown_money["coin"] = text
+                    money(shown_money["coin"], shown_money["result"])
             retry_now = (
                 saw_board
                 and image is not None
@@ -1610,12 +1715,17 @@ def run_play(
                     model_hit, _score = _timeup_hit(predictor, rgb)
                 if model_hit:
                     watch_hit.set()
+                    show_timeup(True)
             if board_left and hud_gone_seen:
                 watch_hit.set()
+                show_timeup(True)
             hud_gone_seen = board_left
             timeup_now = saw_board and not timer_running and (
                 (model_hit and (saw_timer or timer_left == 0))
-                or (watch_hit.is_set() and (timer_left == 0 or board_left))
+                or (
+                    watch_hit.is_set()
+                    and (timer_left == 0 or board_left or _watcher_timeup[0])
+                )
             )
             if retry_now or timeup_now:
                 credit_pending(rgb)
@@ -1644,7 +1754,7 @@ def run_play(
                 flush_idle(True)
                 flush_bomb()
                 flush_skill()
-                _note_match_end(
+                saved_ok = _note_match_end(
                     predictor,
                     rgb,
                     last_boxes,
@@ -1663,13 +1773,43 @@ def run_play(
                     None if go_at is None else max(0, int(round(time.time() - go_at))),
                     sorted(wait_times, reverse=True)[:3],
                     upload=not tsum_unspecified,
+                    defer_coin=True,
                 )
                 watch_hit.clear()
-                if not _continue_after_game():
+                duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
+                waits = sorted(wait_times, reverse=True)[:3]
+                again = _continue_after_game()
+                earned_now[0] = ""
+                _catch_result()
+                if not again:
+                    _commit_earned(
+                        earned_now[0] or coin,
+                        saved_ok,
+                        clears,
+                        swipes,
+                        skill_taps,
+                        used_tsum,
+                        used_items,
+                        duration,
+                        waits,
+                        not tsum_unspecified,
+                    )
                     stop_watch.set()
                     watching.clear()
                     return
                 _seen, replay_items = _replay_after_timeup(say, stop)
+                _commit_earned(
+                    earned_now[0] or coin,
+                    saved_ok,
+                    clears,
+                    swipes,
+                    skill_taps,
+                    used_tsum,
+                    used_items,
+                    duration,
+                    waits,
+                    not tsum_unspecified,
+                )
                 fresh_match()
                 match_over = True
                 if replay_items is not None:
@@ -1742,13 +1882,14 @@ def run_play(
                         _wait_for_heart(say, stop)
                         continue
                     if pause is not None:
+                        ask_used_now(True)
                         say("続けるをクリックします")
                         _slow_tap(pause.center().x(), pause.center().y())
                         _sleep_stop(1.2, stop)
                         saw_board = True
                         match_over = False
                         kinds_locked = True
-                        watching.set()
+                        arm_timeup()
                         if go_at is None:
                             go_at = time.time()
                         resumed_pause = True
@@ -1801,7 +1942,7 @@ def run_play(
             heat_s = 0.0
             type_s = 0.0
             with _gpu_lock:
-                pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+                pieces = predictor.predict_pieces(Path("."), game, rgb=rgb)
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
@@ -1917,7 +2058,7 @@ def run_play(
                 check_rgb = rgb
                 length_pick = False
                 used: set[tuple[int, int]] = set()
-                watching.set()
+                arm_timeup()
                 try:
                     queue = list(found)
                     seen_keys = {_chain_key(item) for item in found}
@@ -1998,7 +2139,7 @@ def run_play(
                             skill_busy[0] = True
                             with _gpu_lock:
                                 pieces = predictor.predict_pieces(
-                                    Path("."), game, rgb=rgb, inner=False
+                                    Path("."), game, rgb=rgb
                                 )
                             tsums = [piece for piece in pieces if _is_tsum(piece)]
                             board = pieces
@@ -2211,7 +2352,9 @@ def run_play(
                                 say("TIME UP / " + _counts_line(clears, swipes, coin))
                         elif _timer_still_running(check_rgb, timer):
                             timeup = False
-                            watch_hit.clear()
+                            if not _watcher_timeup[0]:
+                                watch_hit.clear()
+                                show_timeup(False)
                             next_frame = (check, check_rgb)
                         elif not (
                             check is not None
@@ -2241,7 +2384,7 @@ def run_play(
                     flush_idle(True)
                     flush_bomb()
                     flush_skill()
-                    _note_match_end(
+                    saved_ok = _note_match_end(
                         predictor,
                         check_rgb,
                         last_boxes,
@@ -2260,12 +2403,42 @@ def run_play(
                         None if go_at is None else max(0, int(round(time.time() - go_at))),
                         sorted(wait_times, reverse=True)[:3],
                         upload=not tsum_unspecified,
+                        defer_coin=True,
                     )
-                    if not _continue_after_game():
+                    duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
+                    waits = sorted(wait_times, reverse=True)[:3]
+                    again = _continue_after_game()
+                    earned_now[0] = ""
+                    _catch_result()
+                    if not again:
+                        _commit_earned(
+                            earned_now[0] or coin,
+                            saved_ok,
+                            clears,
+                            swipes,
+                            skill_taps,
+                            used_tsum,
+                            used_items,
+                            duration,
+                            waits,
+                            not tsum_unspecified,
+                        )
                         stop_watch.set()
                         watching.clear()
                         return
                     _seen, replay_items = _replay_after_timeup(say, stop)
+                    _commit_earned(
+                        earned_now[0] or coin,
+                        saved_ok,
+                        clears,
+                        swipes,
+                        skill_taps,
+                        used_tsum,
+                        used_items,
+                        duration,
+                        waits,
+                        not tsum_unspecified,
+                    )
                     fresh_match()
                     match_over = True
                     if replay_items is not None:
@@ -2354,8 +2527,12 @@ def run_play(
             say(f"ツム {len(tsums)}体 / なぞれる3体以上なし")
             continue
     finally:
+        _money_note[0] = None
+        _timeup_lamp[0] = None
+        _watcher_timeup[0] = False
         grab_done.set()
         checker_alive[0] = False
+        _stop_timeup_app()
 
 
 def _note_fall(
@@ -2593,7 +2770,7 @@ def _import_grabbed_board(
         game, skill, fever, timer, fan = _merge_hud(boxes, None, None, None, None, None)
         pieces = []
         if game is not None:
-            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False) or []
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb) or []
     hud = dict(boxes) if isinstance(boxes, dict) else {}
     hud.update(_hud_boxes(game, skill, fever, timer, fan))
     try:
@@ -3505,7 +3682,7 @@ def _break_bombs_until_two(
             _sleep_stop(ERASE_WAIT, stop)
             continue
         with _gpu_lock:
-            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb)
         bombs = _bombs_on_board(pieces, game)
         n = len(bombs)
         tsums = [piece for piece in pieces if _is_tsum(piece)]
@@ -3659,45 +3836,52 @@ def _qimage_rgb(image: QImage):
         return PILImage.frombytes("RGB", (width, height), b"".join(rows))
 
 
-def _watch_timeup(
-    predictor,
-    stop_watch: Event,
-    watching: Event,
-    hit: Event,
-    stop: Event | None,
-) -> None:
-    while not stop_watch.is_set():
-        if stop is not None and stop.is_set():
+_timeup_proc: list[subprocess.Popen | None] = [None]
+_money_note: list = [None]
+_timeup_lamp: list = [None]
+_watcher_timeup: list[bool] = [False]
+
+
+def _ensure_timeup_app(hit: Event, watching: Event) -> None:
+    proc = _timeup_proc[0]
+    if proc is not None and proc.poll() is None:
+        return
+    script = Path(__file__).resolve().parent.parent / "timeup_watch.py"
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        cwd=str(script.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    _timeup_proc[0] = proc
+
+    def read() -> None:
+        out = proc.stdout
+        if out is None:
             return
-        if not watching.is_set() or hit.is_set():
-            time.sleep(0.02)
-            continue
-        image = capture_window_frame()
-        if not watching.is_set() or stop_watch.is_set() or hit.is_set():
-            continue
-        if image is None or image.isNull():
-            time.sleep(0.05)
-            continue
-        rgb = _qimage_rgb(image)
-        if rgb is None:
-            time.sleep(0.05)
-            continue
-        if not watching.is_set() or stop_watch.is_set() or hit.is_set():
-            continue
-        got_gpu = _gpu_lock.acquire(blocking=False)
-        if not got_gpu:
-            time.sleep(0.02)
-            continue
-        try:
-            if not watching.is_set() or stop_watch.is_set() or hit.is_set():
-                continue
-            seen, _score = _timeup_hit(predictor, rgb)
-        finally:
-            _gpu_lock.release()
-        if seen:
-            hit.set()
-        else:
-            time.sleep(0.35)
+        for line in out:
+            if line.strip() == b"TIMEUP" and watching.is_set():
+                hit.set()
+                _watcher_timeup[0] = True
+                note = _timeup_lamp[0]
+                if note is not None:
+                    note(True)
+
+    Thread(target=read, daemon=True).start()
+
+
+def _stop_timeup_app() -> None:
+    proc = _timeup_proc[0]
+    _timeup_proc[0] = None
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def _end_on_timeup(
@@ -3761,11 +3945,15 @@ def _note_match_end(
     duration: int | None = None,
     waits: list[float] | None = None,
     upload: bool = True,
-) -> None:
+    defer_coin: bool = False,
+) -> int:
     if skill_wait_empty:
         fill = _skill_fill(rgb, skill)
         if fill is not None and fill < SKILL_FILL_SPENT:
             skill_ok += 1
+    if defer_coin:
+        record_play(clears, swipes, skill_taps, skill_ok, bomb_taps, fan_taps, None, waits)
+        return skill_ok
     got = coin
     if not got:
         got = _read_coin(predictor, rgb, boxes)
@@ -3785,6 +3973,37 @@ def _note_match_end(
         waits,
         upload,
     )
+    return skill_ok
+
+
+def _commit_earned(
+    text,
+    skill_ok: int,
+    clears: int,
+    swipes: int,
+    skill_taps: int,
+    used_tsum: str,
+    items: list[str] | None,
+    duration: int | None,
+    waits: list[float] | None,
+    upload: bool,
+) -> None:
+    raw = "" if text is None else str(text)
+    kept = play_coin(raw) if raw else None
+    if kept is not None:
+        record_last_coin(kept, skill_ok)
+    append_play(
+        clears,
+        swipes,
+        skill_taps,
+        skill_ok,
+        kept,
+        used_tsum,
+        items,
+        duration,
+        waits,
+        upload,
+    )
 
 
 def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
@@ -3795,29 +4014,33 @@ def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
     return text
 
 
-def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
+def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
     if rgb is None or not boxes:
         return ""
     predict = getattr(predictor, "predict_coin_digits", None)
     if predict is None:
         return ""
+    box = boxes.get(key)
+    if not box:
+        return ""
     width, height = rgb.size
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(width, left + max(1, int(box["w"])))
+    bottom = min(height, top + max(1, int(box["h"])))
+    if right - left < 4 or bottom - top < 4:
+        return ""
+    crop = rgb.crop((left, top, right, bottom))
+    try:
+        raw = str(predict(crop, key) or "")
+    except Exception:
+        return ""
+    return "".join(char for char in raw if char.isdigit())
+
+
+def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
     for key in ("coin", "result_coin"):
-        box = boxes.get(key)
-        if not box:
-            continue
-        left = max(0, int(box["x"]))
-        top = max(0, int(box["y"]))
-        right = min(width, left + max(1, int(box["w"])))
-        bottom = min(height, top + max(1, int(box["h"])))
-        if right - left < 4 or bottom - top < 4:
-            continue
-        crop = rgb.crop((left, top, right, bottom))
-        try:
-            raw = str(predict(crop, key) or "")
-        except Exception:
-            continue
-        digits = "".join(char for char in raw if char.isdigit())
+        digits = _read_coin_key(predictor, rgb, boxes, key)
         if digits:
             return digits
     return ""
@@ -3825,6 +4048,8 @@ def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
 
 def _read_timer(predictor, rgb, timer: dict[str, int] | None) -> int | None:
     del predictor
+    if _watcher_timeup[0]:
+        return 0
     if timer is None or rgb is None:
         return None
     width, height = rgb.size
@@ -4429,6 +4654,9 @@ def _click_start_or_continue(
             return kinds, locked, "start", used_name, items
         retry = None if skip_retry else _retry_button(image)
         if retry is not None:
+            note = _money_note[0]
+            if note is not None:
+                note(path)
             say("リトライをクリックします")
             tap(retry.center().x(), retry.center().y())
             _sleep_stop(1.2, stop)

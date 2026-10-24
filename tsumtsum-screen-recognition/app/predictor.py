@@ -122,13 +122,45 @@ class Predictor:
             keys.extend(SCENE_KEYS)
         return keys
 
-    def use_used_tsum_model(self, folder: str) -> None:
-        general = self.models_dir / model_filename("tsum_types")
+    def _model_file(self, key: str, folder: str = "") -> Path:
+        general = self.models_dir / model_filename(key)
         if folder:
-            dedicated = self.models_dir / folder / model_filename("tsum_types")
-            if dedicated.is_file() and self._load_type_model(dedicated):
-                return
-        self._load_type_model(general)
+            dedicated = self.models_dir / folder / model_filename(key)
+            if dedicated.is_file():
+                return dedicated
+        return general
+
+    def _load_piece_model(self, path: Path) -> bool:
+        self.piece_model = None
+        if not path.is_file():
+            return False
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        model = PieceNet(pretrained=False)
+        state = (
+            checkpoint["state_dict"]
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint
+            else checkpoint
+        )
+        try:
+            adapt_piece_state(model, state)
+        except Exception:
+            return False
+        model.to(self.device)
+        model.eval()
+        self.piece_model = model
+        return True
+
+    def use_used_tsum_model(self, folder: str) -> None:
+        folder = str(folder or "")
+        if folder == getattr(self, "_piece_type_folder", None) and self.piece_model is not None:
+            return
+        piece_path = self._model_file("pieces", folder)
+        if not self._load_piece_model(piece_path):
+            self._load_piece_model(self.models_dir / model_filename("pieces"))
+        type_path = self._model_file("tsum_types", folder)
+        if not self._load_type_model(type_path):
+            self._load_type_model(self.models_dir / model_filename("tsum_types"))
+        self._piece_type_folder = folder
 
     def _load_type_model(self, path: Path) -> bool:
         self.type_model = None
@@ -183,22 +215,11 @@ class Predictor:
             model.eval()
             self.models[key] = model
             tick()
-        piece_path = self.models_dir / model_filename("pieces")
-        if piece_path.exists():
-            checkpoint = torch.load(piece_path, map_location=self.device, weights_only=False)
-            model = PieceNet(pretrained=False)
-            state = (
-                checkpoint["state_dict"]
-                if isinstance(checkpoint, dict) and "state_dict" in checkpoint
-                else checkpoint
-            )
-            adapt_piece_state(model, state)
-            model.to(self.device)
-            model.eval()
-            self.piece_model = model
+        if self._load_piece_model(self.models_dir / model_filename("pieces")):
             tick()
         if self._load_type_model(self.models_dir / model_filename("tsum_types")):
             tick()
+        self._piece_type_folder = ""
         self.digit_models = {}
         for key, filename in (("coin", "coin_digits.pt"), ("result_coin", "result_coin_digits.pt")):
             path = self.models_dir / filename

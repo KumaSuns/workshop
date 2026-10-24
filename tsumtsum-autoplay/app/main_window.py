@@ -116,9 +116,11 @@ _CAPTURE_HOTKEY = 2
 _PLAY_HOTKEY = 3
 _BOARD_HOTKEY = 4
 _NOW_BOARD_HOTKEY = 5
+_BEFORE_HOTKEY = 6
 _WM_HOTKEY = 0x0312
 _VK_Q = 0x51
 _VK_F5 = 0x74
+_VK_F7 = 0x76
 _VK_F8 = 0x77
 _VK_F9 = 0x78
 _VK_F11 = 0x7A
@@ -441,8 +443,36 @@ class MainWindow(QMainWindow):
         meter.addWidget(self._meter_pie_row(self._info_skill_pie, self._info_skill_need), 3, 2)
         meter.setColumnStretch(2, 1)
         info.addLayout(meter)
-        info_row.addWidget(info_text, 1)
+        info_row.addWidget(info_text)
         self._info_text = info_text
+        self._info_money = QWidget()
+        money_col = QVBoxLayout(self._info_money)
+        money_col.setContentsMargins(0, 0, 0, 0)
+        money_col.addStretch(1)
+        self._info_timeup = QPushButton("TIME UP")
+        timeup_row = QHBoxLayout()
+        timeup_row.addStretch(1)
+        timeup_row.addWidget(self._info_timeup)
+        timeup_row.addStretch(1)
+        money_col.addLayout(timeup_row)
+        self._info_coin = QLabel("獲得コイン")
+        self._info_coin_value = QLabel("－")
+        coin_row = QHBoxLayout()
+        coin_row.addStretch(1)
+        coin_row.addWidget(self._info_coin)
+        coin_row.addWidget(self._info_coin_value)
+        coin_row.addStretch(1)
+        money_col.addLayout(coin_row)
+        self._info_result = QLabel("リザルト")
+        self._info_result_value = QLabel("－")
+        result_row = QHBoxLayout()
+        result_row.addStretch(1)
+        result_row.addWidget(self._info_result)
+        result_row.addWidget(self._info_result_value)
+        result_row.addStretch(1)
+        money_col.addLayout(result_row)
+        money_col.addStretch(1)
+        info_row.addWidget(self._info_money, 1)
         self._info_count = QFrame()
         self._info_count.setFrameShape(QFrame.Shape.Box)
         count_col = QVBoxLayout(self._info_count)
@@ -563,6 +593,8 @@ class MainWindow(QMainWindow):
         self._f5_down = False
         self._f5_hotkey = False
         self._play_key_at = 0.0
+        self._f7_down = False
+        self._f7_at = 0.0
         self._f8_down = False
         self._f9_down = False
         self._f11_down = False
@@ -578,6 +610,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._debug.append(str(exc))
         self._start_ipc()
+
+    def _toggle_before_capture(self) -> None:
+        now = time.monotonic()
+        if now - self._f7_at < 0.4:
+            return
+        self._f7_at = now
+        self.capture_btn.click()
 
     def _on_capture_toggled(self, on: bool) -> None:
         if on:
@@ -757,6 +796,7 @@ class MainWindow(QMainWindow):
             if not self._suppress_show:
                 self.show()
             self._f5_down = False
+            self._f7_down = False
             self._f8_down = False
             self._f9_down = False
             self._f11_down = False
@@ -764,6 +804,7 @@ class MainWindow(QMainWindow):
             self._capture_key_timer.start()
         else:
             self._f5_down = False
+            self._f7_down = False
             self._f9_down = False
             self._f11_down = False
             self._unregister_stop_hotkey()
@@ -853,6 +894,16 @@ class MainWindow(QMainWindow):
             self._info_erase_value.setText("－")
         else:
             self._info_erase_value.setText(str(int(_skill_ok)))
+
+    def _show_money(self, coin, result) -> None:
+        self._info_coin_value.setText(str(coin) if coin else "－")
+        self._info_result_value.setText(str(result) if result else "－")
+
+    def _set_timeup_lamp(self, on: bool) -> None:
+        if on:
+            self._info_timeup.setStyleSheet("QPushButton { background: red; color: white; }")
+        else:
+            self._info_timeup.setStyleSheet("")
 
     def _set_skill_lamp(self, on: bool) -> None:
         if on:
@@ -980,15 +1031,17 @@ class MainWindow(QMainWindow):
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
         self._play.gauges.connect(self._show_meters)
+        self._play.money.connect(self._show_money)
+        self._play.timeup_lamp.connect(self._set_timeup_lamp)
         self._play.skill_lamp.connect(self._set_skill_lamp)
         self._play.my_lamp.connect(self._set_my_lamp)
         self._play.failed.connect(self._on_play_fail)
         self._play.items.connect(self._show_items)
         self._play.stopped.connect(self._on_stopped)
         self._play.completed.connect(self._on_play_done)
+        self._play.need_used_tsum.connect(self._on_need_used_tsum)
         if ask_kinds:
             self._play.need_kinds.connect(self._on_need_kinds)
-            self._play.need_used_tsum.connect(self._on_need_used_tsum)
         self._play.start()
         if self._want_record:
             self._start_record()
@@ -1539,7 +1592,7 @@ class MainWindow(QMainWindow):
             self.on_loop_play()
             return True
         if key == Qt.Key.Key_F7:
-            self.capture_btn.click()
+            self._toggle_before_capture()
             return True
         if key == Qt.Key.Key_F8:
             self.on_capture_screen()
@@ -1586,6 +1639,11 @@ class MainWindow(QMainWindow):
             if pressed:
                 self.on_play_now()
             return
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F7) & 0x8000)
+        pressed = down and not self._f7_down
+        self._f7_down = down
+        if pressed:
+            self._toggle_before_capture()
         down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F8) & 0x8000)
         pressed = down and not self._f8_down
         self._f8_down = down
@@ -1612,6 +1670,9 @@ class MainWindow(QMainWindow):
                 msg = wintypes.MSG.from_address(int(message))
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _STOP_HOTKEY:
                     QTimer.singleShot(0, self.on_stop)
+                    return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _BEFORE_HOTKEY:
+                    QTimer.singleShot(0, self._toggle_before_capture)
                     return True, 0
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _CAPTURE_HOTKEY:
                     QTimer.singleShot(0, self.on_capture_screen)
@@ -1646,6 +1707,9 @@ class MainWindow(QMainWindow):
             int(self.winId()), _STOP_HOTKEY, _MOD_NOREPEAT, _VK_Q
         )
         ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _BEFORE_HOTKEY, _MOD_NOREPEAT, _VK_F7
+        )
+        ctypes.windll.user32.RegisterHotKey(
             int(self.winId()), _CAPTURE_HOTKEY, _MOD_NOREPEAT, _VK_F8
         )
         ctypes.windll.user32.RegisterHotKey(
@@ -1661,6 +1725,7 @@ class MainWindow(QMainWindow):
         import ctypes
 
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _BEFORE_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _CAPTURE_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _BOARD_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _NOW_BOARD_HOTKEY)

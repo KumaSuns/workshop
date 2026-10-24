@@ -379,8 +379,7 @@ class Dataset:
             ]
             sample.pieces = kept + incoming
             sample.confirmed = [item for item in sample.confirmed if item != key]
-            if incoming:
-                sample.confirmed.append(key)
+            sample.confirmed.append(key)
         else:
             if box is None:
                 raise ValueError(key)

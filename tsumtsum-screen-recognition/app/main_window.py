@@ -87,6 +87,7 @@ from app.regions import (
     is_piece_key,
     is_scene_key,
     is_tsum_kind,
+    model_filename,
     tsum_group_color,
 )
 from app.skill_export import registered_skills_by_sample, save_skill_image, skill_tsum_choices
@@ -709,6 +710,7 @@ class MainWindow(QMainWindow):
         self._last_piece_radius: dict[str, int] = {}
         self._list_sort_key: str | None = None
         self._list_sort_asc = True
+        self._file_tsum: tuple[str, str] | None = None
         self._skill_registered: dict[str, str] = {}
         self._settings = QSettings("workshop", "TsumTsumScreenTrainer")
         self._group_window: GroupListWindow | None = None
@@ -777,10 +779,20 @@ class MainWindow(QMainWindow):
         left.setObjectName("sidebar")
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(12, 12, 12, 12)
-        left_layout.addWidget(QLabel("教える場所"))
-        place_hint = QLabel("チェックした種類を保存・学習します")
-        place_hint.setObjectName("hint")
-        left_layout.addWidget(place_hint)
+        self.tsum_select_btn = QPushButton("ツム選択")
+        left_layout.addWidget(self.tsum_select_btn)
+        self.tsum_pick_row = QWidget()
+        pick_layout = QHBoxLayout(self.tsum_pick_row)
+        pick_layout.setContentsMargins(0, 0, 0, 0)
+        self.tsum_back_btn = QPushButton("戻す")
+        pick_layout.addWidget(self.tsum_back_btn)
+        self.tsum_pick_row.hide()
+        left_layout.addWidget(self.tsum_pick_row)
+        self.tsum_name_list = QListWidget()
+        self.tsum_name_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.tsum_name_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tsum_name_list.hide()
+        left_layout.addWidget(self.tsum_name_list)
         self.region_list = QListWidget()
         self.region_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.region_list.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -1027,6 +1039,10 @@ class MainWindow(QMainWindow):
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
         self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
         self.list_widget.itemChanged.connect(self.on_list_item_changed)
+        self.list_widget.itemDoubleClicked.connect(self._on_file_name_double_clicked)
+        self.tsum_select_btn.clicked.connect(self.show_tsum_list)
+        self.tsum_back_btn.clicked.connect(self._restore_file_list)
+        self.tsum_name_list.itemClicked.connect(self.on_tsum_name_clicked)
         self.region_list.currentItemChanged.connect(self.on_region_type_changed)
         self.region_list.itemChanged.connect(self.on_place_item_changed)
         self.canvas.regionCommitted.connect(self.on_region_committed)
@@ -1118,9 +1134,13 @@ class MainWindow(QMainWindow):
 
     def _visible_samples(self) -> list[Sample]:
         samples = self.dataset.all()
-        if self.show_unused_chk.isChecked():
-            return samples
-        return [sample for sample in samples if sample.status != "skipped"]
+        if not self.show_unused_chk.isChecked():
+            samples = [sample for sample in samples if sample.status != "skipped"]
+        chosen = getattr(self, "_file_tsum", None)
+        if chosen:
+            folder, shown = chosen
+            samples = [sample for sample in samples if self._matches_used_tsum(sample, folder, shown)]
+        return samples
 
     def _coin_digits_of(self, sample: Sample) -> str:
         for box_key in COIN_BOX_KEYS:
@@ -1365,7 +1385,9 @@ class MainWindow(QMainWindow):
         elif skipped:
             name = f"使わない  {name}"
         name_item.setText(name)
-        if skipped and not skill_name:
+        if self._file_has_tsum_name(sample.source_name):
+            name_item.setForeground(QColor("#ff5c5c"))
+        elif skipped and not skill_name:
             name_item.setForeground(QColor("#7a8190"))
         elif skill_name:
             name_item.setForeground(QColor("#3DDC97"))
@@ -1418,7 +1440,7 @@ class MainWindow(QMainWindow):
             self.model_label.setText(f"モデル: {names}。新しい画像には自動で予測します。")
         else:
             self.model_label.setText("モデル: まだありません。範囲を教えてから学習してください。")
-        self.train_btn.setEnabled(bool(self._trainable_jobs()) and self.train_worker is None)
+        self.train_btn.setEnabled(bool(self._trainable_jobs(self._file_tsum)) and self.train_worker is None)
         if self._is_training():
             self._lock_for_training()
             return
@@ -2296,20 +2318,25 @@ class MainWindow(QMainWindow):
         if not self.current_id:
             return False
         keys = self._selected_place_keys()
-        ready = [key for key in keys if self._key_has_content(key)]
+        removed = self._removed_piece_kinds()
+        ready = [
+            key
+            for key in keys
+            if self._key_has_content(key) or (is_piece_key(key) and key in removed)
+        ]
         scene_ready = [key for key in ready if is_scene_key(key)]
         if len(scene_ready) > 1:
             keep = self._active_key if self._active_key in scene_ready else scene_ready[0]
             ready = [key for key in ready if not is_scene_key(key) or key == keep]
-        missing = [key for key in keys if key not in ready]
-        if not ready:
+        missing = [key for key in keys if key not in ready and key not in removed]
+        if not ready and not removed:
             names = "、".join(PLACE_LABELS.get(key, key) for key in keys)
             QMessageBox.information(self, "まだありません", f"選んだ「{names}」に、まだ枠や〇がありません。")
             return False
         if any(is_piece_key(key) for key in ready) and "game" not in self.canvas.all_region_boxes():
             QMessageBox.information(self, "ゲーム範囲がありません", "ツムとボムにはゲーム範囲が必要です。先にゲーム範囲を囲んでください。")
             return False
-        if not any(self._key_needs_save(key) for key in ready):
+        if not any(self._key_needs_save(key) for key in ready) and not removed:
             names = "、".join(PLACE_LABELS.get(key, key) for key in ready)
             QMessageBox.information(
                 self,
@@ -2319,6 +2346,10 @@ class MainWindow(QMainWindow):
             return True
         saved_names: list[str] = []
         for key in ready:
+            saved_names.append(self._save_one_key(key))
+        for key in removed:
+            if key in ready:
+                continue
             saved_names.append(self._save_one_key(key))
         self._set_dirty(False)
         self.refresh_list(select_id=self.current_id)
@@ -2619,21 +2650,24 @@ class MainWindow(QMainWindow):
         self._server_sync_mod = module
         return module
 
+    def _models_to_upload(self) -> list[Path]:
+        return sorted(
+            path for path in self.dataset.models_dir.glob("*.pt") if path.is_file()
+        )
+
     def upload_data_to_server(self) -> None:
         if self._block_if_training():
             return
-        try:
-            model = self._data_sync().model_file(DATA_DIR)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "保存できませんでした", str(exc))
+        models = self._models_to_upload()
+        if not models:
+            QMessageBox.warning(self, "モデルがありません", "送るモデルがありません。")
             return
-        if not model.is_file():
-            QMessageBox.warning(self, "モデルがありません", f"送るモデルがありません。\n{model}")
-            return
+        names = "、".join(path.name for path in models)
         answer = QMessageBox.question(
             self,
             "サーバーに保存",
-            f"{model.name} を http://hokkai-syabusyabu.com/home_page/workshop/models に保存します。続けますか？",
+            "次のモデルを http://hokkai-syabusyabu.com/home_page/workshop/models に保存します。続けますか？\n"
+            + names,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -2643,19 +2677,21 @@ class MainWindow(QMainWindow):
             sync.run_with_progress(
                 self,
                 "サーバーに保存しています",
-                lambda progress: self._upload_model(sync, model, progress),
+                lambda progress: self._upload_models(sync, models, progress),
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "保存できませんでした", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
-        QMessageBox.information(self, "サーバーに保存しました", f"{model.name} を保存しました。")
+        QMessageBox.information(self, "サーバーに保存しました", f"{names} を保存しました。")
 
-    def _upload_model(self, sync, model: Path, progress) -> None:
-        progress(0, 1, model.name)
-        sync.upload_model(model)
-        progress(1, 1, model.name)
+    def _upload_models(self, sync, models: list[Path], progress) -> None:
+        total = len(models)
+        for index, model in enumerate(models):
+            progress(index, total, model.name)
+            sync.upload_model(model)
+        progress(total, total, models[-1].name)
 
     def _ensure_app_icon(self) -> Path | None:
         path = APP_ROOT / "app.ico"
@@ -2789,20 +2825,30 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "コインの枠がありません", "先にコインの枠を囲んでください。")
             return
         self._ensure_predictor()
+        predict = (
+            (lambda crop, box_key=key: self.predictor.predict_coin_digits(crop, box_key))
+            if self.predictor.digit_model
+            else None
+        )
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        found: list[str] = []
+        crop = None
+        error = ""
         try:
-            crop, number = ocr_coin_number(
-                sample.image_path,
-                box,
-                predict_fn=(lambda crop, box_key=key: self.predictor.predict_coin_digits(crop, box_key))
-                if self.predictor.digit_model
-                else None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "数字を取れませんでした", str(exc))
-            return
+            for _ in range(5):
+                try:
+                    crop, number = ocr_coin_number(sample.image_path, box, predict_fn=predict)
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                    continue
+                if number:
+                    found.append(number)
         finally:
             QApplication.restoreOverrideCursor()
+        if crop is None:
+            QMessageBox.warning(self, "数字を取れませんでした", error or "数字を取れませんでした")
+            return
+        number = max(set(found), key=found.count) if found else ""
         dialog = CoinNumberDialog(crop, number, self)
         dialog.exec()
         if dialog.taught and dialog.number():
@@ -2883,7 +2929,183 @@ class MainWindow(QMainWindow):
         ]
         return sorted(rows, key=lambda row: row[1].casefold())
 
+    def _set_place_tools_visible(self, visible: bool) -> None:
+        for widget in (
+            self.read_coin_btn,
+            self.open_result_train_btn,
+            self.model_label,
+            self.progress,
+            self.server_save_btn,
+            self.shortcut_btn,
+            self.elsa_list_btn,
+        ):
+            widget.setVisible(visible)
+        if visible:
+            self.progress.setVisible(False)
+
+    def show_tsum_list(self) -> None:
+        if self.tsum_name_list.isVisible():
+            self.tsum_pick_row.hide()
+            self.tsum_name_list.hide()
+            self._set_place_tools_visible(True)
+            return
+        choices = self._used_tsum_choices()
+        self.tsum_name_list.clear()
+        for folder, shown in choices:
+            item = QListWidgetItem(shown)
+            item.setData(Qt.ItemDataRole.UserRole, folder)
+            self.tsum_name_list.addItem(item)
+        if self.tsum_name_list.count():
+            self.tsum_name_list.setCurrentRow(0)
+        self.tsum_pick_row.show()
+        self.tsum_name_list.show()
+        self._fit_name_list(self.tsum_name_list)
+        self._set_place_tools_visible(False)
+        if not choices:
+            self.statusBar().showMessage("使用ツムがありません", 4000)
+
+    def on_tsum_name_clicked(self, item: QListWidgetItem) -> None:
+        folder = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if not folder:
+            return
+        self._apply_file_tsum(folder, item.text())
+
+    def _tsum_name_tokens(self) -> list[str]:
+        tokens = getattr(self, "_tsum_name_token_cache", None)
+        if tokens is None:
+            tokens = sorted(
+                {token for folder, name in self._used_tsum_choices() for token in (folder, name) if token},
+                key=len,
+                reverse=True,
+            )
+            self._tsum_name_token_cache = tokens
+        return tokens
+
+    def _specified_tsum_folder(self, sample) -> str:
+        names = [
+            str(getattr(sample, "source_name", "") or ""),
+            str(getattr(sample, "image", "") or ""),
+        ]
+        pairs: list[tuple[str, str]] = []
+        for folder, shown in self._used_tsum_choices():
+            for token in (folder, shown):
+                key = str(token or "").strip()
+                if key:
+                    pairs.append((key.casefold(), folder))
+        pairs.sort(key=lambda item: len(item[0]), reverse=True)
+        for name in names:
+            folded = name.casefold()
+            for key, folder in pairs:
+                if folded.startswith(key + "_") or folded.startswith(key + " "):
+                    return folder
+        return ""
+
+    def _file_has_tsum_name(self, source_name: str) -> bool:
+        folded = (source_name or "").casefold()
+        for token in self._tsum_name_tokens():
+            key = token.casefold()
+            if folded.startswith(key + "_") or folded.startswith(key + " "):
+                return True
+        return False
+
+    def _source_name_for_tsum(self, source_name: str, shown: str) -> str:
+        text = source_name or ""
+        stem, suffix = text, ""
+        if "." in text and not text.endswith("."):
+            stem, ext = text.rsplit(".", 1)
+            suffix = "." + ext
+        tokens = sorted(
+            {token for folder, name in self._used_tsum_choices() for token in (folder, name) if token},
+            key=len,
+            reverse=True,
+        )
+        changed = True
+        while changed:
+            changed = False
+            folded = stem.casefold()
+            for token in tokens:
+                key = token.casefold()
+                for sep in ("_", " "):
+                    prefix = key + sep
+                    if folded.startswith(prefix):
+                        stem = stem[len(prefix) :]
+                        changed = True
+                        break
+                if changed:
+                    break
+        stem = stem.strip(" _") or "image"
+        return f"{shown}_{stem}{suffix}"
+
+    def _on_file_name_double_clicked(self, item: QTableWidgetItem) -> None:
+        if item.column() != self.list_widget.columnCount() - 1:
+            return
+        if self._block_if_training():
+            return
+        sample_id = self._list_id_at(item.row())
+        if not sample_id:
+            return
+        chosen = self._choose_used_tsum("どの使用ツムですか？")
+        if chosen is None:
+            return
+        folder, shown = chosen
+        self._specify_file_tsum(sample_id, folder, shown)
+
+    def _specify_file_tsum(self, sample_id: str, folder: str, shown: str) -> None:
+        sample = self.dataset.get(sample_id)
+        if sample is None:
+            return
+        renamed = self._source_name_for_tsum(sample.source_name, folder)
+        if renamed != sample.source_name:
+            sample.source_name = renamed
+            self.dataset.save()
+        self.refresh_list(sample_id)
+        self.statusBar().showMessage(f"{shown} を指定しました", 4000)
+
+    def _fit_name_list(self, widget: QListWidget) -> None:
+        rows = widget.count()
+        if rows <= 0:
+            return
+        row_h = widget.fontMetrics().height() + 16
+        for row in range(rows):
+            row_h = max(row_h, widget.sizeHintForRow(row))
+        frame = widget.frameWidth() * 2
+        widget.setFixedHeight(rows * row_h + frame + 8)
+
+    def _restore_file_list(self) -> None:
+        self._file_tsum = None
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._refresh_file_view()
+        count = len(self._ordered_visible_samples())
+        self.statusBar().showMessage(f"ファイル一覧を戻しました  {count} 枚", 4000)
+
+    def _refresh_file_view(self) -> None:
+        if getattr(self, "_elsa_list", False):
+            self._elsa_list = False
+            self._apply_elsa_chrome()
+            self.canvas.set_guide_hidden(False)
+        samples = self._ordered_visible_samples()
+        select = (
+            self.current_id
+            if any(sample.id == self.current_id for sample in samples)
+            else (samples[0].id if samples else None)
+        )
+        if select is None:
+            self.current_id = None
+            self.canvas.clear_image()
+            self._set_dirty(False)
+        self.refresh_list(select)
+        if select and select != self.current_id:
+            self.show_sample(select)
+
+    def _apply_file_tsum(self, folder: str, shown: str) -> None:
+        self._file_tsum = (folder, shown)
+        self._refresh_file_view()
+        self.statusBar().showMessage(f"{shown}  {len(self._ordered_visible_samples())} 枚", 4000)
+
     def _ask_train_used_tsum(self) -> tuple[str, str] | None:
+        return self._choose_used_tsum("どの使用ツムを学習しますか？")
+
+    def _choose_used_tsum(self, prompt: str) -> tuple[str, str] | None:
         choices = self._used_tsum_choices()
         if not choices:
             QMessageBox.information(self, "使用ツム", "使用ツムがありません。")
@@ -2893,7 +3115,7 @@ class MainWindow(QMainWindow):
         dialog.setModal(True)
         dialog.setMinimumWidth(320)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("どの使用ツムを学習しますか？"))
+        layout.addWidget(QLabel(prompt))
         name_list = QListWidget()
         for folder, shown in choices:
             item = QListWidgetItem(shown)
@@ -2931,15 +3153,26 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _for_used(self, samples, used: tuple[str, str] | None):
+        if used is None:
+            return list(samples)
+        folder, shown = used
+        return [sample for sample in samples if self._matches_used_tsum(sample, folder, shown)]
+
+    def _path_for_used(self, key: str, used: tuple[str, str] | None):
+        if used is None:
+            return self.dataset.model_path_for(key)
+        return self.dataset.models_dir / used[0] / model_filename(key)
+
     def _trainable_jobs(self, used: tuple[str, str] | None = None) -> list[tuple]:
         selected = set(self._selected_place_keys())
         jobs: list[tuple] = []
         for key in REGION_KEYS:
             if key not in selected:
                 continue
-            samples = self.dataset.labeled_for(key)
+            samples = self._for_used(self.dataset.labeled_for(key), used)
             if len(samples) >= MIN_TRAIN_SAMPLES:
-                jobs.append((key, samples, self.dataset.model_path_for(key), self._job_label(key)))
+                jobs.append((key, samples, self._path_for_used(key, used), self._job_label(key)))
         piece_keys = [key for key in PIECE_KEYS if key in selected]
         if piece_keys:
             piece_map = {
@@ -2947,78 +3180,81 @@ class MainWindow(QMainWindow):
                 for key in piece_keys
                 for sample in self.dataset.labeled_for(key)
             }
-            piece_samples = list(piece_map.values())
-            if len(piece_samples) >= MIN_TRAIN_SAMPLES:
-                if "tsum" in piece_keys or "big" in piece_keys:
-                    type_samples = [
-                        sample
-                        for sample in piece_samples
-                        if len(
-                            {
-                                int(piece.get("group") or 1)
-                                for piece in sample.pieces
-                                if is_tsum_kind(str(piece.get("kind") or ""))
-                            }
+            piece_samples = self._for_used(piece_map.values(), used)
+            if "tsum" in piece_keys or "big" in piece_keys:
+                type_samples = [
+                    sample
+                    for sample in piece_samples
+                    if len(
+                        {
+                            int(piece.get("group") or 1)
+                            for piece in sample.pieces
+                            if is_tsum_kind(str(piece.get("kind") or ""))
+                        }
+                    )
+                    >= 2
+                ]
+                if used is not None and len(type_samples) >= MIN_TRAIN_SAMPLES:
+                    folder, shown = used
+                    jobs.append(
+                        (
+                            "tsum_types",
+                            type_samples,
+                            self.dataset.models_dir / folder / "tsum_types.pt",
+                            f"ツムの種類 {shown}",
                         )
-                        >= 2
-                    ]
-                    if used is not None:
-                        folder, shown = used
-                        mine = [
-                            sample
-                            for sample in type_samples
-                            if self._matches_used_tsum(sample, folder, shown)
-                        ]
-                        if len(mine) >= MIN_TRAIN_SAMPLES:
-                            jobs.append(
-                                (
-                                    "tsum_types",
-                                    mine,
-                                    self.dataset.models_dir / folder / "tsum_types.pt",
-                                    f"ツムの種類 {shown}",
-                                )
-                            )
+                    )
+            if len(piece_samples) >= MIN_TRAIN_SAMPLES:
                 jobs.append(
                     (
                         "pieces",
                         piece_samples,
-                        self.dataset.model_path_for("pieces"),
+                        self._path_for_used("pieces", used),
                         self._piece_job_label(piece_keys),
                     )
                 )
         if set(selected) & set(COIN_BOX_KEYS):
-            digit_samples = self.dataset.labeled_digit_samples()
+            digit_samples = self._for_used(self.dataset.labeled_digit_samples(), used)
             if len(digit_samples) >= MIN_TRAIN_SAMPLES:
                 jobs.append(
                     (
                         "coin_digits",
                         digit_samples,
-                        self.dataset.model_path_for("coin_digits"),
+                        self._path_for_used("coin_digits", used),
                         "コインの数字",
                     )
                 )
         scene_selected = [key for key in SCENE_KEYS if key in selected]
         if scene_selected:
-            playable = [sample for sample in self.dataset.all() if sample.status != "skipped"]
-            others = self._scene_other_count()
+            playable = self._for_used(
+                [sample for sample in self.dataset.all() if sample.status != "skipped"],
+                used,
+            )
+            others = self._scene_other_count(used)
             if (
-                all(len(self.dataset.labeled_for(key)) >= MIN_TRAIN_SAMPLES for key in scene_selected)
+                all(
+                    len(self._for_used(self.dataset.labeled_for(key), used)) >= MIN_TRAIN_SAMPLES
+                    for key in scene_selected
+                )
                 and others >= MIN_TRAIN_SAMPLES
             ):
                 jobs.append(
                     (
                         "scene",
                         playable,
-                        self.dataset.model_path_for("scene"),
+                        self._path_for_used("scene", used),
                         "GO・TIME UP",
                     )
                 )
         return jobs
 
-    def _scene_other_count(self) -> int:
+    def _scene_other_count(self, used: tuple[str, str] | None = None) -> int:
+        samples = self.dataset.all()
+        if used is not None:
+            samples = self._for_used(samples, used)
         return sum(
             1
-            for sample in self.dataset.all()
+            for sample in samples
             if sample.status != "skipped"
             and not any(key in sample.confirmed for key in SCENE_KEYS)
         )
@@ -3096,6 +3332,17 @@ class MainWindow(QMainWindow):
             return [self._active_key]
         return keys
 
+    def _removed_piece_kinds(self) -> list[str]:
+        sample = self.dataset.get(self.current_id) if self.current_id else None
+        if sample is None:
+            return []
+        present = {str(piece.get("kind") or "") for piece in self.canvas.all_pieces()}
+        return [
+            key
+            for key in PIECE_KEYS
+            if key not in present and any(piece.get("kind") == key for piece in sample.pieces)
+        ]
+
     def _key_has_content(self, key: str) -> bool:
         if is_scene_key(key):
             return self.canvas.has_image()
@@ -3116,7 +3363,7 @@ class MainWindow(QMainWindow):
             canvas = [piece for piece in self.canvas.all_pieces() if piece["kind"] == key]
             saved = [piece for piece in (sample.pieces if sample else []) if piece.get("kind") == key]
             if not canvas:
-                return False
+                return bool(saved)
             return canvas != saved or sample is None or key not in sample.confirmed
         box = self.canvas.all_region_boxes().get(key)
         if box is None:
@@ -3222,7 +3469,7 @@ class MainWindow(QMainWindow):
                 self._train_fx.set_shutdown_after(self._shutdown_after_train)
             return
         self.train_shutdown_btn.setText("学習してシャットダウン")
-        self.train_shutdown_btn.setEnabled(bool(self._trainable_jobs()) and self.train_worker is None)
+        self.train_shutdown_btn.setEnabled(bool(self._trainable_jobs(self._file_tsum)) and self.train_worker is None)
 
     def _block_if_training(self) -> bool:
         if not self._is_training():
@@ -3413,16 +3660,24 @@ class MainWindow(QMainWindow):
             used = self._ask_train_used_tsum()
             if used is None:
                 return
+        elif self._file_tsum is not None:
+            used = self._file_tsum
         jobs = self._trainable_jobs(used)
         counts = self.dataset.labeled_counts()
+
+        def place_count(key: str) -> int:
+            if used is None:
+                return counts.get(key, 0)
+            return len(self._for_used(self.dataset.labeled_for(key), used))
+
         if not jobs:
             lines = [
                 f"チェックした種類の学習には、正解が {MIN_TRAIN_SAMPLES} 枚以上必要です。",
                 "",
             ]
-            lines.extend(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚" for key in selected)
+            lines.extend(f"{PLACE_LABELS.get(key, key)}: {place_count(key)} 枚" for key in selected)
             if any(key in SCENE_KEYS for key in selected):
-                lines.append(f"GO/TIME UP以外: {self._scene_other_count()} 枚")
+                lines.append(f"GO/TIME UP以外: {self._scene_other_count(used)} 枚")
             QMessageBox.information(self, "まだ足りません", "\n".join(lines))
             return
         ready_lines = [f"{job[3]}: {len(job[1])} 枚" for job in jobs]
@@ -3432,31 +3687,45 @@ class MainWindow(QMainWindow):
             if key in PIECE_KEYS:
                 if "pieces" in trained_keys:
                     continue
-                skipped.append(f"{PLACE_LABELS[key]}: {counts[key]} 枚")
+                skipped.append(f"{PLACE_LABELS[key]}: {place_count(key)} 枚")
             elif key in SCENE_KEYS:
                 if "scene" in trained_keys:
                     continue
-                skipped.append(f"{PLACE_LABELS[key]}: {counts[key]} 枚")
+                skipped.append(f"{PLACE_LABELS[key]}: {place_count(key)} 枚")
             elif key not in trained_keys:
-                skipped.append(f"{PLACE_LABELS.get(key, key)}: {counts[key]} 枚")
+                skipped.append(f"{PLACE_LABELS.get(key, key)}: {place_count(key)} 枚")
         if set(selected) & set(COIN_BOX_KEYS) and "coin_digits" not in trained_keys:
-            skipped.append(f"コインの数字: {counts.get('coin_digits', 0)} 枚")
+            digit_count = len(self._for_used(self.dataset.labeled_digit_samples(), used))
+            skipped.append(f"コインの数字: {digit_count} 枚")
         if any(key in SCENE_KEYS for key in selected) and "scene" not in trained_keys:
-            others = self._scene_other_count()
+            others = self._scene_other_count(used)
             if others < MIN_TRAIN_SAMPLES:
                 skipped.append(f"GO/TIME UP以外: {others} 枚")
         message = "チェックした種類だけ学習します。\n" + "\n".join(ready_lines)
         piece_selected = [key for key in PIECE_KEYS if key in selected]
-        if piece_selected and "pieces" in trained_keys and set(piece_selected) != set(PIECE_KEYS):
+        if (
+            used is None
+            and piece_selected
+            and "pieces" in trained_keys
+            and set(piece_selected) != set(PIECE_KEYS)
+        ):
             message += "\n（ツム・ボム・デカツムは同じ〇モデルです。選んだ〇の学習で、〇の予測はまとめて更新されます。）"
-        if used is not None and "tsum_types" not in trained_keys:
-            matched = sum(
-                1
-                for sample in self.dataset.all()
-                if self._matches_used_tsum(sample, used[0], used[1])
-                and sample.status == "labeled"
+        if used is not None and ("tsum" in selected or "big" in selected) and "tsum_types" not in trained_keys:
+            type_count = len(
+                [
+                    sample
+                    for sample in self._for_used(self.dataset.labeled_for("tsum"), used)
+                    if len(
+                        {
+                            int(piece.get("group") or 1)
+                            for piece in sample.pieces
+                            if is_tsum_kind(str(piece.get("kind") or ""))
+                        }
+                    )
+                    >= 2
+                ]
             )
-            skipped.append(f"ツムの種類 {used[1]}: {matched} 枚")
+            skipped.append(f"ツムの種類 {used[1]}: {type_count} 枚")
         if skipped:
             message += "\n\n枚数が足りないので、今回は学びません。\n" + "\n".join(skipped)
         message += "\n\n" + self._train_eta_line(self._estimate_jobs_seconds(jobs))
@@ -3625,6 +3894,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _predict_into_sample(self, sample: Sample, *, overwrite: bool = True) -> list[str]:
+        self.predictor.use_used_tsum_model(self._specified_tsum_folder(sample))
         added: list[str] = []
         boxes = self.predictor.predict_all(sample.image_path)
         if boxes:
