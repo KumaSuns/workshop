@@ -71,6 +71,7 @@ from app.paths import (
     IPC_NAME,
     SERVER_SYNC_PATH,
     SKILLS_IMAGES_DIR,
+    USE_TSUM_REGISTRY,
     VIDEO_EXTRACTOR_MAIN,
 )
 from app.predictor import Predictor
@@ -2866,7 +2867,71 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.warning(self, "予測に失敗", message)
 
-    def _trainable_jobs(self) -> list[tuple]:
+    def _used_tsum_choices(self) -> list[tuple[str, str]]:
+        if not USE_TSUM_REGISTRY.is_file():
+            return []
+        try:
+            payload = json.loads(USE_TSUM_REGISTRY.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        rows = [
+            (str(key), str(value))
+            for key, value in payload.items()
+            if str(key).strip() and str(value).strip()
+        ]
+        return sorted(rows, key=lambda row: row[1].casefold())
+
+    def _ask_train_used_tsum(self) -> tuple[str, str] | None:
+        choices = self._used_tsum_choices()
+        if not choices:
+            QMessageBox.information(self, "使用ツム", "使用ツムがありません。")
+            return None
+        dialog = QDialog(self)
+        dialog.setWindowTitle("使用ツム")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("どの使用ツムを学習しますか？"))
+        name_list = QListWidget()
+        for folder, shown in choices:
+            item = QListWidgetItem(shown)
+            item.setData(Qt.ItemDataRole.UserRole, folder)
+            name_list.addItem(item)
+        name_list.setCurrentRow(0)
+        layout.addWidget(name_list, 1)
+        buttons = QDialogButtonBox()
+        ok_btn = buttons.addButton("これにします", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_btn = buttons.addButton("やめる", QDialogButtonBox.ButtonRole.RejectRole)
+        cancel_btn.setAutoDefault(False)
+        layout.addWidget(buttons)
+        name_list.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        row = name_list.currentItem()
+        if row is None:
+            return None
+        folder = str(row.data(Qt.ItemDataRole.UserRole) or "")
+        if not folder:
+            return None
+        return folder, row.text()
+
+    def _matches_used_tsum(self, sample, folder: str, shown: str) -> bool:
+        names = {
+            str(getattr(sample, "source_name", "") or ""),
+            str(getattr(sample, "image", "") or ""),
+        }
+        folded = [name.casefold() for name in names if name]
+        for token in (shown, folder):
+            key = str(token or "").strip()
+            if key and any(key.casefold() in name for name in folded):
+                return True
+        return False
+
+    def _trainable_jobs(self, used: tuple[str, str] | None = None) -> list[tuple]:
         selected = set(self._selected_place_keys())
         jobs: list[tuple] = []
         for key in REGION_KEYS:
@@ -2897,15 +2962,22 @@ class MainWindow(QMainWindow):
                         )
                         >= 2
                     ]
-                    if len(type_samples) >= MIN_TRAIN_SAMPLES:
-                        jobs.append(
-                            (
-                                "tsum_types",
-                                type_samples,
-                                self.dataset.model_path_for("tsum_types"),
-                                "ツムの種類",
+                    if used is not None:
+                        folder, shown = used
+                        mine = [
+                            sample
+                            for sample in type_samples
+                            if self._matches_used_tsum(sample, folder, shown)
+                        ]
+                        if len(mine) >= MIN_TRAIN_SAMPLES:
+                            jobs.append(
+                                (
+                                    "tsum_types",
+                                    mine,
+                                    self.dataset.models_dir / folder / "tsum_types.pt",
+                                    f"ツムの種類 {shown}",
+                                )
                             )
-                        )
                 jobs.append(
                     (
                         "pieces",
@@ -3336,7 +3408,12 @@ class MainWindow(QMainWindow):
         if self._is_training():
             return
         selected = self._selected_place_keys()
-        jobs = self._trainable_jobs()
+        used = None
+        if "tsum" in selected or "big" in selected:
+            used = self._ask_train_used_tsum()
+            if used is None:
+                return
+        jobs = self._trainable_jobs(used)
         counts = self.dataset.labeled_counts()
         if not jobs:
             lines = [
@@ -3372,6 +3449,14 @@ class MainWindow(QMainWindow):
         piece_selected = [key for key in PIECE_KEYS if key in selected]
         if piece_selected and "pieces" in trained_keys and set(piece_selected) != set(PIECE_KEYS):
             message += "\n（ツム・ボム・デカツムは同じ〇モデルです。選んだ〇の学習で、〇の予測はまとめて更新されます。）"
+        if used is not None and "tsum_types" not in trained_keys:
+            matched = sum(
+                1
+                for sample in self.dataset.all()
+                if self._matches_used_tsum(sample, used[0], used[1])
+                and sample.status == "labeled"
+            )
+            skipped.append(f"ツムの種類 {used[1]}: {matched} 枚")
         if skipped:
             message += "\n\n枚数が足りないので、今回は学びません。\n" + "\n".join(skipped)
         message += "\n\n" + self._train_eta_line(self._estimate_jobs_seconds(jobs))

@@ -265,6 +265,7 @@ def run_play(
         show_items("、".join(names) if names else "－")
 
     arrived = ""
+    loaded_predictor: list = [None]
     used_tsum = ""
     tsum_unspecified = False
     start_items: list[str] | None = None
@@ -300,6 +301,8 @@ def run_play(
             used_tsum = ""
             tsum_unspecified = True
             say("使用ツム —")
+        if loaded_predictor[0] is not None:
+            _apply_used_type_model(loaded_predictor[0], used_tsum)
 
     if start_match:
         _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
@@ -318,6 +321,8 @@ def run_play(
     say("モデルを読み込み中")
     try:
         predictor, candidates = load_play_tools()
+        loaded_predictor[0] = predictor
+        _apply_used_type_model(predictor, used_tsum)
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "画面認識に必要なライブラリがありません。画面認識アプリと同じ Python で起動してください。"
@@ -1462,7 +1467,14 @@ def run_play(
     if board_grabs is not None:
         Thread(
             target=_grab_board_loop,
-            args=(predictor, board_grabs, stop, grab_done, say),
+            args=(
+                predictor,
+                board_grabs,
+                stop,
+                grab_done,
+                say,
+                lambda: (used_tsum, _used_tsum_folder(used_tsum)),
+            ),
             daemon=True,
         ).start()
     next_frame = None
@@ -2277,6 +2289,8 @@ def run_play(
                     last_save_at,
                     save_boards,
                     say,
+                    used_tsum,
+                    _used_tsum_folder(used_tsum),
                 )
                 if burst >= 2 or burst_max >= time_bomb_number(used_items):
                     bomb_after_long = True
@@ -2539,7 +2553,14 @@ def _hud_boxes(game, skill, fever, timer, fan) -> dict[str, dict[str, int]]:
     return boxes
 
 
-def _grab_board_loop(predictor, grabs: Queue, stop: Event | None, done: Event, say: StatusFn) -> None:
+def _grab_board_loop(
+    predictor,
+    grabs: Queue,
+    stop: Event | None,
+    done: Event,
+    say: StatusFn,
+    used_now: Callable[[], tuple[str, str]] | None = None,
+) -> None:
     while not done.is_set() and (stop is None or not stop.is_set()):
         try:
             image = grabs.get(timeout=0.2)
@@ -2547,13 +2568,22 @@ def _grab_board_loop(predictor, grabs: Queue, stop: Event | None, done: Event, s
             continue
         if done.is_set() or (stop is not None and stop.is_set()):
             return
+        name, folder = ("", "")
+        if used_now is not None:
+            name, folder = used_now()
         try:
-            _import_grabbed_board(predictor, image, say)
+            _import_grabbed_board(predictor, image, say, name, folder)
         except Exception:
             say("盤面を取り込めませんでした")
 
 
-def _import_grabbed_board(predictor, image: QImage, say: StatusFn) -> None:
+def _import_grabbed_board(
+    predictor,
+    image: QImage,
+    say: StatusFn,
+    used_tsum: str = "",
+    used_tsum_id: str = "",
+) -> None:
     rgb = _qimage_rgb(image)
     if rgb is None:
         say("盤面を取り込めませんでした")
@@ -2568,12 +2598,19 @@ def _import_grabbed_board(predictor, image: QImage, say: StatusFn) -> None:
     hud.update(_hud_boxes(game, skill, fever, timer, fan))
     try:
         learned = save_play_board(
-            predictor, image, game, boxes=hud, pieces=pieces, rgb=rgb
+            predictor,
+            image,
+            game,
+            boxes=hud,
+            pieces=pieces,
+            rgb=rgb,
+            used_tsum=used_tsum,
+            used_tsum_id=used_tsum_id,
         )
     except Exception:
         learned = False
     if learned:
-        say("盤面を取り込みました")
+        say("盤面を取り込みました" + (f" {used_tsum}" if used_tsum else ""))
     else:
         say("盤面を取り込めませんでした")
 
@@ -2594,6 +2631,8 @@ def _learn_board(
     last_save_at: float,
     save_boards: Callable[[], bool] | None,
     say: StatusFn,
+    used_tsum: str = "",
+    used_tsum_id: str = "",
     sample: bool = False,
 ) -> float:
     toggle = save_boards is not None and save_boards()
@@ -2613,12 +2652,19 @@ def _learn_board(
     boxes.update(_hud_boxes(game, skill, fever, timer, fan))
     try:
         learned = save_play_board(
-            predictor, image, game, boxes=boxes, pieces=pieces or [], rgb=rgb
+            predictor,
+            image,
+            game,
+            boxes=boxes,
+            pieces=pieces or [],
+            rgb=rgb,
+            used_tsum=used_tsum,
+            used_tsum_id=used_tsum_id,
         )
     except Exception:
         learned = False
     if learned:
-        say("消す前の盤面を取り込みました")
+        say("消す前の盤面を取り込みました" + (f" {used_tsum}" if used_tsum else ""))
     return time.time()
 
 
@@ -3929,6 +3975,26 @@ def _used_tsum_reader():
 
     _TSUM_READER = TsumReader()
     return _TSUM_READER
+
+
+def _used_tsum_folder(name: str) -> str:
+    cleaned = " ".join((name or "").split())
+    if not cleaned:
+        return ""
+    root = str(_ANALYZE_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tsumtsum_analyze.item_teach import _dir_name, tsum_id_for_name
+
+    return tsum_id_for_name(cleaned) or _dir_name(cleaned)
+
+
+def _apply_used_type_model(predictor, name: str) -> None:
+    switch = getattr(predictor, "use_used_tsum_model", None)
+    if switch is None:
+        return
+    with _gpu_lock:
+        switch(_used_tsum_folder(name))
 
 
 def _read_used_tsum(path: Path) -> str:

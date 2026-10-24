@@ -122,6 +122,34 @@ class Predictor:
             keys.extend(SCENE_KEYS)
         return keys
 
+    def use_used_tsum_model(self, folder: str) -> None:
+        general = self.models_dir / model_filename("tsum_types")
+        if folder:
+            dedicated = self.models_dir / folder / model_filename("tsum_types")
+            if dedicated.is_file() and self._load_type_model(dedicated):
+                return
+        self._load_type_model(general)
+
+    def _load_type_model(self, path: Path) -> bool:
+        self.type_model = None
+        if not path.is_file():
+            return False
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        model = TsumTypeNet(pretrained=False)
+        state = (
+            checkpoint["state_dict"]
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint
+            else checkpoint
+        )
+        try:
+            model.load_state_dict(state)
+        except Exception:
+            return False
+        model.to(self.device)
+        model.eval()
+        self.type_model = model
+        return True
+
     def reload(self, pump=None, device: str | None = None) -> bool:
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,24 +197,8 @@ class Predictor:
             model.eval()
             self.piece_model = model
             tick()
-        type_path = self.models_dir / model_filename("tsum_types")
-        if type_path.exists():
-            checkpoint = torch.load(type_path, map_location=self.device, weights_only=False)
-            model = TsumTypeNet(pretrained=False)
-            state = (
-                checkpoint["state_dict"]
-                if isinstance(checkpoint, dict) and "state_dict" in checkpoint
-                else checkpoint
-            )
-            try:
-                model.load_state_dict(state)
-            except Exception:
-                model = None
-            if model is not None:
-                model.to(self.device)
-                model.eval()
-                self.type_model = model
-                tick()
+        if self._load_type_model(self.models_dir / model_filename("tsum_types")):
+            tick()
         self.digit_models = {}
         for key, filename in (("coin", "coin_digits.pt"), ("result_coin", "result_coin_digits.pt")):
             path = self.models_dir / filename

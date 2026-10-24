@@ -133,6 +133,33 @@ def train_play_models(predictor, stop=None) -> list[str]:
         sys.modules.update(hidden)
 
 
+def _used_type_jobs(dataset, type_samples, min_n: int) -> list[tuple]:
+    folders: dict[str, list] = {}
+    for sample in type_samples:
+        folder = str(getattr(sample, "used_tsum_id", "") or "").strip()
+        if not folder:
+            continue
+        folders.setdefault(folder, []).append(sample)
+    jobs: list[tuple] = []
+    for folder, part in folders.items():
+        if len(part) < min_n:
+            continue
+        shown = ""
+        for sample in part:
+            shown = str(getattr(sample, "used_tsum", "") or "").strip()
+            if shown:
+                break
+        jobs.append(
+            (
+                "tsum_types",
+                part,
+                dataset.models_dir / folder / "tsum_types.pt",
+                f"ツムの種類 {shown or folder}",
+            )
+        )
+    return jobs
+
+
 def _play_train_jobs(dataset, min_n, piece_keys, scene_keys) -> list[tuple]:
     jobs: list[tuple] = []
     piece_map = {
@@ -154,8 +181,7 @@ def _play_train_jobs(dataset, min_n, piece_keys, scene_keys) -> list[tuple]:
             )
             >= 2
         ]
-        if len(type_samples) >= min_n:
-            jobs.append(("tsum_types", type_samples, dataset.model_path_for("tsum_types"), "ツムの種類"))
+        jobs.extend(_used_type_jobs(dataset, type_samples, min_n))
         jobs.append(("pieces", piece_samples, dataset.model_path_for("pieces"), "ツム・ボム・デカツム"))
     digit_samples = dataset.labeled_digit_samples()
     if len(digit_samples) >= min_n:
@@ -223,6 +249,8 @@ def save_play_board(
     boxes: dict[str, dict[str, int]] | None = None,
     pieces: list[dict[str, int]] | None = None,
     rgb=None,
+    used_tsum: str = "",
+    used_tsum_id: str = "",
 ) -> bool:
     hud = _hud_boxes(boxes, HUD_KEYS)
     if game is not None and "game" not in hud:
@@ -254,6 +282,8 @@ def save_play_board(
             "rgb": rgb.copy(),
             "hud": hud,
             "pieces": kept,
+            "used_tsum": str(used_tsum or ""),
+            "used_tsum_id": str(used_tsum_id or ""),
         }
     )
     return True
@@ -306,6 +336,8 @@ def _write_play_board(job: dict) -> None:
     dataset.apply_piece_predictions(sample.id, job.get("pieces") or [])
     sample = dataset.get(sample.id)
     if sample is not None:
+        sample.used_tsum = str(job.get("used_tsum") or "")
+        sample.used_tsum_id = str(job.get("used_tsum_id") or "")
         sample.status = "predicted"
         sample.confirmed = []
         dataset.save()

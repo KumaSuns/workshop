@@ -115,10 +115,12 @@ _STOP_HOTKEY = 1
 _CAPTURE_HOTKEY = 2
 _PLAY_HOTKEY = 3
 _BOARD_HOTKEY = 4
+_NOW_BOARD_HOTKEY = 5
 _WM_HOTKEY = 0x0312
 _VK_Q = 0x51
 _VK_F5 = 0x74
 _VK_F8 = 0x77
+_VK_F9 = 0x78
 _VK_F11 = 0x7A
 _MOD_NOREPEAT = 0x4000
 _NOT_CHARM_TSUMS = frozenset(
@@ -487,6 +489,9 @@ class MainWindow(QMainWindow):
         self.grab_board_btn = QPushButton("盤面を取り込む (F11)")
         self.grab_board_btn.clicked.connect(self.on_grab_board)
         layout.addWidget(self.grab_board_btn)
+        self.grab_now_btn = QPushButton("盤面を取り込む (F9)")
+        self.grab_now_btn.clicked.connect(self.on_grab_board)
+        layout.addWidget(self.grab_now_btn)
         self.capture_btn = QPushButton("消す前の盤面を取り込む (F7)")
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
@@ -559,6 +564,7 @@ class MainWindow(QMainWindow):
         self._f5_hotkey = False
         self._play_key_at = 0.0
         self._f8_down = False
+        self._f9_down = False
         self._f11_down = False
         self._capture_at = 0.0
         self._grab_at = 0.0
@@ -752,11 +758,13 @@ class MainWindow(QMainWindow):
                 self.show()
             self._f5_down = False
             self._f8_down = False
+            self._f9_down = False
             self._f11_down = False
             self._register_stop_hotkey()
             self._capture_key_timer.start()
         else:
             self._f5_down = False
+            self._f9_down = False
             self._f11_down = False
             self._unregister_stop_hotkey()
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
@@ -1536,6 +1544,9 @@ class MainWindow(QMainWindow):
         if key == Qt.Key.Key_F8:
             self.on_capture_screen()
             return True
+        if key == Qt.Key.Key_F9:
+            self.on_grab_board()
+            return True
         if key == Qt.Key.Key_F11:
             self.on_grab_board()
             return True
@@ -1580,6 +1591,11 @@ class MainWindow(QMainWindow):
         self._f8_down = down
         if pressed:
             self.on_capture_screen()
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F9) & 0x8000)
+        pressed = down and not self._f9_down
+        self._f9_down = down
+        if pressed:
+            self.on_grab_board()
         down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F11) & 0x8000)
         pressed = down and not self._f11_down
         self._f11_down = down
@@ -1601,6 +1617,9 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(0, self.on_capture_screen)
                     return True, 0
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _BOARD_HOTKEY:
+                    QTimer.singleShot(0, self.on_grab_board)
+                    return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _NOW_BOARD_HOTKEY:
                     QTimer.singleShot(0, self.on_grab_board)
                     return True, 0
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _PLAY_HOTKEY:
@@ -1632,6 +1651,9 @@ class MainWindow(QMainWindow):
         ctypes.windll.user32.RegisterHotKey(
             int(self.winId()), _BOARD_HOTKEY, _MOD_NOREPEAT, _VK_F11
         )
+        ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _NOW_BOARD_HOTKEY, _MOD_NOREPEAT, _VK_F9
+        )
 
     def _unregister_stop_hotkey(self) -> None:
         if sys.platform != "win32":
@@ -1641,6 +1663,7 @@ class MainWindow(QMainWindow):
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _CAPTURE_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _BOARD_HOTKEY)
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _NOW_BOARD_HOTKEY)
 
     def closeEvent(self, event) -> None:
         self._stop_record()

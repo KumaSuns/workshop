@@ -29,6 +29,8 @@ class Sample:
     pieces: list[dict[str, int]]
     readings: dict[str, str]
     status: str  # unlabeled | predicted | labeled | skipped
+    used_tsum: str = ""
+    used_tsum_id: str = ""
 
     @property
     def image_path(self) -> Path:
@@ -48,6 +50,8 @@ class Sample:
             "pieces": self.pieces,
             "readings": self.readings,
             "status": self.status,
+            "used_tsum": self.used_tsum,
+            "used_tsum_id": self.used_tsum_id,
         }
 
     @classmethod
@@ -79,6 +83,8 @@ class Sample:
             pieces=[dict(item) for item in data.get("pieces") or []],
             readings={str(key): str(value) for key, value in (data.get("readings") or {}).items()},
             status=status,
+            used_tsum=str(data.get("used_tsum") or ""),
+            used_tsum_id=str(data.get("used_tsum_id") or ""),
         )
 
 
