@@ -226,6 +226,7 @@ class PlayWorker(QThread):
         else:
             self.completed.emit()
         finally:
+            _stop_timeup_app()
             flush_style()
 
 
@@ -597,6 +598,7 @@ def run_play(
         nightmare_dice.update(_nightmare_blank())
         watch_hit.clear()
         watching.clear()
+        _watcher_timeup[0] = False
         if timeup_seen is not None:
             timeup_seen.clear()
         go_at = None
@@ -1187,14 +1189,13 @@ def run_play(
     watching = Event()
     watch_hit = Event()
     stop_watch = Event()
-    watcher = Thread(
-        target=_watch_timeup,
-        args=(predictor, stop_watch, watching, watch_hit, stop),
-        daemon=True,
-    )
-    watcher.start()
-    if resumed_pause:
+
+    def arm_timeup() -> None:
+        _ensure_timeup_app(watch_hit, watching)
         watching.set()
+
+    if resumed_pause:
+        arm_timeup()
     checker_alive = [True]
     before_start = [False]
     next_skill_at = [0.0]
@@ -1479,7 +1480,10 @@ def run_play(
             fever_on = _fever_playing(shot_rgb, game)
             meter_fever = _meter_fever_fill(shot_rgb, fever, skill, fan)
             left = _read_timer(predictor, shot_rgb, timer)
-            if left is None:
+            if _watcher_timeup[0] or watch_hit.is_set():
+                left = 0
+                last_left = 0
+            elif left is None:
                 left = last_left
             else:
                 last_left = left
@@ -1643,7 +1647,7 @@ def run_play(
                 saw_board = True
                 match_over = False
                 kinds_locked = True
-                watching.set()
+                arm_timeup()
                 if go_at is None:
                     go_at = time.time()
                 resumed_pause = False
@@ -1654,7 +1658,7 @@ def run_play(
                 saw_board = True
                 match_over = False
                 kinds_locked = True
-                watching.set()
+                arm_timeup()
                 if go_at is None:
                     go_at = time.time()
                 resumed_pause = True
@@ -1689,7 +1693,7 @@ def run_play(
                     saw_board = True
                     match_over = False
                     kinds_locked = True
-                    watching.set()
+                    arm_timeup()
                     if go_at is None:
                         go_at = time.time()
             if saw_board and not watch_hit.is_set() and apply_checker_skill(False):
@@ -1912,7 +1916,7 @@ def run_play(
                         saw_board = True
                         match_over = False
                         kinds_locked = True
-                        watching.set()
+                        arm_timeup()
                         if go_at is None:
                             go_at = time.time()
                         resumed_pause = True
@@ -1925,6 +1929,12 @@ def run_play(
                     last_close_at = None
                     _slow_tap(play.center().x(), play.center().y())
                     _sleep_stop(2.0, stop)
+                    continue
+                cancel = None if image.isNull() else _cancel_button(image)
+                if cancel is not None:
+                    say("キャンセルをクリックします")
+                    _slow_tap(cancel.center().x(), cancel.center().y())
+                    _sleep_stop(1.2, stop)
                     continue
                 say("プレイを待っています")
                 _sleep_stop(0.35, stop)
@@ -2078,7 +2088,7 @@ def run_play(
                 check_rgb = rgb
                 length_pick = False
                 used: set[tuple[int, int]] = set()
-                watching.set()
+                arm_timeup()
                 try:
                     queue = list(found)
                     seen_keys = {_chain_key(item) for item in found}
@@ -2529,8 +2539,10 @@ def run_play(
             say(f"ツム {len(tsums)}体 / なぞれる3体以上なし")
             continue
     finally:
+        _watcher_timeup[0] = False
         grab_done.set()
         checker_alive[0] = False
+        _stop_timeup_app()
 
 
 def _note_fall(
@@ -3802,6 +3814,49 @@ def _qimage_rgb(image: QImage):
         return PILImage.frombytes("RGB", (width, height), b"".join(rows))
 
 
+_timeup_proc: list[subprocess.Popen | None] = [None]
+_watcher_timeup: list[bool] = [False]
+
+
+def _ensure_timeup_app(hit: Event, watching: Event) -> None:
+    proc = _timeup_proc[0]
+    if proc is not None and proc.poll() is None:
+        return
+    script = Path(__file__).resolve().parent.parent / "timeup_watch.py"
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        cwd=str(script.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    _timeup_proc[0] = proc
+
+    def read() -> None:
+        out = proc.stdout
+        if out is None:
+            return
+        for line in out:
+            if line.strip() == b"TIMEUP" and watching.is_set():
+                hit.set()
+                _watcher_timeup[0] = True
+
+    Thread(target=read, daemon=True).start()
+
+
+def _stop_timeup_app() -> None:
+    proc = _timeup_proc[0]
+    _timeup_proc[0] = None
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def _watch_timeup(
     predictor,
     stop_watch: Event,
@@ -3997,6 +4052,8 @@ def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
 
 def _read_timer(predictor, rgb, timer: dict[str, int] | None) -> int | None:
     del predictor
+    if _watcher_timeup[0]:
+        return 0
     if timer is None or rgb is None:
         return None
     width, height = rgb.size
@@ -4623,6 +4680,13 @@ def _click_start_or_continue(
             else:
                 say("続けるを検出しました")
             return kinds, locked, "continue", used_name, items
+        cancel = _cancel_button(image)
+        if cancel is not None:
+            say("キャンセルをクリックします")
+            _slow_tap(cancel.center().x(), cancel.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
         play = _home_play_button(image)
         if play is not None:
             say("プレイをクリックします")
