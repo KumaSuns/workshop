@@ -160,6 +160,7 @@ class PlayWorker(QThread):
         self._kinds_answer: int | None = None
         self._used_gate = Event()
         self._used_answer: str | None = None
+        self._used_dedicated = True
         self.skill_pressed = Event()
         self.timeup_seen = Event()
 
@@ -167,8 +168,9 @@ class PlayWorker(QThread):
         self._kinds_answer = kinds
         self._kinds_gate.set()
 
-    def provide_used_tsum(self, name: str | None) -> None:
+    def provide_used_tsum(self, name: str | None, dedicated: bool = True) -> None:
         self._used_answer = name
+        self._used_dedicated = dedicated
         self._used_gate.set()
 
     def _request_kinds(self) -> int | None:
@@ -206,6 +208,7 @@ class PlayWorker(QThread):
                 games=self._games,
                 request_kinds=self._request_kinds if self._ask_kinds else None,
                 request_used_tsum=self._request_used_tsum,
+                use_dedicated=lambda: self._used_dedicated,
                 skill_pressed=self.skill_pressed,
                 timeup_seen=self.timeup_seen,
                 skill_lamp=self.skill_lamp.emit,
@@ -239,6 +242,7 @@ def run_play(
     games: int | None = None,
     request_kinds: Callable[[], int | None] | None = None,
     request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
+    use_dedicated: Callable[[], bool] | None = None,
     skill_pressed: Event | None = None,
     timeup_seen: Event | None = None,
     skill_lamp: Callable[[bool], None] | None = None,
@@ -306,12 +310,14 @@ def run_play(
             used_tsum = confirmed
             tsum_unspecified = False
             say(f"使用ツム {confirmed}")
+            if use_dedicated is not None and not use_dedicated():
+                say("専用のモデルではない")
         else:
             used_tsum = ""
             tsum_unspecified = True
             say("使用ツム —")
         if loaded_predictor[0] is not None:
-            _apply_used_type_model(loaded_predictor[0], used_tsum)
+            _apply_used_type_model(loaded_predictor[0], _model_tsum_name(used_tsum, use_dedicated))
 
     if start_match:
         _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
@@ -331,7 +337,7 @@ def run_play(
     try:
         predictor, candidates = load_play_tools()
         loaded_predictor[0] = predictor
-        _apply_used_type_model(predictor, used_tsum)
+        _apply_used_type_model(predictor, _model_tsum_name(used_tsum, use_dedicated))
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "画面認識に必要なライブラリがありません。画面認識アプリと同じ Python で起動してください。"
@@ -342,6 +348,11 @@ def run_play(
         raise RuntimeError("ツム種類のモデルがありません。画面認識アプリで学習してください。")
     if getattr(predictor, "scene_model", None) is None:
         raise RuntimeError("TIME UP のモデルがありません。")
+
+    def _groups_inner() -> bool:
+        if use_dedicated is None:
+            return True
+        return bool(use_dedicated())
 
     say("プレイを開始します")
     say(f"予測デバイス {predictor.device}")
@@ -1942,7 +1953,9 @@ def run_play(
             heat_s = 0.0
             type_s = 0.0
             with _gpu_lock:
-                pieces = predictor.predict_pieces(Path("."), game, rgb=rgb)
+                pieces = predictor.predict_pieces(
+                    Path("."), game, rgb=rgb, inner=_groups_inner()
+                )
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
@@ -2139,7 +2152,7 @@ def run_play(
                             skill_busy[0] = True
                             with _gpu_lock:
                                 pieces = predictor.predict_pieces(
-                                    Path("."), game, rgb=rgb
+                                    Path("."), game, rgb=rgb, inner=_groups_inner()
                                 )
                             tsums = [piece for piece in pieces if _is_tsum(piece)]
                             board = pieces
@@ -4212,6 +4225,12 @@ def _used_tsum_folder(name: str) -> str:
     from tsumtsum_analyze.item_teach import _dir_name, tsum_id_for_name
 
     return tsum_id_for_name(cleaned) or _dir_name(cleaned)
+
+
+def _model_tsum_name(name: str, use_dedicated: Callable[[], bool] | None) -> str:
+    if use_dedicated is not None and not use_dedicated():
+        return ""
+    return name
 
 
 def _apply_used_type_model(predictor, name: str) -> None:

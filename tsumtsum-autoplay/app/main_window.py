@@ -581,6 +581,7 @@ class MainWindow(QMainWindow):
         self._record: RecordWorker | None = None
         self._want_record = False
         self._selected_used_tsum = ""
+        self._use_dedicated_model = True
         self._placed = False
         self._enter_yes = None
         app = QApplication.instance()
@@ -1076,13 +1077,14 @@ class MainWindow(QMainWindow):
         if play is None:
             return
         screen = Path(path) if path else None
+        self._use_dedicated_model = True
         name = self._confirm_used_tsum(guess, screen, pick_only)
         if name is None:
             play.provide_used_tsum(None)
             self.on_stop()
             return
         self._selected_used_tsum = name
-        play.provide_used_tsum(name)
+        play.provide_used_tsum(name, self._use_dedicated_model)
 
     def _confirm_used_tsum(
         self, guess: str, path: Path | None, pick_only: bool = False
@@ -1144,13 +1146,70 @@ class MainWindow(QMainWindow):
             self._debug.setEnabled(True)
             self._front_timer.start()
         if yes is not None and result == QDialog.DialogCode.Accepted:
-            return self._save_used_tsum_choice(path, guess, None)
+            saved = self._save_used_tsum_choice(path, guess, None)
+            if saved is None:
+                return None
+            dedicated = self._ask_dedicated_model(saved)
+            if dedicated is None:
+                return None
+            self._use_dedicated_model = dedicated
+            return saved
         if result == 2:
             return self._pick_used_tsum(guess, path)
         if result == 3:
             return self._register_used_tsum(path)
         if result == 4:
             return ""
+        return None
+
+    def _ask_dedicated_model(self, name: str) -> bool | None:
+        dialog = QDialog()
+        dialog.setWindowTitle("今すぐプレイ")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("どのモデルを使いますか？"))
+        buttons = QDialogButtonBox()
+        own = buttons.addButton(f"{name} のモデル", QDialogButtonBox.ButtonRole.ActionRole)
+        shared = buttons.addButton(
+            "専用のモデルではない", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        cancel = buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
+        own.setAutoDefault(True)
+        own.setDefault(True)
+        shared.setAutoDefault(False)
+        cancel.setAutoDefault(False)
+        layout.addWidget(buttons)
+        own.clicked.connect(lambda: dialog.done(1))
+        shared.clicked.connect(lambda: dialog.done(2))
+        buttons.rejected.connect(dialog.reject)
+        own.setFocus()
+        self._enter_yes = lambda: dialog.done(1)
+        self._front_timer.stop()
+        self._debug.setEnabled(False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if sys.platform == "win32":
+            import ctypes
+
+            hwnd = int(dialog.winId())
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040
+            )
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        dialog.grabKeyboard()
+        try:
+            result = dialog.exec()
+        finally:
+            dialog.releaseKeyboard()
+            self._enter_yes = None
+            self._debug.setEnabled(True)
+            self._front_timer.start()
+        if result == 1:
+            return True
+        if result == 2:
+            return False
         return None
 
     def _choose_used_tsum(self, path: Path | None) -> str | None:
