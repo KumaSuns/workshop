@@ -655,6 +655,21 @@ class GroupListWindow(QDialog):
         super().keyPressEvent(event)
 
 
+class CoinReadWorker(QThread):
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, work) -> None:
+        super().__init__()
+        self._work = work
+
+    def run(self) -> None:
+        try:
+            self.finished_ok.emit(self._work())
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class PredictWorker(QThread):
     finished_ok = Signal(str, list)
     failed = Signal(str)
@@ -694,6 +709,7 @@ class MainWindow(QMainWindow):
         self._active_key = "game"
         self.train_worker: TrainWorker | None = None
         self._predict_worker: PredictWorker | None = None
+        self._coin_worker: CoinReadWorker | None = None
         self._train_started_at: float | None = None
         self._cuda_ready: bool | None = None
         self._dirty = False
@@ -2824,31 +2840,49 @@ class MainWindow(QMainWindow):
         if sample is None or key is None or box is None:
             QMessageBox.information(self, "コインの枠がありません", "先にコインの枠を囲んでください。")
             return
+        if self._coin_worker is not None and self._coin_worker.isRunning():
+            return
         self._ensure_predictor()
         predict = (
             (lambda crop, box_key=key: self.predictor.predict_coin_digits(crop, box_key))
             if self.predictor.digit_model
             else None
         )
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        found: list[str] = []
-        crop = None
-        error = ""
-        try:
+        image_path = sample.image_path
+        sample_id = self.current_id
+
+        def work():
+            found: list[str] = []
+            crop = None
+            error = ""
             for _ in range(5):
                 try:
-                    crop, number = ocr_coin_number(sample.image_path, box, predict_fn=predict)
+                    crop, number = ocr_coin_number(image_path, box, predict_fn=predict)
                 except Exception as exc:  # noqa: BLE001
                     error = str(exc)
                     continue
                 if number:
                     found.append(number)
-        finally:
-            QApplication.restoreOverrideCursor()
+            number = max(set(found), key=found.count) if found else ""
+            return sample_id, key, crop, number, error
+
+        self.read_coin_btn.setEnabled(False)
+        self.statusBar().showMessage("コインの数字を読んでいます")
+        worker = CoinReadWorker(work)
+        worker.finished_ok.connect(self._on_coin_read_finished)
+        worker.failed.connect(self._on_coin_read_failed)
+        self._coin_worker = worker
+        worker.start()
+
+    def _on_coin_read_finished(self, result) -> None:
+        self._coin_worker = None
+        self.read_coin_btn.setEnabled(self.current_id is not None)
+        sample_id, key, crop, number, error = result
         if crop is None:
             QMessageBox.warning(self, "数字を取れませんでした", error or "数字を取れませんでした")
             return
-        number = max(set(found), key=found.count) if found else ""
+        if sample_id != self.current_id:
+            return
         dialog = CoinNumberDialog(crop, number, self)
         dialog.exec()
         if dialog.taught and dialog.number():
@@ -2857,6 +2891,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"コイン {dialog.number()} を教えました。学習すると次から使います", 5000)
         elif dialog.number():
             self.statusBar().showMessage(f"コイン {dialog.number()}", 5000)
+
+    def _on_coin_read_failed(self, message: str) -> None:
+        self._coin_worker = None
+        self.read_coin_btn.setEnabled(self.current_id is not None)
+        QMessageBox.warning(self, "数字を取れませんでした", message)
 
     def _coin_read_key(self, boxes: dict[str, dict[str, int]] | None = None) -> str | None:
         boxes = boxes if boxes is not None else self.canvas.all_region_boxes()

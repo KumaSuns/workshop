@@ -343,25 +343,29 @@ def _ocr_image(image: Image.Image) -> str:
         script = temp.with_suffix(".ps1")
         script.write_text(_OCR_SCRIPT, encoding="utf-8")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-STA",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script),
-                "-ImagePath",
-                str(temp.resolve()),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=flags,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-STA",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "-ImagePath",
+                    str(temp.resolve()),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=flags,
+                timeout=12,
+            )
+        except subprocess.TimeoutExpired:
+            return ""
         if result.returncode != 0:
             return ""
         return (result.stdout or "").strip()
