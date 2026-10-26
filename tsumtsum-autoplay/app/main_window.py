@@ -368,6 +368,10 @@ class MainWindow(QMainWindow):
         self._info_mytsum = QLabel("マイツム  —")
         self._info_mytsum.setWordWrap(True)
         info.addWidget(self._info_mytsum)
+        self._info_model = QLabel("")
+        self._info_model.setWordWrap(True)
+        self._info_model.setMinimumHeight(self._info_model.fontMetrics().lineSpacing())
+        info.addWidget(self._info_model)
         self._info_items = QLabel("－")
         self._info_items.setWordWrap(True)
         self._info_items.hide()
@@ -513,45 +517,49 @@ class MainWindow(QMainWindow):
         left = QWidget()
         layout = QVBoxLayout(left)
         layout.setContentsMargins(0, 0, 0, 0)
+        buttons = QVBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(layout.spacing() // 2)
         self.settings_btn = QPushButton("設定")
         self.settings_btn.clicked.connect(self._open_swipe_settings)
-        layout.addWidget(self.settings_btn)
+        buttons.addWidget(self.settings_btn)
         self.grab_board_btn = QPushButton("盤面を取り込む (F11)")
         self.grab_board_btn.clicked.connect(self.on_grab_board)
-        layout.addWidget(self.grab_board_btn)
+        buttons.addWidget(self.grab_board_btn)
         self.grab_now_btn = QPushButton("盤面を取り込む (F9)")
         self.grab_now_btn.clicked.connect(self.on_grab_board)
-        layout.addWidget(self.grab_now_btn)
+        buttons.addWidget(self.grab_now_btn)
         self.capture_btn = QPushButton("消す前の盤面を取り込む (F7)")
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
-        layout.addWidget(self.capture_btn)
+        buttons.addWidget(self.capture_btn)
         self.skill_n_btn = QPushButton("スキル満タン個数")
         self.skill_n_btn.setCheckable(True)
         self.skill_n_btn.toggled.connect(self._on_skill_n_toggled)
-        layout.addWidget(self.skill_n_btn)
+        buttons.addWidget(self.skill_n_btn)
         self.shot_btn = QPushButton("キャプチャー (F8)")
         self.shot_btn.clicked.connect(self.on_capture_screen)
-        layout.addWidget(self.shot_btn)
+        buttons.addWidget(self.shot_btn)
         self.add_tsum_btn = QPushButton("ツムを追加")
         self.add_tsum_btn.clicked.connect(self._add_tsum)
-        layout.addWidget(self.add_tsum_btn)
+        buttons.addWidget(self.add_tsum_btn)
         self.now_btn = QPushButton("今すぐプレイ (F5)")
         self.now_btn.clicked.connect(self.on_play_now)
-        layout.addWidget(self.now_btn)
+        buttons.addWidget(self.now_btn)
         self.loop_btn = QPushButton("連続プレイ (F6)")
         self.loop_btn.clicked.connect(self.on_loop_play)
-        layout.addWidget(self.loop_btn)
+        buttons.addWidget(self.loop_btn)
         self.record_btn = QPushButton("1プレイを録画")
         self.record_btn.clicked.connect(self.on_record_one)
-        layout.addWidget(self.record_btn)
+        buttons.addWidget(self.record_btn)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop)
-        layout.addWidget(self.stop_btn)
+        buttons.addWidget(self.stop_btn)
         self.shortcut_btn = QPushButton("起動アイコン作成")
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
-        layout.addWidget(self.shortcut_btn)
+        buttons.addWidget(self.shortcut_btn)
+        layout.addLayout(buttons)
         self.status_label = QLabel("待機中")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -584,6 +592,7 @@ class MainWindow(QMainWindow):
         self._use_dedicated_model = True
         self._placed = False
         self._enter_yes = None
+        self._key_buttons = None
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -974,6 +983,16 @@ class MainWindow(QMainWindow):
         crop_h = max(1, int(height * 0.126))
         return QPixmap.fromImage(image.copy(left, top, crop_w, crop_h))
 
+    def _set_model_label(self, name: str | None, dedicated: bool) -> None:
+        if name is None:
+            self._info_model.setText("")
+            return
+        shown = " ".join(name.split())
+        if dedicated and shown:
+            self._info_model.setText(f"{shown} のモデル")
+            return
+        self._info_model.setText("専用のモデルではない")
+
     def _set_mytsum(self, name: str) -> None:
         shown = " ".join((name or "").split()) or "—"
         self._info_mytsum.setText(f"マイツム  {shown}")
@@ -1078,12 +1097,14 @@ class MainWindow(QMainWindow):
             return
         screen = Path(path) if path else None
         self._use_dedicated_model = True
+        self._set_model_label(None, True)
         name = self._confirm_used_tsum(guess, screen, pick_only)
         if name is None:
             play.provide_used_tsum(None)
             self.on_stop()
             return
         self._selected_used_tsum = name
+        self._set_model_label(name, self._use_dedicated_model)
         play.provide_used_tsum(name, self._use_dedicated_model)
 
     def _confirm_used_tsum(
@@ -1112,18 +1133,13 @@ class MainWindow(QMainWindow):
         skip.setAutoDefault(False)
         new.setAutoDefault(False)
         cancel.setAutoDefault(False)
-        if yes is not None:
-            yes.setAutoDefault(True)
-            yes.setDefault(True)
         layout.addWidget(buttons)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         no.clicked.connect(lambda: dialog.done(2))
         skip.clicked.connect(lambda: dialog.done(4))
         new.clicked.connect(lambda: dialog.done(3))
-        if yes is not None:
-            yes.setFocus()
-            self._enter_yes = dialog.accept
+        self._arm_key_buttons([button for button in (yes, no, skip, new, cancel) if button is not None])
         self._front_timer.stop()
         self._debug.setEnabled(False)
         dialog.show()
@@ -1138,11 +1154,15 @@ class MainWindow(QMainWindow):
             )
             ctypes.windll.user32.SetForegroundWindow(hwnd)
         dialog.grabKeyboard()
+        current = self._focused_key_button()
+        if current is not None:
+            current.setFocus(Qt.FocusReason.OtherFocusReason)
         try:
             result = dialog.exec()
         finally:
             dialog.releaseKeyboard()
             self._enter_yes = None
+            self._key_buttons = None
             self._debug.setEnabled(True)
             self._front_timer.start()
         if yes is not None and result == QDialog.DialogCode.Accepted:
@@ -1175,16 +1195,14 @@ class MainWindow(QMainWindow):
             "専用のモデルではない", QDialogButtonBox.ButtonRole.ActionRole
         )
         cancel = buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
-        own.setAutoDefault(True)
-        own.setDefault(True)
+        own.setAutoDefault(False)
         shared.setAutoDefault(False)
         cancel.setAutoDefault(False)
         layout.addWidget(buttons)
         own.clicked.connect(lambda: dialog.done(1))
         shared.clicked.connect(lambda: dialog.done(2))
         buttons.rejected.connect(dialog.reject)
-        own.setFocus()
-        self._enter_yes = lambda: dialog.done(1)
+        self._arm_key_buttons([own, shared, cancel])
         self._front_timer.stop()
         self._debug.setEnabled(False)
         dialog.show()
@@ -1199,11 +1217,15 @@ class MainWindow(QMainWindow):
             )
             ctypes.windll.user32.SetForegroundWindow(hwnd)
         dialog.grabKeyboard()
+        current = self._focused_key_button()
+        if current is not None:
+            current.setFocus(Qt.FocusReason.OtherFocusReason)
         try:
             result = dialog.exec()
         finally:
             dialog.releaseKeyboard()
             self._enter_yes = None
+            self._key_buttons = None
             self._debug.setEnabled(True)
             self._front_timer.start()
         if result == 1:
@@ -1664,7 +1686,70 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+    def _arm_key_buttons(self, buttons: list[QPushButton]) -> None:
+        self._key_buttons = buttons
+        for button in buttons:
+            button.setAutoDefault(False)
+            button.setDefault(False)
+        if not buttons:
+            return
+        buttons[0].setAutoDefault(True)
+        buttons[0].setDefault(True)
+        buttons[0].setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _focused_key_button(self) -> QPushButton | None:
+        buttons = self._key_buttons or []
+        focus = QApplication.focusWidget()
+        for button in buttons:
+            if button is focus:
+                return button
+        for button in buttons:
+            if button.isDefault():
+                return button
+        return buttons[0] if buttons else None
+
+    def _move_key_button(self, delta: int) -> None:
+        buttons = [button for button in (self._key_buttons or []) if button.isEnabled()]
+        if not buttons:
+            return
+        current = self._focused_key_button()
+        index = buttons.index(current) if current in buttons else 0
+        nxt = buttons[(index + delta) % len(buttons)]
+        for button in buttons:
+            selected = button is nxt
+            button.setAutoDefault(selected)
+            button.setDefault(selected)
+        nxt.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _click_key_button(self) -> None:
+        button = self._focused_key_button()
+        if button is not None:
+            button.click()
+
     def eventFilter(self, watched, event) -> bool:
+        if self._key_buttons and event.type() in (
+            QEvent.Type.KeyPress,
+            QEvent.Type.ShortcutOverride,
+        ):
+            key = event.key()
+            if key in (
+                Qt.Key.Key_Left,
+                Qt.Key.Key_Right,
+                Qt.Key.Key_Up,
+                Qt.Key.Key_Down,
+                Qt.Key.Key_Return,
+                Qt.Key.Key_Enter,
+            ):
+                event.accept()
+                if event.type() != QEvent.Type.KeyPress:
+                    return True
+                if key in (Qt.Key.Key_Left, Qt.Key.Key_Up):
+                    self._move_key_button(-1)
+                elif key in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+                    self._move_key_button(1)
+                elif not event.isAutoRepeat():
+                    self._click_key_button()
+                return True
         if (
             self._enter_yes is not None
             and event.type()

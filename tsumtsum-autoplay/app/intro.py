@@ -486,6 +486,8 @@ def _play_button(image: QImage) -> QRect | None:
 
 
 def _retry_button(image: QImage) -> QRect | None:
+    if _extend_cancel_button(image) is not None:
+        return None
     low = [
         pill
         for pill in _yellow_pills(image)
@@ -664,6 +666,33 @@ def _match_start_button(image: QImage) -> QRect | None:
 
 
 def _cancel_button(image: QImage) -> QRect | None:
+    left = _yellow_pair_left(image)
+    if left is None:
+        return None
+    if _play_button(image) is not None:
+        return None
+    return left
+
+
+def _extend_cancel_button(image: QImage) -> QRect | None:
+    """マジカルタイムのキャンセル。リザルトのとじる／リトライは含めない。"""
+    if not _is_extend_dialog(image):
+        return None
+    return _yellow_pair_left(image)
+
+
+def _is_extend_dialog(image: QImage) -> bool:
+    """10秒延長の青いダイアログ。ここにある数字はスコアなのでコインではない。"""
+    if image is None or image.isNull():
+        return False
+    left = _yellow_pair_left(image)
+    if left is None or left.center().y() > image.height() * 0.78:
+        return False
+    cyan, navy = _extend_dialog_ratios(image)
+    return navy >= 0.35 and cyan >= 0.04
+
+
+def _yellow_pair_left(image: QImage) -> QRect | None:
     pills = _yellow_pills(image)
     if len(pills) < 2:
         return None
@@ -680,10 +709,41 @@ def _cancel_button(image: QImage) -> QRect | None:
             continue
         if _is_daily_mission(image, right) or _is_daily_mission(image, left):
             continue
-        if _play_button(image) is not None:
-            return None
         return left
     return None
+
+
+def _extend_dialog_ratios(image: QImage) -> tuple[float, float]:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return 0.0, 0.0
+    cyan = 0
+    navy = 0
+    total = 0
+    for y in range(int(height * 0.22), int(height * 0.58)):
+        row = sample[y]
+        for x in range(int(width * 0.15), int(width * 0.85)):
+            pixel = row[x]
+            total += 1
+            if _is_extend_cyan(pixel):
+                cyan += 1
+            elif _is_extend_navy(pixel):
+                navy += 1
+    if total == 0:
+        return 0.0, 0.0
+    return cyan / total, navy / total
+
+
+def _is_extend_cyan(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return red < 140 and green > 140 and blue > 180 and blue >= green - 20
+
+
+def _is_extend_navy(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return blue > 50 and blue > red + 20 and blue >= green and red < 90 and green < 130
 
 
 def _has_highscore_plate(image: QImage) -> bool:
@@ -710,20 +770,37 @@ def _has_highscore_plate(image: QImage) -> bool:
     return False
 
 
+def _highscore_close_button(image: QImage) -> QRect | None:
+    """新記録のハイスコア画面。下のツムではなく、中央のとじる。"""
+    if image is None or image.isNull() or not _has_highscore_plate(image):
+        return None
+    height = image.height()
+    width = image.width()
+    pills = []
+    for pill in _yellow_pills(image):
+        if pill.width() < pill.height() * 1.65:
+            continue
+        if not height * 0.55 < pill.center().y() < height * 0.80:
+            continue
+        if abs(pill.center().x() - width / 2) > width * 0.22:
+            continue
+        if pill.width() < width * 0.18 or pill.width() > width * 0.55:
+            continue
+        if _is_daily_mission(image, pill):
+            continue
+        pills.append(pill)
+    if not pills:
+        return None
+    return min(pills, key=lambda rect: rect.center().y())
+
+
 def _close_button(image: QImage) -> QRect | None:
     mission_close = _mission_dialog_close(image)
     if mission_close is not None:
         return mission_close
-    if _has_highscore_plate(image):
-        pills = [
-            pill
-            for pill in _yellow_pills(image)
-            if image.height() * 0.62 < pill.center().y() < image.height() * 0.92
-            and abs(pill.center().x() - image.width() / 2) < image.width() * 0.18
-            and not _is_daily_mission(image, pill)
-        ]
-        if pills:
-            return max(pills, key=lambda rect: rect.width() * rect.height())
+    highscore = _highscore_close_button(image)
+    if highscore is not None:
+        return highscore
     if (
         _play_button(image) is not None
         or _cancel_button(image) is not None

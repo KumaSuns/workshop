@@ -33,7 +33,10 @@ from app.intro import (
     _close_button,
     _continue_button,
     _daily_mission_button,
+    _extend_cancel_button,
+    _highscore_close_button,
     _in_play_hud,
+    _is_extend_dialog,
     _match_start_button,
     _pause_continue_button,
     _play_button,
@@ -92,6 +95,7 @@ MIN_CHAIN = 3
 BOARD_TSUMS = 8
 BOARD_READY = 40
 TIMEUP_SCORE = 0.70
+SCENE_KIND_SCORE = 0.18
 SKILL_GAP = 2.2
 SKILL_FILL_READY = 0.90
 SKILL_FILL_SPENT = 0.40
@@ -484,9 +488,6 @@ def run_play(
         clears = 0
         swipes = 0
         coin = 0
-        shown_money["coin"] = ""
-        if money is not None:
-            money(shown_money["coin"], shown_money["result"])
         skill_taps = 0
         skill_ok = 0
         skill_used = 0
@@ -1141,7 +1142,117 @@ def run_play(
         timeup_lit[0] = on
         timeup_lamp(on)
 
+    def show_watch_money(kind: str, text: str) -> None:
+        if kind == "COIN":
+            shown_money["coin"] = text
+        elif kind == "RESULT":
+            shown_money["result"] = text
+        else:
+            return
+        if money is not None:
+            money(shown_money["coin"], shown_money["result"])
+
+    def _read_scene_money(frame_rgb, force_key: str = "") -> tuple[str, str]:
+        if frame_rgb is None:
+            return "", ""
+        try:
+            with _gpu_lock:
+                key = force_key or _money_scene_key(_scene_class_scores(predictor, frame_rgb))
+                if not key:
+                    return "", ""
+                box = _region_box(predictor, frame_rgb, key)
+                text = _money_digits(
+                    _read_coin_key(
+                        predictor, frame_rgb, {key: box} if box else None, key
+                    )
+                )
+        except Exception:
+            return "", ""
+        if not text:
+            return "", ""
+        field = "coin" if key == "coin" else "result"
+        return field, text
+
+    def _publish_money(field: str, text: str) -> None:
+        if field not in shown_money or not text or shown_money[field] == text:
+            return
+        shown_money[field] = text
+        if money is not None:
+            money(shown_money["coin"], shown_money["result"])
+
+    def _note_scene_money(frame_rgb, force_key: str = "") -> str:
+        field, text = _read_scene_money(frame_rgb, force_key)
+        if field and text:
+            _publish_money(field, text)
+            if field == "result":
+                _publish_money("coin", text)
+        return field
+
+    def _watch_money_screens() -> None:
+        seen = {"coin": False, "result": False}
+        last = {"coin": "", "result": ""}
+        hits = {"coin": 0, "result": 0}
+        deadline = time.time() + 12
+
+        def take(field: str, text: str) -> None:
+            nonlocal deadline
+            if field not in seen or not text:
+                return
+            if text == last[field]:
+                hits[field] += 1
+            else:
+                last[field] = text
+                hits[field] = 1
+                deadline = max(deadline, time.time() + 2.5)
+            if hits[field] >= 2:
+                seen[field] = True
+                _publish_money(field, text)
+
+        while time.time() < deadline and not (seen["coin"] and seen["result"]):
+            _check_stop(stop)
+            try:
+                shot = capture_play_frame()
+                frame_rgb = _qimage_rgb(shot)
+            except Exception:
+                _sleep_stop(0.25, stop)
+                continue
+            if shot is not None and not shot.isNull() and _is_extend_dialog(shot):
+                _dismiss_extend_dialog(shot, say, stop)
+                last = {"coin": "", "result": ""}
+                hits = {"coin": 0, "result": 0}
+                deadline = max(deadline, time.time() + 8)
+                continue
+            if shot is not None and _dismiss_highscore_dialog(shot, say, stop):
+                last = {"coin": "", "result": ""}
+                hits = {"coin": 0, "result": 0}
+                seen = {"coin": False, "result": False}
+                deadline = max(deadline, time.time() + 8)
+                continue
+            on_result = (
+                shot is not None
+                and not shot.isNull()
+                and _retry_button(shot) is not None
+            )
+            field, text = _read_scene_money(frame_rgb)
+            if field == "coin" and not on_result:
+                take(field, text)
+            if on_result and not seen["result"]:
+                _field, text = _read_scene_money(frame_rgb, "result_coin")
+                if text and seen["coin"] and last["coin"] != text:
+                    seen["coin"] = False
+                if text:
+                    take("result", text)
+                    take("coin", text)
+            if not (seen["coin"] and seen["result"]):
+                _sleep_stop(0.25, stop)
+        for field in ("coin", "result"):
+            if not seen[field] and last[field]:
+                _publish_money(field, last[field])
+
     _timeup_lamp[0] = show_timeup
+    _watch_money[0] = show_watch_money
+    _scene_money_hook[0] = _note_scene_money
+    _scene_money_read[0] = _read_scene_money
     if resumed_pause:
         arm_timeup()
     checker_alive = [True]
@@ -1519,64 +1630,25 @@ def run_play(
             ),
             daemon=True,
         ).start()
-    def _note_result_path(path) -> None:
-        if money is None:
-            return
-        from PIL import Image
-
-        try:
-            with Image.open(path) as image:
-                frame = image.convert("RGB")
-            with _gpu_lock:
-                boxes = predictor.predict_all(Path("."), rgb=frame)
-                text = _read_coin_key(predictor, frame, boxes, "result_coin")
-        except Exception:
-            return
-        if not text:
-            return
-        shown_money["result"] = text
-        earned_now[0] = text
-        money(shown_money["coin"], shown_money["result"])
-
-    def _catch_result() -> None:
-        if money is None:
-            return
-        deadline = time.time() + 12
-        found: list[str] = []
-        while time.time() < deadline and len(found) < 5:
-            _check_stop(stop)
-            try:
-                frame = _qimage_rgb(capture_play_frame())
-            except Exception:
-                frame = None
-            text = ""
-            if frame is not None:
-                try:
-                    with _gpu_lock:
-                        boxes = predictor.predict_all(Path("."), rgb=frame)
-                        text = _read_coin_key(predictor, frame, boxes, "result_coin")
-                except Exception:
-                    text = ""
-            if not text:
-                if not found:
-                    _sleep_stop(0.4, stop)
-                continue
-            found.append(text)
-            shown_money["result"] = text
-            earned_now[0] = text
-            money(shown_money["coin"], shown_money["result"])
-        if not found:
-            return
-        earned_now[0] = max(set(found), key=found.count)
-        shown_money["result"] = earned_now[0]
-        money(shown_money["coin"], shown_money["result"])
+    def _note_result_path(_path) -> None:
+        return
 
     _money_note[0] = _note_result_path
-    money_at = [0.0]
     next_frame = None
     try:
         while True:
             _check_stop(stop)
+            coin_now = _watch_digits[0]
+            result_now = _watch_digits[1]
+            if (coin_now and coin_now != shown_money["coin"]) or (
+                result_now and result_now != shown_money["result"]
+            ):
+                if coin_now:
+                    shown_money["coin"] = coin_now
+                if result_now:
+                    shown_money["result"] = result_now
+                if money is not None:
+                    money(shown_money["coin"], shown_money["result"])
             if next_frame is not None:
                 image, rgb = next_frame
                 next_frame = None
@@ -1600,6 +1672,10 @@ def run_play(
                 if not saw_board:
                     say("画面を待っています")
                     _sleep_stop(0.25, stop)
+                continue
+            if _dismiss_extend_dialog(image, say, stop):
+                continue
+            if not _in_play_hud(image) and _dismiss_highscore_dialog(image, say, stop):
                 continue
             on_board = (
                 saw_board
@@ -1690,18 +1766,6 @@ def run_play(
                 and not image.isNull()
                 and _in_play_hud(image)
             )
-            if play_hud and money is not None and time.time() >= money_at[0]:
-                money_at[0] = time.time() + 1.0
-                text = ""
-                if last_boxes:
-                    try:
-                        with _gpu_lock:
-                            text = _read_coin_key(predictor, rgb, last_boxes, "coin")
-                    except Exception:
-                        text = ""
-                if text:
-                    shown_money["coin"] = text
-                    money(shown_money["coin"], shown_money["result"])
             retry_now = (
                 saw_board
                 and image is not None
@@ -1790,11 +1854,11 @@ def run_play(
                 duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
                 waits = sorted(wait_times, reverse=True)[:3]
                 again = _continue_after_game()
-                earned_now[0] = ""
-                _catch_result()
+                _watch_money_screens()
+                earned_now[0] = shown_money["coin"]
                 if not again:
                     _commit_earned(
-                        earned_now[0] or coin,
+                        earned_now[0],
                         saved_ok,
                         clears,
                         swipes,
@@ -1810,7 +1874,7 @@ def run_play(
                     return
                 _seen, replay_items = _replay_after_timeup(say, stop)
                 _commit_earned(
-                    earned_now[0] or coin,
+                    earned_now[0],
                     saved_ok,
                     clears,
                     swipes,
@@ -1944,7 +2008,7 @@ def run_play(
                 and time.time() - pending_at < 0.5
             ):
                 continue
-            if skill_now and not skill_is_namine(used_tsum):
+            if skill_now and not skill_is_namine(used_tsum) and not skill_is_gadget(used_tsum):
                 _press_ready_skill()
                 if skill_pressed is not None and skill_pressed.is_set():
                     apply_checker_skill(False)
@@ -1996,13 +2060,14 @@ def run_play(
                 and skill is not None
                 and not watch_hit.is_set()
                 and not skill_busy[0]
-                and pending_spots is None
+                and (pending_spots is None or time.time() - pending_at >= 0.5)
                 and skill_ready_now(rgb)
                 and not _gadget_skill_hold(
                     _fever_playing(rgb, game),
                     _meter_fever_fill(rgb, fever, skill, fan),
                     latest_gauge[3],
                 )
+                and _gadget_center_has_tsum(tsums, game)
             ):
                 _press_ready_skill()
             if (
@@ -2339,6 +2404,12 @@ def run_play(
                         except Exception:
                             check = image
                             check_rgb = rgb
+                        if _dismiss_extend_dialog(check, say, stop):
+                            timeup = False
+                            if not _watcher_timeup[0]:
+                                watch_hit.clear()
+                                show_timeup(False)
+                            continue
                         retry_on_check = (
                             check is not None
                             and not check.isNull()
@@ -2360,9 +2431,7 @@ def run_play(
                                 True,
                                 last_boxes,
                             ):
-                                with _gpu_lock:
-                                    coin = _read_coin(predictor, check_rgb, last_boxes)
-                                say("TIME UP / " + _counts_line(clears, swipes, coin))
+                                say("TIME UP / " + _counts_line(clears, swipes))
                         elif _timer_still_running(check_rgb, timer):
                             timeup = False
                             if not _watcher_timeup[0]:
@@ -2389,9 +2458,7 @@ def run_play(
                                 last_boxes,
                             )
                         ):
-                            with _gpu_lock:
-                                coin = _read_coin(predictor, check_rgb, last_boxes)
-                            say("TIME UP / " + _counts_line(clears, swipes, coin))
+                            say("TIME UP / " + _counts_line(clears, swipes))
                 if timeup:
                     credit_pending(check_rgb)
                     flush_idle(True)
@@ -2421,11 +2488,11 @@ def run_play(
                     duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
                     waits = sorted(wait_times, reverse=True)[:3]
                     again = _continue_after_game()
-                    earned_now[0] = ""
-                    _catch_result()
+                    _watch_money_screens()
+                    earned_now[0] = shown_money["coin"]
                     if not again:
                         _commit_earned(
-                            earned_now[0] or coin,
+                            earned_now[0],
                             saved_ok,
                             clears,
                             swipes,
@@ -2441,7 +2508,7 @@ def run_play(
                         return
                     _seen, replay_items = _replay_after_timeup(say, stop)
                     _commit_earned(
-                        earned_now[0] or coin,
+                        earned_now[0],
                         saved_ok,
                         clears,
                         swipes,
@@ -2542,6 +2609,9 @@ def run_play(
     finally:
         _money_note[0] = None
         _timeup_lamp[0] = None
+        _watch_money[0] = None
+        _scene_money_hook[0] = None
+        _scene_money_read[0] = None
         _watcher_timeup[0] = False
         grab_done.set()
         checker_alive[0] = False
@@ -3435,6 +3505,24 @@ def _read_fever(
     return gold_w / stored, stored
 
 
+def _gadget_center_has_tsum(tsums: list[dict[str, int]], game: dict[str, int] | None) -> bool:
+    if not game:
+        return True
+    left = int(game["x"])
+    top = int(game["y"])
+    width = max(1, int(game["w"]))
+    height = max(1, int(game["h"]))
+    x0 = left + width / 3
+    x1 = left + width * 2 / 3
+    bottom = top + height
+    for piece in tsums:
+        x = int(piece["x"])
+        y = int(piece["y"])
+        if x0 <= x < x1 and top <= y < bottom:
+            return True
+    return False
+
+
 def _gadget_skill_hold(fever_on: bool, fever_fill: float | None, left: int | None) -> bool:
     if left is not None and int(left) <= GADGET_TIMER_SKILL:
         return False
@@ -3852,6 +3940,10 @@ def _qimage_rgb(image: QImage):
 _timeup_proc: list[subprocess.Popen | None] = [None]
 _money_note: list = [None]
 _timeup_lamp: list = [None]
+_watch_money: list = [None]
+_watch_digits: list[str] = ["", ""]
+_scene_money_hook: list = [None]
+_scene_money_read: list = [None]
 _watcher_timeup: list[bool] = [False]
 
 
@@ -3875,12 +3967,24 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
         if out is None:
             return
         for line in out:
-            if line.strip() == b"TIMEUP" and watching.is_set():
+            text = line.strip()
+            if text == b"TIMEUP" and watching.is_set():
                 hit.set()
                 _watcher_timeup[0] = True
                 note = _timeup_lamp[0]
                 if note is not None:
                     note(True)
+                continue
+            kind, _, digits = text.partition(b" ")
+            if kind in (b"COIN", b"RESULT") and digits.isdigit():
+                shown = digits.decode()
+                if kind == b"COIN":
+                    _watch_digits[0] = shown
+                else:
+                    _watch_digits[1] = shown
+                note = _watch_money[0]
+                if note is not None:
+                    note(kind.decode(), shown)
 
     Thread(target=read, daemon=True).start()
 
@@ -3895,6 +3999,36 @@ def _stop_timeup_app() -> None:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+def _money_digits(text: str) -> str:
+    return "".join(char for char in str(text or "") if char.isdigit()).lstrip("0")
+
+
+def _dismiss_highscore_dialog(image: QImage, say: StatusFn, stop: Event | None) -> bool:
+    """新記録のハイスコアが出ていたらとじる。これがないとリザルトへ進まない。"""
+    if image is None or image.isNull():
+        return False
+    button = _highscore_close_button(image)
+    if button is None:
+        return False
+    say("とじるをクリックします")
+    _slow_tap(button.center().x(), button.center().y())
+    _sleep_stop(1.0, stop)
+    return True
+
+
+def _dismiss_extend_dialog(image: QImage, say: StatusFn, stop: Event | None) -> bool:
+    """マジカルタイムが出ていたらキャンセルを押し、リザルトへ進める。"""
+    if image is None or image.isNull():
+        return False
+    button = _extend_cancel_button(image)
+    if button is None:
+        return False
+    say("キャンセルをクリックします")
+    _slow_tap(button.center().x(), button.center().y())
+    _sleep_stop(1.0, stop)
+    return True
 
 
 def _end_on_timeup(
@@ -3922,20 +4056,15 @@ def _end_on_timeup(
     if pending_spots is not None and not _spots_lingered(rgb, pending_spots):
         extra = 1
     if retry:
-        with _gpu_lock:
-            coin = _read_coin(predictor, rgb, boxes)
-        say(f"TIME UP / {_counts_line(clears + extra, swipes, coin)}")
+        say(f"TIME UP / {_counts_line(clears + extra, swipes)}")
         return True
     with _gpu_lock:
         hit, score = _timeup_hit(predictor, rgb)
-        coin = ""
-        if hit:
-            coin = _read_coin(predictor, rgb, boxes)
     if _timer_still_running(rgb, timer):
         return False
     if not hit:
         return False
-    say(f"TIME UP {score:.0%} / {_counts_line(clears + extra, swipes, coin)}")
+    say(f"TIME UP {score:.0%} / {_counts_line(clears + extra, swipes)}")
     return True
 
 
@@ -4027,6 +4156,94 @@ def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
     return text
 
 
+def _result_coin_icon(image) -> tuple[int, int, int, int] | None:
+    """リザルトのコインアイコン。星より塗りが濃い金色の円。"""
+    from PIL import Image
+
+    scale = 4 if image.width >= 800 else 2
+    small = image.resize(
+        (max(1, image.width // scale), max(1, image.height // scale)),
+        Image.Resampling.BOX,
+    )
+    width, height = small.size
+    pixels = small.load()
+    mask = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            red, green, blue = pixels[x, y][:3]
+            row.append(red > 175 and green > 110 and blue < 140 and red > green - 15 and red > blue + 40)
+        mask.append(row)
+    seen = [[False] * width for _ in range(height)]
+    best = None
+    for y in range(height):
+        for x in range(width):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            count = 0
+            min_x = max_x = x
+            min_y = max_y = y
+            while stack:
+                cx, cy = stack.pop()
+                count += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if 0 <= nx < width and 0 <= ny < height and mask[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if count < 12:
+                continue
+            box_w = max_x - min_x + 1
+            box_h = max_y - min_y + 1
+            fill = count / (box_w * box_h)
+            icon_w, icon_h = box_w * scale, box_h * scale
+            icon_x, icon_y = min_x * scale, min_y * scale
+            if icon_w < image.width * 0.035 or icon_w > image.width * 0.09:
+                continue
+            if not 0.75 <= icon_w / max(icon_h, 1) <= 1.35:
+                continue
+            center_y = (icon_y + icon_h / 2) / image.height
+            if not 0.42 <= center_y <= 0.68:
+                continue
+            if fill < 0.68:
+                continue
+            if best is None or fill > best[0]:
+                best = (fill, icon_x, icon_y, icon_w, icon_h)
+    if best is None:
+        return None
+    return best[1], best[2], best[3], best[4]
+
+
+def _result_coin_box(image, model_box: dict[str, int] | None) -> dict[str, int] | None:
+    icon = _result_coin_icon(image)
+    if icon is None:
+        return model_box
+    icon_x, icon_y, icon_w, icon_h = icon
+    width, height = image.size
+    left = max(0, int(icon_x - 0.85 * icon_w))
+    top = max(0, int(icon_y + icon_h / 2 - 1.08 * icon_w))
+    box_w = min(width - left, int(round(icon_w * 9.0)))
+    box_h = min(height - top, int(round(icon_w * 2.15)))
+    row = {"x": left, "y": top, "w": max(1, box_w), "h": max(1, box_h)}
+    if not model_box:
+        return row
+    box_left = int(model_box["x"])
+    box_top = int(model_box["y"])
+    box_width = int(model_box["w"])
+    box_height = int(model_box["h"])
+    center_x = icon_x + icon_w / 2
+    center_y = icon_y + icon_h / 2
+    inside = box_left <= center_x <= box_left + box_width and box_top <= center_y <= box_top + box_height
+    if inside and box_height <= icon_w * 2.6:
+        return model_box
+    return row
+
+
 def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
     if rgb is None or not boxes:
         return ""
@@ -4034,6 +4251,8 @@ def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key:
     if predict is None:
         return ""
     box = boxes.get(key)
+    if key == "result_coin":
+        box = _result_coin_box(rgb, box)
     if not box:
         return ""
     width, height = rgb.size
@@ -4093,7 +4312,7 @@ def _timer_still_running(rgb, timer: dict[str, int] | None) -> bool:
 
 def _replay_after_timeup(say: StatusFn, stop: Event | None) -> tuple[str, list[str] | None]:
     _seen, _locked, arrived, used_name, items = _click_start_or_continue(
-        say, stop, tap_start=False, read_tsum=False
+        say, stop, tap_start=False, read_tsum=False, after_timeup=True
     )
     if arrived == "continue":
         _tap_continue_now(say, stop)
@@ -4105,6 +4324,52 @@ def _tap_point(image: QImage, x: int, y: int) -> None:
     result = adb(["shell", "input", "tap", xi, yi], timeout=6)
     if result.returncode != 0:
         tap(x, y, screen_w=image.width(), screen_h=image.height())
+
+
+def _scene_class_scores(predictor, rgb) -> dict[str, float]:
+    model = getattr(predictor, "scene_model", None)
+    transform = getattr(predictor, "_scene_transform", None)
+    if model is None or transform is None or rgb is None:
+        return {}
+    import torch
+
+    view = _portrait_frame(rgb)
+    tensor = transform(view).unsqueeze(0).to(predictor.device)
+    with torch.no_grad():
+        probs = torch.softmax(model(tensor), dim=1)[0]
+    classes = getattr(predictor, "scene_classes", None) or ("other", "go", "timeup")
+    return {
+        classes[i]: float(probs[i].item())
+        for i in range(min(len(classes), int(probs.numel())))
+    }
+
+
+def _money_scene_key(scores: dict[str, float]) -> str:
+    best_name = ""
+    best_score = 0.0
+    for kind, kind_score in scores.items():
+        if kind == "other" or kind_score <= best_score:
+            continue
+        best_name = kind
+        best_score = kind_score
+    if best_score < SCENE_KIND_SCORE:
+        return ""
+    if best_name == "coin":
+        return "coin"
+    if best_name == "result":
+        return "result_coin"
+    return ""
+
+
+def _region_box(predictor, rgb, key: str) -> dict[str, int] | None:
+    models = getattr(predictor, "models", None) or {}
+    model = models.get(key)
+    transform = getattr(predictor, "_transform", None)
+    if model is None or transform is None or rgb is None:
+        return None
+    image = rgb if getattr(rgb, "mode", "") == "RGB" else rgb.convert("RGB")
+    tensor = transform(image).unsqueeze(0).to(predictor.device)
+    return predictor._decode(model, tensor, image.size[0], image.size[1])
 
 
 def _scene_top(predictor, rgb) -> tuple[str, float]:
@@ -4625,12 +4890,16 @@ def _click_start_or_continue(
     tap_start: bool = True,
     skip_retry: bool = False,
     read_tsum: bool = True,
+    after_timeup: bool = False,
 ) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
     locked = False
     used_name = ""
     items: list[str] | None = None
+    result_seen = False
+    stable_result = ""
+    stable_hits = 0
     while time.time() < deadline:
         _check_stop(stop)
         try:
@@ -4643,6 +4912,24 @@ def _click_start_or_continue(
         if image.isNull():
             _sleep_stop(0.4, stop)
             continue
+        note_money = _scene_money_hook[0]
+        rgb = _qimage_rgb(image)
+        extend = _is_extend_dialog(image)
+        if extend:
+            stable_result = ""
+            stable_hits = 0
+        elif _retry_button(image) is not None and _scene_money_read[0] is not None:
+            _field, text = _scene_money_read[0](rgb, "result_coin")
+            if text:
+                if text == stable_result:
+                    stable_hits += 1
+                else:
+                    stable_result = text
+                    stable_hits = 1
+                if stable_hits >= 2:
+                    result_seen = True
+                    if note_money is not None:
+                        note_money(rgb, "result_coin")
         used = _five_to_four_used_path(path)
         if used is not None:
             kinds = 4 if used else 5
@@ -4673,6 +4960,9 @@ def _click_start_or_continue(
             return kinds, locked, "start", used_name, items
         retry = None if skip_retry else _retry_button(image)
         if retry is not None:
+            if after_timeup and not result_seen and time.time() + 1.5 < deadline:
+                _sleep_stop(0.25, stop)
+                continue
             note = _money_note[0]
             if note is not None:
                 note(path)
@@ -4701,7 +4991,14 @@ def _click_start_or_continue(
             else:
                 say("続けるを検出しました")
             return kinds, locked, "continue", used_name, items
-        cancel = _cancel_button(image)
+        highscore = _highscore_close_button(image)
+        if highscore is not None:
+            say("とじるをクリックします")
+            _slow_tap(highscore.center().x(), highscore.center().y())
+            _sleep_stop(1.0, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        cancel = _extend_cancel_button(image) or _cancel_button(image)
         if cancel is not None:
             say("キャンセルをクリックします")
             _slow_tap(cancel.center().x(), cancel.center().y())
@@ -4710,13 +5007,17 @@ def _click_start_or_continue(
             continue
         close = _close_button(image)
         if close is not None:
+            if after_timeup and not result_seen and time.time() + 1.5 < deadline:
+                _sleep_stop(0.25, stop)
+                continue
             say("とじるをクリックします")
             _slow_tap(close.center().x(), close.center().y())
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue
         if (
-            _in_play_hud(image)
+            not after_timeup
+            and _in_play_hud(image)
             and _play_button(image) is None
             and _match_start_button(image) is None
             and _close_button(image) is None
