@@ -130,6 +130,7 @@ class PlayWorker(QThread):
     preview = Signal(QImage)
     gauges = Signal(object, object, object, object, object, object, object, object, object, object)
     money = Signal(object, object)
+    named_tsums = Signal(str)
     timeup_lamp = Signal(bool)
     skill_lamp = Signal(bool)
     my_lamp = Signal(str)
@@ -165,6 +166,7 @@ class PlayWorker(QThread):
         self._used_gate = Event()
         self._used_answer: str | None = None
         self._used_dedicated = True
+        self._used_named = False
         self.skill_pressed = Event()
         self.timeup_seen = Event()
 
@@ -172,9 +174,12 @@ class PlayWorker(QThread):
         self._kinds_answer = kinds
         self._kinds_gate.set()
 
-    def provide_used_tsum(self, name: str | None, dedicated: bool = True) -> None:
+    def provide_used_tsum(
+        self, name: str | None, dedicated: bool = True, named: bool = False
+    ) -> None:
         self._used_answer = name
         self._used_dedicated = dedicated
+        self._used_named = named
         self._used_gate.set()
 
     def _request_kinds(self) -> int | None:
@@ -213,11 +218,13 @@ class PlayWorker(QThread):
                 request_kinds=self._request_kinds if self._ask_kinds else None,
                 request_used_tsum=self._request_used_tsum,
                 use_dedicated=lambda: self._used_dedicated,
+                use_named=lambda: self._used_named,
                 skill_pressed=self.skill_pressed,
                 timeup_seen=self.timeup_seen,
                 skill_lamp=self.skill_lamp.emit,
                 my_lamp=self.my_lamp.emit,
                 money=self.money.emit,
+                named_line=self.named_tsums.emit,
                 timeup_lamp=self.timeup_lamp.emit,
             )
         except Stopped:
@@ -247,11 +254,13 @@ def run_play(
     request_kinds: Callable[[], int | None] | None = None,
     request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
     use_dedicated: Callable[[], bool] | None = None,
+    use_named: Callable[[], bool] | None = None,
     skill_pressed: Event | None = None,
     timeup_seen: Event | None = None,
     skill_lamp: Callable[[bool], None] | None = None,
     my_lamp: Callable[[str], None] | None = None,
     money: Callable[[object, object], None] | None = None,
+    named_line: Callable[[str], None] | None = None,
     timeup_lamp: Callable[[bool], None] | None = None,
 ) -> None:
     def say(text: str) -> None:
@@ -314,14 +323,16 @@ def run_play(
             used_tsum = confirmed
             tsum_unspecified = False
             say(f"使用ツム {confirmed}")
-            if use_dedicated is not None and not use_dedicated():
+            if use_named is not None and use_named():
+                say("ツム名のモデル")
+            elif use_dedicated is not None and not use_dedicated():
                 say("専用のモデルではない")
         else:
             used_tsum = ""
             tsum_unspecified = True
             say("使用ツム —")
         if loaded_predictor[0] is not None:
-            _apply_used_type_model(loaded_predictor[0], _model_tsum_name(used_tsum, use_dedicated))
+            _apply_type_model(loaded_predictor[0], used_tsum, use_dedicated, use_named)
 
     if start_match:
         _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
@@ -341,7 +352,7 @@ def run_play(
     try:
         predictor, candidates = load_play_tools()
         loaded_predictor[0] = predictor
-        _apply_used_type_model(predictor, _model_tsum_name(used_tsum, use_dedicated))
+        _apply_type_model(predictor, used_tsum, use_dedicated, use_named)
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "画面認識に必要なライブラリがありません。画面認識アプリと同じ Python で起動してください。"
@@ -353,7 +364,42 @@ def run_play(
     if getattr(predictor, "scene_model", None) is None:
         raise RuntimeError("TIME UP のモデルがありません。")
 
+    last_named = ""
+
+    def note_named(found: list) -> None:
+        nonlocal last_named
+        if named_line is None or use_named is None or not use_named():
+            return
+        roster = [
+            str(name).strip()
+            for name in (getattr(predictor, "named_open", []) or [])
+            if str(name).strip()
+        ]
+        if not roster:
+            return
+        shown = "\n".join(roster)
+        if shown == last_named:
+            return
+        last_named = shown
+        named_line(shown)
+
+    def _sync_named() -> None:
+        if use_named is None or not use_named():
+            return
+        setter = getattr(predictor, "prepare_named", None)
+        if setter is None:
+            return
+        if used_items is not None:
+            limit = 4 if "5＞4" in used_items else 5
+        elif kinds_locked:
+            limit = 4 if int(kinds) <= 4 else 5
+        else:
+            limit = 0
+        setter(limit, used_tsum)
+
     def _groups_inner() -> bool:
+        if use_named is not None and use_named():
+            return False
         if use_dedicated is None:
             return True
         return bool(use_dedicated())
@@ -1638,6 +1684,7 @@ def run_play(
     try:
         while True:
             _check_stop(stop)
+            _sync_named()
             coin_now = _watch_digits[0]
             result_now = _watch_digits[1]
             if (coin_now and coin_now != shown_money["coin"]) or (
@@ -1923,6 +1970,7 @@ def run_play(
                     kinds = 4 if used else 5
                     kinds_locked = True
                     say(f"5＞4 {'使用' if used else '未使用'} / 種類 {kinds}")
+            _sync_named()
             if not saw_board:
                 retry = None if image.isNull() else _retry_button(image)
                 if retry is not None and _match_start_button(image) is None:
@@ -2023,6 +2071,7 @@ def run_play(
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
+            note_named(tsums)
             add_idle("pred", time.perf_counter() - t0)
             add_idle("heat", heat_s)
             add_idle("type", type_s)
@@ -2220,6 +2269,7 @@ def run_play(
                                     Path("."), game, rgb=rgb, inner=_groups_inner()
                                 )
                             tsums = [piece for piece in pieces if _is_tsum(piece)]
+                            note_named(tsums)
                             board = pieces
                             pending_used |= used
                             used = set()
@@ -2920,6 +2970,7 @@ def _learn_board(
             rgb=rgb,
             used_tsum=used_tsum,
             used_tsum_id=used_tsum_id,
+            name_tsum=True,
         )
     except Exception:
         learned = False
@@ -4496,6 +4547,23 @@ def _model_tsum_name(name: str, use_dedicated: Callable[[], bool] | None) -> str
     if use_dedicated is not None and not use_dedicated():
         return ""
     return name
+
+
+def _apply_type_model(predictor, name: str, use_dedicated, use_named) -> None:
+    if use_named is not None and use_named():
+        _apply_named_type_model(predictor)
+        return
+    _apply_used_type_model(predictor, _model_tsum_name(name, use_dedicated))
+
+
+def _apply_named_type_model(predictor) -> None:
+    switch = getattr(predictor, "use_named_tsum_model", None)
+    if switch is None:
+        raise RuntimeError("ツム名のモデルを読み込めません。")
+    path = Path(getattr(predictor, "models_dir")) / "named_tsum_test.pt"
+    with _gpu_lock:
+        if not switch(path):
+            raise RuntimeError("ツム名のモデルがありません。")
 
 
 def _apply_used_type_model(predictor, name: str) -> None:

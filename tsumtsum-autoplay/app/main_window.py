@@ -475,6 +475,16 @@ class MainWindow(QMainWindow):
         result_row.addWidget(self._info_result_value)
         result_row.addStretch(1)
         money_col.addLayout(result_row)
+        self._info_named = QLabel("")
+        self._info_named.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self._info_named.setWordWrap(False)
+        named_font = QFont(self._info_result.font())
+        named_size = named_font.pointSize()
+        if named_size > 0:
+            named_font.setPointSize(max(7, named_size - 3))
+        self._info_named.setFont(named_font)
+        self._info_named.hide()
+        money_col.addWidget(self._info_named)
         money_col.addStretch(1)
         info_row.addWidget(self._info_money, 1)
         self._info_count = QFrame()
@@ -590,6 +600,7 @@ class MainWindow(QMainWindow):
         self._want_record = False
         self._selected_used_tsum = ""
         self._use_dedicated_model = True
+        self._use_named_model = False
         self._placed = False
         self._enter_yes = None
         self._key_buttons = None
@@ -909,6 +920,20 @@ class MainWindow(QMainWindow):
         self._info_coin_value.setText(str(coin) if coin else "－")
         self._info_result_value.setText(str(result) if result else "－")
 
+    def _show_named_tsums(self, text: str) -> None:
+        if not self._use_named_model:
+            self._info_named.hide()
+            return
+        lines: list[str] = []
+        for line in str(text or "").replace("、", "\n").splitlines():
+            cleaned = line.strip()
+            if cleaned and cleaned not in lines:
+                lines.append(cleaned)
+        if not lines:
+            return
+        self._info_named.setText("\n".join(lines))
+        self._info_named.show()
+
     def _set_timeup_lamp(self, on: bool) -> None:
         if on:
             self._info_timeup.setStyleSheet("QPushButton { background: red; color: white; }")
@@ -983,9 +1008,12 @@ class MainWindow(QMainWindow):
         crop_h = max(1, int(height * 0.126))
         return QPixmap.fromImage(image.copy(left, top, crop_w, crop_h))
 
-    def _set_model_label(self, name: str | None, dedicated: bool) -> None:
+    def _set_model_label(self, name: str | None, dedicated: bool, named: bool = False) -> None:
         if name is None:
             self._info_model.setText("")
+            return
+        if named:
+            self._info_model.setText("ツム名のモデル")
             return
         shown = " ".join(name.split())
         if dedicated and shown:
@@ -1036,6 +1064,8 @@ class MainWindow(QMainWindow):
             loop = self._loop_play
         self._selected_used_tsum = ""
         self._set_mytsum("")
+        self._info_named.clear()
+        self._info_named.hide()
         self._play = PlayWorker(
             self._stop,
             self,
@@ -1052,6 +1082,7 @@ class MainWindow(QMainWindow):
         self._play.preview.connect(self._debug.set_preview)
         self._play.gauges.connect(self._show_meters)
         self._play.money.connect(self._show_money)
+        self._play.named_tsums.connect(self._show_named_tsums)
         self._play.timeup_lamp.connect(self._set_timeup_lamp)
         self._play.skill_lamp.connect(self._set_skill_lamp)
         self._play.my_lamp.connect(self._set_my_lamp)
@@ -1097,6 +1128,7 @@ class MainWindow(QMainWindow):
             return
         screen = Path(path) if path else None
         self._use_dedicated_model = True
+        self._use_named_model = False
         self._set_model_label(None, True)
         name = self._confirm_used_tsum(guess, screen, pick_only)
         if name is None:
@@ -1104,8 +1136,8 @@ class MainWindow(QMainWindow):
             self.on_stop()
             return
         self._selected_used_tsum = name
-        self._set_model_label(name, self._use_dedicated_model)
-        play.provide_used_tsum(name, self._use_dedicated_model)
+        self._set_model_label(name, self._use_dedicated_model, self._use_named_model)
+        play.provide_used_tsum(name, self._use_dedicated_model, self._use_named_model)
 
     def _confirm_used_tsum(
         self, guess: str, path: Path | None, pick_only: bool = False
@@ -1169,10 +1201,10 @@ class MainWindow(QMainWindow):
             saved = self._save_used_tsum_choice(path, guess, None)
             if saved is None:
                 return None
-            dedicated = self._ask_dedicated_model(saved)
-            if dedicated is None:
+            choice = self._ask_dedicated_model(saved)
+            if choice is None:
                 return None
-            self._use_dedicated_model = dedicated
+            self._use_dedicated_model, self._use_named_model = choice
             return saved
         if result == 2:
             return self._pick_used_tsum(guess, path)
@@ -1182,7 +1214,7 @@ class MainWindow(QMainWindow):
             return ""
         return None
 
-    def _ask_dedicated_model(self, name: str) -> bool | None:
+    def _ask_dedicated_model(self, name: str) -> tuple[bool, bool] | None:
         dialog = QDialog()
         dialog.setWindowTitle("今すぐプレイ")
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -1191,18 +1223,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("どのモデルを使いますか？"))
         buttons = QDialogButtonBox()
         own = buttons.addButton(f"{name} のモデル", QDialogButtonBox.ButtonRole.ActionRole)
+        named = buttons.addButton("ツム名のモデル", QDialogButtonBox.ButtonRole.ActionRole)
         shared = buttons.addButton(
             "専用のモデルではない", QDialogButtonBox.ButtonRole.ActionRole
         )
         cancel = buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
         own.setAutoDefault(False)
+        named.setAutoDefault(False)
         shared.setAutoDefault(False)
         cancel.setAutoDefault(False)
         layout.addWidget(buttons)
         own.clicked.connect(lambda: dialog.done(1))
         shared.clicked.connect(lambda: dialog.done(2))
+        named.clicked.connect(lambda: dialog.done(3))
         buttons.rejected.connect(dialog.reject)
-        self._arm_key_buttons([own, shared, cancel])
+        self._arm_key_buttons([own, named, shared, cancel])
         self._front_timer.stop()
         self._debug.setEnabled(False)
         dialog.show()
@@ -1229,9 +1264,11 @@ class MainWindow(QMainWindow):
             self._debug.setEnabled(True)
             self._front_timer.start()
         if result == 1:
-            return True
+            return True, False
         if result == 2:
-            return False
+            return False, False
+        if result == 3:
+            return False, True
         return None
 
     def _choose_used_tsum(self, path: Path | None) -> str | None:

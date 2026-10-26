@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLayout,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -182,6 +183,18 @@ QPushButton#video {
     font-weight: 600;
 }
 QPushButton#video:hover { background: #4590de; }
+QPushButton#mode:checked {
+    background: #2f7fd1;
+    font-weight: 600;
+}
+QPushButton#mode:checked:hover { background: #4590de; }
+QLineEdit {
+    background: #2a303b;
+    color: #e8eaed;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 10px;
+}
 QCheckBox {
     color: #9aa3b2;
     spacing: 8px;
@@ -795,6 +808,38 @@ class MainWindow(QMainWindow):
         left.setObjectName("sidebar")
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(12, 12, 12, 12)
+        self.name_mode_btn = QPushButton("ツム名を登録")
+        self.name_mode_btn.setCheckable(True)
+        self.name_mode_btn.setObjectName("mode")
+        left_layout.addWidget(self.name_mode_btn)
+        self.name_panel = QWidget()
+        name_layout = QVBoxLayout(self.name_panel)
+        name_layout.setContentsMargins(0, 0, 0, 0)
+        self.name_faces = QWidget()
+        self.name_faces_layout = QGridLayout(self.name_faces)
+        self.name_faces_layout.setContentsMargins(0, 0, 0, 0)
+        self.name_faces_layout.setSpacing(4)
+        self.name_ja = QLineEdit()
+        self.name_ja.setPlaceholderText("日本語")
+        self.name_en = QLineEdit()
+        self.name_en.setPlaceholderText("英語")
+        self.name_save_btn = QPushButton("登録")
+        self.name_saved_list = QListWidget()
+        self.name_saved_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.name_saved_list.setWordWrap(True)
+        self.name_saved_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.name_saved_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.name_saved_list.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.name_state = QLabel("未登録")
+        self.name_state.setWordWrap(True)
+        name_layout.addWidget(self.name_faces)
+        name_layout.addWidget(self.name_state)
+        name_layout.addWidget(self.name_ja)
+        name_layout.addWidget(self.name_en)
+        name_layout.addWidget(self.name_save_btn)
+        name_layout.addWidget(self.name_saved_list, 1)
+        self.name_panel.hide()
+        left_layout.addWidget(self.name_panel)
         self.tsum_select_btn = QPushButton("ツム選択")
         left_layout.addWidget(self.tsum_select_btn)
         self.tsum_pick_row = QWidget()
@@ -1056,6 +1101,9 @@ class MainWindow(QMainWindow):
         self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
         self.list_widget.itemChanged.connect(self.on_list_item_changed)
         self.list_widget.itemDoubleClicked.connect(self._on_file_name_double_clicked)
+        self.name_mode_btn.toggled.connect(self._toggle_name_mode)
+        self.name_save_btn.clicked.connect(self._register_circle_name)
+        self.name_saved_list.itemClicked.connect(self._open_saved_circle_name)
         self.tsum_select_btn.clicked.connect(self.show_tsum_list)
         self.tsum_back_btn.clicked.connect(self._restore_file_list)
         self.tsum_name_list.itemClicked.connect(self.on_tsum_name_clicked)
@@ -1395,13 +1443,18 @@ class MainWindow(QMainWindow):
             name_item = QTableWidgetItem()
             self.list_widget.setItem(row, name_col, name_item)
         name = sample.source_name
+        registered = self._circle_name_text(sample)
         skill_name = self._skill_registered.get(sample.id, "")
+        if registered:
+            name = f"{registered}  {name}"
         if skill_name:
             name = f"SKILL  {skill_name}  {name}"
-        elif skipped:
+        elif skipped and not registered:
             name = f"使わない  {name}"
         name_item.setText(name)
-        if self._file_has_tsum_name(sample.source_name):
+        if registered:
+            name_item.setForeground(QColor("#3DDC97"))
+        elif self._file_has_tsum_name(sample.source_name):
             name_item.setForeground(QColor("#ff5c5c"))
         elif skipped and not skill_name:
             name_item.setForeground(QColor("#7a8190"))
@@ -1624,6 +1677,7 @@ class MainWindow(QMainWindow):
         self._refresh_region_list()
         self._apply_sample_hint(sample)
         self._refresh_group_strip()
+        self._load_circle_name_fields()
         self.update_stats()
 
     def _apply_sample_hint(self, sample: Sample | None = None) -> None:
@@ -2283,6 +2337,7 @@ class MainWindow(QMainWindow):
 
     def on_group_changed(self, value: int) -> None:
         self.canvas.set_piece_group(value)
+        self._load_circle_name_fields()
 
     def trace_chain_candidate(self, index: int) -> None:
         if not self.canvas.start_chain_trace(index):
@@ -2292,6 +2347,7 @@ class MainWindow(QMainWindow):
         self.spin_group.blockSignals(True)
         self.spin_group.setValue(value)
         self.spin_group.blockSignals(False)
+        self._load_circle_name_fields()
 
     def _set_dirty(self, dirty: bool) -> None:
         changed = self._dirty != dirty
@@ -2981,6 +3037,242 @@ class MainWindow(QMainWindow):
             widget.setVisible(visible)
         if visible:
             self.progress.setVisible(False)
+
+    def _toggle_name_mode(self, on: bool) -> None:
+        self.name_mode_btn.setText("今までの画面" if on else "ツム名を登録")
+        self.name_panel.setVisible(on)
+        self.tsum_select_btn.setVisible(not on)
+        if on:
+            self.tsum_pick_row.hide()
+            self.tsum_name_list.hide()
+            self.region_list.hide()
+            self._set_place_tools_visible(False)
+            self._load_circle_name_fields()
+            self._refresh_saved_names()
+            return
+        self.region_list.show()
+        self._set_place_tools_visible(True)
+
+    def _load_circle_name_fields(self) -> None:
+        sample = self.dataset.get(self.current_id) if self.current_id else None
+        saved: dict[str, str] = {}
+        if sample is not None:
+            saved = sample.circle_names.get(str(int(self.spin_group.value()))) or {}
+        self.name_ja.setText(str(saved.get("ja") or ""))
+        self.name_en.setText(str(saved.get("en") or ""))
+        self._show_name_state(sample, int(self.spin_group.value()))
+        self._fill_name_faces(sample, str(int(self.spin_group.value())))
+        if sample is not None:
+            self.canvas.set_circle_names(sample.circle_names)
+
+    def _register_circle_name(self) -> None:
+        sample = self.dataset.get(self.current_id) if self.current_id else None
+        if sample is None:
+            self.statusBar().showMessage("画像がありません", 4000)
+            return
+        group = int(self.spin_group.value())
+        has = any(
+            is_tsum_kind(str(piece.get("kind") or "")) and int(piece.get("group") or 1) == group
+            for piece in self.canvas.all_pieces()
+        )
+        if not has:
+            self.statusBar().showMessage(f"No. {group} の〇がありません", 4000)
+            return
+        ja = self.name_ja.text().strip()
+        en = self.name_en.text().strip()
+        if not ja or not en:
+            self.statusBar().showMessage("日本語と英語を入れてください", 4000)
+            return
+        names = dict(sample.circle_names)
+        names[str(group)] = {"ja": ja, "en": en}
+        sample.circle_names = names
+        self.dataset.save()
+        self.canvas.set_circle_names(sample.circle_names)
+        self._show_name_state(sample, group)
+        self._fill_name_faces(sample, str(group))
+        self._refresh_saved_names()
+        self._restyle_sample_row(sample.id)
+        self.statusBar().showMessage(f"No. {group}  {ja}  {en}", 4000)
+
+    def _show_name_state(self, sample: Sample | None, group: int) -> None:
+        saved: dict[str, str] = {}
+        if sample is not None:
+            saved = sample.circle_names.get(str(group)) or {}
+        ja = str(saved.get("ja") or "").strip()
+        en = str(saved.get("en") or "").strip()
+        if ja or en:
+            self.name_state.setText(f"No.{group}  登録済み  {ja}  {en}".strip())
+            self.name_state.setStyleSheet("color: #3DDC97;")
+            return
+        self.name_state.setText(f"No.{group}  未登録")
+        self.name_state.setStyleSheet("color: #8b93a0;")
+
+    def _sample_board(self, sample: Sample) -> QPixmap | None:
+        if sample.id == self.current_id:
+            pixmap = self.canvas.source_pixmap()
+            if pixmap is not None and not pixmap.isNull():
+                return pixmap
+        pixmap = QPixmap(str(sample.image_path))
+        if pixmap.isNull():
+            return None
+        return pixmap
+
+    def _group_pieces(self, sample: Sample, group: str) -> list[dict]:
+        source = self.canvas.all_pieces() if sample.id == self.current_id else sample.pieces
+        return [
+            piece
+            for piece in source
+            if is_tsum_kind(str(piece.get("kind") or "")) and str(int(piece.get("group") or 1)) == str(group)
+        ]
+
+    def _piece_face(self, pixmap: QPixmap, piece: dict, size: int = 52) -> QPixmap:
+        x, y = int(piece["x"]), int(piece["y"])
+        radius = max(8, int(piece.get("r") or 16))
+        span = max(12, int(round(radius * 1.05)))
+        tile = pixmap.copy(QRect(x - span, y - span, span * 2, span * 2))
+        if tile.isNull():
+            return QPixmap()
+        return tile.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def _clear_grid(self, layout: QGridLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _fill_name_faces(self, sample: Sample | None, group: str) -> None:
+        self._clear_grid(self.name_faces_layout)
+        if sample is None:
+            self.name_faces.hide()
+            return
+        pixmap = self._sample_board(sample)
+        pieces = self._group_pieces(sample, group)
+        if pixmap is None or not pieces:
+            self.name_faces.hide()
+            return
+        for index, piece in enumerate(pieces):
+            face = self._piece_face(pixmap, piece)
+            if face.isNull():
+                continue
+            label = QLabel()
+            label.setPixmap(face)
+            label.setFixedSize(face.size())
+            self.name_faces_layout.addWidget(label, index // 4, index % 4)
+        self.name_faces.setVisible(self.name_faces_layout.count() > 0)
+
+    def _circle_name_text(self, sample: Sample) -> str:
+        names = getattr(sample, "circle_names", None) or {}
+        parts: list[str] = []
+        for key in sorted(names, key=lambda item: int(item) if str(item).isdigit() else 0):
+            value = names[key] or {}
+            ja = str(value.get("ja") or "").strip()
+            en = str(value.get("en") or "").strip()
+            if ja or en:
+                parts.append(f"No.{key} {ja} {en}".strip())
+        return "  ".join(parts)
+
+    def _refresh_saved_names(self) -> None:
+        current = self.current_id
+        current_saved: dict[str, str] = {}
+        if current:
+            current_sample = self.dataset.get(current)
+            if current_sample is not None:
+                current_saved = current_sample.circle_names.get(str(int(self.spin_group.value()))) or {}
+        current_ja = str(current_saved.get("ja") or "").strip()
+        current_en = str(current_saved.get("en") or "").strip()
+        grouped: dict[tuple[str, str], list[tuple[Sample, str]]] = {}
+        for sample in self.dataset.all():
+            names = getattr(sample, "circle_names", None) or {}
+            for key in sorted(names, key=lambda item: int(item) if str(item).isdigit() else 0):
+                value = names[key] or {}
+                ja = str(value.get("ja") or "").strip()
+                en = str(value.get("en") or "").strip()
+                if not ja and not en:
+                    continue
+                grouped.setdefault((ja, en), []).append((sample, str(key)))
+        self.name_saved_list.clear()
+        select = -1
+        for (ja, en), rows in grouped.items():
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(4, 4, 4, 4)
+            row_layout.setSpacing(4)
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setSpacing(4)
+            face_count = 0
+            for sample, key in rows:
+                pixmap = self._sample_board(sample)
+                if pixmap is None:
+                    continue
+                for piece in self._group_pieces(sample, key):
+                    face = self._piece_face(pixmap, piece, 44)
+                    if face.isNull():
+                        continue
+                    label = QLabel()
+                    label.setPixmap(face)
+                    label.setFixedSize(face.size())
+                    grid.addWidget(label, face_count // 4, face_count % 4)
+                    face_count += 1
+            if grid.count():
+                row_layout.addLayout(grid)
+            caption = QLabel(f"{ja}  {en}  {face_count}個".strip())
+            caption.setWordWrap(True)
+            row_layout.addWidget(caption)
+            self._click_through(row)
+            row.adjustSize()
+            face_rows = (face_count + 3) // 4 if face_count else 0
+            height = 8 + face_rows * 48 + caption.sizeHint().height() + 8
+            hint = row.sizeHint()
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, ja)
+            item.setData(Qt.ItemDataRole.UserRole + 1, en)
+            item.setToolTip(f"{ja}  {en}  {face_count}個".strip())
+            item.setSizeHint(QSize(220, max(hint.height(), height)))
+            self.name_saved_list.addItem(item)
+            self.name_saved_list.setItemWidget(item, row)
+            if ja == current_ja and en == current_en and (current_ja or current_en):
+                select = self.name_saved_list.count() - 1
+        if select >= 0:
+            self.name_saved_list.setCurrentRow(select)
+
+    def _click_through(self, widget: QWidget) -> None:
+        widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        for child in widget.findChildren(QWidget):
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def _open_saved_circle_name(self, item: QListWidgetItem) -> None:
+        ja = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        en = str(item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
+        if not ja or not en:
+            return
+        self.name_ja.setText(ja)
+        self.name_en.setText(en)
+
+    def _restyle_sample_row(self, sample_id: str) -> None:
+        sample = self.dataset.get(sample_id)
+        if sample is None:
+            return
+        for row in range(self.list_widget.rowCount()):
+            item = self.list_widget.item(row, 0)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == sample_id:
+                self._style_list_row(row, sample)
+                return
+
+    def _select_sample_row(self, sample_id: str) -> None:
+        for row in range(self.list_widget.rowCount()):
+            item = self.list_widget.item(row, 0)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == sample_id:
+                self.list_widget.setCurrentCell(row, 0)
+                self.list_widget.scrollToItem(item)
+                return
+        self.show_sample(sample_id)
 
     def show_tsum_list(self) -> None:
         if self.tsum_name_list.isVisible():

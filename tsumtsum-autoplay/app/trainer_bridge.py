@@ -251,6 +251,7 @@ def save_play_board(
     rgb=None,
     used_tsum: str = "",
     used_tsum_id: str = "",
+    name_tsum: bool = False,
 ) -> bool:
     hud = _hud_boxes(boxes, HUD_KEYS)
     if game is not None and "game" not in hud:
@@ -284,6 +285,7 @@ def save_play_board(
             "pieces": kept,
             "used_tsum": str(used_tsum or ""),
             "used_tsum_id": str(used_tsum_id or ""),
+            "name_tsum": bool(name_tsum),
         }
     )
     return True
@@ -307,6 +309,14 @@ def _board_save_loop() -> None:
             _write_play_board(job)
         except Exception:
             pass
+
+
+def _source_name_with_tsum(source_name: str, token: str) -> str:
+    text = source_name or "image.png"
+    prefix = f"{token}_"
+    if text.casefold().startswith(prefix.casefold()):
+        return text
+    return prefix + text
 
 
 def _write_play_board(job: dict) -> None:
@@ -338,6 +348,10 @@ def _write_play_board(job: dict) -> None:
     if sample is not None:
         sample.used_tsum = str(job.get("used_tsum") or "")
         sample.used_tsum_id = str(job.get("used_tsum_id") or "")
+        if job.get("name_tsum"):
+            token = sample.used_tsum_id or sample.used_tsum
+            if token:
+                sample.source_name = _source_name_with_tsum(sample.source_name, token)
         sample.status = "predicted"
         sample.confirmed = []
         dataset.save()

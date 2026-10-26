@@ -99,6 +99,7 @@ class ImageCanvas(QGraphicsView):
         self._run_lines: list[dict] = []
         self._run_active = False
         self._guide_hidden = False
+        self._circle_names: dict[str, dict[str, str]] = {}
 
         self._guide = QLabel(self)
         self._guide.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -204,6 +205,18 @@ class ImageCanvas(QGraphicsView):
 
     def all_pieces(self) -> list[dict[str, int]]:
         return [dict(piece) for piece in self._pieces]
+
+    def set_circle_names(self, names: dict | None) -> None:
+        cleaned: dict[str, dict[str, str]] = {}
+        for key, value in (names or {}).items():
+            if not isinstance(value, dict):
+                continue
+            cleaned[str(key)] = {
+                "ja": str(value.get("ja") or ""),
+                "en": str(value.get("en") or ""),
+            }
+        self._circle_names = cleaned
+        self.viewport().update()
 
     def source_pixmap(self) -> QPixmap | None:
         if self._pixmap_item is None:
@@ -576,6 +589,28 @@ class ImageCanvas(QGraphicsView):
             painter.drawRoundedRect(badge, 4, 4)
             painter.setPen(accent)
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
+            if is_tsum_kind(kind):
+                shown = str(
+                    (self._circle_names.get(str(int(piece.get("group") or 1))) or {}).get("ja") or ""
+                ).strip()
+                if shown:
+                    name_font = QFont("Yu Gothic UI", 8, QFont.Weight.Bold)
+                    painter.setFont(name_font)
+                    name_metrics = painter.fontMetrics()
+                    name_w = name_metrics.horizontalAdvance(shown) + 8
+                    name_h = name_metrics.height() + 2
+                    name_badge = QRect(
+                        int(center.x() - name_w / 2),
+                        int(center.y() + radius + 2),
+                        name_w,
+                        name_h,
+                    )
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(12, 16, 20, 220))
+                    painter.drawRoundedRect(name_badge, 4, 4)
+                    painter.setPen(QColor("white"))
+                    painter.drawText(name_badge, Qt.AlignmentFlag.AlignCenter, shown)
+                    painter.setFont(font)
         self._draw_piece_guide(painter)
         self._draw_chain_trace(painter)
 

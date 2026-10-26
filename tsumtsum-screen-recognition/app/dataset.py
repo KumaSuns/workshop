@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,7 @@ class Sample:
     status: str  # unlabeled | predicted | labeled | skipped
     used_tsum: str = ""
     used_tsum_id: str = ""
+    circle_names: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def image_path(self) -> Path:
@@ -52,6 +53,7 @@ class Sample:
             "status": self.status,
             "used_tsum": self.used_tsum,
             "used_tsum_id": self.used_tsum_id,
+            "circle_names": self.circle_names,
         }
 
     @classmethod
@@ -85,7 +87,23 @@ class Sample:
             status=status,
             used_tsum=str(data.get("used_tsum") or ""),
             used_tsum_id=str(data.get("used_tsum_id") or ""),
+            circle_names=_circle_names(data.get("circle_names")),
         )
+
+
+def _circle_names(raw: Any) -> dict[str, dict[str, str]]:
+    if not isinstance(raw, dict):
+        return {}
+    names: dict[str, dict[str, str]] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        ja = str(value.get("ja") or "").strip()
+        en = str(value.get("en") or "").strip()
+        if not ja and not en:
+            continue
+        names[str(key)] = {"ja": ja, "en": en}
+    return names
 
 
 class Dataset:

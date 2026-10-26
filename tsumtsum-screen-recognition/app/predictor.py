@@ -49,6 +49,12 @@ class Predictor:
         self.models: dict[str, GameRegionNet] = {}
         self.piece_model: PieceNet | None = None
         self.type_model: TsumTypeNet | None = None
+        self.named_prototypes = None
+        self.named_names: list[str] | None = None
+        self.named_match: dict[str, str] = {}
+        self.named_open: list[str] = []
+        self.named_limit = 0
+        self.named_pin = ""
         self.digit_models: dict[str, CoinDigitNet] = {}
         self.scene_model: SceneNet | None = None
         self.scene_classes: tuple[str, ...] = SCENE_CLASSES
@@ -96,6 +102,12 @@ class Predictor:
         self.models = {}
         self.piece_model = None
         self.type_model = None
+        self.named_prototypes = None
+        self.named_names = None
+        self.named_match = {}
+        self.named_open = []
+        self.named_limit = 0
+        self.named_pin = ""
         self.digit_models = {}
         self.scene_model = None
         if self.device.type == "cuda":
@@ -151,6 +163,12 @@ class Predictor:
         return True
 
     def use_used_tsum_model(self, folder: str) -> None:
+        self.named_prototypes = None
+        self.named_names = None
+        self.named_match = {}
+        self.named_open = []
+        self.named_limit = 0
+        self.named_pin = ""
         folder = str(folder or "")
         if folder == getattr(self, "_piece_type_folder", None) and self.piece_model is not None:
             return
@@ -182,6 +200,54 @@ class Predictor:
         self.type_model = model
         return True
 
+    def use_named_tsum_model(self, path: Path) -> bool:
+        path = Path(path)
+        if not path.is_file():
+            return False
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        if not isinstance(checkpoint, dict):
+            return False
+        state = checkpoint.get("state_dict")
+        prototypes = checkpoint.get("prototypes")
+        if not isinstance(state, dict) or prototypes is None:
+            return False
+        model = TsumTypeNet(pretrained=False)
+        try:
+            model.load_state_dict(state)
+        except Exception:
+            return False
+        model.to(self.device)
+        model.eval()
+        proto = torch.nn.functional.normalize(prototypes.float().to(self.device), dim=1)
+        raw_names = checkpoint.get("names")
+        if proto.ndim != 2 or proto.size(0) < 1 or not isinstance(raw_names, list):
+            return False
+        if len(raw_names) != int(proto.size(0)):
+            return False
+        ja_names: list[str] = []
+        match: dict[str, str] = {}
+        for item in raw_names:
+            if isinstance(item, dict):
+                ja = str(item.get("ja") or "").strip()
+                en = str(item.get("en") or "").strip()
+            else:
+                ja = ""
+                en = ""
+            ja_names.append(ja)
+            if ja:
+                match[ja.casefold()] = ja
+            if en:
+                match[en.casefold()] = ja
+        self.type_model = model
+        self.named_prototypes = proto
+        self.named_names = ja_names
+        self.named_match = match
+        self.named_open = []
+        self.named_limit = 0
+        self.named_pin = ""
+        self._piece_type_folder = None
+        return True
+
     def reload(self, pump=None, device: str | None = None) -> bool:
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -190,6 +256,12 @@ class Predictor:
         self.models = {}
         self.piece_model = None
         self.type_model = None
+        self.named_prototypes = None
+        self.named_names = None
+        self.named_match = {}
+        self.named_open = []
+        self.named_limit = 0
+        self.named_pin = ""
         self.digit_models = {}
         self.scene_model = None
         self.scene_classes = SCENE_CLASSES
@@ -499,6 +571,9 @@ class Predictor:
                 tsums.append(piece)
         if not tsums:
             return
+        if self.named_prototypes is not None:
+            self._assign_named_groups(image, tsums)
+            return
         colors: list[tuple[float, ...]] | None = None
         cosine = False
         points: list[tuple[float, ...]]
@@ -550,6 +625,99 @@ class Predictor:
         if cosine:
             for piece, point in zip(tsums, points):
                 piece["_vec"] = tuple(point)
+
+    def prepare_named(self, limit: int, used: str) -> None:
+        if self.named_names is None:
+            return
+        self.named_limit = 4 if int(limit) == 4 else (5 if int(limit) == 5 else 0)
+        pin = self.named_pin_for(used)
+        self.named_pin = pin
+        if pin and pin not in self.named_open:
+            self.named_open.insert(0, pin)
+
+    def named_pin_for(self, used: str) -> str:
+        key = " ".join((used or "").split()).casefold()
+        if not key:
+            return ""
+        return self.named_match.get(key, "")
+
+    def _named_index(self, name: str) -> int:
+        names = self.named_names or []
+        if name not in names:
+            return -1
+        return names.index(name)
+
+    def _nearest_names(self, embed: torch.Tensor, indices: list[int]) -> list[int]:
+        proto = self.named_prototypes
+        if proto is None or not indices:
+            return [0] * int(embed.size(0))
+        if len(indices) == 1:
+            return indices * int(embed.size(0))
+        choice = torch.tensor(indices, device=proto.device, dtype=torch.long)
+        picked = torch.argmax(embed @ proto.index_select(0, choice).T, dim=1).tolist()
+        return [indices[int(item)] for item in picked]
+
+    def _assign_named_groups(self, image: Image.Image, tsums: list[dict[str, int]]) -> None:
+        proto = self.named_prototypes
+        names = self.named_names
+        if proto is None or not names:
+            return
+        points = self._tsum_embeddings(image, tsums)
+        embed = torch.nn.functional.normalize(
+            torch.tensor(points, dtype=torch.float32, device=proto.device),
+            dim=1,
+        )
+        limit = int(self.named_limit or 0)
+        open_names = self.named_open
+        open_index = [self._named_index(name) for name in open_names]
+        open_index = [index for index in open_index if index >= 0]
+        if limit and len(open_names) >= limit and open_index:
+            labels = self._nearest_names(embed, open_index)
+        else:
+            labels = self._nearest_names(embed, list(range(len(names))))
+            if limit:
+                counts: dict[int, int] = {}
+                for label in labels:
+                    counts[label] = counts.get(int(label), 0) + 1
+                ranked = sorted(counts, key=lambda label: (-counts[label], label))
+                for label in ranked:
+                    name = names[label] if 0 <= label < len(names) else ""
+                    if not name or name in open_names:
+                        continue
+                    if len(open_names) >= limit:
+                        break
+                    open_names.append(name)
+                open_index = [self._named_index(name) for name in open_names]
+                open_index = [index for index in open_index if index >= 0]
+                if len(open_names) >= limit and open_index:
+                    labels = self._nearest_names(embed, open_index)
+        for piece, label, point in zip(tsums, labels, points):
+            index = int(label)
+            piece["group"] = index + 1
+            piece["tsum_name"] = names[index] if 0 <= index < len(names) else ""
+            piece["_vec"] = tuple(point)
+
+    def named_board_line(self, tsums: list[dict]) -> str:
+        names = self.named_names
+        if not names or self.named_prototypes is None:
+            return ""
+        counts: dict[str, int] = {}
+        first: dict[str, int] = {}
+        for piece in tsums:
+            name = str(piece.get("tsum_name") or "").strip()
+            if not name:
+                group = int(piece.get("group") or 0) - 1
+                if group < 0 or group >= len(names):
+                    continue
+                name = names[group]
+            if not name:
+                continue
+            if name not in counts:
+                first[name] = len(first)
+                counts[name] = 0
+            counts[name] += 1
+        ordered = sorted(counts, key=lambda name: (-counts[name], first[name]))
+        return "、".join(ordered)
 
     def _cluster_sizes(self, labels: list[int]) -> list[int]:
         counts: dict[int, int] = {}
