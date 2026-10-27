@@ -395,7 +395,13 @@ def run_play(
             limit = 4 if int(kinds) <= 4 else 5
         else:
             limit = 0
-        setter(limit, used_tsum)
+        roster = None
+        join = None
+        if skill_is_nightmare(used_tsum):
+            roster = ["サリー", "ジャックN", "ゼロ", "パンプキンキング", "ブギー", "メイヤー"]
+            join = ["ジャックN", "ゼロ"]
+            limit = len(roster)
+        setter(limit, used_tsum, roster, join)
 
     def _groups_inner() -> bool:
         if use_named is not None and use_named():
@@ -1078,24 +1084,7 @@ def run_play(
     def emit_gauges(_skill_fill: float | None) -> None:
         take_fever()
 
-    def _nightmare_chain_n() -> int:
-        if used_items and "+Bomb" in used_items:
-            return 9
-        return 10
-
     def _chain_pref(chain: list[dict[str, int]]) -> tuple:
-        if skill_is_nightmare(used_tsum):
-            aim = _nightmare_chain_n()
-            n = len(chain)
-            if n == aim:
-                band = 3
-            elif n == aim + 1:
-                band = 2
-            elif n == aim - 1:
-                band = 1
-            else:
-                band = 0
-            return (band, -abs(n - aim))
         return (
             my_group > 0 and int(chain[0].get("group") or 0) == my_group,
             len(chain),
@@ -1134,15 +1123,6 @@ def run_play(
                 if len(part) >= MIN_CHAIN
             ]
         found = [item for item in raw if not _chain_too_similar(item, blocked)]
-        if skill_is_nightmare(used_tsum):
-            aim = _nightmare_chain_n()
-            trimmed = []
-            for item in found:
-                if len(item) >= aim + 2:
-                    item = item[:aim]
-                if len(item) >= MIN_CHAIN:
-                    trimmed.append(item)
-            found = trimmed
         if extra:
             extra_keys = set(extra)
             found = [item for item in found if _chain_key(item) not in extra_keys]
@@ -1939,12 +1919,8 @@ def run_play(
                     show_used(replay_items)
                 say("プレイを開始します")
                 continue
-            if (
-                saw_board
-                and skill_is_nightmare(used_tsum)
-                and nightmare_dice_step(image, rgb, nightmare_dice, say, stop, watch_hit)
-            ):
-                continue
+            if saw_board and skill_is_nightmare(used_tsum):
+                nightmare_dice_step(image, rgb, nightmare_dice, say, stop, watch_hit)
             _check_stop(stop)
             if not saw_board:
                 start = _match_start_button(image)
@@ -2289,8 +2265,6 @@ def run_play(
                             if not queue:
                                 break
                             continue
-                        if _nightmare_live_dice():
-                            break
                         chain = queue.pop(0)
                         spots = {(int(piece["x"]), int(piece["y"])) for piece in chain}
                         if spots & used:

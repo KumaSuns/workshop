@@ -54,6 +54,8 @@ class Predictor:
         self.named_match: dict[str, str] = {}
         self.named_open: list[str] = []
         self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
         self.named_pin = ""
         self.digit_models: dict[str, CoinDigitNet] = {}
         self.scene_model: SceneNet | None = None
@@ -107,6 +109,8 @@ class Predictor:
         self.named_match = {}
         self.named_open = []
         self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
         self.named_pin = ""
         self.digit_models = {}
         self.scene_model = None
@@ -168,6 +172,8 @@ class Predictor:
         self.named_match = {}
         self.named_open = []
         self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
         self.named_pin = ""
         folder = str(folder or "")
         if folder == getattr(self, "_piece_type_folder", None) and self.piece_model is not None:
@@ -244,6 +250,8 @@ class Predictor:
         self.named_match = match
         self.named_open = []
         self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
         self.named_pin = ""
         self._piece_type_folder = None
         return True
@@ -261,6 +269,8 @@ class Predictor:
         self.named_match = {}
         self.named_open = []
         self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
         self.named_pin = ""
         self.digit_models = {}
         self.scene_model = None
@@ -626,9 +636,34 @@ class Predictor:
             for piece, point in zip(tsums, points):
                 piece["_vec"] = tuple(point)
 
-    def prepare_named(self, limit: int, used: str) -> None:
+    def prepare_named(
+        self,
+        limit: int,
+        used: str,
+        roster: list[str] | None = None,
+        join: list[str] | None = None,
+    ) -> None:
         if self.named_names is None:
             return
+        if roster:
+            picked: list[str] = []
+            for name in roster:
+                cleaned = str(name).strip()
+                if cleaned and self._named_index(cleaned) >= 0 and cleaned not in picked:
+                    picked.append(cleaned)
+            joined: list[str] = []
+            for name in join or []:
+                cleaned = str(name).strip()
+                if cleaned and cleaned in picked and cleaned not in joined:
+                    joined.append(cleaned)
+            self.named_open = picked
+            self.named_limit = len(picked)
+            self.named_fixed = bool(picked)
+            self.named_join = joined
+            self.named_pin = ""
+            return
+        self.named_fixed = False
+        self.named_join = []
         self.named_limit = 4 if int(limit) == 4 else (5 if int(limit) == 5 else 0)
         pin = self.named_pin_for(used)
         self.named_pin = pin
@@ -671,30 +706,34 @@ class Predictor:
         open_names = self.named_open
         open_index = [self._named_index(name) for name in open_names]
         open_index = [index for index in open_index if index >= 0]
-        if limit and len(open_names) >= limit and open_index:
+        if self.named_fixed and open_index:
             labels = self._nearest_names(embed, open_index)
         else:
             labels = self._nearest_names(embed, list(range(len(names))))
-            if limit:
-                counts: dict[int, int] = {}
-                for label in labels:
-                    counts[label] = counts.get(int(label), 0) + 1
-                ranked = sorted(counts, key=lambda label: (-counts[label], label))
-                for label in ranked:
-                    name = names[label] if 0 <= label < len(names) else ""
-                    if not name or name in open_names:
-                        continue
-                    if len(open_names) >= limit:
-                        break
-                    open_names.append(name)
-                open_index = [self._named_index(name) for name in open_names]
-                open_index = [index for index in open_index if index >= 0]
-                if len(open_names) >= limit and open_index:
-                    labels = self._nearest_names(embed, open_index)
+        if not self.named_fixed and limit and len(open_names) < limit:
+            counts: dict[int, int] = {}
+            for label in labels:
+                counts[label] = counts.get(int(label), 0) + 1
+            ranked = sorted(counts, key=lambda label: (-counts[label], label))
+            for label in ranked:
+                name = names[label] if 0 <= label < len(names) else ""
+                if not name or name in open_names:
+                    continue
+                if len(open_names) >= limit:
+                    break
+                open_names.append(name)
+        join_at = -1
+        if self.named_fixed and len(self.named_join) >= 2:
+            joined = [self._named_index(name) for name in self.named_join]
+            joined = [index for index in joined if index >= 0]
+            if len(joined) >= 2:
+                join_at = joined[0]
         for piece, label, point in zip(tsums, labels, points):
             index = int(label)
-            piece["group"] = index + 1
             piece["tsum_name"] = names[index] if 0 <= index < len(names) else ""
+            if join_at >= 0 and index in joined:
+                index = join_at
+            piece["group"] = index + 1
             piece["_vec"] = tuple(point)
 
     def named_board_line(self, tsums: list[dict]) -> str:
