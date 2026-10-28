@@ -490,7 +490,17 @@ class MenuWindow(QMainWindow):
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
         )
         self._used_tsum_icon.setFixedHeight(0)
-        above.addWidget(self._used_tsum_icon, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._used_tsum_frame = QFrame()
+        self._used_tsum_frame.setFrameShape(QFrame.Shape.Box)
+        self._used_tsum_frame.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        icon_box = QVBoxLayout(self._used_tsum_frame)
+        icon_box.setContentsMargins(0, 0, 0, 0)
+        icon_box.setSpacing(0)
+        icon_box.addWidget(self._used_tsum_icon, 0, Qt.AlignmentFlag.AlignCenter)
+        above.addWidget(self._used_tsum_frame, 0, Qt.AlignmentFlag.AlignHCenter)
+        above.addSpacing(3)
         self._used_tsum_label = QLabel("")
         self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         above.addWidget(self._used_tsum_label)
@@ -1398,24 +1408,30 @@ class MenuWindow(QMainWindow):
 
     def _show_used_tsum_icon(self, name: str) -> None:
         label = self._used_tsum_icon
-        if label is None:
+        frame = getattr(self, "_used_tsum_frame", None)
+        if label is None or frame is None:
             return
         limit_w, limit_h = self._used_tsum_icon_limit()
+        if limit_w > 1 and limit_h > 1:
+            frame.setFixedSize(limit_w, limit_h)
+        border = frame.frameWidth() * 2
+        inner_w = max(0, limit_w - border)
+        inner_h = max(0, limit_h - border)
         path = _used_tsum_icon_file(name) if name else None
         pixmap = QPixmap(str(path)) if path is not None else QPixmap()
-        if pixmap.isNull() or limit_w < 1 or limit_h < 1:
+        if pixmap.isNull() or inner_w < 1 or inner_h < 1:
             label.clear()
-            label.setFixedSize(0, 0)
+            label.setFixedSize(inner_w, inner_h)
             return
-        if pixmap.width() != limit_w or pixmap.height() != limit_h:
+        if pixmap.width() != inner_w or pixmap.height() != inner_h:
             pixmap = pixmap.scaled(
-                limit_w,
-                limit_h,
+                inner_w,
+                inner_h,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
         label.setPixmap(pixmap)
-        label.setFixedSize(limit_w, limit_h)
+        label.setFixedSize(pixmap.width(), pixmap.height())
 
     def _fit_used_tsum_icon(self) -> None:
         self._show_used_tsum_icon(self._used_tsum_name)
@@ -1555,10 +1571,8 @@ class MenuWindow(QMainWindow):
         if rect.width() <= 1 or count < 1:
             return
         side = rect.width() * 64 // (count * 64 + (count - 1) * 4)
+        side = side * 3 // 4
         gap = max(0, round(side * 4 / 64)) if side > 0 else 0
-        while side > 1 and count * side + (count - 1) * gap > rect.width():
-            side -= 1
-            gap = max(0, round(side * 4 / 64))
         if side < 1:
             return
         for row in self._item_rows:
