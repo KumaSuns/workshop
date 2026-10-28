@@ -387,20 +387,6 @@ def run_play(
             tsum_unspecified = True
             say("使用ツム —")
 
-    if start_match:
-        _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
-            say, stop, tap_start=False
-        )
-        if seen_tsum:
-            used_tsum = seen_tsum
-        if arrived in ("start", "continue"):
-            ask_used_now(arrived == "start")
-        if arrived in ("start", "continue") and request_kinds is not None:
-            asked = request_kinds()
-            if asked is None:
-                raise Stopped()
-            kind_count = asked
-
     say("モデルを読み込み中")
     tried_libs = False
     while True:
@@ -429,6 +415,20 @@ def run_play(
         raise RuntimeError("ツム種類のモデルがありません。画面認識アプリで学習してください。")
     if getattr(predictor, "scene_model", None) is None:
         raise RuntimeError("TIME UP のモデルがありません。")
+
+    if start_match:
+        _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
+            say, stop, tap_start=False
+        )
+        if seen_tsum:
+            used_tsum = seen_tsum
+        if arrived in ("start", "continue"):
+            ask_used_now(arrived == "start")
+        if arrived in ("start", "continue") and request_kinds is not None:
+            asked = request_kinds()
+            if asked is None:
+                raise Stopped()
+            kind_count = asked
 
     say("プレイを開始します")
     say(f"予測デバイス {predictor.device}")
@@ -1634,6 +1634,19 @@ def run_play(
             limit = len(roster)
         setter(limit, used_tsum, roster, join)
 
+    def _model_ready() -> bool:
+        if getattr(predictor, "piece_model", None) is None:
+            return False
+        if getattr(predictor, "scene_model", None) is None:
+            return False
+        if not use_named:
+            return getattr(predictor, "type_model", None) is not None
+        if getattr(predictor, "named_prototypes", None) is None:
+            return False
+        if getattr(predictor, "named_fixed", False):
+            return bool(getattr(predictor, "named_open", None))
+        return int(getattr(predictor, "named_limit", 0) or 0) in (4, 5)
+
     next_frame = None
     try:
         while True:
@@ -1887,6 +1900,10 @@ def run_play(
                         if found_items:
                             say("アイテム " + "、".join(used_items))
                     _sync_named()
+                    if not _model_ready():
+                        say("モデルを準備しています")
+                        _sleep_stop(0.4, stop)
+                        continue
                     _say_heart_mail(say, rgb or image)
                     say("スタートをクリックします")
                     _slow_tap(start.center().x(), start.center().y())
@@ -1956,6 +1973,12 @@ def run_play(
                             go_at = time.time()
                         resumed_pause = True
                         continue
+                    if _match_start_button(image) is not None:
+                        _sync_named()
+                        if not _model_ready():
+                            say("モデルを準備しています")
+                            _sleep_stop(0.4, stop)
+                            continue
                     if _tap_start_or_continue(image, say, stop):
                         continue
                 play = None if image.isNull() else _home_play_button(image)
