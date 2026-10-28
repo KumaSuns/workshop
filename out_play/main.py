@@ -1565,10 +1565,10 @@ class MenuWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         column.addWidget(title)
         bar = QFrame()
-        bar.setFixedHeight(3)
-        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        bar.setFixedSize(QFontMetrics(title_font).horizontalAdvance(text), 3)
+        bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         bar.setStyleSheet("background-color: #2c4a7a; border: none;")
-        column.addWidget(bar)
+        column.addWidget(bar, 0, Qt.AlignmentFlag.AlignHCenter)
         return wrap
 
     def _fit_items(self) -> None:
