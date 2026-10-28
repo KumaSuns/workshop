@@ -1400,16 +1400,14 @@ class MenuWindow(QMainWindow):
         label = self._used_tsum_icon
         if label is None:
             return
+        limit_w, limit_h = self._used_tsum_icon_limit()
         path = _used_tsum_icon_file(name) if name else None
         pixmap = QPixmap(str(path)) if path is not None else QPixmap()
-        if pixmap.isNull():
+        if pixmap.isNull() or limit_w < 1 or limit_h < 1:
             label.clear()
-            label.setFixedHeight(0)
+            label.setFixedSize(0, 0)
             return
-        limit_w, limit_h = self._used_tsum_icon_limit()
-        if limit_w > 1 and limit_h > 1 and (
-            pixmap.width() > limit_w or pixmap.height() > limit_h
-        ):
+        if pixmap.width() != limit_w or pixmap.height() != limit_h:
             pixmap = pixmap.scaled(
                 limit_w,
                 limit_h,
@@ -1417,7 +1415,7 @@ class MenuWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         label.setPixmap(pixmap)
-        label.setFixedHeight(pixmap.height())
+        label.setFixedSize(limit_w, limit_h)
 
     def _fit_used_tsum_icon(self) -> None:
         self._show_used_tsum_icon(self._used_tsum_name)
@@ -1429,11 +1427,22 @@ class MenuWindow(QMainWindow):
         width = box.contentsRect().width()
         if width <= 1 and self._model_box is not None:
             width = self._model_box.contentsRect().width()
-        count = max(1, len(ITEM_ICONS))
-        side = width * 64 // (count * 64 + (count - 1) * 4)
+        side = self._icon_side(width)
         if side < 1:
             return 0, 0
         return side, side
+
+    def _icon_side(self, width: int) -> int:
+        title_font = self.font()
+        title_font.setBold(True)
+        title_font.setPointSize(TITLE_POINT)
+        side = QFontMetrics(title_font).height()
+        count = max(1, len(ITEM_ICONS))
+        gap = max(0, round(side * 4 / 64))
+        while side > 1 and count * side + (count - 1) * gap > width:
+            side -= 1
+            gap = max(0, round(side * 4 / 64))
+        return side
 
     def _save_used_tsum_choice(
         self, path: Path | None, name: str, folder_id: str | None
@@ -1557,13 +1566,10 @@ class MenuWindow(QMainWindow):
         count = len(self._item_labels)
         if rect.width() <= 1 or count < 1:
             return
-        side = rect.width() * 64 // (count * 64 + (count - 1) * 4)
-        gap = max(0, round(side * 4 / 64)) if side > 0 else 0
-        while side > 1 and count * side + (count - 1) * gap > rect.width():
-            side -= 1
-            gap = max(0, round(side * 4 / 64))
+        side = self._icon_side(rect.width())
         if side < 1:
             return
+        gap = max(0, round(side * 4 / 64))
         for row in self._item_rows:
             row.setSpacing(gap)
         if self._item_block is not None:
