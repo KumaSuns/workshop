@@ -1634,19 +1634,6 @@ def run_play(
             limit = len(roster)
         setter(limit, used_tsum, roster, join)
 
-    def _model_ready() -> bool:
-        if getattr(predictor, "piece_model", None) is None:
-            return False
-        if getattr(predictor, "scene_model", None) is None:
-            return False
-        if not use_named:
-            return getattr(predictor, "type_model", None) is not None
-        if getattr(predictor, "named_prototypes", None) is None:
-            return False
-        if getattr(predictor, "named_fixed", False):
-            return bool(getattr(predictor, "named_open", None))
-        return int(getattr(predictor, "named_limit", 0) or 0) in (4, 5)
-
     next_frame = None
     try:
         while True:
@@ -1889,7 +1876,9 @@ def run_play(
                     return
                 start = _match_start_button(image)
                 if start is not None:
-                    ask_used_now(True)
+                    if not tsum_asked:
+                        ask_used_now(True)
+                        continue
                     if _start_hearts(image) == 0:
                         _wait_for_heart(say, stop)
                         continue
@@ -1900,10 +1889,6 @@ def run_play(
                         if found_items:
                             say("アイテム " + "、".join(used_items))
                     _sync_named()
-                    if not _model_ready():
-                        say("モデルを準備しています")
-                        _sleep_stop(0.4, stop)
-                        continue
                     _say_heart_mail(say, rgb or image)
                     say("スタートをクリックします")
                     _slow_tap(start.center().x(), start.center().y())
@@ -1956,8 +1941,9 @@ def run_play(
                         used_items = found_items
                         show_used(found_items)
                 if time.time() >= ignore_start_until:
-                    if _match_start_button(image) is not None:
+                    if _match_start_button(image) is not None and not tsum_asked:
                         ask_used_now(True)
+                        continue
                     if _match_start_button(image) is not None and _start_hearts(image) == 0:
                         _wait_for_heart(say, stop)
                         continue
@@ -1975,10 +1961,6 @@ def run_play(
                         continue
                     if _match_start_button(image) is not None:
                         _sync_named()
-                        if not _model_ready():
-                            say("モデルを準備しています")
-                            _sleep_stop(0.4, stop)
-                            continue
                     if _tap_start_or_continue(image, say, stop):
                         continue
                 play = None if image.isNull() else _home_play_button(image)
