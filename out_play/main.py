@@ -387,6 +387,12 @@ class MenuWindow(QMainWindow):
             mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
             mark.setFont(mark_font)
             left.addWidget(mark)
+        self._add_used_sections(left)
+        left.addWidget(self._section_title("プレイ回数"))
+        self._play_count_label = QLabel("0")
+        self._play_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._play_count_label.setFont(mark_font)
+        left.addWidget(self._play_count_label)
         left.addStretch(1)
         self._model_differs: dict[str, bool] = {}
         self._model_fetch = None
@@ -437,29 +443,16 @@ class MenuWindow(QMainWindow):
             return
         button.setFixedWidth(width)
 
-    def _fill_items(self, slot: QFrame) -> None:
-        column = QVBoxLayout(slot)
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(0)
-        frames = QHBoxLayout()
-        frames.setContentsMargins(0, 0, 0, 0)
-        frames.setSpacing(0)
-        stack_host = QWidget()
-        stack = QVBoxLayout(stack_host)
-        stack.setContentsMargins(0, 0, 0, 0)
-        stack.setSpacing(0)
+    def _add_used_sections(self, left: QVBoxLayout) -> None:
         tsum_box = QFrame()
         tsum_box.setFrameShape(QFrame.Shape.Box)
+        tsum_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self._tsum_box = tsum_box
         self._item_box = QFrame()
         self._item_box.setFrameShape(QFrame.Shape.Box)
-        stack.addWidget(tsum_box, 1)
-        stack.addWidget(self._item_box, 1)
-        frames.addWidget(stack_host, 1)
-        right_box = QFrame()
-        right_box.setFrameShape(QFrame.Shape.Box)
-        frames.addWidget(right_box, 1)
-        column.addLayout(frames, 1)
+        self._item_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        left.addWidget(tsum_box)
+        left.addWidget(self._item_box)
         inner = QVBoxLayout(self._item_box)
         inner.setContentsMargins(0, 0, 0, 0)
         inner.setSpacing(0)
@@ -485,7 +478,6 @@ class MenuWindow(QMainWindow):
                 row.addWidget(label)
             block_layout.addLayout(row)
         inner.addWidget(block, 0, Qt.AlignmentFlag.AlignHCenter)
-        inner.addStretch(1)
         above = QVBoxLayout(tsum_box)
         above.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         above.setSpacing(0)
@@ -501,7 +493,14 @@ class MenuWindow(QMainWindow):
         self._used_tsum_label = QLabel("")
         self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         above.addWidget(self._used_tsum_label)
-        above.addStretch(1)
+
+    def _fill_items(self, slot: QFrame) -> None:
+        column = QVBoxLayout(slot)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        right_box = QFrame()
+        right_box.setFrameShape(QFrame.Shape.Box)
+        column.addWidget(right_box, 1)
         right = QVBoxLayout(right_box)
         right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         right.setSpacing(0)
@@ -827,12 +826,20 @@ class MenuWindow(QMainWindow):
                 for label, (text, _right) in zip(labels, parts):
                     label.setText(text)
             self._align_game_records()
+            self._show_play_count()
             return
         entry = QListWidgetItem()
         entry.setData(Qt.ItemDataRole.UserRole, record_id)
         self._game_list.insertItem(0, entry)
         self._game_list.setItemWidget(entry, self._record_row(parts))
         self._align_game_records()
+        self._show_play_count()
+
+    def _show_play_count(self) -> None:
+        label = getattr(self, "_play_count_label", None)
+        if label is None or self._game_list is None:
+            return
+        label.setText(str(self._game_list.count()))
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
@@ -1529,9 +1536,9 @@ class MenuWindow(QMainWindow):
         if box is None:
             return
         rect = box.contentsRect()
-        if rect.width() <= 1 or rect.height() <= 1:
+        if rect.width() <= 1:
             return
-        side = min(rect.width() // 4, rect.height() // 2) * 9 // 16
+        side = rect.width() // 4 * 9 // 16
         if side < 1:
             return
         gap = max(0, round(side * 4 / 64))
