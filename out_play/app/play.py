@@ -1639,15 +1639,6 @@ def run_play(
             limit = len(roster)
         setter(limit, used_tsum, roster, join)
 
-    def _tsum_handed() -> bool:
-        if not tsum_asked:
-            return False
-        if not use_named or tsum_unspecified:
-            return True
-        if getattr(predictor, "named_fixed", False):
-            return True
-        return bool(str(getattr(predictor, "named_pin", "") or ""))
-
     next_frame = None
     try:
         while True:
@@ -1912,8 +1903,6 @@ def run_play(
                         if found_items:
                             say("アイテム " + "、".join(used_items))
                     _sync_named()
-                    if not _tsum_handed():
-                        continue
                     _say_heart_mail(say, rgb or image)
                     say("スタートをクリックします")
                     _slow_tap(start.center().x(), start.center().y())
@@ -1986,8 +1975,6 @@ def run_play(
                         continue
                     if _match_start_button(image) is not None:
                         _sync_named()
-                        if not _tsum_handed():
-                            continue
                     if _tap_start_or_continue(image, say, stop):
                         continue
                 play = None if image.isNull() else _home_play_button(image)
