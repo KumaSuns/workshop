@@ -1670,6 +1670,9 @@ class MenuWindow(QMainWindow):
         column.addWidget(named)
         column.addWidget(QLabel(_gpu_label() or "ナイト"))
         column.addWidget(QLabel(f"本アプリが動く環境値 {_guide_score()}/100"))
+        decide = QPushButton("決定")
+        decide.clicked.connect(dialog.accept)
+        column.addWidget(decide)
 
         def save(checked: bool) -> None:
             if not checked:
