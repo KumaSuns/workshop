@@ -420,18 +420,15 @@ def run_play(
         raise RuntimeError("TIME UP のモデルがありません。")
 
     if start_match:
-        _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
+        seen_kinds, locked, arrived, seen_tsum, start_items = _click_start_or_continue(
             say, stop, tap_start=False
         )
         if seen_tsum:
             used_tsum = seen_tsum
+        if locked and kind_count is None:
+            kind_count = seen_kinds
         if arrived in ("start", "continue"):
             ask_used_now(arrived == "start")
-        if arrived in ("start", "continue") and request_kinds is not None:
-            asked = request_kinds()
-            if asked is None:
-                raise Stopped()
-            kind_count = asked
 
     say("プレイを開始します")
     say(f"予測デバイス {predictor.device}")
