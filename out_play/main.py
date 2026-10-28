@@ -403,6 +403,11 @@ class MenuWindow(QMainWindow):
         self._play_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._play_count_label.setFont(mark_font)
         left.addWidget(self._play_count_label)
+        left.addWidget(self._section_title("ツム認知度"))
+        self._tsum_recognition = QLabel("")
+        self._tsum_recognition.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._tsum_recognition.setFont(mark_font)
+        left.addWidget(self._tsum_recognition)
         left.addStretch(1)
         memory_title = QLabel("メモリ使用率")
         memory_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -879,6 +884,12 @@ class MenuWindow(QMainWindow):
         if label is None or self._center_input is None:
             return
         label.setText(self._center_input.currentText().strip())
+
+    def _show_tsum_recognition(self, count: int) -> None:
+        label = getattr(self, "_tsum_recognition", None)
+        if label is None:
+            return
+        label.setText(f"{int(count)}体")
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
@@ -2077,6 +2088,7 @@ def _start_match(window: MenuWindow) -> None:
         use_named=_type_model_choice() == "named",
     )
     worker.status.connect(window._set_activity)
+    worker.recognized.connect(window._show_tsum_recognition)
     worker.recorded.connect(window._show_game_record)
     worker.items.connect(window._on_play_items)
     worker.need_used_tsum.connect(window._on_need_used_tsum)

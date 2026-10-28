@@ -131,6 +131,7 @@ class PlayWorker(QThread):
     skill_lamp = Signal(bool)
     my_lamp = Signal(str)
     items = Signal(str)
+    recognized = Signal(int)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
     recorded = Signal(object)
@@ -221,6 +222,7 @@ class PlayWorker(QThread):
                 my_lamp=self.my_lamp.emit,
                 notify_record=self.recorded.emit,
                 use_named=self._use_named,
+                show_recognized=self.recognized.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -320,6 +322,7 @@ def run_play(
     my_lamp: Callable[[str], None] | None = None,
     notify_record: Callable[[dict], None] | None = None,
     use_named: bool = False,
+    show_recognized: Callable[[int], None] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
@@ -2016,6 +2019,8 @@ def run_play(
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
+            if show_recognized is not None:
+                show_recognized(len(tsums))
             add_idle("pred", time.perf_counter() - t0)
             add_idle("heat", heat_s)
             add_idle("type", type_s)
@@ -2212,6 +2217,8 @@ def run_play(
                                     Path("."), game, rgb=rgb, inner=False
                                 )
                             tsums = [piece for piece in pieces if _is_tsum(piece)]
+                            if show_recognized is not None:
+                                show_recognized(len(tsums))
                             board = pieces
                             pending_used |= used
                             used = set()
