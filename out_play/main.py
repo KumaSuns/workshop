@@ -92,6 +92,8 @@ FLOW_LAMPS = (
 )
 FLOW_LAMP_OFF = "background: #ffffff; color: palette(window-text);"
 FLOW_LAMP_ON = "background: palette(highlight); color: palette(highlighted-text);"
+FLOW_LAMP_BLINK_WHITE = "background: #ffffff; color: #2c4a7a;"
+FLOW_LAMP_BLINK = "background: #A4C6FF; color: #2c4a7a;"
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -414,17 +416,7 @@ class MenuWindow(QMainWindow):
             mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
             mark.setFont(mark_font)
             left.addWidget(mark)
-        self._add_used_sections(left)
-        left.addWidget(self._section_title("プレイ回数"))
-        self._play_count_label = QLabel("0")
-        self._play_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._play_count_label.setFont(mark_font)
-        left.addWidget(self._play_count_label)
-        left.addWidget(self._section_title("ツム認知度"))
-        self._tsum_recognition = QLabel("")
-        self._tsum_recognition.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._tsum_recognition.setFont(mark_font)
-        left.addWidget(self._tsum_recognition)
+        self._add_used_sections(left, mark_font)
         self._flow_lamps: dict[str, QLabel] = {}
         for name in FLOW_LAMPS:
             lamp = QLabel(name)
@@ -505,7 +497,7 @@ class MenuWindow(QMainWindow):
             return
         button.setFixedWidth(width)
 
-    def _add_used_sections(self, left: QVBoxLayout) -> None:
+    def _add_used_sections(self, left: QVBoxLayout, mark_font) -> None:
         tsum_box = QFrame()
         tsum_box.setFrameShape(QFrame.Shape.NoFrame)
         tsum_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -513,7 +505,6 @@ class MenuWindow(QMainWindow):
         self._item_box = QFrame()
         self._item_box.setFrameShape(QFrame.Shape.NoFrame)
         self._item_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        left.addWidget(tsum_box)
         left.addWidget(self._item_box)
         inner = QVBoxLayout(self._item_box)
         inner.setContentsMargins(0, 0, 0, 0)
@@ -564,6 +555,43 @@ class MenuWindow(QMainWindow):
         self._used_tsum_label = QLabel("")
         self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         above.addWidget(self._used_tsum_label)
+        self._play_count_label = QLabel("0")
+        self._play_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._play_count_label.setFont(mark_font)
+        self._tsum_recognition = QLabel("")
+        self._tsum_recognition.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._tsum_recognition.setFont(mark_font)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(
+            self._count_side("プレイ回数", self._play_count_label),
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
+        row.addStretch(1)
+        row.addWidget(
+            tsum_box,
+            0,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+        )
+        row.addStretch(1)
+        row.addWidget(
+            self._count_side("ツム認知度", self._tsum_recognition),
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+        )
+        left.insertLayout(left.indexOf(self._item_box), row)
+
+    def _count_side(self, title: str, label: QLabel) -> QWidget:
+        wrap = QWidget()
+        wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        column = QVBoxLayout(wrap)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(self._section_title(title))
+        column.addWidget(label)
+        return wrap
 
     def _fill_items(self, slot: QFrame) -> None:
         column = QVBoxLayout(slot)
@@ -1025,7 +1053,7 @@ class MenuWindow(QMainWindow):
             return
         self._flow_blink_on = not self._flow_blink_on
         lamps[name].setStyleSheet(
-            FLOW_LAMP_ON if self._flow_blink_on else FLOW_LAMP_OFF
+            FLOW_LAMP_BLINK if self._flow_blink_on else FLOW_LAMP_BLINK_WHITE
         )
 
     def _set_flow_lamp(self, name: str) -> None:
@@ -1060,7 +1088,9 @@ class MenuWindow(QMainWindow):
         self._flow_current = name
         self._flow_reached = index
         self._flow_blink_on = True
-        lamps[name].setStyleSheet(FLOW_LAMP_ON)
+        lamps[name].setStyleSheet(
+            FLOW_LAMP_ON if name == "システム終了" else FLOW_LAMP_BLINK
+        )
         if name == "システム終了":
             self._flow_blink_timer.stop()
             return
@@ -1608,12 +1638,10 @@ class MenuWindow(QMainWindow):
         self._show_used_tsum_icon(self._used_tsum_name)
 
     def _used_tsum_icon_limit(self) -> tuple[int, int]:
-        box = self._tsum_box
-        if box is None or box.layout() is None:
+        box = self._model_box
+        if box is None:
             return 0, 0
         width = box.contentsRect().width()
-        if width <= 1 and self._model_box is not None:
-            width = self._model_box.contentsRect().width()
         side = width // 9
         if side < 1:
             return 0, 0
