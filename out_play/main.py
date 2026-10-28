@@ -395,6 +395,7 @@ class MenuWindow(QMainWindow):
         self._play_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._play_count_label.setFont(mark_font)
         left.addWidget(self._play_count_label)
+        left.addStretch(1)
         self._model_differs: dict[str, bool] = {}
         self._model_fetch = None
         self._model_progress = None
@@ -447,12 +448,12 @@ class MenuWindow(QMainWindow):
     def _add_used_sections(self, left: QVBoxLayout) -> None:
         tsum_box = QFrame()
         tsum_box.setFrameShape(QFrame.Shape.NoFrame)
-        tsum_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        tsum_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self._tsum_box = tsum_box
         self._item_box = QFrame()
         self._item_box.setFrameShape(QFrame.Shape.NoFrame)
         self._item_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        left.addWidget(tsum_box, 1)
+        left.addWidget(tsum_box)
         left.addWidget(self._item_box)
         inner = QVBoxLayout(self._item_box)
         inner.setContentsMargins(0, 0, 0, 0)
@@ -493,7 +494,6 @@ class MenuWindow(QMainWindow):
         self._used_tsum_label = QLabel("")
         self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         above.addWidget(self._used_tsum_label)
-        above.addStretch(1)
 
     def _fill_items(self, slot: QFrame) -> None:
         column = QVBoxLayout(slot)
@@ -1426,20 +1426,14 @@ class MenuWindow(QMainWindow):
         box = self._tsum_box
         if box is None or box.layout() is None:
             return 0, 0
-        rect = box.contentsRect()
-        width = rect.width()
+        width = box.contentsRect().width()
         if width <= 1 and self._model_box is not None:
             width = self._model_box.contentsRect().width()
-        layout = box.layout()
-        used = layout.contentsMargins().top() + layout.contentsMargins().bottom()
-        for index in range(layout.count()):
-            item = layout.itemAt(index)
-            if item is None or item.spacerItem() is not None:
-                continue
-            if item.widget() is self._used_tsum_icon:
-                continue
-            used += item.sizeHint().height()
-        return width, max(0, rect.height() - used)
+        count = max(1, len(ITEM_ICONS))
+        side = width * 64 // (count * 64 + (count - 1) * 4)
+        if side < 1:
+            return 0, 0
+        return side, side
 
     def _save_used_tsum_choice(
         self, path: Path | None, name: str, folder_id: str | None
