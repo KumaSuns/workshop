@@ -1210,6 +1210,10 @@ class MenuWindow(QMainWindow):
         if self._play_stop.is_set():
             worker.provide_used_tsum(None)
             return
+        saved = self._used_tsum_name
+        if saved:
+            worker.provide_used_tsum(saved)
+            return
         self._tsum_path = Path(path) if path else None
         if pick_only or not guess:
             self._show_tsum_list("" if pick_only else guess)

@@ -464,6 +464,7 @@ def run_play(
     last_save_at = 0.0
     ignore_start_until = 0.0
     saw_board = False
+    odd_top_tapped = False
     saw_timer = False
     hud_gone_seen = False
     fan_fall_n: int | None = None
@@ -521,7 +522,7 @@ def run_play(
     def fresh_match() -> None:
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
-        nonlocal ignore_start_until, saw_board, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
+        nonlocal ignore_start_until, saw_board, odd_top_tapped, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
         nonlocal clears, swipes, coin, earned_coin, coin_read_at, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
@@ -555,6 +556,7 @@ def run_play(
         last_save_at = 0.0
         ignore_start_until = time.time() + 6
         saw_board = False
+        odd_top_tapped = False
         saw_timer = False
         hud_gone_seen = False
         fan_fall_n = None
@@ -1637,6 +1639,15 @@ def run_play(
             limit = len(roster)
         setter(limit, used_tsum, roster, join)
 
+    def _tsum_handed() -> bool:
+        if not tsum_asked:
+            return False
+        if not use_named or tsum_unspecified:
+            return True
+        if getattr(predictor, "named_fixed", False):
+            return True
+        return bool(str(getattr(predictor, "named_pin", "") or ""))
+
     next_frame = None
     try:
         while True:
@@ -1679,6 +1690,15 @@ def run_play(
                 on_mission = _daily_mission_button(image) is not None
                 pause = _pause_continue_button(image)
             on_pause = pause is not None
+            if (
+                saw_board
+                or on_pause
+                or _match_start_button(image) is not None
+                or _retry_button(image) is not None
+                or _play_button(image) is not None
+                or _close_button(image) is not None
+            ):
+                odd_top_tapped = False
             if resumed_pause and not on_pause and not on_mission:
                 saw_board = True
                 match_over = False
@@ -1892,6 +1912,8 @@ def run_play(
                         if found_items:
                             say("アイテム " + "、".join(used_items))
                     _sync_named()
+                    if not _tsum_handed():
+                        continue
                     _say_heart_mail(say, rgb or image)
                     say("スタートをクリックします")
                     _slow_tap(start.center().x(), start.center().y())
@@ -1964,6 +1986,8 @@ def run_play(
                         continue
                     if _match_start_button(image) is not None:
                         _sync_named()
+                        if not _tsum_handed():
+                            continue
                     if _tap_start_or_continue(image, say, stop):
                         continue
                 play = None if image.isNull() else _home_play_button(image)
@@ -1978,6 +2002,12 @@ def run_play(
                     say("キャンセルをクリックします")
                     _slow_tap(cancel.center().x(), cancel.center().y())
                     _sleep_stop(1.2, stop)
+                    continue
+                if not odd_top_tapped and image is not None and not image.isNull():
+                    odd_top_tapped = True
+                    say("上部をクリックします")
+                    _slow_tap(image.width() // 2, max(1, image.height() // 10))
+                    _sleep_stop(0.8, stop)
                     continue
                 say("プレイを待っています")
                 _sleep_stop(0.35, stop)
@@ -4654,6 +4684,7 @@ def _click_start_or_continue(
     locked = False
     used_name = ""
     items: list[str] | None = None
+    odd_top_tapped = False
     while time.time() < deadline:
         _check_stop(stop)
         if finish_after is not None and finish_after.is_set():
@@ -4764,6 +4795,12 @@ def _click_start_or_continue(
             else:
                 say("続けるを検出しました")
             return kinds, locked, "continue", used_name, items
+        if not image.isNull():
+            if not odd_top_tapped:
+                say("上部をクリックします")
+            odd_top_tapped = True
+            _slow_tap(image.width() // 2, max(1, image.height() // 10))
+            _sleep_stop(0.8, stop)
         _sleep_stop(0.4, stop)
     return kinds, locked, "", used_name, items
 
