@@ -1646,6 +1646,9 @@ class MenuWindow(QMainWindow):
         kinds.setChecked(not named.isChecked())
         column.addWidget(kinds)
         column.addWidget(named)
+        gpu = _gpu_label()
+        if gpu:
+            column.addWidget(QLabel(gpu))
 
         def save(checked: bool) -> None:
             if not checked:
@@ -1668,6 +1671,19 @@ def _type_model_choice() -> str:
     if stored == "named":
         return "named"
     return "kinds"
+
+
+def _gpu_label() -> str:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return ""
+        name = str(torch.cuda.get_device_name(0) or "").strip()
+    except Exception:
+        return ""
+    if not name:
+        return ""
+    return f"GPU {name}"
 
 
 SCREEN_MODELS = ROOT / "bundled" / "screen" / "data" / "models"
