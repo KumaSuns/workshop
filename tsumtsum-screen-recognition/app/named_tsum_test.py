@@ -41,6 +41,10 @@ def registered_crops() -> list[tuple[str, str, torch.Tensor]]:
             en = str(saved.get("en") or "").strip()
             if not ja and not en:
                 continue
+            raw_out = saved.get("out")
+            out = {str(item) for item in raw_out} if isinstance(raw_out, list) else set()
+            if f"{int(piece['x'])},{int(piece['y'])}" in out:
+                continue
             rows.append((ja, en, isolated_tsum_rgb(image, piece, tsums)))
     return rows
 

@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -437,12 +438,25 @@ class MenuWindow(QMainWindow):
         self._model_fetch_name = ""
         self._model_token_value = _model_token()
         self._update_buttons: dict[str, QPushButton] = {}
-        model_grid = QGridLayout()
-        model_grid.setContentsMargins(4, 4, 4, 4)
+        self._model_summary = QPushButton("更新なし")
+        self._model_summary.clicked.connect(self._open_model_updates)
+        self._model_summary.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._model_summary.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._paint_model_button(self._model_summary, False)
+        summary_row = QHBoxLayout()
+        summary_row.setContentsMargins(4, 4, 4, 4)
+        summary_row.addStretch(1)
+        summary_row.addWidget(self._model_summary)
+        summary_row.addStretch(1)
+        left.addLayout(summary_row)
+        self._model_update_window = QDialog(self)
+        self._model_update_window.setWindowTitle("更新")
+        model_grid = QGridLayout(self._model_update_window)
+        model_grid.setContentsMargins(8, 8, 8, 8)
         model_grid.setHorizontalSpacing(4)
         model_grid.setVerticalSpacing(4)
-        model_grid.setColumnStretch(0, 1)
-        model_grid.setColumnStretch(1, 1)
         for index, (name, label, _dest) in enumerate(MODEL_BUTTONS):
             button = QPushButton(f"{label} 更新なし")
             button.clicked.connect(
@@ -453,13 +467,7 @@ class MenuWindow(QMainWindow):
             self._paint_model_button(button, False)
             self._update_buttons[name] = button
             self._model_differs[name] = False
-            model_grid.addWidget(
-                button,
-                index // 2,
-                index % 2,
-                Qt.AlignmentFlag.AlignHCenter,
-            )
-        left.addLayout(model_grid)
+            model_grid.addWidget(button, index // 2, index % 2)
         self._fit_model_buttons()
         above = QVBoxLayout(tsum_box)
         above.setContentsMargins(0, 0, 0, TITLE_MARGIN)
@@ -622,14 +630,12 @@ class MenuWindow(QMainWindow):
                 width = max(width, button.sizeHint().width())
         for button, text in saved:
             button.setText(text)
-        host = buttons[0].parentWidget()
-        span = host.width() if host is not None else 0
-        if span > 1:
-            width = max(1, span // 3)
         if width <= 0:
             return
         for button in buttons:
             button.setFixedWidth(width)
+        window = self._model_update_window
+        window.adjustSize()
 
     def _paint_model_button(self, button: QPushButton, differs: bool) -> None:
         if differs:
@@ -670,6 +676,20 @@ class MenuWindow(QMainWindow):
             button.setText(f"{label} 更新する" if differs else f"{label} 更新なし")
             self._paint_model_button(button, differs)
             button.setEnabled(True)
+        self._refresh_model_summary()
+
+    def _refresh_model_summary(self) -> None:
+        differs = any(self._model_differs.values())
+        self._model_summary.setText("更新あり" if differs else "更新なし")
+        self._paint_model_button(self._model_summary, differs)
+
+    def _open_model_updates(self) -> None:
+        if not any(self._model_differs.values()):
+            return
+        self._fit_model_buttons()
+        self._model_update_window.show()
+        self._model_update_window.raise_()
+        self._model_update_window.activateWindow()
 
     def _import_model(self, name: str) -> None:
         if not self._model_differs.get(name) or self._model_fetch is not None:
@@ -717,6 +737,7 @@ class MenuWindow(QMainWindow):
         if button is not None:
             button.setText(f"{label} 更新なし")
             self._paint_model_button(button, False)
+        self._refresh_model_summary()
         QMessageBox.information(self, "モデルを取り込みました", f"{label} を取り込みました。")
 
     def _fill_records(self, slot: QFrame) -> None:

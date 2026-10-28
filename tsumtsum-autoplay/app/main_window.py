@@ -322,8 +322,24 @@ class DebugWindow(QWidget):
         normal = QTextCharFormat()
         red = QTextCharFormat()
         red.setForeground(QColor(220, 0, 0))
+        green = QTextCharFormat()
+        green.setForeground(QColor(0, 100, 0))
+        blue = QTextCharFormat()
+        blue.setForeground(QColor(0, 0, 220))
         cursor.setCharFormat(normal)
         cursor.insertText(f"{now}  ")
+        if text.startswith("サイコロ") or text == "振り直し":
+            cursor.insertText(text, green)
+            cursor.setCharFormat(normal)
+            self._log.setTextCursor(cursor)
+            self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+            return
+        if text == "システム終了":
+            cursor.insertText(text, blue)
+            cursor.setCharFormat(normal)
+            self._log.setTextCursor(cursor)
+            self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+            return
         mark = "TIME UP"
         rest = text
         while mark in rest:
@@ -475,6 +491,14 @@ class MainWindow(QMainWindow):
         result_row.addWidget(self._info_result_value)
         result_row.addStretch(1)
         money_col.addLayout(result_row)
+        self._info_rate = QLabel("倍率")
+        self._info_rate_value = QLabel("－")
+        rate_row = QHBoxLayout()
+        rate_row.addStretch(1)
+        rate_row.addWidget(self._info_rate)
+        rate_row.addWidget(self._info_rate_value)
+        rate_row.addStretch(1)
+        money_col.addLayout(rate_row)
         self._info_named = QLabel("")
         self._info_named.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self._info_named.setWordWrap(False)
@@ -916,9 +940,21 @@ class MainWindow(QMainWindow):
         else:
             self._info_erase_value.setText(str(int(_skill_ok)))
 
+    def _coin_rate(self, coin, result) -> str:
+        try:
+            earned = int(coin)
+            got = int(result)
+        except (TypeError, ValueError):
+            return "－"
+        if earned <= 0 or got <= 0:
+            return "－"
+        text = f"{got / earned:.2f}".rstrip("0").rstrip(".")
+        return f"{text}倍"
+
     def _show_money(self, coin, result) -> None:
         self._info_coin_value.setText(str(coin) if coin else "－")
         self._info_result_value.setText(str(result) if result else "－")
+        self._info_rate_value.setText(self._coin_rate(coin, result))
 
     def _show_named_tsums(self, text: str) -> None:
         if not self._use_named_model:
@@ -1946,11 +1982,7 @@ class MainWindow(QMainWindow):
     def _on_play_done(self) -> None:
         self._stop_record()
         self._set_running(False)
-        text = self.status_label.text()
-        if "リトライ" in text:
-            return
-        if "コイン" not in text and text != "TIME UP" and not text.startswith("録画しました"):
-            self._set_status("TIME UP")
+        self._set_status("システム終了")
 
     def _on_stopped(self) -> None:
         self._stop_record()

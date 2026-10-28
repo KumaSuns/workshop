@@ -535,6 +535,35 @@ class GroupStrip(QScrollArea):
         return self._body._selected
 
 
+class _ClickLabel(QLabel):
+    def __init__(self, text: str, callback) -> None:
+        super().__init__(text)
+        self.setWordWrap(True)
+        self._callback = callback
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._callback()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class _NamedFace(QLabel):
+    def __init__(self, pixmap: QPixmap, callback) -> None:
+        super().__init__()
+        self.setPixmap(pixmap)
+        self.setFixedSize(pixmap.size())
+        self._callback = callback
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._callback()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class GroupListWindow(QDialog):
     pieceClicked = Signal(int)
     pieceRemoveRequested = Signal(int)
@@ -837,8 +866,21 @@ class MainWindow(QMainWindow):
         name_layout.addWidget(self.name_ja)
         name_layout.addWidget(self.name_en)
         name_layout.addWidget(self.name_save_btn)
-        name_layout.addWidget(self.name_saved_list, 1)
         self.name_panel.hide()
+        self._name_window = QDialog(self)
+        self._name_window.setWindowTitle("ツム名")
+        self._name_window.setModal(False)
+        self._name_window.setStyleSheet(STYLESHEET)
+        self._name_window.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        name_window_layout = QVBoxLayout(self._name_window)
+        name_window_layout.setContentsMargins(8, 8, 8, 8)
+        name_window_layout.addWidget(self.name_saved_list)
         left_layout.addWidget(self.name_panel)
         self.tsum_select_btn = QPushButton("ツム選択")
         left_layout.addWidget(self.tsum_select_btn)
@@ -1103,6 +1145,8 @@ class MainWindow(QMainWindow):
         self.list_widget.itemDoubleClicked.connect(self._on_file_name_double_clicked)
         self.name_mode_btn.toggled.connect(self._toggle_name_mode)
         self.name_save_btn.clicked.connect(self._register_circle_name)
+        self.name_ja.textChanged.connect(lambda text: self._show_existing_name("ja", text))
+        self.name_en.textChanged.connect(lambda text: self._show_existing_name("en", text))
         self.name_saved_list.itemClicked.connect(self._open_saved_circle_name)
         self.tsum_select_btn.clicked.connect(self.show_tsum_list)
         self.tsum_back_btn.clicked.connect(self._restore_file_list)
@@ -3045,11 +3089,14 @@ class MainWindow(QMainWindow):
         if on:
             self.tsum_pick_row.hide()
             self.tsum_name_list.hide()
-            self.region_list.hide()
             self._set_place_tools_visible(False)
             self._load_circle_name_fields()
             self._refresh_saved_names()
+            self._name_window.show()
+            self._name_window.raise_()
+            self._name_window.activateWindow()
             return
+        self._name_window.hide()
         self.region_list.show()
         self._set_place_tools_visible(True)
 
@@ -3084,7 +3131,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("日本語と英語を入れてください", 4000)
             return
         names = dict(sample.circle_names)
-        names[str(group)] = {"ja": ja, "en": en}
+        prev = names.get(str(group)) or {}
+        entry: dict = {"ja": ja, "en": en}
+        raw_out = prev.get("out")
+        if isinstance(raw_out, list) and raw_out:
+            entry["out"] = [str(item) for item in raw_out]
+        names[str(group)] = entry
         sample.circle_names = names
         self.dataset.save()
         self.canvas.set_circle_names(sample.circle_names)
@@ -3211,21 +3263,29 @@ class MainWindow(QMainWindow):
                 pixmap = self._sample_board(sample)
                 if pixmap is None:
                     continue
+                skipped = self._named_out(sample, key)
                 for piece in self._group_pieces(sample, key):
+                    spot = f"{int(piece['x'])},{int(piece['y'])}"
+                    if spot in skipped:
+                        continue
                     face = self._piece_face(pixmap, piece, 44)
                     if face.isNull():
                         continue
-                    label = QLabel()
-                    label.setPixmap(face)
-                    label.setFixedSize(face.size())
+                    label = _NamedFace(
+                        face,
+                        lambda sid=sample.id, g=key, x=int(piece["x"]), y=int(piece["y"]): self._exclude_named_piece(
+                            sid, g, x, y
+                        ),
+                    )
                     grid.addWidget(label, face_count // 4, face_count % 4)
                     face_count += 1
+            caption = _ClickLabel(
+                f"{ja}  {en}  {face_count}個".strip(),
+                lambda name_ja=ja, name_en=en: self._pick_saved_name(name_ja, name_en),
+            )
+            row_layout.addWidget(caption)
             if grid.count():
                 row_layout.addLayout(grid)
-            caption = QLabel(f"{ja}  {en}  {face_count}個".strip())
-            caption.setWordWrap(True)
-            row_layout.addWidget(caption)
-            self._click_through(row)
             row.adjustSize()
             face_rows = (face_count + 3) // 4 if face_count else 0
             height = 8 + face_rows * 48 + caption.sizeHint().height() + 8
@@ -3242,18 +3302,92 @@ class MainWindow(QMainWindow):
         if select >= 0:
             self.name_saved_list.setCurrentRow(select)
 
-    def _click_through(self, widget: QWidget) -> None:
-        widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        for child in widget.findChildren(QWidget):
-            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    def _named_out(self, sample: Sample, group: str) -> set[str]:
+        saved = (sample.circle_names or {}).get(str(group)) or {}
+        raw = saved.get("out")
+        if not isinstance(raw, list):
+            return set()
+        return {str(item) for item in raw}
+
+    def _exclude_named_piece(self, sample_id: str, group: str, x: int, y: int) -> None:
+        sample = self.dataset.get(sample_id)
+        if sample is None:
+            return
+        names = dict(sample.circle_names)
+        saved = dict(names.get(str(group)) or {})
+        spot = f"{int(x)},{int(y)}"
+        out = [str(item) for item in saved.get("out") or []]
+        if spot not in out:
+            out.append(spot)
+        saved["out"] = out
+        names[str(group)] = saved
+        sample.circle_names = names
+        self.dataset.save()
+        self._refresh_saved_names()
+        if sample_id == self.current_id:
+            self._fill_name_faces(sample, str(group))
+        ja = str(saved.get("ja") or "").strip()
+        en = str(saved.get("en") or "").strip()
+        self.statusBar().showMessage(f"除外しました  {ja}  {en}".strip(), 4000)
+
+    def _existing_circle_name(self, field: str, text: str) -> tuple[str, str] | None:
+        query = text.strip()
+        if not query:
+            return None
+        folded = query.casefold()
+        for sample in self.dataset.all():
+            names = getattr(sample, "circle_names", None) or {}
+            for value in names.values():
+                ja = str(value.get("ja") or "").strip()
+                en = str(value.get("en") or "").strip()
+                if field == "ja" and ja and ja.casefold() == folded:
+                    return ja, en
+                if field == "en" and en and en.casefold() == folded:
+                    return ja, en
+        return None
+
+    def _show_existing_name(self, field: str, text: str) -> None:
+        if getattr(self, "_name_lookup_lock", False):
+            return
+        found = self._existing_circle_name(field, text)
+        if found is None:
+            return
+        ja, en = found
+        self._name_lookup_lock = True
+        try:
+            if ja and self.name_ja.text().strip() != ja:
+                self.name_ja.setText(ja)
+            if en and self.name_en.text().strip() != en:
+                self.name_en.setText(en)
+        finally:
+            self._name_lookup_lock = False
+        for row in range(self.name_saved_list.count()):
+            item = self.name_saved_list.item(row)
+            if item is None:
+                continue
+            saved_ja = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            saved_en = str(item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
+            if saved_ja == ja and saved_en == en:
+                self.name_saved_list.setCurrentRow(row)
+                self.name_saved_list.scrollToItem(item)
+                self._name_window.show()
+                self._name_window.raise_()
+                return
+
+    def _pick_saved_name(self, ja: str, en: str) -> None:
+        if not ja and not en:
+            return
+        self._name_lookup_lock = True
+        try:
+            self.name_ja.setText(ja)
+            self.name_en.setText(en)
+        finally:
+            self._name_lookup_lock = False
 
     def _open_saved_circle_name(self, item: QListWidgetItem) -> None:
         ja = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
         en = str(item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
-        if not ja or not en:
-            return
-        self.name_ja.setText(ja)
-        self.name_en.setText(en)
+        self._pick_saved_name(ja, en)
 
     def _restyle_sample_row(self, sample_id: str) -> None:
         sample = self.dataset.get(sample_id)

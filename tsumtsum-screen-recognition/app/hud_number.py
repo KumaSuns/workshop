@@ -291,6 +291,84 @@ def _timer_digit_crop(crop: Image.Image) -> Image.Image:
     )
 
 
+def _ink_rows(crop: Image.Image) -> list[tuple[int, int]]:
+    rgb = crop.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+    rows = [
+        y
+        for y in range(height)
+        if sum(1 for x in range(width) if _is_digit_pixel(*pixels[x, y][:3])) >= 3
+    ]
+    if not rows:
+        return []
+    bands: list[tuple[int, int]] = []
+    start = prev = rows[0]
+    for y in rows[1:]:
+        if y > prev + 2:
+            bands.append((start, prev))
+            start = y
+        prev = y
+    bands.append((start, prev))
+    min_h = max(4, height // 8)
+    return [(top, bottom) for top, bottom in bands if bottom - top + 1 >= min_h]
+
+
+def _ink_glyphs(crop: Image.Image) -> list[tuple[int, int]]:
+    rgb = crop.convert("RGB")
+    width, height = rgb.size
+    pixels = rgb.load()
+    cols = [
+        x
+        for x in range(width)
+        if sum(1 for y in range(height) if _is_digit_pixel(*pixels[x, y][:3])) >= 2
+    ]
+    if not cols:
+        return []
+    groups: list[tuple[int, int]] = []
+    start = prev = cols[0]
+    for x in cols[1:]:
+        if x > prev + 2:
+            groups.append((start, prev))
+            start = x
+        prev = x
+    groups.append((start, prev))
+    min_w = max(3, int(height * 0.20))
+    return [(left, right) for left, right in groups if right - left + 1 >= min_w]
+
+
+def _coin_digit_body(crop: Image.Image) -> Image.Image:
+    crop = ImageOps.autocontrast(crop.convert("RGB"), cutoff=1)
+    skip = _gold_icon_width(crop)
+    if skip >= 8:
+        crop = crop.crop((skip, 0, crop.size[0], crop.size[1]))
+        crop = ImageOps.autocontrast(crop, cutoff=1)
+    bands = _ink_rows(crop)
+    if len(bands) >= 2:
+        top, bottom = bands[0]
+        crop = crop.crop((0, max(0, top - 2), crop.size[0], min(crop.size[1], bottom + 1 + 2)))
+        crop = ImageOps.autocontrast(crop, cutoff=1)
+    crop = _tight_ink(crop)
+    return _drop_comma(crop)
+
+
+def realign_long_coin(crop: Image.Image) -> tuple[Image.Image, int] | None:
+    body = _coin_digit_body(crop)
+    glyphs = _ink_glyphs(body)
+    if not glyphs or not 3 <= len(glyphs) <= _SLOT_COUNT:
+        return None
+    height = body.size[1]
+    if height < 4:
+        return None
+    slot = max(1, int(round(height * _SLOT_WIDTH_RATIO)))
+    left, right = glyphs[0][0], glyphs[-1][1] + 1
+    strip = body.crop((max(0, left - 1), 0, min(body.size[0], right + 1), height))
+    scaled = strip.resize((slot * len(glyphs), height), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (slot * _SLOT_COUNT, height), (0, 0, 0))
+    canvas.paste(scaled, (0, 0))
+    return canvas, len(glyphs)
+
+
 def prepare_digit_crop(crop: Image.Image, key: str = "coin") -> Image.Image:
     crop = crop.convert("RGB")
     if key == "timer":

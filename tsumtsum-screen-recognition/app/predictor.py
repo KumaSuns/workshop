@@ -16,7 +16,7 @@ from app.digit_model import (
     CoinDigitNet,
     decode_logits,
 )
-from app.hud_number import adjust_coin_digits, prepare_digit_crop
+from app.hud_number import adjust_coin_digits, prepare_digit_crop, realign_long_coin
 from app.model import INPUT_SIZE, IMAGENET_MEAN, IMAGENET_STD, GameRegionNet
 from app.piece_model import (
     HEATMAP_SIZE,
@@ -378,8 +378,24 @@ class Predictor:
         with torch.no_grad():
             logits = model(tensor)
         digits = decode_logits(logits.cpu())
-        if key == "coin":
-            return adjust_coin_digits(prepared, digits)
+        if key != "coin":
+            return digits
+        digits = adjust_coin_digits(prepared, digits)
+        shown = digits.lstrip("0")
+        if len(shown) < 6:
+            return digits
+        realigned = realign_long_coin(crop)
+        if realigned is None:
+            return digits
+        canvas, count = realigned
+        if not 3 <= count < len(shown):
+            return digits
+        alt_tensor = self._digit_transform(canvas.convert("RGB")).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            alt_logits = model(alt_tensor)
+        alt = adjust_coin_digits(canvas, decode_logits(alt_logits.cpu())).lstrip("0")
+        if alt and len(alt) == count:
+            return alt
         return digits
 
     def predict_all(self, image_path: Path, rgb: Image.Image | None = None) -> dict[str, dict[str, int]]:

@@ -31,7 +31,7 @@ class Sample:
     status: str  # unlabeled | predicted | labeled | skipped
     used_tsum: str = ""
     used_tsum_id: str = ""
-    circle_names: dict[str, dict[str, str]] = field(default_factory=dict)
+    circle_names: dict[str, dict] = field(default_factory=dict)
 
     @property
     def image_path(self) -> Path:
@@ -91,7 +91,7 @@ class Sample:
         )
 
 
-def _circle_names(raw: Any) -> dict[str, dict[str, str]]:
+def _circle_names(raw: Any) -> dict[str, dict]:
     if not isinstance(raw, dict):
         return {}
     names: dict[str, dict[str, str]] = {}
@@ -102,7 +102,13 @@ def _circle_names(raw: Any) -> dict[str, dict[str, str]]:
         en = str(value.get("en") or "").strip()
         if not ja and not en:
             continue
-        names[str(key)] = {"ja": ja, "en": en}
+        entry: dict[str, str | list[str]] = {"ja": ja, "en": en}
+        raw_out = value.get("out")
+        if isinstance(raw_out, list):
+            spots = [str(item).strip() for item in raw_out if str(item).strip()]
+            if spots:
+                entry["out"] = spots
+        names[str(key)] = entry
     return names
 
 

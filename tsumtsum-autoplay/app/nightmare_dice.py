@@ -46,19 +46,26 @@ def _pips(arr, labels, index: int, red_area: int) -> int:
         return 0
     x0, x1 = int(xs.min()), int(xs.max())
     y0, y1 = int(ys.min()), int(ys.max())
-    crop_dark = (
-        (arr[y0 : y1 + 1, x0 : x1 + 1, 0] < 90)
-        & (arr[y0 : y1 + 1, x0 : x1 + 1, 1] < 90)
-        & (arr[y0 : y1 + 1, x0 : x1 + 1, 2] < 90)
+    crop = arr[y0 : y1 + 1, x0 : x1 + 1]
+    dark = (
+        (crop[:, :, 0] < 80)
+        & (crop[:, :, 1] < 80)
+        & (crop[:, :, 2] < 80)
     ).astype(np.uint8)
-    count, lab, stats, _centroids = cv2.connectedComponentsWithStats(crop_dark, 8)
+    count, lab, stats, _centroids = cv2.connectedComponentsWithStats(dark, 8)
     found = 0
-    low = max(20, int(red_area * 0.015))
-    high = max(low + 1, int(red_area * 0.20))
+    low = max(1, int(red_area * 0.04))
+    high = max(low + 1, int(red_area * 0.18))
+    height, width = dark.shape
     for comp in range(1, count):
         area = int(stats[comp, cv2.CC_STAT_AREA])
         if area < low or area > high:
             continue
+        left = int(stats[comp, cv2.CC_STAT_LEFT])
+        top = int(stats[comp, cv2.CC_STAT_TOP])
+        box_w = int(stats[comp, cv2.CC_STAT_WIDTH])
+        box_h = int(stats[comp, cv2.CC_STAT_HEIGHT])
+        border = left <= 1 or top <= 1 or left + box_w >= width - 1 or top + box_h >= height - 1
         mask = (lab == comp).astype(np.uint8)
         contours, _hier = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not contours:
@@ -67,7 +74,7 @@ def _pips(arr, labels, index: int, red_area: int) -> int:
         if per <= 0:
             continue
         circ = 4.0 * 3.14159265 * area / (per * per)
-        if circ < 0.85:
+        if circ < (0.63 if border else 0.75):
             continue
         found += 1
     return found
@@ -114,21 +121,24 @@ def _dice_pair(rgb):
     red = arr[:, :, 0].astype(np.int16)
     green = arr[:, :, 1].astype(np.int16)
     blue = arr[:, :, 2].astype(np.int16)
-    mask = ((red > 150) & (red > green + 60) & (red > blue + 60) & (green < 140)).astype(np.uint8)
+    mask = ((red > 150) & (red > green + 60) & (red > blue + 60) & (green < 80)).astype(np.uint8)
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
     height, width = mask.shape[:2]
     if width < 2 or height < 2:
         return None
-    min_side = width * 0.14
+    min_side = width * 0.08
+    min_area = max(1, int(width * height * 0.0008))
     found = []
     for index in range(1, count):
         area = int(stats[index, cv2.CC_STAT_AREA])
         box_w = int(stats[index, cv2.CC_STAT_WIDTH])
         box_h = int(stats[index, cv2.CC_STAT_HEIGHT])
-        if area < 3000 or box_w < min_side or box_h < min_side:
+        if area >= min_area and box_w > width * 0.35 and box_h > width * 0.2:
+            return None
+        if area < min_area or box_w < min_side or box_h < min_side:
             continue
         aspect = box_w / box_h
-        if aspect < 0.7 or aspect > 1.6:
+        if aspect < 0.6 or aspect > 2.0:
             continue
         cx = float(centroids[index][0])
         cy = float(centroids[index][1])
@@ -180,14 +190,6 @@ def nightmare_dice_step(image: QImage, rgb, state: dict, say, stop, watch_hit) -
         counts = (int(faces[0][0]), int(faces[1][0]))
         total = counts[0] + counts[1]
         if any(item < 1 or item > 6 for item in counts):
-            state["last"] = None
-            state["still_at"] = 0.0
-            return True
-        if state.get("last") != counts:
-            state["last"] = counts
-            state["still_at"] = time.time()
-            return True
-        if time.time() - float(state.get("still_at") or 0.0) < 0.5:
             return True
         if total >= 7:
             if roll == 0:
