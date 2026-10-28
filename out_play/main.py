@@ -404,6 +404,19 @@ class MenuWindow(QMainWindow):
         self._play_count_label.setFont(mark_font)
         left.addWidget(self._play_count_label)
         left.addStretch(1)
+        memory_title = QLabel("メモリ使用率")
+        memory_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        memory_title.setFont(mark_font)
+        left.addWidget(memory_title)
+        self._memory_use = QLabel("")
+        self._memory_use.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._memory_use.setFont(mark_font)
+        left.addWidget(self._memory_use)
+        self._refresh_memory_use()
+        self._memory_timer = QTimer(self)
+        self._memory_timer.setInterval(1000)
+        self._memory_timer.timeout.connect(self._refresh_memory_use)
+        self._memory_timer.start()
         self._model_differs: dict[str, bool] = {}
         self._model_fetch = None
         self._model_progress = None
@@ -442,6 +455,15 @@ class MenuWindow(QMainWindow):
             model_grid.addWidget(button, index // 2, index % 2)
         self._fit_model_buttons()
         self._fit_model_summary()
+
+    def _refresh_memory_use(self) -> None:
+        label = getattr(self, "_memory_use", None)
+        if label is None:
+            return
+        percent = _memory_use_percent()
+        if percent is None:
+            return
+        label.setText(f"{percent} %")
 
     def _fit_model_summary(self) -> None:
         box = getattr(self, "_model_box", None)
@@ -1646,9 +1668,8 @@ class MenuWindow(QMainWindow):
         kinds.setChecked(not named.isChecked())
         column.addWidget(kinds)
         column.addWidget(named)
-        gpu = _gpu_label()
-        if gpu:
-            column.addWidget(QLabel(gpu))
+        column.addWidget(QLabel(_gpu_label() or "ナイト"))
+        column.addWidget(QLabel(f"目安 {_guide_score()}点"))
 
         def save(checked: bool) -> None:
             if not checked:
@@ -1684,6 +1705,120 @@ def _gpu_label() -> str:
     if not name:
         return ""
     return f"GPU {name}"
+
+
+def _ram_bytes() -> int:
+    if sys.platform == "win32":
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return 0
+        return int(status.ullTotalPhys)
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, ValueError):
+        return 0
+
+
+def _memory_use_percent() -> int | None:
+    if sys.platform == "win32":
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return max(0, min(100, int(status.dwMemoryLoad)))
+    if sys.platform == "darwin":
+        try:
+            text = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        page = 4096
+        pages: dict[str, int] = {}
+        for line in text.splitlines():
+            if line.startswith("Mach Virtual Memory Statistics"):
+                mark = "page size of "
+                if mark in line and "bytes" in line:
+                    page = int(line.split(mark, 1)[1].split("bytes", 1)[0].strip())
+                continue
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            number = value.strip().strip(".").replace(",", "")
+            if number.isdigit():
+                pages[key.strip()] = int(number)
+        total = _ram_bytes()
+        if total <= 0 or page <= 0:
+            return None
+        available = (
+            pages.get("Pages free", 0)
+            + pages.get("Pages inactive", 0)
+            + pages.get("Pages speculative", 0)
+        ) * page
+        used = max(0, total - available)
+        return max(0, min(100, round(used / total * 100)))
+    try:
+        info = Path("/proc/meminfo").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    mem: dict[str, int] = {}
+    for line in info.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            mem[parts[0].rstrip(":")] = int(parts[1])
+    total = mem.get("MemTotal", 0)
+    available = mem.get("MemAvailable", mem.get("MemFree", 0))
+    if total <= 0:
+        return None
+    return max(0, min(100, round((total - available) / total * 100)))
+
+
+def _guide_score() -> int:
+    ram = _ram_bytes()
+    ram_gb = ram / (1024 ** 3) if ram else 0.0
+    memory_points = min(40.0, ram_gb / 16 * 40) if ram_gb else 0.0
+    cores = os.cpu_count() or 1
+    cpu_points = min(30.0, cores / 8 * 30)
+    gpu_points = 8.0
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            vram_gb = int(getattr(props, "total_memory", 0) or 0) / (1024 ** 3)
+            gpu_points = min(30.0, 18.0 + vram_gb / 8 * 12)
+    except Exception:
+        pass
+    return max(0, min(100, round(memory_points + cpu_points + gpu_points)))
 
 
 SCREEN_MODELS = ROOT / "bundled" / "screen" / "data" / "models"
