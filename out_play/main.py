@@ -445,11 +445,11 @@ class MenuWindow(QMainWindow):
 
     def _add_used_sections(self, left: QVBoxLayout) -> None:
         tsum_box = QFrame()
-        tsum_box.setFrameShape(QFrame.Shape.Box)
-        tsum_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        tsum_box.setFrameShape(QFrame.Shape.NoFrame)
+        tsum_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self._tsum_box = tsum_box
         self._item_box = QFrame()
-        self._item_box.setFrameShape(QFrame.Shape.Box)
+        self._item_box.setFrameShape(QFrame.Shape.NoFrame)
         self._item_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         left.addWidget(tsum_box)
         left.addWidget(self._item_box)
@@ -463,20 +463,19 @@ class MenuWindow(QMainWindow):
         block_layout.setContentsMargins(0, 0, 0, 0)
         block_layout.setSpacing(0)
         self._item_block = block_layout
-        for names in (ITEM_ICONS[:4], ITEM_ICONS[4:]):
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(0)
-            row.setAlignment(Qt.AlignmentFlag.AlignLeft)
-            self._item_rows.append(row)
-            for filename in names:
-                label = QLabel()
-                raw = QPixmap(str(ICON_DIR / filename))
-                self._item_lit.append(raw)
-                self._item_src.append(_mist_pixmap(_dim_pixmap(raw)))
-                self._item_labels.append(label)
-                row.addWidget(label)
-            block_layout.addLayout(row)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self._item_rows.append(row)
+        for filename in ITEM_ICONS:
+            label = QLabel()
+            raw = QPixmap(str(ICON_DIR / filename))
+            self._item_lit.append(raw)
+            self._item_src.append(_mist_pixmap(_dim_pixmap(raw)))
+            self._item_labels.append(label)
+            row.addWidget(label)
+        block_layout.addLayout(row)
         inner.addWidget(block, 0, Qt.AlignmentFlag.AlignHCenter)
         above = QVBoxLayout(tsum_box)
         above.setContentsMargins(0, 0, 0, TITLE_MARGIN)
@@ -826,20 +825,18 @@ class MenuWindow(QMainWindow):
                 for label, (text, _right) in zip(labels, parts):
                     label.setText(text)
             self._align_game_records()
-            self._show_play_count()
             return
         entry = QListWidgetItem()
         entry.setData(Qt.ItemDataRole.UserRole, record_id)
         self._game_list.insertItem(0, entry)
         self._game_list.setItemWidget(entry, self._record_row(parts))
         self._align_game_records()
-        self._show_play_count()
 
     def _show_play_count(self) -> None:
         label = getattr(self, "_play_count_label", None)
-        if label is None or self._game_list is None:
+        if label is None or self._center_input is None:
             return
-        label.setText(str(self._game_list.count()))
+        label.setText(self._center_input.currentText().strip())
 
     def _fill_center(self, slot: QFrame) -> None:
         self._center_slot = slot
@@ -914,6 +911,8 @@ class MenuWindow(QMainWindow):
         field.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9]*")))
         field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._center_input.setCurrentIndex(0)
+        self._center_input.currentTextChanged.connect(self._show_play_count)
+        self._show_play_count()
         self._center_input.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
@@ -1404,6 +1403,7 @@ class MenuWindow(QMainWindow):
         if pixmap.isNull():
             label.clear()
             label.setFixedHeight(0)
+            self._fit_used_tsum_frame()
             return
         width = label.width()
         if width <= 1 and self._tsum_box is not None:
@@ -1416,6 +1416,14 @@ class MenuWindow(QMainWindow):
             pixmap = pixmap.scaledToWidth(half, Qt.TransformationMode.SmoothTransformation)
         label.setPixmap(pixmap)
         label.setFixedHeight(pixmap.height())
+        self._fit_used_tsum_frame()
+
+    def _fit_used_tsum_frame(self) -> None:
+        box = self._tsum_box
+        if box is None or box.layout() is None:
+            return
+        box.updateGeometry()
+        box.setMinimumHeight(box.sizeHint().height())
 
     def _save_used_tsum_choice(
         self, path: Path | None, name: str, folder_id: str | None
@@ -1536,12 +1544,16 @@ class MenuWindow(QMainWindow):
         if box is None:
             return
         rect = box.contentsRect()
-        if rect.width() <= 1:
+        count = len(self._item_labels)
+        if rect.width() <= 1 or count < 1:
             return
-        side = rect.width() // 4 * 9 // 16
+        side = rect.width() * 64 // (count * 64 + (count - 1) * 4)
+        gap = max(0, round(side * 4 / 64)) if side > 0 else 0
+        while side > 1 and count * side + (count - 1) * gap > rect.width():
+            side -= 1
+            gap = max(0, round(side * 4 / 64))
         if side < 1:
             return
-        gap = max(0, round(side * 4 / 64))
         for row in self._item_rows:
             row.setSpacing(gap)
         if self._item_block is not None:
