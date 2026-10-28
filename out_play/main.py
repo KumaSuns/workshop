@@ -563,24 +563,20 @@ class MenuWindow(QMainWindow):
         self._tsum_recognition.setFont(mark_font)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(0)
+        row.setSpacing(TITLE_MARGIN)
+        row.addStretch(1)
         row.addWidget(
             self._count_side("プレイ回数", self._play_count_label),
             0,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            Qt.AlignmentFlag.AlignTop,
         )
-        row.addStretch(1)
-        row.addWidget(
-            tsum_box,
-            0,
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-        )
-        row.addStretch(1)
+        row.addWidget(tsum_box, 0, Qt.AlignmentFlag.AlignTop)
         row.addWidget(
             self._count_side("ツム認知度", self._tsum_recognition),
             0,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+            Qt.AlignmentFlag.AlignTop,
         )
+        row.addStretch(1)
         left.insertLayout(left.indexOf(self._item_box), row)
 
     def _count_side(self, title: str, label: QLabel) -> QWidget:
