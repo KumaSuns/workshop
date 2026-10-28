@@ -573,6 +573,8 @@ def _wide_bottom_play(image: QImage) -> QRect | None:
 
 
 def _home_play_button(image: QImage) -> QRect | None:
+    if _match_start_button(image) is not None:
+        return None
     if _yellow_pair_left(image) is not None:
         return None
     wide = _wide_bottom_play(image)
