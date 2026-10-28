@@ -341,12 +341,14 @@ class MenuWindow(QMainWindow):
         self._fit_logo()
         QTimer.singleShot(0, self._fit_items)
         QTimer.singleShot(0, self._fit_center)
+        QTimer.singleShot(0, self._fit_model_summary)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._fit_logo()
         QTimer.singleShot(0, self._fit_items)
         QTimer.singleShot(0, self._fit_center)
+        QTimer.singleShot(0, self._fit_model_summary)
 
     def _fit_logo(self) -> None:
         if self._fitting_logo or self._logo_src.isNull():
@@ -372,11 +374,11 @@ class MenuWindow(QMainWindow):
         self._fitting_logo = False
 
     def _fill_model(self, model_box: QFrame) -> None:
+        self._model_box = model_box
         left = QVBoxLayout(model_box)
         left.setContentsMargins(0, 0, 0, TITLE_MARGIN)
         left.setSpacing(0)
         left.addWidget(self._section_title("MODEL情報"))
-        left.addStretch(1)
         mark_font = self.font()
         mark_font.setBold(True)
         mark_font.setPointSize(10)
@@ -385,7 +387,7 @@ class MenuWindow(QMainWindow):
             mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
             mark.setFont(mark_font)
             left.addWidget(mark)
-        left.addStretch(2)
+        left.addStretch(1)
         self._model_differs: dict[str, bool] = {}
         self._model_fetch = None
         self._model_progress = None
@@ -423,6 +425,17 @@ class MenuWindow(QMainWindow):
             self._model_differs[name] = False
             model_grid.addWidget(button, index // 2, index % 2)
         self._fit_model_buttons()
+        self._fit_model_summary()
+
+    def _fit_model_summary(self) -> None:
+        box = getattr(self, "_model_box", None)
+        button = getattr(self, "_model_summary", None)
+        if box is None or button is None:
+            return
+        width = box.width() * 80 // 100
+        if width < 1:
+            return
+        button.setFixedWidth(width)
 
     def _fill_items(self, slot: QFrame) -> None:
         column = QVBoxLayout(slot)
@@ -760,15 +773,15 @@ class MenuWindow(QMainWindow):
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addStretch(1)
         labels = []
         for text, _right in parts:
             label = QLabel(text)
             label.setAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
             )
             labels.append(label)
             layout.addWidget(label)
+        layout.addStretch(1)
         row._record_labels = labels
         return row
 
