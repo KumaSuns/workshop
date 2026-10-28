@@ -1191,12 +1191,7 @@ def run_play(
         show_used(start_items)
     if used_items:
         say("アイテム " + "、".join(used_items))
-    if start_match and arrived == "start":
-        found_items = _tap_start_now(say, stop)
-        if found_items is not None:
-            used_items = found_items
-            show_used(found_items)
-    elif start_match and arrived == "continue":
+    if start_match and arrived == "continue":
         resumed_pause = _tap_continue_now(say, stop)
         if resumed_pause:
             saw_board = True
@@ -1891,6 +1886,7 @@ def run_play(
                         show_used(found_items)
                         if found_items:
                             say("アイテム " + "、".join(used_items))
+                    _sync_named()
                     _say_heart_mail(say, rgb or image)
                     say("スタートをクリックします")
                     _slow_tap(start.center().x(), start.center().y())
@@ -4758,28 +4754,6 @@ def _click_start_or_continue(
             return kinds, locked, "continue", used_name, items
         _sleep_stop(0.4, stop)
     return kinds, locked, "", used_name, items
-
-
-def _tap_start_now(say: StatusFn, stop: Event | None) -> list[str] | None:
-    try:
-        path = capture_screen_path()
-        image = QImage(str(path))
-    except Exception:
-        return None
-    if image.isNull():
-        return None
-    items = _items_used_path(path)
-    start = _match_start_button(image)
-    if start is None:
-        return items
-    if _start_hearts(image) == 0:
-        _wait_for_heart(say, stop)
-        return items
-    _say_heart_mail(say, image)
-    say("スタートをクリックします")
-    _slow_tap(start.center().x(), start.center().y())
-    _sleep_stop(1.2, stop)
-    return items
 
 
 def _tap_continue_now(say: StatusFn, stop: Event | None) -> bool:
