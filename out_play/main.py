@@ -72,7 +72,7 @@ ITEM_NAMES = (
 )
 ITEM_DIM = 0.6
 ITEM_MIST = 0.6
-TITLE_POINT = 14
+TITLE_POINT = 12
 TITLE_MARGIN = 16
 
 
@@ -1552,15 +1552,24 @@ class MenuWindow(QMainWindow):
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
-    def _section_title(self, text: str) -> QLabel:
+    def _section_title(self, text: str) -> QWidget:
+        wrap = QWidget()
+        column = QVBoxLayout(wrap)
+        column.setContentsMargins(0, TITLE_MARGIN, 0, TITLE_MARGIN)
+        column.setSpacing(2)
         title = QLabel(text)
         title_font = title.font()
         title_font.setBold(True)
         title_font.setPointSize(TITLE_POINT)
         title.setFont(title_font)
-        title.setContentsMargins(0, TITLE_MARGIN, 0, TITLE_MARGIN)
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        return title
+        column.addWidget(title)
+        bar = QFrame()
+        bar.setFixedHeight(3)
+        bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        bar.setStyleSheet("background-color: #2c4a7a; border: none;")
+        column.addWidget(bar)
+        return wrap
 
     def _fit_items(self) -> None:
         box = self._item_box
