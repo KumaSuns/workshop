@@ -143,21 +143,14 @@ def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
         items_text = names
     else:
         items_text = "、".join(str(name) for name in names if str(name))
-    play_time = item.get("play_time")
-    play_text = "" if play_time is None else f"{int(play_time)}秒"
     coin = item.get("coin")
     result = item.get("result_coin")
-    tsum = item.get("tsum") or ""
+    coin_text = "－" if coin is None else str(int(coin))
+    result_text = "－" if result is None else str(int(result))
     return [
         (str(item.get("started") or ""), False),
-        (f"  使用ツム {tsum}", False),
         (f"  使用アイテム {items_text}", False),
-        ("  プレイ時間 ", False),
-        (play_text, True),
-        ("  獲得コイン ", False),
-        ("" if coin is None else str(int(coin)), True),
-        ("  リザルトコイン ", False),
-        ("" if result is None else str(int(result)), True),
+        (f"  コイン {coin_text} / {result_text}", False),
     ]
 
 
@@ -756,14 +749,15 @@ class MenuWindow(QMainWindow):
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        layout.addStretch(1)
         labels = []
-        for text, right in parts:
+        for text, _right in parts:
             label = QLabel(text)
-            align = Qt.AlignmentFlag.AlignRight if right else Qt.AlignmentFlag.AlignLeft
-            label.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+            label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
             labels.append(label)
             layout.addWidget(label)
-        layout.addStretch(1)
         row._record_labels = labels
         return row
 
