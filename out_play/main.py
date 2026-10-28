@@ -77,20 +77,20 @@ TITLE_POINT = 12
 TITLE_MARGIN = 16
 FLOW_LAMPS = (
     "システム開始",
+    "BLUE STACK 起動確認",
     "使用アイテム確認",
     "ゲーム数確認",
-    "BLUE STACK 起動確認",
     "画面の確認",
-    "スタート画面確認",
-    "ハートの確認",
     "モデルの確認",
+    "ハートの確認",
+    "スタート画面確認",
     "使用ツムの確認",
     "プレイを開始",
     "TIME UP 検知",
     "リザルト検知",
     "システム終了",
 )
-FLOW_LAMP_OFF = "background: palette(mid); color: palette(window-text);"
+FLOW_LAMP_OFF = "background: #ffffff; color: palette(window-text);"
 FLOW_LAMP_ON = "background: palette(highlight); color: palette(highlighted-text);"
 
 
@@ -1020,7 +1020,7 @@ class MenuWindow(QMainWindow):
             return "TIME UP 検知"
         if text.startswith("ハート"):
             return "ハートの確認"
-        if text.startswith("使用ツム"):
+        if text == "使用ツムの問いに答えてください":
             return "使用ツムの確認"
         if (
             text.startswith("モデルを読み込み")
