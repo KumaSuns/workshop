@@ -75,6 +75,23 @@ ITEM_DIM = 0.6
 ITEM_MIST = 0.6
 TITLE_POINT = 12
 TITLE_MARGIN = 16
+FLOW_LAMPS = (
+    "システム開始",
+    "使用アイテム確認",
+    "ゲーム数確認",
+    "BLUE STACK 起動確認",
+    "画面の確認",
+    "スタート画面確認",
+    "ハートの確認",
+    "モデルの確認",
+    "使用ツムの確認",
+    "プレイを開始",
+    "TIME UP 検知",
+    "リザルト検知",
+    "システム終了",
+)
+FLOW_LAMP_OFF = "background: palette(mid); color: palette(window-text);"
+FLOW_LAMP_ON = "background: palette(highlight); color: palette(highlighted-text);"
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -408,6 +425,14 @@ class MenuWindow(QMainWindow):
         self._tsum_recognition.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._tsum_recognition.setFont(mark_font)
         left.addWidget(self._tsum_recognition)
+        self._flow_lamps: dict[str, QLabel] = {}
+        for name in FLOW_LAMPS:
+            lamp = QLabel(name)
+            lamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lamp.setFont(mark_font)
+            lamp.setStyleSheet(FLOW_LAMP_OFF)
+            self._flow_lamps[name] = lamp
+            left.addWidget(lamp)
         left.addStretch(1)
         memory_title = QLabel("メモリ使用率")
         memory_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -861,6 +886,8 @@ class MenuWindow(QMainWindow):
         if not isinstance(item, dict) or self._game_list is None:
             return
         record_id = item.get("id")
+        if item.get("result_coin") is not None and self._play_busy():
+            self._set_flow_lamp("リザルト検知")
         parts = _game_record_parts(item)
         for row in range(self._game_list.count()):
             listed = self._game_list.item(row)
@@ -979,16 +1006,59 @@ class MenuWindow(QMainWindow):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
         )
 
+    def _set_flow_lamp(self, name: str) -> None:
+        lamps = getattr(self, "_flow_lamps", None)
+        if not lamps or name not in lamps:
+            return
+        if name == "システム開始":
+            for lamp in lamps.values():
+                lamp.setStyleSheet(FLOW_LAMP_OFF)
+        lamps[name].setStyleSheet(FLOW_LAMP_ON)
+
+    def _lamp_for_activity(self, text: str) -> str:
+        if text.startswith("TIME UP"):
+            return "TIME UP 検知"
+        if text.startswith("ハート"):
+            return "ハートの確認"
+        if text.startswith("使用ツム"):
+            return "使用ツムの確認"
+        if (
+            text.startswith("モデルを読み込み")
+            or text == "ツム名のモデル"
+            or text.startswith("画面認識のライブラリ")
+        ):
+            return "モデルの確認"
+        if text.startswith("スタートを検出") or text.startswith("スタートをクリック"):
+            return "スタート画面確認"
+        if text == "プレイを開始します":
+            return "プレイを開始"
+        if text.startswith("BlueStacks"):
+            return "BLUE STACK 起動確認"
+        if text.startswith("アイテムの画面"):
+            return "使用アイテム確認"
+        if (
+            "画面を待って" in text
+            or text.startswith("許可")
+            or text.startswith("TAP TO START")
+            or text.startswith("動画")
+        ):
+            return "画面の確認"
+        return ""
+
     def _set_activity(self, text: str) -> None:
         if self._activity is None:
             return
         if text.startswith("LossTime "):
             return
         self._activity.setText(text)
+        lamp = self._lamp_for_activity(text)
+        if lamp:
+            self._set_flow_lamp(lamp)
 
     def _on_play_done(self) -> None:
         self._unregister_stop_hotkey()
         self._set_activity("プレイが終わりました")
+        self._set_flow_lamp("システム終了")
 
     def _play_busy(self) -> bool:
         intro_on = self._intro is not None and self._intro.isRunning()
@@ -1056,6 +1126,7 @@ class MenuWindow(QMainWindow):
             return
         self._stopped_by_key = False
         self._set_activity("停止しました")
+        self._set_flow_lamp("システム終了")
 
     def nativeEvent(self, eventType, message):
         if sys.platform == "win32" and (self._stop_hotkey or self._tsum_hotkey):
@@ -1160,6 +1231,7 @@ class MenuWindow(QMainWindow):
     def _on_autoplay(self) -> None:
         if not self._app_allowed:
             return
+        self._set_flow_lamp("システム開始")
         self._set_activity("BlueStacks を確認しています")
         if not _bluestacks_running():
             self._set_activity("BlueStacks は起動していません。")
@@ -1181,6 +1253,7 @@ class MenuWindow(QMainWindow):
             self._autoplay_button.setEnabled(True)
         if isinstance(payload, dict) and isinstance(payload.get("items"), list):
             self._light_items([str(name) for name in payload["items"]])
+        self._set_flow_lamp("ゲーム数確認")
         ok, games = self._game_count()
         if not ok:
             self._set_activity("プレイするゲーム数がありません。")
@@ -1196,11 +1269,13 @@ class MenuWindow(QMainWindow):
     def _on_intro_fail(self, message: str) -> None:
         self._unregister_stop_hotkey()
         self._set_activity(message)
+        self._set_flow_lamp("システム終了")
         QMessageBox.critical(self, "オートプレイ", message)
 
     def _on_play_fail(self, message: str) -> None:
         self._unregister_stop_hotkey()
         self._set_activity(message)
+        self._set_flow_lamp("システム終了")
         QMessageBox.critical(self, "オートプレイ", message)
 
     def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
@@ -2093,6 +2168,7 @@ def _start_match(window: MenuWindow) -> None:
     )
     worker.status.connect(window._set_activity)
     worker.recognized.connect(window._show_tsum_recognition)
+    worker.flow.connect(window._set_flow_lamp)
     worker.recorded.connect(window._show_game_record)
     worker.items.connect(window._on_play_items)
     worker.need_used_tsum.connect(window._on_need_used_tsum)

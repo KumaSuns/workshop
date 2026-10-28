@@ -132,6 +132,7 @@ class PlayWorker(QThread):
     my_lamp = Signal(str)
     items = Signal(str)
     recognized = Signal(int)
+    flow = Signal(str)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
     recorded = Signal(object)
@@ -223,6 +224,7 @@ class PlayWorker(QThread):
                 notify_record=self.recorded.emit,
                 use_named=self._use_named,
                 show_recognized=self.recognized.emit,
+                mark=self.flow.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -323,7 +325,11 @@ def run_play(
     notify_record: Callable[[dict], None] | None = None,
     use_named: bool = False,
     show_recognized: Callable[[int], None] | None = None,
+    mark: Callable[[str], None] | None = None,
 ) -> None:
+    global _flow_mark
+    _flow_mark = mark
+
     def say(text: str) -> None:
         if report is not None:
             report(text)
@@ -4596,7 +4602,17 @@ def _filled_heart_count(image) -> int | None:
     return len(same)
 
 
+_flow_mark: Callable[[str], None] | None = None
+
+
+def _mark_flow(name: str) -> None:
+    mark = _flow_mark
+    if mark is not None:
+        mark(name)
+
+
 def _start_hearts(image: QImage) -> int | None:
+    _mark_flow("ハートの確認")
     if image is None or image.isNull() or _match_start_button(image) is None:
         return None
     rgb = _qimage_rgb(image)
