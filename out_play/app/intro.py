@@ -110,6 +110,8 @@ def run_intro_flow(report: StatusFn | None = None, stop: Event | None = None) ->
             time.sleep(0.35)
             continue
         start_hits = 0
+        if _match_start_button(image) is not None:
+            return
         play = _home_play_button(image)
         if play is not None:
             play_hits += 1
@@ -205,6 +207,7 @@ def _press_play(play: QRect, say: StatusFn) -> None:
 def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -> None:
     play_hits = 0
     popup_hits = 0
+    odd_top = False
     while time.time() < deadline:
         _check_stop(stop)
         try:
@@ -213,6 +216,8 @@ def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -
             say("画面を待っています")
             time.sleep(1.0)
             continue
+        if _match_start_button(image) is not None:
+            return
         play = _home_play_button(image)
         if play is not None:
             popup_hits = 0
@@ -225,8 +230,11 @@ def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -
             continue
         play_hits = 0
         popup_hits = 0
-        say("プレイを待っています")
-        time.sleep(0.35)
+        if not odd_top:
+            say("上部をクリックします")
+            odd_top = True
+        _slow_tap(image.width() // 2, max(1, image.height() // 10))
+        time.sleep(0.8)
     raise TimeoutError("プレイが出ませんでした。")
 
 
@@ -572,13 +580,21 @@ def _wide_bottom_play(image: QImage) -> QRect | None:
     return rect
 
 
+def _same_button(left: QRect | None, right: QRect | None) -> bool:
+    if left is None or right is None:
+        return False
+    return (
+        abs(left.center().x() - right.center().x()) < max(left.width(), right.width()) * 0.4
+        and abs(left.center().y() - right.center().y()) < max(left.height(), right.height()) * 0.4
+    )
+
+
 def _home_play_button(image: QImage) -> QRect | None:
-    if _match_start_button(image) is not None:
-        return None
+    start = _match_start_button(image)
     if _yellow_pair_left(image) is not None:
         return None
     wide = _wide_bottom_play(image)
-    if wide is not None:
+    if wide is not None and not _same_button(wide, start):
         return wide
     if (
         _retry_button(image) is not None
@@ -595,6 +611,8 @@ def _home_play_button(image: QImage) -> QRect | None:
         if abs(pill.center().x() - image.width() / 2) > image.width() * 0.15:
             continue
         if _is_daily_mission(image, pill):
+            continue
+        if _same_button(pill, start):
             continue
         bottom.append(pill)
     if not bottom:
