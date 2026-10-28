@@ -396,6 +396,7 @@ def run_play(
             tsum_unspecified = True
             say("使用ツム —")
 
+    _mark_flow("")
     say("モデルを読み込み中")
     tried_libs = False
     while True:
@@ -4686,10 +4687,18 @@ def _click_start_or_continue(
     used_name = ""
     items: list[str] | None = None
     odd_top_tapped = False
+    opened = False
+
+    def _seen_model() -> None:
+        _mark_flow("モデルの確認")
+
     while time.time() < deadline:
         _check_stop(stop)
         if finish_after is not None and finish_after.is_set():
             return kinds, locked, "stop", used_name, items
+        if not opened:
+            _mark_flow("画面の確認")
+            opened = True
         try:
             path = capture_screen_path()
             image = QImage(str(path))
@@ -4717,6 +4726,7 @@ def _click_start_or_continue(
             if items:
                 say("アイテム " + "、".join(items))
             _say_heart_mail(say, image)
+            _seen_model()
             if _start_hearts(image) == 0:
                 _wait_for_heart(say, stop)
                 deadline = time.time() + 12
@@ -4758,6 +4768,7 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
             else:
                 say("続けるを検出しました")
+            _seen_model()
             return kinds, locked, "continue", used_name, items
         cancel = _cancel_button(image)
         if cancel is not None:
@@ -4779,6 +4790,7 @@ def _click_start_or_continue(
             and _match_start_button(image) is None
             and _close_button(image) is None
         ):
+            _seen_model()
             return kinds, locked, "", used_name, items
         play = _play_button(image)
         if play is not None:
@@ -4795,6 +4807,7 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
             else:
                 say("続けるを検出しました")
+            _seen_model()
             return kinds, locked, "continue", used_name, items
         if not image.isNull():
             if not odd_top_tapped:
@@ -4803,6 +4816,7 @@ def _click_start_or_continue(
             _slow_tap(image.width() // 2, max(1, image.height() // 10))
             _sleep_stop(0.8, stop)
         _sleep_stop(0.4, stop)
+    _seen_model()
     return kinds, locked, "", used_name, items
 
 

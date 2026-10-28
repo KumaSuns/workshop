@@ -1006,14 +1006,65 @@ class MenuWindow(QMainWindow):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
         )
 
+    def _ensure_flow_blink(self) -> None:
+        timer = getattr(self, "_flow_blink_timer", None)
+        if timer is not None:
+            return
+        timer = QTimer(self)
+        timer.setInterval(500)
+        timer.timeout.connect(self._tick_flow_blink)
+        self._flow_blink_timer = timer
+        self._flow_current = ""
+        self._flow_blink_on = True
+        self._flow_reached = -1
+
+    def _tick_flow_blink(self) -> None:
+        name = getattr(self, "_flow_current", "")
+        lamps = getattr(self, "_flow_lamps", None)
+        if not name or not lamps or name not in lamps:
+            return
+        self._flow_blink_on = not self._flow_blink_on
+        lamps[name].setStyleSheet(
+            FLOW_LAMP_ON if self._flow_blink_on else FLOW_LAMP_OFF
+        )
+
     def _set_flow_lamp(self, name: str) -> None:
         lamps = getattr(self, "_flow_lamps", None)
-        if not lamps or name not in lamps:
+        if not lamps:
+            return
+        self._ensure_flow_blink()
+        if not name:
+            self._flow_blink_timer.stop()
+            current = self._flow_current
+            if current in lamps:
+                lamps[current].setStyleSheet(FLOW_LAMP_ON)
+            return
+        if name not in lamps:
             return
         if name == "システム開始":
+            self._flow_blink_timer.stop()
             for lamp in lamps.values():
                 lamp.setStyleSheet(FLOW_LAMP_OFF)
+            self._flow_current = ""
+            self._flow_reached = -1
+        index = FLOW_LAMPS.index(name)
+        reached = self._flow_reached
+        if index < reached:
+            return
+        if name != "システム終了" and index > reached + 1:
+            return
+        if name == self._flow_current and self._flow_blink_timer.isActive():
+            return
+        if self._flow_current in lamps and self._flow_current != name:
+            lamps[self._flow_current].setStyleSheet(FLOW_LAMP_ON)
+        self._flow_current = name
+        self._flow_reached = index
+        self._flow_blink_on = True
         lamps[name].setStyleSheet(FLOW_LAMP_ON)
+        if name == "システム終了":
+            self._flow_blink_timer.stop()
+            return
+        self._flow_blink_timer.start()
 
     def _lamp_for_activity(self, text: str) -> str:
         if text.startswith("TIME UP"):
