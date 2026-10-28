@@ -81,3 +81,35 @@ def set_result_coin(record_id: int, result_coin: int) -> dict | None:
         lines[index] = json.dumps(found, ensure_ascii=False)
         PATH.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     return found
+
+
+def update_game_coins(record_id: int, coin: int | None, result_coin: int | None) -> dict | None:
+    if record_id is None or (coin is None and result_coin is None):
+        return None
+    with _lock:
+        if not PATH.is_file():
+            return None
+        lines = PATH.read_text(encoding="utf-8").splitlines()
+        found = None
+        index = -1
+        for row in range(len(lines) - 1, -1, -1):
+            raw = lines[row].strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict) and item.get("id") == record_id:
+                found = item
+                index = row
+                break
+        if found is None:
+            return None
+        if coin is not None:
+            found["coin"] = int(coin)
+        if result_coin is not None:
+            found["result_coin"] = int(result_coin)
+        lines[index] = json.dumps(found, ensure_ascii=False)
+        PATH.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return found

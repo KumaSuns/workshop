@@ -34,7 +34,10 @@ from app.intro import (
     _close_button,
     _continue_button,
     _daily_mission_button,
+    _extend_cancel_button,
+    _has_highscore_plate,
     _in_play_hud,
+    _is_extend_dialog,
     _match_start_button,
     _home_play_button,
     _pause_continue_button,
@@ -81,7 +84,7 @@ from app.play_style import (
     should_bomb,
     unlike_hit,
 )
-from app.game_record import append_game_record, set_result_coin
+from app.game_record import append_game_record, set_result_coin, update_game_coins
 from app.play_web import append_play
 from app.paths import APP_ROOT
 from app.trainer_bridge import (
@@ -95,6 +98,7 @@ MIN_CHAIN = 3
 BOARD_TSUMS = 8
 BOARD_READY = 40
 TIMEUP_SCORE = 0.70
+SCENE_KIND_SCORE = 0.18
 SKILL_GAP = 2.2
 SKILL_FILL_READY = 0.90
 SKILL_FILL_SPENT = 0.40
@@ -1643,6 +1647,26 @@ def run_play(
             limit = len(roster)
         setter(limit, used_tsum, roster, join)
 
+    def _settle_after_timeup() -> bool:
+        coin_text, result_text = _watch_money_screens(predictor, say, stop)
+        coin_n = play_coin(coin_text) if coin_text else None
+        result_n = play_coin(result_text) if result_text else None
+        if last_record_id[0] is not None and (coin_n is not None or result_n is not None):
+            updated = update_game_coins(last_record_id[0], coin_n, result_n)
+            if updated is not None:
+                if result_n is not None:
+                    last_has_result[0] = True
+                if notify_record is not None:
+                    notify_record(updated)
+        if not _continue_after_game():
+            _replay_after_timeup(
+                say, stop, finish_after, on_retry=take_result, stop_at_start=True
+            )
+            stop_watch.set()
+            watching.clear()
+            return True
+        return False
+
     next_frame = None
     try:
         while True:
@@ -1857,14 +1881,7 @@ def run_play(
                     notify_record=publish,
                 )
                 watch_hit.clear()
-                if not _continue_after_game():
-                    stop_watch.set()
-                    watching.clear()
-                    return
-                if finish_after is not None and finish_after.is_set():
-                    say("このプレイでやめます")
-                    stop_watch.set()
-                    watching.clear()
+                if _settle_after_timeup():
                     return
                 _seen, replay_items = _replay_after_timeup(say, stop, finish_after, on_retry=take_result)
                 if finish_after is not None and finish_after.is_set():
@@ -2507,14 +2524,7 @@ def run_play(
                         on_result=retry_on_check,
                         notify_record=publish,
                     )
-                    if not _continue_after_game():
-                        stop_watch.set()
-                        watching.clear()
-                        return
-                    if finish_after is not None and finish_after.is_set():
-                        say("このプレイでやめます")
-                        stop_watch.set()
-                        watching.clear()
+                    if _settle_after_timeup():
                         return
                     _seen, replay_items = _replay_after_timeup(say, stop, finish_after, on_retry=take_result)
                     if finish_after is not None and finish_after.is_set():
@@ -4087,13 +4097,110 @@ def _counts_line(clears: int, swipes: int, coin: str = "") -> str:
     return text
 
 
+def _result_coin_icon(image) -> tuple[int, int, int, int] | None:
+    from PIL import Image
+
+    scale = 4 if image.width >= 800 else 2
+    small = image.resize(
+        (max(1, image.width // scale), max(1, image.height // scale)),
+        Image.Resampling.BOX,
+    )
+    width, height = small.size
+    pixels = small.load()
+    mask = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            red, green, blue = pixels[x, y][:3]
+            row.append(red > 175 and green > 110 and blue < 140 and red > green - 15 and red > blue + 40)
+        mask.append(row)
+    seen = [[False] * width for _ in range(height)]
+    best = None
+    for y in range(height):
+        for x in range(width):
+            if not mask[y][x] or seen[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            count = 0
+            min_x = max_x = x
+            min_y = max_y = y
+            while stack:
+                cx, cy = stack.pop()
+                count += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if 0 <= nx < width and 0 <= ny < height and mask[ny][nx] and not seen[ny][nx]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if count < 12:
+                continue
+            box_w = max_x - min_x + 1
+            box_h = max_y - min_y + 1
+            fill = count / (box_w * box_h)
+            icon_w, icon_h = box_w * scale, box_h * scale
+            icon_x, icon_y = min_x * scale, min_y * scale
+            if icon_w < image.width * 0.035 or icon_w > image.width * 0.09:
+                continue
+            if not 0.75 <= icon_w / max(icon_h, 1) <= 1.35:
+                continue
+            center_y = (icon_y + icon_h / 2) / image.height
+            if not 0.42 <= center_y <= 0.68:
+                continue
+            if fill < 0.68:
+                continue
+            if best is None or fill > best[0]:
+                best = (fill, icon_x, icon_y, icon_w, icon_h)
+    if best is None:
+        return None
+    return best[1], best[2], best[3], best[4]
+
+
+def _result_coin_box(image, model_box: dict[str, int] | None) -> dict[str, int] | None:
+    icon = _result_coin_icon(image)
+    if icon is None:
+        return model_box
+    icon_x, icon_y, icon_w, icon_h = icon
+    width, height = image.size
+    left = max(0, int(icon_x - 0.85 * icon_w))
+    top = max(0, int(icon_y + icon_h / 2 - 1.08 * icon_w))
+    box_w = min(width - left, int(round(icon_w * 9.0)))
+    box_h = min(height - top, int(round(icon_w * 2.15)))
+    row = {"x": left, "y": top, "w": max(1, box_w), "h": max(1, box_h)}
+    if not model_box:
+        return row
+    box_left = int(model_box["x"])
+    box_top = int(model_box["y"])
+    box_width = int(model_box["w"])
+    box_height = int(model_box["h"])
+    center_x = icon_x + icon_w / 2
+    center_y = icon_y + icon_h / 2
+    inside = box_left <= center_x <= box_left + box_width and box_top <= center_y <= box_top + box_height
+    if inside and box_height <= icon_w * 2.6:
+        return model_box
+    return row
+
+
+_TAUGHT_COIN_900 = {"x": 311, "y": 234, "w": 275, "h": 73}
+
+
 def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
-    if rgb is None or not boxes:
+    if rgb is None:
         return ""
     predict = getattr(predictor, "predict_coin_digits", None)
     if predict is None:
         return ""
-    box = boxes.get(key)
+    if key == "coin" and rgb.size == (900, 1600):
+        box = _TAUGHT_COIN_900
+    else:
+        if not boxes:
+            return ""
+        box = boxes.get(key)
+        if key == "result_coin":
+            box = _result_coin_box(rgb, box)
     if not box:
         return ""
     width, height = rgb.size
@@ -4151,20 +4258,175 @@ def _timer_still_running(rgb, timer: dict[str, int] | None) -> bool:
     return left is not None and left > 0
 
 
+def _money_digits(text: str) -> str:
+    return "".join(char for char in str(text or "") if char.isdigit()).lstrip("0")
+
+
+def _scene_class_scores(predictor, rgb) -> dict[str, float]:
+    model = getattr(predictor, "scene_model", None)
+    transform = getattr(predictor, "_scene_transform", None)
+    if model is None or transform is None or rgb is None:
+        return {}
+    import torch
+
+    view = _portrait_frame(rgb)
+    tensor = transform(view).unsqueeze(0).to(predictor.device)
+    with torch.no_grad():
+        probs = torch.softmax(model(tensor), dim=1)[0]
+    classes = getattr(predictor, "scene_classes", None) or ("other", "go", "timeup")
+    return {
+        classes[i]: float(probs[i].item())
+        for i in range(min(len(classes), int(probs.numel())))
+    }
+
+
+def _money_scene_key(scores: dict[str, float]) -> str:
+    best_name = ""
+    best_score = 0.0
+    for kind, kind_score in scores.items():
+        if kind == "other" or kind_score <= best_score:
+            continue
+        best_name = kind
+        best_score = kind_score
+    if best_score < SCENE_KIND_SCORE:
+        return ""
+    if best_name == "coin":
+        return "coin"
+    if best_name == "result":
+        return "result_coin"
+    return ""
+
+
+def _read_scene_money(predictor, frame_rgb, force_key: str = "") -> tuple[str, str]:
+    if frame_rgb is None:
+        return "", ""
+    try:
+        with _gpu_lock:
+            key = force_key or _money_scene_key(_scene_class_scores(predictor, frame_rgb))
+            if not key:
+                return "", ""
+            found = predictor.predict_all(Path("."), rgb=frame_rgb)
+            text = _money_digits(_read_coin_key(predictor, frame_rgb, found, key))
+    except Exception:
+        return "", ""
+    if not text:
+        return "", ""
+    field = "coin" if key == "coin" else "result"
+    return field, text
+
+
+def _dismiss_highscore_dialog(image: QImage, say: StatusFn, stop: Event | None) -> bool:
+    if image is None or image.isNull() or not _has_highscore_plate(image):
+        return False
+    button = _close_button(image)
+    if button is None:
+        return False
+    say("とじるをクリックします")
+    _slow_tap(button.center().x(), button.center().y())
+    _sleep_stop(1.0, stop)
+    return True
+
+
+def _dismiss_extend_dialog(image: QImage, say: StatusFn, stop: Event | None) -> bool:
+    if image is None or image.isNull():
+        return False
+    button = _extend_cancel_button(image)
+    if button is None:
+        return False
+    say("キャンセルをクリックします")
+    _slow_tap(button.center().x(), button.center().y())
+    _sleep_stop(1.0, stop)
+    return True
+
+
+def _watch_money_screens(predictor, say: StatusFn, stop: Event | None) -> tuple[str, str]:
+    seen = {"coin": False, "result": False}
+    last = {"coin": "", "result": ""}
+    hits = {"coin": 0, "result": 0}
+    shown = {"coin": "", "result": ""}
+    deadline = time.time() + 12
+
+    def publish(field: str, text: str) -> None:
+        if field not in shown or not text or shown[field] == text:
+            return
+        shown[field] = text
+        if field == "coin":
+            say(f"獲得コイン {text}")
+        elif field == "result":
+            say(f"リザルトコイン {text}")
+
+    def take(field: str, text: str) -> None:
+        nonlocal deadline
+        if field not in seen or not text:
+            return
+        if text == last[field]:
+            hits[field] += 1
+        else:
+            last[field] = text
+            hits[field] = 1
+            deadline = max(deadline, time.time() + 2.5)
+        if hits[field] >= 2:
+            seen[field] = True
+            publish(field, text)
+
+    while time.time() < deadline and not seen["result"]:
+        _check_stop(stop)
+        try:
+            shot = capture_play_frame()
+            frame_rgb = _qimage_rgb(shot)
+        except Exception:
+            _sleep_stop(0.25, stop)
+            continue
+        if shot is not None and not shot.isNull() and _is_extend_dialog(shot):
+            _dismiss_extend_dialog(shot, say, stop)
+            last = {"coin": "", "result": ""}
+            hits = {"coin": 0, "result": 0}
+            deadline = max(deadline, time.time() + 8)
+            continue
+        if shot is not None and _dismiss_highscore_dialog(shot, say, stop):
+            last = {"coin": "", "result": ""}
+            hits = {"coin": 0, "result": 0}
+            seen = {"coin": False, "result": False}
+            deadline = max(deadline, time.time() + 8)
+            continue
+        on_result = shot is not None and not shot.isNull() and _retry_button(shot) is not None
+        on_start = shot is not None and not shot.isNull() and _match_start_button(shot) is not None
+        field, text = _read_scene_money(predictor, frame_rgb)
+        if field == "coin" and not on_result and not on_start:
+            take(field, text)
+        if on_result and not seen["result"]:
+            _field, text = _read_scene_money(predictor, frame_rgb, "result_coin")
+            if text:
+                take("result", text)
+        if not seen["result"]:
+            _sleep_stop(0.25, stop)
+    for field in ("coin", "result"):
+        if not seen[field] and last[field]:
+            publish(field, last[field])
+    return shown["coin"], shown["result"]
+
+
 def _replay_after_timeup(
     say: StatusFn,
     stop: Event | None,
     finish_after: Event | None = None,
     on_retry: Callable[[QImage], None] | None = None,
+    stop_at_start: bool = False,
 ) -> tuple[str, list[str] | None]:
-    if finish_after is not None and finish_after.is_set():
+    if finish_after is not None and finish_after.is_set() and not stop_at_start:
         return "", None
     _seen, _locked, arrived, used_name, items = _click_start_or_continue(
-        say, stop, tap_start=False, read_tsum=False, finish_after=finish_after, on_retry=on_retry
+        say,
+        stop,
+        tap_start=False,
+        read_tsum=False,
+        finish_after=None if stop_at_start else finish_after,
+        on_retry=on_retry,
+        stop_at_start=stop_at_start,
     )
-    if finish_after is not None and finish_after.is_set():
+    if finish_after is not None and finish_after.is_set() and not stop_at_start:
         return "", None
-    if arrived == "continue":
+    if arrived == "continue" and not stop_at_start:
         _tap_continue_now(say, stop)
     return used_name, items
 
@@ -4680,6 +4942,7 @@ def _click_start_or_continue(
     read_tsum: bool = True,
     finish_after: Event | None = None,
     on_retry: Callable[[QImage], None] | None = None,
+    stop_at_start: bool = False,
 ) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
@@ -4692,9 +4955,9 @@ def _click_start_or_continue(
     def _seen_model() -> None:
         _mark_flow("モデルの確認")
 
-    while time.time() < deadline:
+    while stop_at_start or time.time() < deadline:
         _check_stop(stop)
-        if finish_after is not None and finish_after.is_set():
+        if finish_after is not None and finish_after.is_set() and not stop_at_start:
             return kinds, locked, "stop", used_name, items
         if not opened:
             _mark_flow("画面の確認")
@@ -4715,6 +4978,8 @@ def _click_start_or_continue(
             locked = True
         start = _match_start_button(image)
         if start is not None:
+            if stop_at_start:
+                return kinds, locked, "start", used_name, items
             if read_tsum:
                 name = _read_used_tsum(path)
                 if name:
@@ -4740,7 +5005,7 @@ def _click_start_or_continue(
             return kinds, locked, "start", used_name, items
         retry = None if skip_retry else _retry_button(image)
         if retry is not None:
-            if finish_after is not None and finish_after.is_set():
+            if finish_after is not None and finish_after.is_set() and not stop_at_start:
                 return kinds, locked, "stop", used_name, items
             if on_retry is not None:
                 on_retry(image)
@@ -4761,7 +5026,7 @@ def _click_start_or_continue(
                 _sleep_stop(0.4, stop)
             continue
         pause = _pause_continue_button(image)
-        if pause is not None:
+        if pause is not None and not stop_at_start:
             if tap_start:
                 say("続けるをクリックします")
                 _slow_tap(pause.center().x(), pause.center().y())
@@ -4777,6 +5042,13 @@ def _click_start_or_continue(
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue
+        close = _close_button(image)
+        if close is not None:
+            say("とじるをクリックします")
+            _slow_tap(close.center().x(), close.center().y())
+            _sleep_stop(1.2, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
         play = _home_play_button(image)
         if play is not None:
             say("プレイをクリックします")
@@ -4785,7 +5057,8 @@ def _click_start_or_continue(
             deadline = max(deadline, time.time() + 12)
             continue
         if (
-            _in_play_hud(image)
+            not stop_at_start
+            and _in_play_hud(image)
             and _play_button(image) is None
             and _match_start_button(image) is None
             and _close_button(image) is None
@@ -4800,7 +5073,7 @@ def _click_start_or_continue(
             deadline = max(deadline, time.time() + 12)
             continue
         resume = _continue_button(image)
-        if resume is not None:
+        if resume is not None and not stop_at_start:
             if tap_start:
                 say("続けるをクリックします")
                 _slow_tap(resume.center().x(), resume.center().y())
@@ -4809,7 +5082,7 @@ def _click_start_or_continue(
                 say("続けるを検出しました")
             _seen_model()
             return kinds, locked, "continue", used_name, items
-        if not image.isNull():
+        if not image.isNull() and (not odd_top_tapped or stop_at_start):
             if not odd_top_tapped:
                 say("上部をクリックします")
             odd_top_tapped = True

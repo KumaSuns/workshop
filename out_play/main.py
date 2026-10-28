@@ -167,10 +167,13 @@ def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
     result = item.get("result_coin")
     coin_text = "－" if coin is None else str(int(coin))
     result_text = "－" if result is None else str(int(result))
+    shown = f"{coin_text} / {result_text}"
+    if coin is not None and result is not None and int(coin) > 0:
+        shown += f" × {int(result) / int(coin):.1f}"
     return [
         (str(item.get("started") or ""), False),
         (f"  使用アイテム {items_text}", False),
-        (f"  コイン {coin_text} / {result_text}", False),
+        (f"  コイン {shown}", False),
     ]
 
 

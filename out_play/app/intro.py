@@ -804,6 +804,55 @@ def _cancel_button(image: QImage) -> QRect | None:
     return _yellow_pair_left(image)
 
 
+def _extend_cancel_button(image: QImage) -> QRect | None:
+    if not _is_extend_dialog(image):
+        return None
+    return _yellow_pair_left(image)
+
+
+def _is_extend_dialog(image: QImage) -> bool:
+    if image is None or image.isNull():
+        return False
+    left = _yellow_pair_left(image)
+    if left is None or left.center().y() > image.height() * 0.78:
+        return False
+    cyan, navy = _extend_dialog_ratios(image)
+    return navy >= 0.35 and cyan >= 0.04
+
+
+def _extend_dialog_ratios(image: QImage) -> tuple[float, float]:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return 0.0, 0.0
+    cyan = 0
+    navy = 0
+    total = 0
+    for y in range(int(height * 0.22), int(height * 0.58)):
+        row = sample[y]
+        for x in range(int(width * 0.15), int(width * 0.85)):
+            pixel = row[x]
+            total += 1
+            if _is_extend_cyan(pixel):
+                cyan += 1
+            elif _is_extend_navy(pixel):
+                navy += 1
+    if total == 0:
+        return 0.0, 0.0
+    return cyan / total, navy / total
+
+
+def _is_extend_cyan(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return red < 140 and green > 140 and blue > 180 and blue >= green - 20
+
+
+def _is_extend_navy(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return blue > 50 and blue > red + 20 and blue >= green and red < 90 and green < 130
+
+
 def _has_highscore_plate(image: QImage) -> bool:
     sample = _sample(image)
     height = len(sample)
