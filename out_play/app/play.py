@@ -147,11 +147,13 @@ class PlayWorker(QThread):
         loop: bool = False,
         ask_kinds: bool = False,
         games: int | None = None,
+        use_named: bool = False,
     ) -> None:
         super().__init__(parent)
         self._stop = stop
         self._start_match = start_match
         self._kind_count = kind_count
+        self._use_named = use_named
         self._save_boards = save_boards
         self._board_grabs = board_grabs
         self._count_skill = count_skill
@@ -218,6 +220,7 @@ class PlayWorker(QThread):
                 skill_lamp=self.skill_lamp.emit,
                 my_lamp=self.my_lamp.emit,
                 notify_record=self.recorded.emit,
+                use_named=self._use_named,
             )
         except Stopped:
             self.stopped.emit()
@@ -285,6 +288,16 @@ def _install_screen_libs() -> str:
     return ""
 
 
+def _apply_named_type_model(predictor) -> None:
+    switch = getattr(predictor, "use_named_tsum_model", None)
+    if switch is None:
+        raise RuntimeError("ツム名のモデルを読み込めません。")
+    path = Path(getattr(predictor, "models_dir")) / "named_tsum_test.pt"
+    with _gpu_lock:
+        if not switch(path):
+            raise RuntimeError("ツム名のモデルがありません。")
+
+
 def run_play(
     report: StatusFn | None,
     stop: Event | None,
@@ -306,6 +319,7 @@ def run_play(
     skill_lamp: Callable[[bool], None] | None = None,
     my_lamp: Callable[[str], None] | None = None,
     notify_record: Callable[[dict], None] | None = None,
+    use_named: bool = False,
 ) -> None:
     def say(text: str) -> None:
         if report is not None:
@@ -408,7 +422,10 @@ def run_play(
                 ) from exc
     if getattr(predictor, "piece_model", None) is None:
         raise RuntimeError("ツムの〇モデルがありません。画面認識アプリで学習してください。")
-    if getattr(predictor, "type_model", None) is None:
+    if use_named:
+        _apply_named_type_model(predictor)
+        say("ツム名のモデル")
+    elif getattr(predictor, "type_model", None) is None:
         raise RuntimeError("ツム種類のモデルがありません。画面認識アプリで学習してください。")
     if getattr(predictor, "scene_model", None) is None:
         raise RuntimeError("TIME UP のモデルがありません。")
@@ -1602,10 +1619,31 @@ def run_play(
         if notify_record is not None:
             notify_record(updated)
 
+    def _sync_named() -> None:
+        if not use_named:
+            return
+        setter = getattr(predictor, "prepare_named", None)
+        if setter is None:
+            return
+        if used_items is not None:
+            limit = 4 if "5＞4" in used_items else 5
+        elif kinds_locked:
+            limit = 4 if int(kinds) <= 4 else 5
+        else:
+            limit = 0
+        roster = None
+        join = None
+        if skill_is_nightmare(used_tsum):
+            roster = ["サリー", "ジャックN", "ゼロ", "パンプキンキング", "ブギー", "メイヤー"]
+            join = ["ジャックN", "ゼロ"]
+            limit = len(roster)
+        setter(limit, used_tsum, roster, join)
+
     next_frame = None
     try:
         while True:
             _check_stop(stop)
+            _sync_named()
             if next_frame is not None:
                 image, rgb = next_frame
                 next_frame = None
@@ -1864,6 +1902,7 @@ def run_play(
                     kinds = 4 if used else 5
                     kinds_locked = True
                     say(f"5＞4 {'使用' if used else '未使用'} / 種類 {kinds}")
+                    _sync_named()
             if not saw_board:
                 retry = None if image.isNull() else _retry_button(image)
                 if retry is not None and _match_start_button(image) is None:

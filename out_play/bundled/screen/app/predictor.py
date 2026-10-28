@@ -48,6 +48,14 @@ class Predictor:
         self.models: dict[str, GameRegionNet] = {}
         self.piece_model: PieceNet | None = None
         self.type_model: TsumTypeNet | None = None
+        self.named_prototypes = None
+        self.named_names: list[str] | None = None
+        self.named_match: dict[str, str] = {}
+        self.named_open: list[str] = []
+        self.named_limit = 0
+        self.named_fixed = False
+        self.named_join: list[str] = []
+        self.named_pin = ""
         self.digit_models: dict[str, CoinDigitNet] = {}
         self.scene_model: SceneNet | None = None
         self.scene_classes: tuple[str, ...] = SCENE_CLASSES
@@ -95,6 +103,14 @@ class Predictor:
         self.models = {}
         self.piece_model = None
         self.type_model = None
+        self.named_prototypes = None
+        self.named_names = None
+        self.named_match = {}
+        self.named_open = []
+        self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
+        self.named_pin = ""
         self.digit_models = {}
         self.scene_model = None
         if self.device.type == "cuda":
@@ -129,6 +145,14 @@ class Predictor:
         self.models = {}
         self.piece_model = None
         self.type_model = None
+        self.named_prototypes = None
+        self.named_names = None
+        self.named_match = {}
+        self.named_open = []
+        self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
+        self.named_pin = ""
         self.digit_models = {}
         self.scene_model = None
         self.scene_classes = SCENE_CLASSES
@@ -451,6 +475,156 @@ class Predictor:
                 pruned.append(piece)
         return pruned
 
+    def use_named_tsum_model(self, path: Path) -> bool:
+        path = Path(path)
+        if not path.is_file():
+            return False
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        if not isinstance(checkpoint, dict):
+            return False
+        state = checkpoint.get("state_dict")
+        prototypes = checkpoint.get("prototypes")
+        if not isinstance(state, dict) or prototypes is None:
+            return False
+        model = TsumTypeNet(pretrained=False)
+        try:
+            model.load_state_dict(state)
+        except Exception:
+            return False
+        model.to(self.device)
+        model.eval()
+        proto = torch.nn.functional.normalize(prototypes.float().to(self.device), dim=1)
+        raw_names = checkpoint.get("names")
+        if proto.ndim != 2 or proto.size(0) < 1 or not isinstance(raw_names, list):
+            return False
+        if len(raw_names) != int(proto.size(0)):
+            return False
+        ja_names: list[str] = []
+        match: dict[str, str] = {}
+        for item in raw_names:
+            if isinstance(item, dict):
+                ja = str(item.get("ja") or "").strip()
+                en = str(item.get("en") or "").strip()
+            else:
+                ja = ""
+                en = ""
+            ja_names.append(ja)
+            if ja:
+                match[ja.casefold()] = ja
+            if en:
+                match[en.casefold()] = ja
+        self.type_model = model
+        self.named_prototypes = proto
+        self.named_names = ja_names
+        self.named_match = match
+        self.named_open = []
+        self.named_limit = 0
+        self.named_fixed = False
+        self.named_join = []
+        self.named_pin = ""
+        return True
+
+    def prepare_named(
+        self,
+        limit: int,
+        used: str,
+        roster: list[str] | None = None,
+        join: list[str] | None = None,
+    ) -> None:
+        if self.named_names is None:
+            return
+        if roster:
+            picked: list[str] = []
+            for name in roster:
+                cleaned = str(name).strip()
+                if cleaned and self._named_index(cleaned) >= 0 and cleaned not in picked:
+                    picked.append(cleaned)
+            joined: list[str] = []
+            for name in join or []:
+                cleaned = str(name).strip()
+                if cleaned and cleaned in picked and cleaned not in joined:
+                    joined.append(cleaned)
+            self.named_open = picked
+            self.named_limit = len(picked)
+            self.named_fixed = bool(picked)
+            self.named_join = joined
+            self.named_pin = ""
+            return
+        self.named_fixed = False
+        self.named_join = []
+        self.named_limit = 4 if int(limit) == 4 else (5 if int(limit) == 5 else 0)
+        pin = self.named_pin_for(used)
+        self.named_pin = pin
+        if pin and pin not in self.named_open:
+            self.named_open.insert(0, pin)
+
+    def named_pin_for(self, used: str) -> str:
+        key = " ".join((used or "").split()).casefold()
+        if not key:
+            return ""
+        return self.named_match.get(key, "")
+
+    def _named_index(self, name: str) -> int:
+        names = self.named_names or []
+        if name not in names:
+            return -1
+        return names.index(name)
+
+    def _nearest_names(self, embed: torch.Tensor, indices: list[int]) -> list[int]:
+        proto = self.named_prototypes
+        if proto is None or not indices:
+            return [0] * int(embed.size(0))
+        if len(indices) == 1:
+            return indices * int(embed.size(0))
+        choice = torch.tensor(indices, device=proto.device, dtype=torch.long)
+        picked = torch.argmax(embed @ proto.index_select(0, choice).T, dim=1).tolist()
+        return [indices[int(item)] for item in picked]
+
+    def _assign_named_groups(self, image: Image.Image, tsums: list[dict[str, int]]) -> None:
+        proto = self.named_prototypes
+        names = self.named_names
+        if proto is None or not names:
+            return
+        points = self._tsum_embeddings(image, tsums)
+        embed = torch.nn.functional.normalize(
+            torch.tensor(points, dtype=torch.float32, device=proto.device),
+            dim=1,
+        )
+        limit = int(self.named_limit or 0)
+        open_names = self.named_open
+        open_index = [self._named_index(name) for name in open_names]
+        open_index = [index for index in open_index if index >= 0]
+        if self.named_fixed and open_index:
+            labels = self._nearest_names(embed, open_index)
+        else:
+            labels = self._nearest_names(embed, list(range(len(names))))
+        if not self.named_fixed and limit and len(open_names) < limit:
+            counts: dict[int, int] = {}
+            for label in labels:
+                counts[label] = counts.get(int(label), 0) + 1
+            ranked = sorted(counts, key=lambda label: (-counts[label], label))
+            for label in ranked:
+                name = names[label] if 0 <= label < len(names) else ""
+                if not name or name in open_names:
+                    continue
+                if len(open_names) >= limit:
+                    break
+                open_names.append(name)
+        join_at = -1
+        joined: list[int] = []
+        if self.named_fixed and len(self.named_join) >= 2:
+            joined = [self._named_index(name) for name in self.named_join]
+            joined = [index for index in joined if index >= 0]
+            if len(joined) >= 2:
+                join_at = joined[0]
+        for piece, label, point in zip(tsums, labels, points):
+            index = int(label)
+            piece["tsum_name"] = names[index] if 0 <= index < len(names) else ""
+            if join_at >= 0 and index in joined:
+                index = join_at
+            piece["group"] = index + 1
+            piece["_vec"] = tuple(point)
+
     def _assign_groups(
         self,
         image: Image.Image,
@@ -465,6 +639,9 @@ class Predictor:
             else:
                 tsums.append(piece)
         if not tsums:
+            return
+        if self.named_prototypes is not None:
+            self._assign_named_groups(image, tsums)
             return
         colors: list[tuple[float, ...]] | None = None
         cosine = False

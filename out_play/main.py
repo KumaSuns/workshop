@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -181,6 +182,13 @@ class MenuWindow(QMainWindow):
         header_layout = QHBoxLayout(self._header)
         header_layout.setContentsMargins(50, 0, 0, 0)
         header_layout.addWidget(self._logo, 1)
+        settings_button = QPushButton("設定")
+        settings_button.clicked.connect(self._open_type_settings)
+        header_layout.addWidget(
+            settings_button,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
         self._front = QCheckBox("最前面")
         self._front.setStyleSheet("background: transparent;")
         self._front.toggled.connect(self._set_front)
@@ -1627,9 +1635,39 @@ class MenuWindow(QMainWindow):
             return
         self._light_items([part.strip() for part in text.split("、")])
 
+    def _open_type_settings(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("設定")
+        column = QVBoxLayout(dialog)
+        column.addWidget(QLabel("どのモデルを使いますか？"))
+        kinds = QRadioButton("ツムの種類")
+        named = QRadioButton("ツム名")
+        named.setChecked(_type_model_choice() == "named")
+        kinds.setChecked(not named.isChecked())
+        column.addWidget(kinds)
+        column.addWidget(named)
+
+        def save(checked: bool) -> None:
+            if not checked:
+                return
+            QSettings("workshop", "AutoPlay").setValue(
+                "tsum_model", "named" if named.isChecked() else "kinds"
+            )
+
+        kinds.toggled.connect(save)
+        named.toggled.connect(save)
+        dialog.exec()
+
     def _set_front(self, on: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.show()
+
+
+def _type_model_choice() -> str:
+    stored = str(QSettings("workshop", "AutoPlay").value("tsum_model", "kinds") or "kinds")
+    if stored == "named":
+        return "named"
+    return "kinds"
 
 
 SCREEN_MODELS = ROOT / "bundled" / "screen" / "data" / "models"
@@ -1637,6 +1675,7 @@ APP_MODEL = ROOT / "models" / "scene.pt"
 MODEL_BUTTONS: list[tuple[str, str, Path]] = [
     ("pieces.pt", "〇", SCREEN_MODELS / "pieces.pt"),
     ("tsum_types.pt", "ツムの種類", SCREEN_MODELS / "tsum_types.pt"),
+    ("named_tsum_test.pt", "ツム名", SCREEN_MODELS / "named_tsum_test.pt"),
     ("game_region.pt", "ゲーム範囲", SCREEN_MODELS / "game_region.pt"),
     ("score.pt", "スコア", SCREEN_MODELS / "score.pt"),
     ("coin.pt", "コイン", SCREEN_MODELS / "coin.pt"),
@@ -1879,6 +1918,7 @@ def _start_match(window: MenuWindow) -> None:
         loop=True,
         ask_kinds=True,
         games=window._play_games,
+        use_named=_type_model_choice() == "named",
     )
     worker.status.connect(window._set_activity)
     worker.recorded.connect(window._show_game_record)
