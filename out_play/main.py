@@ -490,7 +490,7 @@ class MenuWindow(QMainWindow):
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
         )
         self._used_tsum_icon.setFixedHeight(0)
-        above.addWidget(self._used_tsum_icon)
+        above.addWidget(self._used_tsum_icon, 0, Qt.AlignmentFlag.AlignHCenter)
         self._used_tsum_label = QLabel("")
         self._used_tsum_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         above.addWidget(self._used_tsum_label)
@@ -1427,22 +1427,10 @@ class MenuWindow(QMainWindow):
         width = box.contentsRect().width()
         if width <= 1 and self._model_box is not None:
             width = self._model_box.contentsRect().width()
-        side = self._icon_side(width)
+        side = width // 2
         if side < 1:
             return 0, 0
         return side, side
-
-    def _icon_side(self, width: int) -> int:
-        title_font = self.font()
-        title_font.setBold(True)
-        title_font.setPointSize(TITLE_POINT)
-        side = QFontMetrics(title_font).height()
-        count = max(1, len(ITEM_ICONS))
-        gap = max(0, round(side * 4 / 64))
-        while side > 1 and count * side + (count - 1) * gap > width:
-            side -= 1
-            gap = max(0, round(side * 4 / 64))
-        return side
 
     def _save_used_tsum_choice(
         self, path: Path | None, name: str, folder_id: str | None
@@ -1566,10 +1554,13 @@ class MenuWindow(QMainWindow):
         count = len(self._item_labels)
         if rect.width() <= 1 or count < 1:
             return
-        side = self._icon_side(rect.width())
+        side = rect.width() * 64 // (count * 64 + (count - 1) * 4)
+        gap = max(0, round(side * 4 / 64)) if side > 0 else 0
+        while side > 1 and count * side + (count - 1) * gap > rect.width():
+            side -= 1
+            gap = max(0, round(side * 4 / 64))
         if side < 1:
             return
-        gap = max(0, round(side * 4 / 64))
         for row in self._item_rows:
             row.setSpacing(gap)
         if self._item_block is not None:
