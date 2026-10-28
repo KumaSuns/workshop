@@ -1443,7 +1443,7 @@ class MenuWindow(QMainWindow):
         width = box.contentsRect().width()
         if width <= 1 and self._model_box is not None:
             width = self._model_box.contentsRect().width()
-        side = width // 2
+        side = width // 9
         if side < 1:
             return 0, 0
         return side, side
