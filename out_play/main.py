@@ -1668,7 +1668,9 @@ class MenuWindow(QMainWindow):
         kinds.setChecked(not named.isChecked())
         column.addWidget(kinds)
         column.addWidget(named)
-        column.addWidget(QLabel(_gpu_label() or "ナイト"))
+        gpu = _gpu_label()
+        if gpu:
+            column.addWidget(QLabel(gpu))
         column.addWidget(QLabel(f"本アプリが動く環境値 {_guide_score()}/100"))
         decide = QPushButton("決定")
         decide.clicked.connect(dialog.accept)
