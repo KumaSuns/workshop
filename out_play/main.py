@@ -587,18 +587,18 @@ class MenuWindow(QMainWindow):
         self._item_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         left.addWidget(self._item_box)
         inner = QVBoxLayout(self._item_box)
-        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setContentsMargins(0, 0, 0, 5)
         inner.setSpacing(0)
-        inner.addWidget(self._section_title("使用アイテム"))
+        inner.addWidget(self._section_title("使用アイテム", 5, 5))
         block = QWidget()
         block.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
         block_layout = QVBoxLayout(block)
         block_layout.setContentsMargins(0, 0, 0, 0)
-        block_layout.setSpacing(0)
+        block_layout.setSpacing(5)
         self._item_block = block_layout
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(0)
+        row.setSpacing(5)
         row.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self._item_rows.append(row)
         for filename in ITEM_ICONS:
@@ -611,7 +611,7 @@ class MenuWindow(QMainWindow):
         block_layout.addLayout(row)
         inner.addWidget(block, 0, Qt.AlignmentFlag.AlignHCenter)
         above = QVBoxLayout(tsum_box)
-        above.setContentsMargins(0, 0, 0, TITLE_MARGIN)
+        above.setContentsMargins(0, 0, 0, 0)
         above.setSpacing(0)
         above.addWidget(self._section_title("使用ツム"))
         self._used_tsum_icon = QLabel()
@@ -1917,10 +1917,10 @@ class MenuWindow(QMainWindow):
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
-    def _section_title(self, text: str) -> QWidget:
+    def _section_title(self, text: str, top: int = TITLE_MARGIN, bottom: int = TITLE_MARGIN) -> QWidget:
         wrap = QWidget()
         column = QVBoxLayout(wrap)
-        column.setContentsMargins(0, TITLE_MARGIN, 0, TITLE_MARGIN)
+        column.setContentsMargins(0, top, 0, bottom)
         column.setSpacing(2)
         title = QLabel(text)
         title_font = title.font()
@@ -1945,9 +1945,8 @@ class MenuWindow(QMainWindow):
         count = len(self._item_labels)
         if rect.width() <= 1 or count < 1:
             return
-        side = rect.width() * 64 // (count * 64 + (count - 1) * 4)
-        side = side * 3 // 4
-        gap = max(0, round(side * 4 / 64)) if side > 0 else 0
+        gap = 5
+        side = (rect.width() - (count - 1) * gap) * 3 // (4 * count)
         if side < 1:
             return
         for row in self._item_rows:
