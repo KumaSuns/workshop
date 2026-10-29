@@ -103,9 +103,9 @@ def _flow_lamp_style(background: str, color: str, border: str) -> str:
     )
 
 
-SURFACE = "#17233f"
+SURFACE = "#ffffff"
 SURFACE_LINE = "#A4C6FF"
-SURFACE_INK = "#e8f0ff"
+SURFACE_INK = "#17233f"
 
 
 def _plain_surface(widget) -> None:
@@ -123,16 +123,25 @@ def _soft_box(frame: QFrame) -> None:
     frame.setFrameShape(QFrame.Shape.NoFrame)
     frame.setStyleSheet(
         "QFrame#softBox {"
-        " background: #22325a;"
+        " background: #ffffff;"
         f" border: 1px solid {SURFACE_LINE};"
         "}"
     )
 
 
-FLOW_LAMP_OFF = _flow_lamp_style("#22325a", "#e8f0ff", "#A4C6FF")
-FLOW_LAMP_ON = _flow_lamp_style("#2c426e", "#f4f8ff", "#A4C6FF")
-FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#17233f", "#A4C6FF")
-FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#17233f", "#7eb0f0")
+FLOW_LAMP_OFF = _flow_lamp_style("#ffffff", "#17233f", "#A4C6FF")
+FLOW_LAMP_ON = (
+    "QPushButton {"
+    " background: palette(highlight);"
+    " color: palette(highlighted-text);"
+    " font-weight: 700;"
+    " border: 1px solid palette(highlight);"
+    " border-radius: 6px;"
+    " padding: 2px;"
+    "}"
+)
+FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a", "#A4C6FF")
+FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a", "#7eb0f0")
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -489,7 +498,7 @@ class MenuWindow(QMainWindow):
         self._model_choice_label = QLabel("")
         self._model_choice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._model_choice_label.setFont(mark_font)
-        self._model_choice_label.setStyleSheet("color: #A4C6FF; background: transparent;")
+        self._model_choice_label.setStyleSheet("color: #2c4a7a; background: transparent;")
         left.addWidget(self._model_choice_label)
         self._show_model_choice()
         self._add_used_sections(left, mark_font)
@@ -940,8 +949,8 @@ class MenuWindow(QMainWindow):
         self._game_list = QListWidget()
         self._game_list.setFrameShape(QFrame.Shape.NoFrame)
         self._game_list.setStyleSheet(
-            "QListWidget { background: #17233f; color: #e8f0ff; border: none; }"
-            "QListWidget QLabel { color: #e8f0ff; background: transparent; }"
+            "QListWidget { background: #ffffff; color: #17233f; border: none; }"
+            "QListWidget QLabel { color: #17233f; background: transparent; }"
         )
         column.addWidget(self._game_list, 1)
         for item in load_game_records():
@@ -1927,13 +1936,13 @@ class MenuWindow(QMainWindow):
         title_font.setBold(True)
         title_font.setPointSize(TITLE_POINT)
         title.setFont(title_font)
-        title.setStyleSheet("color: #f4f8ff; background: transparent;")
+        title.setStyleSheet("color: #2c4a7a; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         column.addWidget(title)
         bar = QFrame()
         bar.setFixedSize(QFontMetrics(title_font).horizontalAdvance(text), 3)
         bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        bar.setStyleSheet("background-color: #A4C6FF; border: none;")
+        bar.setStyleSheet("background-color: #2c4a7a; border: none;")
         column.addWidget(bar, 0, Qt.AlignmentFlag.AlignHCenter)
         return wrap
 
