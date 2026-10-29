@@ -90,23 +90,25 @@ FLOW_LAMPS = (
     "リザルト検知",
     "システム終了",
 )
-def _flow_lamp_style(background: str, color: str) -> str:
+def _flow_lamp_style(background: str, color: str, border: str) -> str:
     return (
         "QPushButton {"
         f" background: {background};"
         f" color: {color};"
         " font-weight: 700;"
-        " border: 1px solid #8eb4ee;"
+        f" border: 1px solid {border};"
         " border-radius: 6px;"
         " padding: 2px;"
         "}"
     )
 
 
-FLOW_LAMP_OFF = _flow_lamp_style("#ffffff", "palette(window-text)")
-FLOW_LAMP_ON = _flow_lamp_style("palette(highlight)", "palette(highlighted-text)")
-FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a")
-FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a")
+FLOW_LAMP_OFF = _flow_lamp_style("#ffffff", "palette(window-text)", "#d5d8de")
+FLOW_LAMP_ON = _flow_lamp_style(
+    "palette(highlight)", "palette(highlighted-text)", "palette(highlight)"
+)
+FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a", "#d5d8de")
+FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a", "#A4C6FF")
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
