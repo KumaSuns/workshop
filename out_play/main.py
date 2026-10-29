@@ -103,6 +103,30 @@ def _flow_lamp_style(background: str, color: str, border: str) -> str:
     )
 
 
+SURFACE = "#ffffff"
+SURFACE_LINE = "#d5d8de"
+
+
+def _plain_surface(widget) -> None:
+    palette = widget.palette()
+    color = QColor(SURFACE)
+    palette.setColor(QPalette.ColorRole.Window, color)
+    palette.setColor(QPalette.ColorRole.Base, color)
+    widget.setAutoFillBackground(True)
+    widget.setPalette(palette)
+
+
+def _soft_box(frame: QFrame) -> None:
+    frame.setObjectName("softBox")
+    frame.setFrameShape(QFrame.Shape.NoFrame)
+    frame.setStyleSheet(
+        "QFrame#softBox {"
+        f" background: {SURFACE};"
+        f" border: 1px solid {SURFACE_LINE};"
+        "}"
+    )
+
+
 FLOW_LAMP_OFF = _flow_lamp_style("#ffffff", "palette(window-text)", "#d5d8de")
 FLOW_LAMP_ON = _flow_lamp_style(
     "palette(highlight)", "palette(highlighted-text)", "palette(highlight)"
@@ -217,6 +241,7 @@ class MenuWindow(QMainWindow):
         self.tsum_icon_ready.connect(self._on_tsum_icon_ready)
         self.setWindowTitle("AUTO PLAY")
         root = QWidget()
+        _plain_surface(root)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -310,14 +335,16 @@ class MenuWindow(QMainWindow):
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         model_box = QFrame()
-        model_box.setFrameShape(QFrame.Shape.Box)
+        model_box.setFrameShape(QFrame.Shape.NoFrame)
+        _plain_surface(model_box)
         body.addWidget(model_box, 1)
         right_column = QVBoxLayout()
         right_column.setContentsMargins(0, 0, 0, 0)
         right_column.setSpacing(0)
         for _ in range(3):
             slot = QFrame()
-            slot.setFrameShape(QFrame.Shape.Box)
+            slot.setFrameShape(QFrame.Shape.NoFrame)
+            _plain_surface(slot)
             right_column.addWidget(slot, 1)
             self._slots.append(slot)
         body.addLayout(right_column, 2)
@@ -592,7 +619,7 @@ class MenuWindow(QMainWindow):
         )
         self._used_tsum_icon.setFixedHeight(0)
         self._used_tsum_frame = QFrame()
-        self._used_tsum_frame.setFrameShape(QFrame.Shape.Box)
+        _soft_box(self._used_tsum_frame)
         self._used_tsum_frame.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
@@ -644,7 +671,7 @@ class MenuWindow(QMainWindow):
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(0)
         right_box = QFrame()
-        right_box.setFrameShape(QFrame.Shape.Box)
+        right_box.setFrameShape(QFrame.Shape.NoFrame)
         column.addWidget(right_box, 1)
         right = QVBoxLayout(right_box)
         right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
@@ -908,6 +935,10 @@ class MenuWindow(QMainWindow):
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(0)
         self._game_list = QListWidget()
+        self._game_list.setFrameShape(QFrame.Shape.NoFrame)
+        self._game_list.setStyleSheet(
+            "QListWidget { background: #ffffff; border: none; }"
+        )
         column.addWidget(self._game_list, 1)
         for item in load_game_records():
             self._show_game_record(item)
@@ -1031,7 +1062,7 @@ class MenuWindow(QMainWindow):
         self._launch_button.clicked.connect(self._create_desktop_shortcut)
         self._center_buttons.append(self._launch_button)
         self._center_blank = QFrame()
-        self._center_blank.setFrameShape(QFrame.Shape.Box)
+        _soft_box(self._center_blank)
         blank_layout = QVBoxLayout(self._center_blank)
         blank_layout.setContentsMargins(TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN)
         blank_layout.setSpacing(0)
