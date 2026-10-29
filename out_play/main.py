@@ -129,10 +129,10 @@ def _soft_box(frame: QFrame) -> None:
     )
 
 
-FLOW_LAMP_OFF = _flow_lamp_style("transparent", "#d5e4ff", "transparent")
-FLOW_LAMP_ON = _flow_lamp_style("#2c426e", "#f4f8ff", "transparent")
-FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#17233f", "transparent")
-FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#17233f", "transparent")
+FLOW_LAMP_OFF = _flow_lamp_style("#22325a", "#e8f0ff", "#A4C6FF")
+FLOW_LAMP_ON = _flow_lamp_style("#2c426e", "#f4f8ff", "#A4C6FF")
+FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#17233f", "#A4C6FF")
+FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#17233f", "#7eb0f0")
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -498,7 +498,7 @@ class MenuWindow(QMainWindow):
             lamp = QPushButton(name)
             lamp.setFont(mark_font)
             lamp.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            lamp.setFlat(True)
+            lamp.setFlat(False)
             lamp.setAutoDefault(False)
             lamp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             lamp.setStyleSheet(FLOW_LAMP_OFF)
