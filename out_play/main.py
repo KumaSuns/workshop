@@ -270,6 +270,11 @@ class MenuWindow(QMainWindow):
         self._stop_hotkey = False
         self._stop_key_timer = None
         self._q_down = False
+        self._autoplay_alive = False
+        self._stop_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Q), self)
+        self._stop_shortcut.setAutoRepeat(False)
+        self._stop_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._stop_shortcut.activated.connect(self._stop_play)
         self._tsum_hotkey = False
         app = QApplication.instance()
         if app is not None:
@@ -1187,6 +1192,7 @@ class MenuWindow(QMainWindow):
             self._set_flow_lamp(lamp)
 
     def _on_play_done(self) -> None:
+        self._autoplay_alive = False
         self._unregister_stop_hotkey()
         self._set_activity("プレイが終わりました")
         self._set_flow_lamp("システム終了")
@@ -1253,9 +1259,12 @@ class MenuWindow(QMainWindow):
         self._set_activity("このプレイでやめます")
 
     def _stop_play(self) -> None:
-        if not self._play_busy():
+        item_check = self._item_check
+        item_on = item_check is not None and item_check.isRunning()
+        if not self._play_busy() and not item_on and not self._autoplay_alive:
             return
         self._stopped_by_key = True
+        self._autoplay_alive = False
         if not self._play_stop.is_set():
             self._play_stop.set()
             if self._intro is not None and self._intro.isRunning():
@@ -1263,6 +1272,9 @@ class MenuWindow(QMainWindow):
             if self._play_worker is not None and self._play_worker.isRunning():
                 self._play_worker.requestInterruption()
         self._clear_tsum_frame()
+        if item_on:
+            item_check.requestInterruption()
+            self._item_check = None
         worker = self._play_worker
         if worker is not None:
             worker.provide_used_tsum(None)
@@ -1276,9 +1288,16 @@ class MenuWindow(QMainWindow):
             halt_input = None
         if halt_input is not None:
             halt_input()
+        if self._autoplay_button is not None:
+            self._autoplay_button.setEnabled(True)
+        if not self._play_busy():
+            self._set_activity("停止しました")
+            self._set_flow_lamp("システム終了")
+            return
         self._set_activity("停止しています")
 
     def _on_play_stopped(self) -> None:
+        self._autoplay_alive = False
         self._unregister_stop_hotkey()
         if not self._stopped_by_key:
             return
@@ -1287,7 +1306,7 @@ class MenuWindow(QMainWindow):
         self._set_flow_lamp("システム終了")
 
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat() and self._play_busy():
+        if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat():
             self._stop_play()
             return
         super().keyPressEvent(event)
@@ -1297,7 +1316,6 @@ class MenuWindow(QMainWindow):
             event.type() == QEvent.Type.KeyPress
             and event.key() == Qt.Key.Key_Q
             and not event.isAutoRepeat()
-            and self._play_busy()
         ):
             self._stop_play()
             return True
@@ -1406,11 +1424,18 @@ class MenuWindow(QMainWindow):
     def _on_autoplay(self) -> None:
         if not self._app_allowed:
             return
+        self._autoplay_alive = True
+        self._play_stop.clear()
         self._set_flow_lamp("システム開始")
         self._set_activity("BlueStacks を確認しています")
+        if self._play_stop.is_set():
+            return
         if not _bluestacks_running():
+            self._autoplay_alive = False
             self._set_activity("BlueStacks は起動していません。")
             QMessageBox.information(self, "オートプレイ", "BlueStacks は起動していません。")
+            return
+        if self._play_stop.is_set():
             return
         if self._item_check is not None:
             return
@@ -1424,6 +1449,10 @@ class MenuWindow(QMainWindow):
 
     def _on_items_checked(self, payload: object) -> None:
         self._item_check = None
+        if self._play_stop.is_set() or not self._autoplay_alive:
+            if self._autoplay_button is not None:
+                self._autoplay_button.setEnabled(True)
+            return
         if self._autoplay_button is not None:
             self._autoplay_button.setEnabled(True)
         if isinstance(payload, dict) and isinstance(payload.get("items"), list):
@@ -1431,6 +1460,7 @@ class MenuWindow(QMainWindow):
         self._set_flow_lamp("ゲーム数確認")
         ok, games = self._game_count()
         if not ok:
+            self._autoplay_alive = False
             self._set_activity("プレイするゲーム数がありません。")
             QMessageBox.information(self, "オートプレイ", "プレイするゲーム数がありません。")
             return
@@ -1442,12 +1472,14 @@ class MenuWindow(QMainWindow):
         _start_match(self)
 
     def _on_intro_fail(self, message: str) -> None:
+        self._autoplay_alive = False
         self._unregister_stop_hotkey()
         self._set_activity(message)
         self._set_flow_lamp("システム終了")
         QMessageBox.critical(self, "オートプレイ", message)
 
     def _on_play_fail(self, message: str) -> None:
+        self._autoplay_alive = False
         self._unregister_stop_hotkey()
         self._set_activity(message)
         self._set_flow_lamp("システム終了")
