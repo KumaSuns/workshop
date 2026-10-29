@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from pathlib import Path
 from typing import Callable
@@ -316,7 +317,8 @@ def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_
     first = True
     for frac, delay, label in cbuzz_steps():
         if not first:
-            _wait_until(time.time() + delay, stop, None)
+            wait = float(delay) + random.choice((0.0, 0.01, 0.02))
+            _wait_until(time.time() + wait, stop, None)
         first = False
         x = int(frac[0] * width)
         y = int(frac[1] * height)

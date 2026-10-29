@@ -598,18 +598,28 @@ class Predictor:
             labels = self._nearest_names(embed, open_index)
         else:
             labels = self._nearest_names(embed, list(range(len(names))))
-        if not self.named_fixed and limit and len(open_names) < limit:
-            counts: dict[int, int] = {}
-            for label in labels:
-                counts[label] = counts.get(int(label), 0) + 1
-            ranked = sorted(counts, key=lambda label: (-counts[label], label))
-            for label in ranked:
-                name = names[label] if 0 <= label < len(names) else ""
-                if not name or name in open_names:
-                    continue
-                if len(open_names) >= limit:
-                    break
-                open_names.append(name)
+            if limit > 0:
+                counts: dict[int, int] = {}
+                for label in labels:
+                    counts[int(label)] = counts.get(int(label), 0) + 1
+                ranked = sorted(counts, key=lambda label: (-counts[label], label))
+                allowed: list[int] = []
+                pin_index = self._named_index(self.named_pin) if self.named_pin else -1
+                if pin_index >= 0:
+                    allowed.append(pin_index)
+                for label in ranked:
+                    if label in allowed:
+                        continue
+                    if len(allowed) >= limit:
+                        break
+                    allowed.append(int(label))
+                if allowed:
+                    labels = self._nearest_names(embed, allowed)
+                    open_names[:] = [
+                        names[index]
+                        for index in allowed
+                        if 0 <= index < len(names) and names[index]
+                    ]
         join_at = -1
         joined: list[int] = []
         if self.named_fixed and len(self.named_join) >= 2:
@@ -624,6 +634,28 @@ class Predictor:
                 index = join_at
             piece["group"] = index + 1
             piece["_vec"] = tuple(point)
+
+    def named_board_line(self, tsums: list[dict]) -> str:
+        names = self.named_names
+        if not names or self.named_prototypes is None:
+            return ""
+        counts: dict[str, int] = {}
+        first: dict[str, int] = {}
+        for piece in tsums:
+            name = str(piece.get("tsum_name") or "").strip()
+            if not name:
+                group = int(piece.get("group") or 0) - 1
+                if group < 0 or group >= len(names):
+                    continue
+                name = names[group]
+            if not name:
+                continue
+            if name not in counts:
+                first[name] = len(first)
+                counts[name] = 0
+            counts[name] += 1
+        ordered = sorted(counts, key=lambda name: (-counts[name], first[name]))
+        return "、".join(ordered)
 
     def _assign_groups(
         self,

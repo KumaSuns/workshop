@@ -382,15 +382,28 @@ def run_play(
         nonlocal last_named
         if named_line is None or use_named is None or not use_named():
             return
-        roster = [
+        limit = int(getattr(predictor, "named_limit", 0) or 0)
+        open_names = [
             str(name).strip()
             for name in (getattr(predictor, "named_open", []) or [])
             if str(name).strip()
         ]
-        if not roster:
-            return
-        shown = "\n".join(roster)
-        if shown == last_named:
+        parts: list[str] = []
+        if limit and len(open_names) >= limit:
+            parts = open_names[:limit]
+        else:
+            line_fn = getattr(predictor, "named_board_line", None)
+            if line_fn is not None:
+                for part in str(line_fn(found) or "").replace("、", "\n").splitlines():
+                    cleaned = part.strip()
+                    if cleaned and cleaned not in parts:
+                        parts.append(cleaned)
+            if not parts:
+                parts = list(open_names)
+            cap = limit if limit > 0 else 5
+            parts = parts[:cap]
+        shown = "\n".join(parts)
+        if not shown or shown == last_named:
             return
         last_named = shown
         named_line(shown)
@@ -1408,14 +1421,20 @@ def run_play(
         nonlocal bomb_taps, last_bomb_at
         if not board_bombs[0]:
             return
+        if skill_is_namine(used_tsum):
+            if int(board_bombs[0]) <= 1:
+                return
+            n = _break_bombs_until_one(predictor, game, say, stop, watch_hit)
+            bomb_taps += n
+            if n:
+                last_bomb_at = time.time()
+            return
         bombs = [
             piece
             for piece in _bombs_on_board(pieces, game)
             if _piece_cell(piece) not in skip_bomb_cells
         ]
         if not bombs:
-            return
-        if skill_is_namine(used_tsum) and len(bombs) <= 1:
             return
         for bomb in bombs:
             _check_stop(stop)
@@ -2043,18 +2062,14 @@ def run_play(
                     _slow_tap(play.center().x(), play.center().y())
                     _sleep_stop(2.0, stop)
                     continue
-                close = None if image.isNull() else _close_button(image)
-                if close is not None:
-                    odd_top_tapped = False
-                    say("とじるをクリックします")
-                    _slow_tap(close.center().x(), close.center().y())
+                cancel = None if image.isNull() else _cancel_button(image)
+                if cancel is not None:
+                    say("キャンセルをクリックします")
+                    _slow_tap(cancel.center().x(), cancel.center().y())
                     _sleep_stop(1.2, stop)
                     continue
-                if not odd_top_tapped:
-                    odd_top_tapped = True
-                    say("上部をクリックします")
-                    _slow_tap(image.width() // 2, max(1, image.height() // 10))
-                    _sleep_stop(0.8, stop)
+                say("プレイを待っています")
+                _sleep_stop(0.35, stop)
                 continue
             erased_now = False
             if credit_pending(rgb):

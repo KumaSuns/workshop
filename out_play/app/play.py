@@ -2021,13 +2021,6 @@ def run_play(
                     _slow_tap(cancel.center().x(), cancel.center().y())
                     _sleep_stop(1.2, stop)
                     continue
-                if image is not None and not image.isNull():
-                    if not odd_top_tapped:
-                        odd_top_tapped = True
-                        say("上部をクリックします")
-                    _slow_tap(image.width() // 2, max(1, image.height() // 10))
-                    _sleep_stop(0.8, stop)
-                    continue
                 say("プレイを待っています")
                 _sleep_stop(0.35, stop)
                 continue

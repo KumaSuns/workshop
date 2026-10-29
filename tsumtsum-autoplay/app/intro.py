@@ -801,24 +801,7 @@ def _close_button(image: QImage) -> QRect | None:
     highscore = _highscore_close_button(image)
     if highscore is not None:
         return highscore
-    if (
-        _play_button(image) is not None
-        or _cancel_button(image) is not None
-        or _pause_continue_button(image) is not None
-    ):
-        return None
-    pills = [
-        pill
-        for pill in _yellow_pills(image)
-        if pill.center().y() > image.height() * 0.55
-        and abs(pill.center().x() - image.width() / 2) < image.width() * 0.28
-        and not _is_daily_mission(image, pill)
-    ]
-    if not pills:
-        return None
-    if len(pills) >= 3:
-        return pills[len(pills) // 2]
-    return max(pills, key=lambda rect: rect.width() * rect.height())
+    return None
 
 
 def _is_highscore_cyan(pixel: tuple[int, int, int]) -> bool:

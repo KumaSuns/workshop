@@ -825,7 +825,6 @@ class MainWindow(QMainWindow):
             self.clear_btn,
             self.undo_piece_btn,
             self.predict_btn,
-            self.train_btn,
             self.train_shutdown_btn,
         ):
             top_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
@@ -924,6 +923,7 @@ class MainWindow(QMainWindow):
             first.setCheckState(Qt.CheckState.Checked)
         self._fit_region_list()
         left_layout.addWidget(self.region_list)
+        left_layout.addWidget(self.train_btn)
         self.read_coin_btn = QPushButton("コインの数字を取る")
         left_layout.addWidget(self.read_coin_btn)
         self.open_result_train_btn = QPushButton("resultの学習画像を開く")
