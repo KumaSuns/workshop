@@ -103,15 +103,17 @@ def _flow_lamp_style(background: str, color: str, border: str) -> str:
     )
 
 
-SURFACE = "#f4f7fb"
-SURFACE_LINE = "#d7e3f4"
+SURFACE = "#17233f"
+SURFACE_LINE = "#A4C6FF"
+SURFACE_INK = "#e8f0ff"
 
 
 def _plain_surface(widget) -> None:
     palette = widget.palette()
-    color = QColor(SURFACE)
-    palette.setColor(QPalette.ColorRole.Window, color)
-    palette.setColor(QPalette.ColorRole.Base, color)
+    palette.setColor(QPalette.ColorRole.Window, QColor(SURFACE))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(SURFACE_INK))
+    palette.setColor(QPalette.ColorRole.Base, QColor(SURFACE))
+    palette.setColor(QPalette.ColorRole.Text, QColor(SURFACE_INK))
     widget.setAutoFillBackground(True)
     widget.setPalette(palette)
 
@@ -121,16 +123,16 @@ def _soft_box(frame: QFrame) -> None:
     frame.setFrameShape(QFrame.Shape.NoFrame)
     frame.setStyleSheet(
         "QFrame#softBox {"
-        " background: #ffffff;"
+        " background: #22325a;"
         f" border: 1px solid {SURFACE_LINE};"
         "}"
     )
 
 
-FLOW_LAMP_OFF = _flow_lamp_style("transparent", "#2c4a7a", "transparent")
-FLOW_LAMP_ON = _flow_lamp_style("#e7eef9", "#2c4a7a", "transparent")
-FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a", "transparent")
-FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a", "transparent")
+FLOW_LAMP_OFF = _flow_lamp_style("transparent", "#d5e4ff", "transparent")
+FLOW_LAMP_ON = _flow_lamp_style("#2c426e", "#f4f8ff", "transparent")
+FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#17233f", "transparent")
+FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#17233f", "transparent")
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -247,6 +249,7 @@ class MenuWindow(QMainWindow):
         self._footer = QWidget()
         blue = root.palette()
         blue.setColor(QPalette.ColorRole.Window, QColor("#A4C6FF"))
+        blue.setColor(QPalette.ColorRole.WindowText, QColor("#17233f"))
         for band in (self._header, self._footer):
             band.setAutoFillBackground(True)
             band.setPalette(blue)
@@ -486,7 +489,7 @@ class MenuWindow(QMainWindow):
         self._model_choice_label = QLabel("")
         self._model_choice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._model_choice_label.setFont(mark_font)
-        self._model_choice_label.setStyleSheet("color: #2c4a7a; background: transparent;")
+        self._model_choice_label.setStyleSheet("color: #A4C6FF; background: transparent;")
         left.addWidget(self._model_choice_label)
         self._show_model_choice()
         self._add_used_sections(left, mark_font)
@@ -937,7 +940,8 @@ class MenuWindow(QMainWindow):
         self._game_list = QListWidget()
         self._game_list.setFrameShape(QFrame.Shape.NoFrame)
         self._game_list.setStyleSheet(
-            f"QListWidget {{ background: {SURFACE}; border: none; }}"
+            "QListWidget { background: #17233f; color: #e8f0ff; border: none; }"
+            "QListWidget QLabel { color: #e8f0ff; background: transparent; }"
         )
         column.addWidget(self._game_list, 1)
         for item in load_game_records():
@@ -1923,13 +1927,13 @@ class MenuWindow(QMainWindow):
         title_font.setBold(True)
         title_font.setPointSize(TITLE_POINT)
         title.setFont(title_font)
-        title.setStyleSheet("color: #2c4a7a; background: transparent;")
+        title.setStyleSheet("color: #f4f8ff; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         column.addWidget(title)
         bar = QFrame()
         bar.setFixedSize(QFontMetrics(title_font).horizontalAdvance(text), 3)
         bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        bar.setStyleSheet("background-color: #6f97d2; border: none;")
+        bar.setStyleSheet("background-color: #A4C6FF; border: none;")
         column.addWidget(bar, 0, Qt.AlignmentFlag.AlignHCenter)
         return wrap
 
