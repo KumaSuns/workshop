@@ -451,11 +451,11 @@ class MenuWindow(QMainWindow):
         mark_font = self.font()
         mark_font.setBold(True)
         mark_font.setPointSize(10)
-        for text in ("Version : 0.00.01", "2026/10/22"):
-            mark = QLabel(text)
-            mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            mark.setFont(mark_font)
-            left.addWidget(mark)
+        self._model_choice_label = QLabel("")
+        self._model_choice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._model_choice_label.setFont(mark_font)
+        left.addWidget(self._model_choice_label)
+        self._show_model_choice()
         self._add_used_sections(left, mark_font)
         self._flow_lamps: dict[str, QPushButton] = {}
         for name in FLOW_LAMPS:
@@ -1925,8 +1925,8 @@ class MenuWindow(QMainWindow):
         dialog.setWindowTitle("設定")
         column = QVBoxLayout(dialog)
         column.addWidget(QLabel("どのモデルを使いますか？"))
-        kinds = QRadioButton("ツムの種類")
-        named = QRadioButton("ツム名")
+        kinds = QRadioButton("PatternType")
+        named = QRadioButton("NamedType")
         named.setChecked(_type_model_choice() == "named")
         kinds.setChecked(not named.isChecked())
         column.addWidget(kinds)
@@ -1949,6 +1949,13 @@ class MenuWindow(QMainWindow):
         kinds.toggled.connect(save)
         named.toggled.connect(save)
         dialog.exec()
+        self._show_model_choice()
+
+    def _show_model_choice(self) -> None:
+        label = getattr(self, "_model_choice_label", None)
+        if label is None:
+            return
+        label.setText("NamedType" if _type_model_choice() == "named" else "PatternType")
 
     def _set_front(self, on: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
@@ -2093,8 +2100,8 @@ SCREEN_MODELS = ROOT / "bundled" / "screen" / "data" / "models"
 APP_MODEL = ROOT / "models" / "scene.pt"
 MODEL_BUTTONS: list[tuple[str, str, Path]] = [
     ("pieces.pt", "〇", SCREEN_MODELS / "pieces.pt"),
-    ("tsum_types.pt", "ツムの種類", SCREEN_MODELS / "tsum_types.pt"),
-    ("named_tsum_test.pt", "ツム名", SCREEN_MODELS / "named_tsum_test.pt"),
+    ("tsum_types.pt", "PatternType", SCREEN_MODELS / "tsum_types.pt"),
+    ("named_tsum_test.pt", "NamedType", SCREEN_MODELS / "named_tsum_test.pt"),
     ("game_region.pt", "ゲーム範囲", SCREEN_MODELS / "game_region.pt"),
     ("score.pt", "スコア", SCREEN_MODELS / "score.pt"),
     ("coin.pt", "コイン", SCREEN_MODELS / "coin.pt"),
