@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDir, QEvent, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QColor,
@@ -90,10 +90,23 @@ FLOW_LAMPS = (
     "リザルト検知",
     "システム終了",
 )
-FLOW_LAMP_OFF = "background: #ffffff; color: palette(window-text);"
-FLOW_LAMP_ON = "background: palette(highlight); color: palette(highlighted-text);"
-FLOW_LAMP_BLINK_WHITE = "background: #ffffff; color: #2c4a7a;"
-FLOW_LAMP_BLINK = "background: #A4C6FF; color: #2c4a7a;"
+def _flow_lamp_style(background: str, color: str) -> str:
+    return (
+        "QPushButton {"
+        f" background: {background};"
+        f" color: {color};"
+        " font-weight: 700;"
+        " border: 1px solid #8eb4ee;"
+        " border-radius: 6px;"
+        " padding: 2px;"
+        "}"
+    )
+
+
+FLOW_LAMP_OFF = _flow_lamp_style("#ffffff", "palette(window-text)")
+FLOW_LAMP_ON = _flow_lamp_style("palette(highlight)", "palette(highlighted-text)")
+FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a")
+FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a")
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -177,6 +190,23 @@ def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
     ]
 
 
+def _windows_msg_type(event_type) -> bytes:
+    if isinstance(event_type, (bytes, bytearray)):
+        return bytes(event_type)
+    data = getattr(event_type, "data", None)
+    if callable(data):
+        try:
+            raw = data()
+        except Exception:
+            raw = b""
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw)
+    try:
+        return bytes(event_type)
+    except Exception:
+        return b""
+
+
 class MenuWindow(QMainWindow):
     tsum_icon_ready = Signal(str)
 
@@ -238,7 +268,12 @@ class MenuWindow(QMainWindow):
         self._item_check = None
         self._play_stop = threading.Event()
         self._stop_hotkey = False
+        self._stop_key_timer = None
+        self._q_down = False
         self._tsum_hotkey = False
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._tsum_hot_ids: list[int] = []
         self._tsum_hot_yes = None
         self._tsum_hot_no = None
@@ -373,6 +408,7 @@ class MenuWindow(QMainWindow):
         QTimer.singleShot(0, self._fit_center)
         QTimer.singleShot(0, self._fit_model_summary)
         QTimer.singleShot(0, self._fit_used_tsum_icon)
+        QTimer.singleShot(0, self._fit_flow_lamps)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -381,6 +417,7 @@ class MenuWindow(QMainWindow):
         QTimer.singleShot(0, self._fit_center)
         QTimer.singleShot(0, self._fit_model_summary)
         QTimer.singleShot(0, self._fit_used_tsum_icon)
+        QTimer.singleShot(0, self._fit_flow_lamps)
 
     def _fit_logo(self) -> None:
         if self._fitting_logo or self._logo_src.isNull():
@@ -420,14 +457,17 @@ class MenuWindow(QMainWindow):
             mark.setFont(mark_font)
             left.addWidget(mark)
         self._add_used_sections(left, mark_font)
-        self._flow_lamps: dict[str, QLabel] = {}
+        self._flow_lamps: dict[str, QPushButton] = {}
         for name in FLOW_LAMPS:
-            lamp = QLabel(name)
-            lamp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lamp = QPushButton(name)
             lamp.setFont(mark_font)
+            lamp.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            lamp.setAutoDefault(False)
+            lamp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             lamp.setStyleSheet(FLOW_LAMP_OFF)
             self._flow_lamps[name] = lamp
-            left.addWidget(lamp)
+            left.addWidget(lamp, 0, Qt.AlignmentFlag.AlignHCenter)
+        QTimer.singleShot(0, self._fit_flow_lamps)
         left.addStretch(1)
         memory_title = QLabel("メモリ使用率")
         memory_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1033,6 +1073,17 @@ class MenuWindow(QMainWindow):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
         )
 
+    def _fit_flow_lamps(self) -> None:
+        box = getattr(self, "_model_box", None)
+        lamps = getattr(self, "_flow_lamps", None)
+        if box is None or not lamps:
+            return
+        width = box.contentsRect().width() // 2
+        if width < 1:
+            return
+        for lamp in lamps.values():
+            lamp.setFixedWidth(width)
+
     def _ensure_flow_blink(self) -> None:
         timer = getattr(self, "_flow_blink_timer", None)
         if timer is not None:
@@ -1146,17 +1197,44 @@ class MenuWindow(QMainWindow):
         return intro_on or play_on
 
     def _register_stop_hotkey(self) -> None:
-        if sys.platform != "win32" or self._stop_hotkey:
+        if sys.platform == "win32" and not self._stop_hotkey:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+            ok = user32.RegisterHotKey(hwnd, 1, 0x4000, 0x51)
+            user32.RegisterHotKey(hwnd, 2, 0x4000, 0x71)
+            self._stop_hotkey = bool(ok)
+        self._start_stop_key_poll()
+
+    def _start_stop_key_poll(self) -> None:
+        if sys.platform != "win32":
+            return
+        timer = self._stop_key_timer
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(100)
+            timer.timeout.connect(self._poll_stop_key)
+            self._stop_key_timer = timer
+        if not timer.isActive():
+            self._q_down = False
+            timer.start()
+
+    def _poll_stop_key(self) -> None:
+        if not self._play_busy():
             return
         import ctypes
 
-        user32 = ctypes.windll.user32
-        hwnd = int(self.winId())
-        ok = user32.RegisterHotKey(hwnd, 1, 0x4000, 0x51)
-        user32.RegisterHotKey(hwnd, 2, 0x4000, 0x71)
-        self._stop_hotkey = bool(ok)
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(0x51) & 0x8000)
+        pressed = down and not self._q_down
+        self._q_down = down
+        if pressed:
+            self._stop_play()
 
     def _unregister_stop_hotkey(self) -> None:
+        timer = self._stop_key_timer
+        if timer is not None:
+            timer.stop()
         if sys.platform != "win32" or not self._stop_hotkey:
             return
         import ctypes
@@ -1208,10 +1286,27 @@ class MenuWindow(QMainWindow):
         self._set_activity("停止しました")
         self._set_flow_lamp("システム終了")
 
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Q and not event.isAutoRepeat() and self._play_busy():
+            self._stop_play()
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Q
+            and not event.isAutoRepeat()
+            and self._play_busy()
+        ):
+            self._stop_play()
+            return True
+        return super().eventFilter(watched, event)
+
     def nativeEvent(self, eventType, message):
         if sys.platform == "win32" and (self._stop_hotkey or self._tsum_hotkey):
-            raw = bytes(eventType) if not isinstance(eventType, (bytes, bytearray)) else eventType
-            if raw.startswith(b"windows_generic_MSG"):
+            raw = _windows_msg_type(eventType)
+            if raw.startswith(b"windows_generic_MSG") or raw.startswith(b"windows_dispatcher_MSG"):
                 import ctypes
                 from ctypes import wintypes
 

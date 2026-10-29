@@ -2133,9 +2133,8 @@ def run_play(
                 )
                 did_skill = armed and apply_checker_skill(True)
                 add_idle("act", time.perf_counter() - t0)
-                if did_skill or armed:
-                    if did_skill:
-                        skip_after_skill = True
+                if did_skill:
+                    skip_after_skill = True
                     continue
                 skill_fill = _skill_fill(rgb, skill)
                 emit_gauges(skill_fill)
