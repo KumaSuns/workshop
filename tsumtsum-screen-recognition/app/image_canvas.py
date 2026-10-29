@@ -590,9 +590,11 @@ class ImageCanvas(QGraphicsView):
             painter.setPen(accent)
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
             if is_tsum_kind(kind):
-                shown = str(
-                    (self._circle_names.get(str(int(piece.get("group") or 1))) or {}).get("ja") or ""
-                ).strip()
+                shown = str(piece.get("tsum_name") or "").strip()
+                if not shown:
+                    shown = str(
+                        (self._circle_names.get(str(int(piece.get("group") or 1))) or {}).get("ja") or ""
+                    ).strip()
                 if shown:
                     name_font = QFont("Yu Gothic UI", 8, QFont.Weight.Bold)
                     painter.setFont(name_font)

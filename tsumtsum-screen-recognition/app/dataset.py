@@ -15,6 +15,20 @@ from app.paths import DATA_DIR, IMAGE_EXTENSIONS
 from app.regions import PIECE_KEYS, REGION_KEYS, SCENE_KEYS, model_filename
 
 
+def _stored_piece(piece: dict) -> dict:
+    item = {
+        "x": int(piece["x"]),
+        "y": int(piece["y"]),
+        "r": int(piece["r"]),
+        "kind": str(piece["kind"]),
+        "group": int(piece.get("group") or 1),
+    }
+    name = str(piece.get("tsum_name") or "").strip()
+    if name:
+        item["tsum_name"] = name
+    return item
+
+
 @dataclass
 class Sample:
     id: str
@@ -352,13 +366,7 @@ class Dataset:
         sample.game_region = cleaned.get("game")
         if pieces is not None:
             sample.pieces = [
-                {
-                    "x": int(piece["x"]),
-                    "y": int(piece["y"]),
-                    "r": int(piece["r"]),
-                    "kind": str(piece["kind"]),
-                    "group": int(piece.get("group") or 1),
-                }
+                _stored_piece(piece)
                 for piece in pieces
                 if int(piece.get("r") or 0) >= 4
             ]
@@ -484,13 +492,7 @@ class Dataset:
             if kind in confirmed:
                 continue
             incoming = [
-                {
-                    "x": int(piece["x"]),
-                    "y": int(piece["y"]),
-                    "r": int(piece["r"]),
-                    "kind": str(piece["kind"]),
-                    "group": int(piece.get("group") or 1),
-                }
+                _stored_piece(piece)
                 for piece in pieces
                 if piece.get("kind") == kind and int(piece.get("r") or 0) >= 4
             ]
@@ -513,13 +515,7 @@ class Dataset:
         if sample is None:
             raise KeyError(sample_id)
         sample.pieces = [
-            {
-                "x": int(piece["x"]),
-                "y": int(piece["y"]),
-                "r": int(piece["r"]),
-                "kind": str(piece["kind"]),
-                "group": int(piece.get("group") or 1),
-            }
+            _stored_piece(piece)
             for piece in pieces
             if int(piece.get("r") or 0) >= 4
         ]

@@ -841,6 +841,11 @@ class MainWindow(QMainWindow):
         self.name_mode_btn.setCheckable(True)
         self.name_mode_btn.setObjectName("mode")
         left_layout.addWidget(self.name_mode_btn)
+        self.named_circle_btn = QPushButton("ツム名で〇を付ける")
+        self.named_circle_btn.setCheckable(True)
+        self.named_circle_btn.setObjectName("mode")
+        self._named_circle_backup = {}
+        left_layout.addWidget(self.named_circle_btn)
         self.name_panel = QWidget()
         name_layout = QVBoxLayout(self.name_panel)
         name_layout.setContentsMargins(0, 0, 0, 0)
@@ -1144,6 +1149,7 @@ class MainWindow(QMainWindow):
         self.list_widget.itemChanged.connect(self.on_list_item_changed)
         self.list_widget.itemDoubleClicked.connect(self._on_file_name_double_clicked)
         self.name_mode_btn.toggled.connect(self._toggle_name_mode)
+        self.named_circle_btn.toggled.connect(self._toggle_named_circle_mode)
         self.name_save_btn.clicked.connect(self._register_circle_name)
         self.name_ja.textChanged.connect(lambda text: self._show_existing_name("ja", text))
         self.name_en.textChanged.connect(lambda text: self._show_existing_name("en", text))
@@ -3016,13 +3022,14 @@ class MainWindow(QMainWindow):
         sample_id = self.current_id
         self.predict_btn.setEnabled(False)
         self.statusBar().showMessage("予測しています")
-        worker = PredictWorker(lambda: self._predict_work(sample_id))
+        named_place = self.named_circle_btn.isChecked()
+        worker = PredictWorker(lambda: self._predict_work(sample_id, named_place))
         worker.finished_ok.connect(self._on_predict_finished)
         worker.failed.connect(self._on_predict_failed)
         self._predict_worker = worker
         worker.start()
 
-    def _predict_work(self, sample_id: str) -> tuple[str, list[str]]:
+    def _predict_work(self, sample_id: str, named_place: bool = False) -> tuple[str, list[str]]:
         if not self.predictor.is_ready():
             self.predictor.reload(pump=None, device="cpu")
         if not self.predictor.is_ready():
@@ -3030,7 +3037,7 @@ class MainWindow(QMainWindow):
         sample = self.dataset.get(sample_id)
         if sample is None:
             raise RuntimeError("画像がありません")
-        return sample_id, self._predict_into_sample(sample)
+        return sample_id, self._predict_into_sample(sample, named_place=named_place)
 
     def _on_predict_finished(self, sample_id: str, added: list) -> None:
         self._predict_worker = None
@@ -3081,6 +3088,83 @@ class MainWindow(QMainWindow):
             widget.setVisible(visible)
         if visible:
             self.progress.setVisible(False)
+
+    def _uncheck_named_circle(self) -> None:
+        self.named_circle_btn.blockSignals(True)
+        self.named_circle_btn.setChecked(False)
+        self.named_circle_btn.blockSignals(False)
+
+    def _toggle_named_circle_mode(self, on: bool) -> None:
+        if on:
+            from app.named_tsum_test import TEST_MODEL_PATH
+
+            if self.predictor.piece_model is None and not self._ensure_predictor():
+                self._uncheck_named_circle()
+                self.statusBar().showMessage("ツムのモデルがありません", 4000)
+                return
+            if self.predictor.piece_model is None:
+                self._uncheck_named_circle()
+                self.statusBar().showMessage("ツムのモデルがありません", 4000)
+                return
+            if not self.predictor.use_named_tsum_model(TEST_MODEL_PATH):
+                self._uncheck_named_circle()
+                self.statusBar().showMessage("ツム名のモデルがありません", 4000)
+                return
+            sample = self.dataset.get(self.current_id) if self.current_id else None
+            if sample is None:
+                self.statusBar().showMessage("画像がありません", 4000)
+                return
+            self.statusBar().showMessage("ツム名で〇を付けています")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            try:
+                game = sample.regions.get("game") or sample.game_region
+                predicted = self.predictor.predict_pieces(sample.image_path, game)
+                placed = self._store_named_tsum_pieces(sample, predicted)
+            finally:
+                QApplication.restoreOverrideCursor()
+            if not placed:
+                self.statusBar().showMessage("ツムの〇が付きませんでした", 4000)
+                return
+            self.show_sample(sample.id)
+            count = sum(1 for piece in predicted if is_tsum_kind(str(piece.get("kind") or "")))
+            self.statusBar().showMessage(f"ツム名で〇を {count} 個付けました", 4000)
+            return
+        self._restore_named_circles()
+        sample = self.dataset.get(self.current_id) if self.current_id else None
+        folder = self._specified_tsum_folder(sample) if sample is not None else ""
+        self.predictor._piece_type_folder = None
+        self.predictor.use_used_tsum_model(folder)
+        if sample is not None:
+            self._relabel_tsum_groups(sample)
+            self.show_sample(sample.id)
+        self.statusBar().showMessage("ツム名で〇を付けるのをやめました", 4000)
+
+    def _store_named_tsum_pieces(self, sample: Sample, predicted: list[dict]) -> bool:
+        tsums = [
+            piece
+            for piece in predicted
+            if is_tsum_kind(str(piece.get("kind") or ""))
+        ]
+        if not tsums:
+            return False
+        backup = self._named_circle_backup
+        if sample.id not in backup:
+            backup[sample.id] = [dict(piece) for piece in sample.pieces]
+        others = [
+            piece
+            for piece in backup[sample.id]
+            if not is_tsum_kind(str(piece.get("kind") or ""))
+        ]
+        self.dataset.set_pieces(sample.id, others + tsums)
+        return True
+
+    def _restore_named_circles(self) -> None:
+        backup = self._named_circle_backup
+        self._named_circle_backup = {}
+        for sample_id, pieces in backup.items():
+            if self.dataset.get(sample_id) is not None:
+                self.dataset.set_pieces(sample_id, pieces)
 
     def _toggle_name_mode(self, on: bool) -> None:
         self.name_mode_btn.setText("今までの画面" if on else "ツム名を登録")
@@ -4342,14 +4426,27 @@ class MainWindow(QMainWindow):
 
         pieces = [dict(piece) for piece in sample.pieces]
         before = [
-            (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
+            (
+                int(piece["x"]),
+                int(piece["y"]),
+                int(piece.get("group") or 1),
+                str(piece.get("tsum_name") or ""),
+            )
             for piece in pieces
             if is_tsum_kind(str(piece.get("kind") or ""))
         ]
+        if self.predictor.named_prototypes is None:
+            for piece in pieces:
+                piece.pop("tsum_name", None)
         with Image.open(sample.image_path) as image:
             self.predictor._assign_groups(image.convert("RGB"), pieces)
         after = [
-            (int(piece["x"]), int(piece["y"]), int(piece.get("group") or 1))
+            (
+                int(piece["x"]),
+                int(piece["y"]),
+                int(piece.get("group") or 1),
+                str(piece.get("tsum_name") or ""),
+            )
             for piece in pieces
             if is_tsum_kind(str(piece.get("kind") or ""))
         ]
@@ -4358,8 +4455,18 @@ class MainWindow(QMainWindow):
         self.dataset.set_pieces(sample.id, pieces)
         return True
 
-    def _predict_into_sample(self, sample: Sample, *, overwrite: bool = True) -> list[str]:
+    def _predict_into_sample(
+        self,
+        sample: Sample,
+        *,
+        overwrite: bool = True,
+        named_place: bool = False,
+    ) -> list[str]:
         self.predictor.use_used_tsum_model(self._specified_tsum_folder(sample))
+        if named_place or self.named_circle_btn.isChecked():
+            from app.named_tsum_test import TEST_MODEL_PATH
+
+            self.predictor.use_named_tsum_model(TEST_MODEL_PATH)
         added: list[str] = []
         boxes = self.predictor.predict_all(sample.image_path)
         if boxes:
@@ -4372,19 +4479,27 @@ class MainWindow(QMainWindow):
         tsum_locked = (not overwrite) and (
             "tsum" in sample.confirmed or "big" in sample.confirmed
         )
-        if existing_tsums and not tsum_locked:
+        if existing_tsums and not tsum_locked and not named_place:
             if self._relabel_tsum_groups(sample):
                 added.append("tsum")
             sample = self.dataset.get(sample.id) or sample
         pieces = self.predictor.predict_pieces(sample.image_path, game)
-        if existing_tsums:
+        if named_place:
+            if self._store_named_tsum_pieces(sample, pieces):
+                added.append("tsum")
+            pieces = [
+                piece
+                for piece in pieces
+                if not is_tsum_kind(str(piece.get("kind") or ""))
+            ]
+        elif existing_tsums:
             pieces = [
                 piece
                 for piece in pieces
                 if str(piece.get("kind") or "") != "tsum"
             ]
         replace_empty: tuple[str, ...] = ()
-        if overwrite and "big" not in sample.confirmed:
+        if overwrite and not named_place and "big" not in sample.confirmed:
             replace_empty = ("big",)
         if pieces or replace_empty:
             if not overwrite:
