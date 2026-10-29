@@ -948,11 +948,13 @@ class MenuWindow(QMainWindow):
         column.setSpacing(0)
         self._game_list = QListWidget()
         self._game_list.setFrameShape(QFrame.Shape.NoFrame)
+        pad = QFontMetrics(self.font()).horizontalAdvance("あ")
         self._game_list.setStyleSheet(
             "QListWidget {"
             " background: #ffffff;"
             " color: #17233f;"
             f" border: 1px solid {SURFACE_LINE};"
+            f" padding-left: {pad}px;"
             "}"
             "QListWidget QLabel { color: #17233f; background: transparent; }"
         )
