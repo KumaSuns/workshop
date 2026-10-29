@@ -103,8 +103,8 @@ def _flow_lamp_style(background: str, color: str, border: str) -> str:
     )
 
 
-SURFACE = "#ffffff"
-SURFACE_LINE = "#d5d8de"
+SURFACE = "#f4f7fb"
+SURFACE_LINE = "#d7e3f4"
 
 
 def _plain_surface(widget) -> None:
@@ -121,18 +121,16 @@ def _soft_box(frame: QFrame) -> None:
     frame.setFrameShape(QFrame.Shape.NoFrame)
     frame.setStyleSheet(
         "QFrame#softBox {"
-        f" background: {SURFACE};"
+        " background: #ffffff;"
         f" border: 1px solid {SURFACE_LINE};"
         "}"
     )
 
 
-FLOW_LAMP_OFF = _flow_lamp_style("#ffffff", "palette(window-text)", "#d5d8de")
-FLOW_LAMP_ON = _flow_lamp_style(
-    "palette(highlight)", "palette(highlighted-text)", "palette(highlight)"
-)
-FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a", "#d5d8de")
-FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a", "#A4C6FF")
+FLOW_LAMP_OFF = _flow_lamp_style("transparent", "#2c4a7a", "transparent")
+FLOW_LAMP_ON = _flow_lamp_style("#e7eef9", "#2c4a7a", "transparent")
+FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a", "transparent")
+FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a", "transparent")
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -488,6 +486,7 @@ class MenuWindow(QMainWindow):
         self._model_choice_label = QLabel("")
         self._model_choice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._model_choice_label.setFont(mark_font)
+        self._model_choice_label.setStyleSheet("color: #2c4a7a; background: transparent;")
         left.addWidget(self._model_choice_label)
         self._show_model_choice()
         self._add_used_sections(left, mark_font)
@@ -496,6 +495,7 @@ class MenuWindow(QMainWindow):
             lamp = QPushButton(name)
             lamp.setFont(mark_font)
             lamp.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            lamp.setFlat(True)
             lamp.setAutoDefault(False)
             lamp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             lamp.setStyleSheet(FLOW_LAMP_OFF)
@@ -829,15 +829,15 @@ class MenuWindow(QMainWindow):
         if differs:
             button.setStyleSheet(
                 "QPushButton {"
-                " background: #e10600;"
+                " background: #FF1A6F;"
                 " color: #ffffff;"
                 " font-weight: 700;"
                 " font-size: 8pt;"
-                " border: 1px solid #a10400;"
+                " border: 1px solid #FF1A6F;"
                 " border-radius: 6px;"
                 " padding: 2px;"
                 "}"
-                "QPushButton:hover { background: #c10500; }"
+                "QPushButton:hover { background: #FF1A6F; }"
             )
             return
         button.setStyleSheet(
@@ -937,7 +937,7 @@ class MenuWindow(QMainWindow):
         self._game_list = QListWidget()
         self._game_list.setFrameShape(QFrame.Shape.NoFrame)
         self._game_list.setStyleSheet(
-            "QListWidget { background: #ffffff; border: none; }"
+            f"QListWidget {{ background: {SURFACE}; border: none; }}"
         )
         column.addWidget(self._game_list, 1)
         for item in load_game_records():
@@ -1078,7 +1078,7 @@ class MenuWindow(QMainWindow):
         hint_font.setPointSize(hint_point + 2)
         hint_font.setBold(True)
         stop_hint.setFont(hint_font)
-        stop_hint.setStyleSheet("color: #FF0000;")
+        stop_hint.setStyleSheet("color: #FF1A6F;")
         stop_hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         hint_metrics = stop_hint.fontMetrics()
         stop_hint.setContentsMargins(0, 0, hint_metrics.horizontalAdvance("あ"), max(1, hint_metrics.height() // 2))
@@ -1169,6 +1169,14 @@ class MenuWindow(QMainWindow):
             return
         if name != "システム終了" and index > reached + 1:
             return
+        if name == "システム終了":
+            self._flow_blink_timer.stop()
+            for lamp in lamps.values():
+                lamp.setStyleSheet(FLOW_LAMP_OFF)
+            lamps[name].setStyleSheet(FLOW_LAMP_BLINK)
+            self._flow_current = name
+            self._flow_reached = index
+            return
         if name == self._flow_current and self._flow_blink_timer.isActive():
             return
         if self._flow_current in lamps and self._flow_current != name:
@@ -1176,12 +1184,7 @@ class MenuWindow(QMainWindow):
         self._flow_current = name
         self._flow_reached = index
         self._flow_blink_on = True
-        lamps[name].setStyleSheet(
-            FLOW_LAMP_ON if name == "システム終了" else FLOW_LAMP_BLINK
-        )
-        if name == "システム終了":
-            self._flow_blink_timer.stop()
-            return
+        lamps[name].setStyleSheet(FLOW_LAMP_BLINK)
         self._flow_blink_timer.start()
 
     def _lamp_for_activity(self, text: str) -> str:
@@ -1654,7 +1657,7 @@ class MenuWindow(QMainWindow):
         label = self._tsum_prompt
         if label is None:
             return
-        color = "#FF0000" if self._tsum_blink_on else "transparent"
+        color = "#FF1A6F" if self._tsum_blink_on else "transparent"
         point = getattr(self, "_tsum_prompt_pt", 13)
         label.setStyleSheet(f"color: {color}; font-weight: 700; font-size: {point}pt;")
 
@@ -1920,12 +1923,13 @@ class MenuWindow(QMainWindow):
         title_font.setBold(True)
         title_font.setPointSize(TITLE_POINT)
         title.setFont(title_font)
+        title.setStyleSheet("color: #2c4a7a; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         column.addWidget(title)
         bar = QFrame()
         bar.setFixedSize(QFontMetrics(title_font).horizontalAdvance(text), 3)
         bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        bar.setStyleSheet("background-color: #2c4a7a; border: none;")
+        bar.setStyleSheet("background-color: #6f97d2; border: none;")
         column.addWidget(bar, 0, Qt.AlignmentFlag.AlignHCenter)
         return wrap
 
