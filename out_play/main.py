@@ -324,6 +324,7 @@ class MenuWindow(QMainWindow):
         self._intro = None
         self._play_worker = None
         self._play_games = None
+        self._play_current = None
         self._play_api = None
         self._used_tsum_name = ""
         self._tsum_body = None
@@ -1032,9 +1033,25 @@ class MenuWindow(QMainWindow):
 
     def _show_play_count(self) -> None:
         label = getattr(self, "_play_count_label", None)
-        if label is None or self._center_input is None:
+        if label is None:
+            return
+        current = getattr(self, "_play_current", None)
+        total = getattr(self, "_play_games", None)
+        if current is not None and total is not None and int(total) > 0:
+            label.setText(f"{int(current)} / {int(total)}")
+            return
+        if current is not None:
+            label.setText(str(int(current)))
+            return
+        if self._center_input is None:
             return
         label.setText(self._center_input.currentText().strip())
+
+    def _on_play_progress(self, current: int, total: object) -> None:
+        self._play_current = int(current)
+        if total is not None:
+            self._play_games = int(total)
+        self._show_play_count()
 
     def _show_tsum_recognition(self, count: int) -> None:
         label = getattr(self, "_tsum_recognition", None)
@@ -1249,6 +1266,8 @@ class MenuWindow(QMainWindow):
     def _on_play_done(self) -> None:
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
+        self._play_current = None
+        self._show_play_count()
         self._set_activity("プレイが終わりました")
         self._set_flow_lamp("システム終了")
 
@@ -1354,6 +1373,8 @@ class MenuWindow(QMainWindow):
     def _on_play_stopped(self) -> None:
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
+        self._play_current = None
+        self._show_play_count()
         if not self._stopped_by_key:
             return
         self._stopped_by_key = False
@@ -1536,6 +1557,8 @@ class MenuWindow(QMainWindow):
     def _on_play_fail(self, message: str) -> None:
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
+        self._play_current = None
+        self._show_play_count()
         self._set_activity(message)
         self._set_flow_lamp("システム終了")
         QMessageBox.critical(self, "オートプレイ", message)
@@ -2437,6 +2460,7 @@ def _start_match(window: MenuWindow) -> None:
     worker.recognized.connect(window._show_tsum_recognition)
     worker.flow.connect(window._set_flow_lamp)
     worker.recorded.connect(window._show_game_record)
+    worker.play_progress.connect(window._on_play_progress)
     worker.items.connect(window._on_play_items)
     worker.need_used_tsum.connect(window._on_need_used_tsum)
     worker.need_kinds.connect(window._on_need_kinds)
@@ -2444,6 +2468,7 @@ def _start_match(window: MenuWindow) -> None:
     worker.completed.connect(window._on_play_done)
     worker.stopped.connect(window._on_play_stopped)
     window._used_tsum_name = ""
+    window._play_current = None
     window._play_worker = worker
     window._register_stop_hotkey()
     worker.start()

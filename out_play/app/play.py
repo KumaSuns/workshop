@@ -140,6 +140,7 @@ class PlayWorker(QThread):
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
     recorded = Signal(object)
+    play_progress = Signal(int, object)
 
     def __init__(
         self,
@@ -229,6 +230,7 @@ class PlayWorker(QThread):
                 use_named=self._use_named,
                 show_recognized=self.recognized.emit,
                 mark=self.flow.emit,
+                show_progress=self.play_progress.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -330,6 +332,7 @@ def run_play(
     use_named: bool = False,
     show_recognized: Callable[[int], None] | None = None,
     mark: Callable[[str], None] | None = None,
+    show_progress: Callable[[int, int | None], None] | None = None,
 ) -> None:
     global _flow_mark
     _flow_mark = mark
@@ -339,6 +342,11 @@ def run_play(
             report(text)
 
     games_done = 0
+
+    def _mark_play_progress() -> None:
+        if show_progress is None:
+            return
+        show_progress(games_done + 1, games)
 
     def _continue_after_game() -> bool:
         nonlocal games_done
@@ -441,6 +449,7 @@ def run_play(
         if arrived in ("start", "continue"):
             ask_used_now(arrived == "start")
 
+    _mark_play_progress()
     say("プレイを開始します")
     say(f"予測デバイス {predictor.device}")
     reset_swipe_mouse()
@@ -1894,6 +1903,7 @@ def run_play(
                 if replay_items is not None:
                     used_items = replay_items
                     show_used(replay_items)
+                _mark_play_progress()
                 say("プレイを開始します")
                 continue
             if (
@@ -2536,6 +2546,7 @@ def run_play(
                     if replay_items is not None:
                         used_items = replay_items
                         show_used(replay_items)
+                    _mark_play_progress()
                     say("プレイを開始します")
                     continue
                 last_save_at = _learn_board(
