@@ -944,7 +944,7 @@ class MenuWindow(QMainWindow):
         from app.game_record import load_game_records
 
         column = QVBoxLayout(slot)
-        column.setContentsMargins(0, 0, 0, 0)
+        column.setContentsMargins(0, 0, TITLE_MARGIN, TITLE_MARGIN)
         column.setSpacing(0)
         self._game_list = QListWidget()
         self._game_list.setFrameShape(QFrame.Shape.NoFrame)
