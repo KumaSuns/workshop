@@ -949,7 +949,11 @@ class MenuWindow(QMainWindow):
         self._game_list = QListWidget()
         self._game_list.setFrameShape(QFrame.Shape.NoFrame)
         self._game_list.setStyleSheet(
-            "QListWidget { background: #ffffff; color: #17233f; border: none; }"
+            "QListWidget {"
+            " background: #ffffff;"
+            " color: #17233f;"
+            f" border: 1px solid {SURFACE_LINE};"
+            "}"
             "QListWidget QLabel { color: #17233f; background: transparent; }"
         )
         column.addWidget(self._game_list, 1)
