@@ -213,11 +213,17 @@ def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
         items_text = "、".join(str(name) for name in names if str(name))
     coin = item.get("coin")
     result = item.get("result_coin")
-    coin_text = "－" if coin is None else str(int(coin))
-    result_text = "－" if result is None else str(int(result))
-    shown = f"{coin_text} / {result_text}"
-    if coin is not None and result is not None and int(coin) > 0:
-        shown += f" × {int(result) / int(coin):.1f}"
+    if result is not None and coin is not None and int(coin) > 0:
+        rate = int(result) / int(coin)
+        shown = f"{int(result)} * {rate:.1f} GET {int(coin)}"
+    elif result is not None and coin is not None:
+        shown = f"{int(result)} * － GET {int(coin)}"
+    elif result is not None:
+        shown = f"{int(result)} * － GET －"
+    elif coin is not None:
+        shown = f"－ * － GET {int(coin)}"
+    else:
+        shown = "－"
     return [
         (str(item.get("started") or ""), False),
         (f"  使用アイテム {items_text}", False),
