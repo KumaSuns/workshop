@@ -6,6 +6,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# プレイ中に集めたコイン切り出し
+data/coin_crops/
+
 # 学習用の個人スクリーンショットとモデルはリポジトリに入れない
 tsumtsum-screen-recognition/data/images/
 tsumtsum-screen-recognition/data/labels/

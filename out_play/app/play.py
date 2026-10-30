@@ -81,6 +81,8 @@ from app.play_style import (
     flush_style,
     record_rl_bomb,
     record_rl_skill,
+    set_last_play_coins,
+    set_last_result_coin,
     should_bomb,
     unlike_hit,
 )
@@ -1616,9 +1618,19 @@ def run_play(
             notify_record(item)
 
     def take_result(image: QImage) -> None:
-        if last_has_result[0] or last_record_id[0] is None or image is None or image.isNull():
+        if last_has_result[0]:
             return
-        frame = _qimage_rgb(image)
+        frame = None
+        try:
+            shot = capture_play_frame()
+            if shot is not None and not shot.isNull():
+                frame = _qimage_rgb(shot)
+        except Exception:
+            frame = None
+        if frame is None and image is not None and not image.isNull():
+            frame = _qimage_rgb(image)
+        if frame is None:
+            return
         text = ""
         try:
             with _gpu_lock:
@@ -1626,15 +1638,16 @@ def run_play(
                 text = _read_coin_key(predictor, frame, found, "result_coin")
         except Exception:
             return
-        kept = _kept_coin(text)
+        kept = play_coin(_kept_coin(text))
         if kept is None:
             return
-        updated = set_result_coin(last_record_id[0], kept)
-        if updated is None:
-            return
+        set_last_result_coin(kept)
         last_has_result[0] = True
-        if notify_record is not None:
-            notify_record(updated)
+        say(f"リザルトコイン {kept}")
+        if last_record_id[0] is not None:
+            updated = set_result_coin(last_record_id[0], kept)
+            if updated is not None and notify_record is not None:
+                notify_record(updated)
 
     def _sync_named() -> None:
         if not use_named:
@@ -1660,13 +1673,14 @@ def run_play(
         coin_text, result_text = _watch_money_screens(predictor, say, stop)
         coin_n = play_coin(coin_text) if coin_text else None
         result_n = play_coin(result_text) if result_text else None
+        if coin_n is not None or result_n is not None:
+            set_last_play_coins(coin_n, result_n)
+            if result_n is not None:
+                last_has_result[0] = True
         if last_record_id[0] is not None and (coin_n is not None or result_n is not None):
             updated = update_game_coins(last_record_id[0], coin_n, result_n)
-            if updated is not None:
-                if result_n is not None:
-                    last_has_result[0] = True
-                if notify_record is not None:
-                    notify_record(updated)
+            if updated is not None and notify_record is not None:
+                notify_record(updated)
         if not _continue_after_game():
             _replay_after_timeup(
                 say, stop, finish_after, on_retry=take_result, stop_at_start=True
@@ -4056,29 +4070,42 @@ def _note_match_end(
     coin_n = None
     if got:
         coin_n = play_coin(got)
-    record_play(clears, swipes, skill_taps, skill_ok, bomb_taps, fan_taps, coin_n, waits)
-    append_play(
-        clears,
-        swipes,
-        skill_taps,
-        skill_ok,
-        coin_n,
-        used_tsum,
-        items,
-        duration,
-        waits,
-        upload,
-    )
+    earn_n = play_coin(earned) if earned is not None else None
+    if earn_n is None:
+        earn_n = coin_n
     result_n = None
     if on_result and rgb is not None:
         try:
             with _gpu_lock:
                 found = predictor.predict_all(Path("."), rgb=rgb)
                 result_text = _read_coin_key(predictor, rgb, found, "result_coin")
-            result_n = _kept_coin(result_text)
+            result_n = play_coin(_kept_coin(result_text))
         except Exception:
             result_n = None
-    recorded = append_game_record(started, used_tsum, items, duration, earned, result_n)
+    record_play(
+        clears,
+        swipes,
+        skill_taps,
+        skill_ok,
+        bomb_taps,
+        fan_taps,
+        earn_n,
+        waits,
+        result_coin=result_n,
+    )
+    append_play(
+        clears,
+        swipes,
+        skill_taps,
+        skill_ok,
+        earn_n,
+        used_tsum,
+        items,
+        duration,
+        waits,
+        upload,
+    )
+    recorded = append_game_record(started, used_tsum, items, duration, earn_n, result_n)
     if notify_record is not None:
         notify_record(recorded)
 
@@ -4188,6 +4215,30 @@ def _result_coin_box(image, model_box: dict[str, int] | None) -> dict[str, int] 
 
 
 _TAUGHT_COIN_900 = {"x": 311, "y": 234, "w": 275, "h": 73}
+_COIN_CROP_ROOT = APP_ROOT.parent / "data" / "coin_crops"
+
+
+def _coin_crop_label_taken(folder: Path, label: str) -> bool:
+    suffix = f"_{label}.png"
+    try:
+        return any(path.is_file() and path.name.endswith(suffix) for path in folder.iterdir())
+    except OSError:
+        return False
+
+
+def _save_coin_crop(key: str, crop, digits: str) -> None:
+    if key not in ("coin", "result_coin"):
+        return
+    folder = _COIN_CROP_ROOT / key
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        label = digits if digits else "empty"
+        if _coin_crop_label_taken(folder, label):
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        crop.save(folder / f"{stamp}_{label}.png")
+    except Exception:
+        return
 
 
 def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
@@ -4218,7 +4269,9 @@ def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key:
         raw = str(predict(crop, key) or "")
     except Exception:
         return ""
-    return "".join(char for char in raw if char.isdigit())
+    digits = "".join(char for char in raw if char.isdigit())
+    _save_coin_crop(key, crop, digits)
+    return digits
 
 
 def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
@@ -4396,11 +4449,13 @@ def _watch_money_screens(predictor, say: StatusFn, stop: Event | None) -> tuple[
         on_start = shot is not None and not shot.isNull() and _match_start_button(shot) is not None
         field, text = _read_scene_money(predictor, frame_rgb)
         if field == "coin" and not on_result and not on_start:
-            take(field, text)
-        if on_result and not seen["result"]:
-            _field, text = _read_scene_money(predictor, frame_rgb, "result_coin")
-            if text:
-                take("result", text)
+            take("coin", text)
+        elif field == "result" and not on_start:
+            take("result", text)
+        if not seen["result"] and not on_start and (on_result or field == "result"):
+            _field, forced = _read_scene_money(predictor, frame_rgb, "result_coin")
+            if forced:
+                take("result", forced)
         if not seen["result"]:
             _sleep_stop(0.25, stop)
     for field in ("coin", "result"):

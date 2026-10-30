@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import math
@@ -7,7 +8,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
@@ -65,6 +66,7 @@ from app.hud_number import CoinNumberDialog, format_coin_number, read_coin_numbe
 from app.image_canvas import ImageCanvas
 from app.paths import (
     APP_ROOT,
+    COIN_CROP_ROOT,
     DATA_DIR,
     DATA_SYNC_PATH,
     EXTRACTOR_IPC_NAME,
@@ -172,6 +174,12 @@ QPushButton#accent {
     font-weight: 600;
 }
 QPushButton#accent:hover { background: #27a36c; }
+QPushButton#done {
+    background: #3DDC97;
+    color: #102218;
+    font-weight: 700;
+}
+QPushButton#done:hover { background: #55e5a6; }
 QPushButton#danger {
     background: #c4453c;
     font-weight: 600;
@@ -697,6 +705,388 @@ class GroupListWindow(QDialog):
         super().keyPressEvent(event)
 
 
+class CoinCropListWindow(QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("コイン切り出し")
+        self.setModal(False)
+        self.setStyleSheet(STYLESHEET)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.resize(720, 560)
+        self._key = "coin"
+        self._path: Path | None = None
+        self._accepted: dict[str, set[str]] = {"coin": set(), "result_coin": set()}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        bar = QHBoxLayout()
+        self.coin_btn = QPushButton("コイン")
+        self.coin_btn.setCheckable(True)
+        self.coin_btn.setChecked(True)
+        self.result_btn = QPushButton("リザルトのコイン")
+        self.result_btn.setCheckable(True)
+        self.refresh_btn = QPushButton("更新")
+        self.train_btn = QPushButton("学習する")
+        self.train_btn.setObjectName("primary")
+        bar.addWidget(self.coin_btn)
+        bar.addWidget(self.result_btn)
+        bar.addWidget(self.refresh_btn)
+        bar.addWidget(self.train_btn)
+        bar.addStretch(1)
+        self.count_label = QLabel("0 枚")
+        bar.addWidget(self.count_label)
+        layout.addLayout(bar)
+        body = QHBoxLayout()
+        self.file_list = QListWidget()
+        self.file_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.file_list.setMinimumWidth(280)
+        body.addWidget(self.file_list, 1)
+        right = QVBoxLayout()
+        self.preview = QLabel("画像がありません")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumSize(280, 120)
+        self.preview.setStyleSheet("background:#14171c;border:1px solid #2a303a;border-radius:8px;")
+        right.addWidget(self.preview, 1)
+        edit_row = QHBoxLayout()
+        edit_row.addWidget(QLabel("数字"))
+        self.value_edit = QLineEdit()
+        self.value_edit.setPlaceholderText("数字")
+        self.value_edit.setEnabled(False)
+        edit_row.addWidget(self.value_edit, 1)
+        self.save_btn = QPushButton("この数字にする")
+        self.save_btn.setObjectName("accent")
+        self.save_btn.setEnabled(False)
+        edit_row.addWidget(self.save_btn)
+        self.delete_btn = QPushButton("削除")
+        self.delete_btn.setObjectName("danger")
+        self.delete_btn.setEnabled(False)
+        edit_row.addWidget(self.delete_btn)
+        right.addLayout(edit_row)
+        body.addLayout(right, 2)
+        layout.addLayout(body, 1)
+        self.coin_btn.clicked.connect(lambda: self._set_key("coin"))
+        self.result_btn.clicked.connect(lambda: self._set_key("result_coin"))
+        self.refresh_btn.clicked.connect(self.reload)
+        self.file_list.currentItemChanged.connect(self._on_select)
+        self.save_btn.clicked.connect(self._save_value)
+        self.value_edit.returnPressed.connect(self._save_value)
+        self.value_edit.textEdited.connect(self._on_value_edited)
+        self.delete_btn.clicked.connect(self._delete_current)
+        self.train_btn.clicked.connect(self._on_train)
+        self._load_accepted()
+
+    def _accepted_path(self) -> Path:
+        return COIN_CROP_ROOT / "accepted.json"
+
+    def _load_accepted(self) -> None:
+        path = self._accepted_path()
+        loaded = {"coin": set(), "result_coin": set()}
+        if path.is_file():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                for key in ("coin", "result_coin"):
+                    rows = payload.get(key)
+                    if isinstance(rows, list):
+                        loaded[key] = {str(name) for name in rows if str(name)}
+        self._accepted = loaded
+
+    def _save_accepted(self) -> None:
+        path = self._accepted_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "coin": sorted(self._accepted.get("coin") or []),
+                        "result_coin": sorted(self._accepted.get("result_coin") or []),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            return
+
+    def _is_accepted(self, path: Path) -> bool:
+        return path.name in (self._accepted.get(self._key) or set())
+
+    def _mark_accepted(self, path: Path, previous: Path | None = None) -> None:
+        bucket = self._accepted.setdefault(self._key, set())
+        if previous is not None:
+            bucket.discard(previous.name)
+        bucket.add(path.name)
+        self._save_accepted()
+
+    def _unmark_accepted(self, path: Path) -> None:
+        bucket = self._accepted.setdefault(self._key, set())
+        bucket.discard(path.name)
+        self._save_accepted()
+
+    def accepted_names(self, key: str | None = None) -> set[str]:
+        target = self._key if key is None else key
+        return set(self._accepted.get(target) or set())
+
+    def _mark_save_idle(self) -> None:
+        self.save_btn.setObjectName("accent")
+        self.save_btn.setText("この数字にする")
+        self.save_btn.style().unpolish(self.save_btn)
+        self.save_btn.style().polish(self.save_btn)
+
+    def _mark_save_done(self) -> None:
+        self.save_btn.setObjectName("done")
+        self.save_btn.setText("直しました")
+        self.save_btn.style().unpolish(self.save_btn)
+        self.save_btn.style().polish(self.save_btn)
+
+    def _on_value_edited(self, _text: str) -> None:
+        if self._path is None:
+            return
+        typed = "".join(char for char in self.value_edit.text() if char.isdigit())
+        current = self._digits_of(self._path)
+        if typed == current and self._is_accepted(self._path):
+            self._mark_save_done()
+        else:
+            self._mark_save_idle()
+
+    def _style_list_item(self, item: QListWidgetItem, path: Path) -> None:
+        digits = self._digits_of(path)
+        if self._is_accepted(path):
+            label = format_coin_number(digits) if digits else path.name
+            item.setText(f"済 {label}")
+            item.setForeground(QColor("#3DDC97"))
+        else:
+            item.setText(path.name)
+            item.setForeground(QColor("#c5cad3"))
+
+    def _on_train(self) -> None:
+        main = self.parent()
+        if main is None or not hasattr(main, "on_coin_crop_train_button"):
+            return
+        if self._path is not None and self.value_edit.isEnabled():
+            typed = "".join(char for char in self.value_edit.text() if char.isdigit())
+            current = self._digits_of(self._path)
+            if typed and typed != current:
+                self._save_value()
+        main.on_coin_crop_train_button()
+
+    def set_training(self, on: bool) -> None:
+        self.train_btn.setEnabled(True)
+        self.train_btn.setText("中止" if on else "学習する")
+        self.coin_btn.setEnabled(not on)
+        self.result_btn.setEnabled(not on)
+        self.refresh_btn.setEnabled(not on)
+        self.save_btn.setEnabled(not on and self._path is not None)
+        self.delete_btn.setEnabled(not on and self._path is not None)
+        self.value_edit.setEnabled(not on and self._path is not None)
+        self.file_list.setEnabled(not on)
+
+    def _delete_current(self) -> None:
+        path = self._path
+        if path is None or not path.is_file():
+            return
+        answer = QMessageBox.question(self, "削除", f"{path.name} を削除しますか？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        files = self._files()
+        try:
+            index = next(i for i, item in enumerate(files) if item.resolve() == path.resolve())
+        except (StopIteration, OSError):
+            index = -1
+        neighbor = None
+        if index >= 0 and index + 1 < len(files):
+            neighbor = files[index + 1]
+        elif index > 0:
+            neighbor = files[index - 1]
+        try:
+            path.unlink()
+        except OSError as exc:
+            QMessageBox.warning(self, "削除できませんでした", str(exc))
+            return
+        self._unmark_accepted(path)
+        self._path = None
+        self.reload(keep=neighbor)
+
+    def _set_key(self, key: str) -> None:
+        self._key = key
+        self.coin_btn.setChecked(key == "coin")
+        self.result_btn.setChecked(key == "result_coin")
+        self.reload()
+
+    def _folder(self) -> Path:
+        return COIN_CROP_ROOT / self._key
+
+    def _files(self) -> list[Path]:
+        folder = self._folder()
+        if not folder.is_dir():
+            return []
+        return sorted(
+            (
+                path
+                for path in folder.iterdir()
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            ),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+
+    @staticmethod
+    def _digits_of(path: Path) -> str:
+        stem = path.stem
+        if "_" not in stem:
+            return ""
+        label = stem.rsplit("_", 1)[-1]
+        if label == "empty":
+            return ""
+        return "".join(char for char in label if char.isdigit())
+
+    @staticmethod
+    def _stamp_of(path: Path) -> str:
+        stem = path.stem
+        if "_" not in stem:
+            return stem
+        return stem.rsplit("_", 1)[0]
+
+    def reload(self, keep: str | Path | None = None) -> None:
+        files = self._files()
+        if keep is None:
+            current = self.file_list.currentItem()
+            keep = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        keep_text = str(keep) if keep is not None else None
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        chosen_row = 0
+        for row, path in enumerate(files):
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(str(path))
+            self._style_list_item(item, path)
+            self.file_list.addItem(item)
+            if keep_text is not None and str(path) == keep_text:
+                chosen_row = row
+        self.file_list.blockSignals(False)
+        self.count_label.setText(f"{len(files)} 枚")
+        if files:
+            self.file_list.setCurrentRow(chosen_row)
+        else:
+            self._path = None
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("画像がありません")
+            self.value_edit.clear()
+            self.value_edit.setEnabled(False)
+            self.save_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+            self._mark_save_idle()
+
+    def _on_select(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None:
+            self._path = None
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("画像がありません")
+            self.value_edit.clear()
+            self.value_edit.setEnabled(False)
+            self.save_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+            self._mark_save_idle()
+            return
+        path = Path(str(current.data(Qt.ItemDataRole.UserRole) or ""))
+        self._path = path
+        digits = self._digits_of(path)
+        self.value_edit.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        self.delete_btn.setEnabled(True)
+        self.value_edit.setText(format_coin_number(digits) if digits else "")
+        if self._is_accepted(path):
+            self._mark_save_done()
+        else:
+            self._mark_save_idle()
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("画像を開けませんでした")
+            return
+        area = self.preview.size()
+        scaled = pixmap.scaled(
+            max(40, area.width() - 16),
+            max(40, area.height() - 16),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview.setPixmap(scaled)
+        self.preview.setText("")
+
+    def _others_with_label(self, label: str, keep: Path) -> list[Path]:
+        suffix = f"_{label}{keep.suffix.lower()}"
+        folder = self._folder()
+        if not folder.is_dir():
+            return []
+        keep_resolved = keep.resolve()
+        rows: list[Path] = []
+        for path in folder.iterdir():
+            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            if not path.name.endswith(suffix):
+                continue
+            try:
+                if path.resolve() == keep_resolved:
+                    continue
+            except OSError:
+                continue
+            rows.append(path)
+        return rows
+
+    def _save_value(self) -> None:
+        path = self._path
+        if path is None or not path.is_file():
+            return
+        digits = "".join(char for char in self.value_edit.text() if char.isdigit())
+        if not digits:
+            QMessageBox.warning(self, "数字がありません", "直す数字を入れてください。")
+            return
+        label = digits
+        for other in self._others_with_label(label, path):
+            try:
+                other.unlink()
+            except OSError as exc:
+                QMessageBox.warning(self, "保存できませんでした", str(exc))
+                return
+        target = path.with_name(f"{self._stamp_of(path)}_{label}{path.suffix.lower()}")
+        if target != path:
+            if target.exists():
+                QMessageBox.warning(self, "保存できませんでした", f"{target.name} がすでにあります。")
+                return
+            try:
+                path = path.rename(target)
+            except OSError as exc:
+                QMessageBox.warning(self, "保存できませんでした", str(exc))
+                return
+        previous = self._path
+        self._mark_accepted(path, previous=previous)
+        self._path = path
+        self.value_edit.setText(format_coin_number(digits))
+        self._mark_save_done()
+        self.reload(keep=path)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._load_accepted()
+        self.reload()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        current = self.file_list.currentItem()
+        if current is not None:
+            self._on_select(current, None)
+
+
 class CoinReadWorker(QThread):
     finished_ok = Signal(object)
     failed = Signal(str)
@@ -952,6 +1342,9 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(left_grid)
         self.elsa_list_btn = QPushButton("エルサ")
         left_layout.addWidget(self.elsa_list_btn)
+        self.coin_crop_list_btn = QPushButton("コイン切り出し")
+        left_layout.addWidget(self.coin_crop_list_btn)
+        self._coin_crop_window = CoinCropListWindow(self)
         left_layout.addStretch(1)
         left.setMinimumWidth(317)
         left.setMaximumWidth(461)
@@ -1141,6 +1534,7 @@ class MainWindow(QMainWindow):
         self.show_unused_chk.toggled.connect(self.on_show_unused_toggled)
         self.server_save_btn.clicked.connect(self.upload_data_to_server)
         self.elsa_list_btn.clicked.connect(self.toggle_elsa_list)
+        self.coin_crop_list_btn.clicked.connect(self.open_coin_crop_list)
         self.elsa_run_btn.clicked.connect(self.run_elsa)
         self.elsa_delete_btn.clicked.connect(self.delete_elsa_image)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
@@ -1977,6 +2371,12 @@ class MainWindow(QMainWindow):
         folder = target if target.is_dir() else target.parent
         if folder.is_dir():
             self._settings.setValue(f"last_dir/{key}", str(folder.resolve()))
+
+    def open_coin_crop_list(self) -> None:
+        self._coin_crop_window.reload()
+        self._coin_crop_window.show()
+        self._coin_crop_window.raise_()
+        self._coin_crop_window.activateWindow()
 
     def toggle_elsa_list(self) -> None:
         if self._block_if_training():
@@ -3084,6 +3484,7 @@ class MainWindow(QMainWindow):
             self.server_save_btn,
             self.shortcut_btn,
             self.elsa_list_btn,
+            self.coin_crop_list_btn,
         ):
             widget.setVisible(visible)
         if visible:
@@ -3996,6 +4397,8 @@ class MainWindow(QMainWindow):
             widget.setEnabled(False)
         self.train_btn.setEnabled(True)
         self.train_btn.setText("中止")
+        if hasattr(self, "_coin_crop_window"):
+            self._coin_crop_window.set_training(True)
         self._sync_train_shutdown_btn()
         self.hint_label.setText("学習中です。中止できます。")
 
@@ -4004,6 +4407,8 @@ class MainWindow(QMainWindow):
         for widget in self._training_lock_widgets():
             widget.setEnabled(True)
         self.train_btn.setText("学習する")
+        if hasattr(self, "_coin_crop_window"):
+            self._coin_crop_window.set_training(False)
         self._sync_train_shutdown_btn()
         self.hint_label.setText("色つきの四角が付いています。保存したい種類にチェックを付けて保存してください。")
 
@@ -4300,6 +4705,141 @@ class MainWindow(QMainWindow):
         self._train_started_at = time.perf_counter()
         self.statusBar().showMessage("学習中です。中止できます")
         self.train_worker.start()
+
+    def _accepted_coin_crop_entries(self) -> list[tuple[str, Path, str]]:
+        window = getattr(self, "_coin_crop_window", None)
+        if window is not None:
+            window._load_accepted()
+        rows: list[tuple[str, Path, str]] = []
+        for key in ("coin", "result_coin"):
+            names = window.accepted_names(key) if window is not None else set()
+            if not names:
+                continue
+            folder = COIN_CROP_ROOT / key
+            if not folder.is_dir():
+                continue
+            for path in sorted(folder.iterdir(), key=lambda item: item.name):
+                if path.name not in names:
+                    continue
+                if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+                label = path.stem.rsplit("_", 1)[-1] if "_" in path.stem else ""
+                if label == "empty":
+                    continue
+                digits = "".join(char for char in label if char.isdigit())
+                if not digits:
+                    continue
+                rows.append((key, path, digits))
+        return rows
+
+    def _samples_from_accepted_coin_crops(self, entries: list[tuple[str, Path, str]]) -> list[Sample]:
+        from PIL import Image
+
+        by_digest: dict[str, Sample] = {}
+        samples: list[Sample] = []
+        images_dir = self.dataset.images_dir
+        images_dir.mkdir(parents=True, exist_ok=True)
+        for key, path, digits in entries:
+            data = path.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()[:12]
+            ext = path.suffix.lower() if path.suffix.lower() in IMAGE_EXTENSIONS else ".png"
+            filename = f"{digest}{ext}"
+            dest = images_dir / filename
+            if not dest.exists():
+                dest.write_bytes(data)
+            sample = by_digest.get(digest)
+            if sample is None:
+                with Image.open(dest) as image:
+                    width, height = image.size
+                if width < 4 or height < 4:
+                    continue
+                sample = Sample(
+                    id=f"crop-{digest}",
+                    image=filename,
+                    source_name=path.name,
+                    added_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    width=width,
+                    height=height,
+                    game_region=None,
+                    regions={},
+                    confirmed=[],
+                    pieces=[],
+                    readings={},
+                    status="labeled",
+                )
+                by_digest[digest] = sample
+                samples.append(sample)
+            sample.regions[key] = {"x": 0, "y": 0, "w": int(sample.width), "h": int(sample.height)}
+            if key not in sample.confirmed:
+                sample.confirmed.append(key)
+            sample.readings[key] = digits
+            QApplication.processEvents()
+        return samples
+
+    def start_coin_crop_training(self) -> None:
+        if self._is_training():
+            return
+        entries = self._accepted_coin_crop_entries()
+        if len(entries) < MIN_TRAIN_SAMPLES:
+            QMessageBox.information(
+                self,
+                "まだ足りません",
+                f"済の切り出しが {MIN_TRAIN_SAMPLES} 枚以上必要です。\n"
+                f"いま済は {len(entries)} 枚です。",
+            )
+            return
+        message = (
+            f"済の切り出しだけで学習します。\n"
+            f"済: {len(entries)} 枚\n\n"
+            "学習を開始しますか？"
+        )
+        answer = QMessageBox.question(self, "学習を開始", message)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            samples = self._samples_from_accepted_coin_crops(entries)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if len(samples) < MIN_TRAIN_SAMPLES:
+            QMessageBox.information(
+                self,
+                "まだ足りません",
+                f"済の切り出しが {MIN_TRAIN_SAMPLES} 枚以上必要です。\n"
+                f"いま使える分は {len(samples)} 枚です。",
+            )
+            return
+        jobs = [
+            (
+                "coin_digits",
+                samples,
+                self._path_for_used("coin_digits", None),
+                "コインの数字",
+            )
+        ]
+        self._shutdown_after_train = False
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 40 * len(jobs))
+        self.progress.setValue(0)
+        self.train_worker = TrainWorker(jobs)
+        self.train_worker.progress.connect(self.on_train_progress)
+        self.train_worker.finished_ok.connect(self.on_train_finished)
+        self.train_worker.failed.connect(self.on_train_failed)
+        self._lock_for_training()
+        self._keep_display_awake(True)
+        self._place_train_fx()
+        self._train_fx.start()
+        self._train_fx.set_shutdown_after(False)
+        QApplication.processEvents()
+        self._train_started_at = time.perf_counter()
+        self.statusBar().showMessage("学習中です。中止できます")
+        self.train_worker.start()
+
+    def on_coin_crop_train_button(self) -> None:
+        if self._is_training():
+            self.cancel_training()
+            return
+        self.start_coin_crop_training()
 
     def on_train_button(self) -> None:
         if self._is_training():

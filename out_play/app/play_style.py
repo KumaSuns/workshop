@@ -116,6 +116,10 @@ def _load() -> dict:
             kept = play_coin(item.get("coin"))
             if kept is not None:
                 cleaned[-1]["coin"] = kept
+        if "result_coin" in item:
+            kept = play_coin(item.get("result_coin"))
+            if kept is not None:
+                cleaned[-1]["result_coin"] = kept
         waits = _play_waits(item)
         if waits:
             cleaned[-1]["waits"] = waits
@@ -221,37 +225,28 @@ def history_text() -> str:
     cw = _num_width(*clears)
     sw = _num_width(*swipes)
     has_skill = any("skill_ok" in item for item in plays)
-    has_coin = any("coin" in item for item in plays)
     ok_w = 1
-    tap_w = 1
-    coin_w = 1
+    coin_w = 6
     if has_skill:
         oks = [int(item.get("skill_ok") or 0) for item in plays if "skill_ok" in item]
-        taps = [int(item.get("skills") or 0) for item in plays if "skill_ok" in item]
         ok_w = _num_width(*oks)
-        tap_w = _num_width(*taps)
-    if has_coin:
-        coins = [int(item.get("coin") or 0) for item in plays if "coin" in item]
-        coin_w = _num_width(*coins)
     for item in reversed(plays):
-        line = f"消し {int(item.get('clears') or 0):>{cw}} / なぞり {int(item.get('swipes') or 0):>{sw}}"
+        line = f"Clear {int(item.get('clears') or 0):>{cw}} / {int(item.get('swipes') or 0):>{sw}}"
         if has_skill:
             if "skill_ok" in item:
-                skill = (
-                    f"{int(item.get('skill_ok') or 0):>{ok_w}}/"
-                    f"{int(item.get('skills') or 0):>{tap_w}}"
-                )
-                line += f" / スキル {skill}"
-            elif has_coin:
-                line += f" / スキル {' ' * (ok_w + 1 + tap_w)}"
-        if has_coin:
-            if "coin" in item:
-                line += f" / コイン {int(item.get('coin') or 0):>{coin_w}}"
+                line += f" Skill {int(item.get('skill_ok') or 0):>{ok_w}}"
             else:
-                line += f" / コイン {'':>{coin_w}}"
+                line += f" Skill {' ' * ok_w}"
+        earn_text = f"{int(item.get('coin') or 0):>{coin_w}}" if "coin" in item else f"{'':>{coin_w}}"
+        result_text = (
+            f"{int(item.get('result_coin') or 0):>{coin_w}}"
+            if "result_coin" in item
+            else f"{'':>{coin_w}}"
+        )
+        line += f" Coin {earn_text} / {result_text}"
         waits = _play_waits(item)
         if waits:
-            line += " / LossTime / " + " ".join(f"{wait:.1f}s" for wait in waits)
+            line += " LOSS " + "/".join(f"{wait:.1f}" for wait in waits)
         lines.append(line)
     return "\n".join(lines)
 
@@ -574,6 +569,7 @@ def record_play(
     fans: int,
     coin: int | None = None,
     waits: list[float] | None = None,
+    result_coin: int | None = None,
 ) -> None:
     data = _load()
     plays = list(data.get("plays") or [])
@@ -589,6 +585,10 @@ def record_play(
         kept = play_coin(coin)
         if kept is not None:
             item["coin"] = kept
+    if result_coin is not None:
+        kept = play_coin(result_coin)
+        if kept is not None:
+            item["result_coin"] = kept
     shown_waits = _play_waits({"waits": waits or []})
     if shown_waits:
         item["waits"] = shown_waits
@@ -598,6 +598,28 @@ def record_play(
     if item.get("coin") is not None:
         record_rl_skill_coin(int(item.get("skill_ok") or 0), int(item["coin"]))
     flush_style()
+
+
+def set_last_play_coins(coin: int | None = None, result_coin: int | None = None) -> None:
+    earn = play_coin(coin) if coin is not None else None
+    result = play_coin(result_coin) if result_coin is not None else None
+    if earn is None and result is None:
+        return
+    data = _load()
+    plays = list(data.get("plays") or [])
+    if not plays:
+        return
+    plays[-1] = dict(plays[-1])
+    if earn is not None:
+        plays[-1]["coin"] = earn
+    if result is not None:
+        plays[-1]["result_coin"] = result
+    data["plays"] = plays
+    _save(data, True)
+
+
+def set_last_result_coin(result_coin: int) -> None:
+    set_last_play_coins(result_coin=result_coin)
 
 
 def record_pick(options: list[int], picked: int, ok: bool) -> None:

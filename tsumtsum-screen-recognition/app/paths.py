@@ -10,6 +10,7 @@ SERVER_SYNC_PATH = WORKSHOP_ROOT / "video-frame-extractor" / "app" / "server_syn
 SKILLS_IMAGES_DIR = WORKSHOP_ROOT / "video-frame-extractor" / "app" / "assets" / "images" / "skills"
 USE_TSUM_REGISTRY = WORKSHOP_ROOT / "video-frame-extractor" / "app" / "assets" / "models" / "use_tsum" / "registry.json"
 DATA_DIR = APP_ROOT / "data"
+COIN_CROP_ROOT = WORKSHOP_ROOT / "data" / "coin_crops"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 IPC_NAME = "workshop-tsumtsum-screen-recognition"
 EXTRACTOR_IPC_NAME = "workshop-video-frame-extractor"

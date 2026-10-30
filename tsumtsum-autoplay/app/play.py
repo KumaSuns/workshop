@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -80,10 +81,12 @@ from app.play_style import (
     flush_style,
     record_rl_bomb,
     record_rl_skill,
+    set_last_result_coin,
     should_bomb,
     unlike_hit,
 )
 from app.play_web import append_play
+from app.paths import APP_ROOT
 from app.trainer_bridge import (
     TRAINER_ROOT,
     load_play_tools,
@@ -1308,11 +1311,13 @@ def run_play(
             )
             field, text = _read_scene_money(frame_rgb)
             if field == "coin" and not on_result and not on_start:
-                take(field, text)
-            if on_result and not seen["result"]:
-                _field, text = _read_scene_money(frame_rgb, "result_coin")
-                if text:
-                    take("result", text)
+                take("coin", text)
+            elif field == "result" and not on_start:
+                take("result", text)
+            if not seen["result"] and not on_start and (on_result or field == "result"):
+                _field, forced = _read_scene_money(frame_rgb, "result_coin")
+                if forced:
+                    take("result", forced)
             if not seen["result"]:
                 _sleep_stop(0.25, stop)
         for field in ("coin", "result"):
@@ -1944,8 +1949,9 @@ def run_play(
                 _watch_money_screens()
                 earned_now[0] = shown_money["coin"]
                 if not again:
+                    _replay_after_timeup(say, stop, stop_at_start=True)
                     _commit_earned(
-                        earned_now[0],
+                        shown_money["coin"],
                         saved_ok,
                         clears,
                         swipes,
@@ -1955,14 +1961,14 @@ def run_play(
                         duration,
                         waits,
                         not tsum_unspecified,
+                        result_text=shown_money["result"],
                     )
-                    _replay_after_timeup(say, stop, stop_at_start=True)
                     stop_watch.set()
                     watching.clear()
                     return
                 _seen, replay_items = _replay_after_timeup(say, stop)
                 _commit_earned(
-                    earned_now[0],
+                    shown_money["coin"],
                     saved_ok,
                     clears,
                     swipes,
@@ -1972,6 +1978,7 @@ def run_play(
                     duration,
                     waits,
                     not tsum_unspecified,
+                    result_text=shown_money["result"],
                 )
                 fresh_match()
                 match_over = True
@@ -2632,8 +2639,9 @@ def run_play(
                     _watch_money_screens()
                     earned_now[0] = shown_money["coin"]
                     if not again:
+                        _replay_after_timeup(say, stop, stop_at_start=True)
                         _commit_earned(
-                            earned_now[0],
+                            shown_money["coin"],
                             saved_ok,
                             clears,
                             swipes,
@@ -2643,14 +2651,14 @@ def run_play(
                             duration,
                             waits,
                             not tsum_unspecified,
+                            result_text=shown_money["result"],
                         )
-                        _replay_after_timeup(say, stop, stop_at_start=True)
                         stop_watch.set()
                         watching.clear()
                         return
                     _seen, replay_items = _replay_after_timeup(say, stop)
                     _commit_earned(
-                        earned_now[0],
+                        shown_money["coin"],
                         saved_ok,
                         clears,
                         swipes,
@@ -2660,6 +2668,7 @@ def run_play(
                         duration,
                         waits,
                         not tsum_unspecified,
+                        result_text=shown_money["result"],
                     )
                     fresh_match()
                     match_over = True
@@ -4274,11 +4283,15 @@ def _commit_earned(
     duration: int | None,
     waits: list[float] | None,
     upload: bool,
+    result_text: str = "",
 ) -> None:
     raw = "" if text is None else str(text)
     kept = play_coin(raw) if raw else None
+    result = play_coin(result_text) if result_text else None
     if kept is not None:
         record_last_coin(kept, skill_ok)
+    if result is not None:
+        set_last_result_coin(result)
     append_play(
         clears,
         swipes,
@@ -4391,6 +4404,30 @@ def _result_coin_box(image, model_box: dict[str, int] | None) -> dict[str, int] 
 
 # 900×1600 の獲得コイン枠。ラベル 144 枚がこの位置。
 _TAUGHT_COIN_900 = {"x": 311, "y": 234, "w": 275, "h": 73}
+_COIN_CROP_ROOT = APP_ROOT.parent / "data" / "coin_crops"
+
+
+def _coin_crop_label_taken(folder: Path, label: str) -> bool:
+    suffix = f"_{label}.png"
+    try:
+        return any(path.is_file() and path.name.endswith(suffix) for path in folder.iterdir())
+    except OSError:
+        return False
+
+
+def _save_coin_crop(key: str, crop, digits: str) -> None:
+    if key not in ("coin", "result_coin"):
+        return
+    folder = _COIN_CROP_ROOT / key
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        label = digits if digits else "empty"
+        if _coin_crop_label_taken(folder, label):
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        crop.save(folder / f"{stamp}_{label}.png")
+    except Exception:
+        return
 
 
 def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
@@ -4421,7 +4458,9 @@ def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key:
         raw = str(predict(crop, key) or "")
     except Exception:
         return ""
-    return "".join(char for char in raw if char.isdigit())
+    digits = "".join(char for char in raw if char.isdigit())
+    _save_coin_crop(key, crop, digits)
+    return digits
 
 
 def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
