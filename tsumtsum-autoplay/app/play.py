@@ -26,6 +26,7 @@ from app.bluestacks import (
     swipe_path,
     tap,
     tap_skill,
+    tap_together,
 )
 from app.intro import (
     Stopped,
@@ -64,6 +65,7 @@ from app.nightmare_dice import _blank as _nightmare_blank
 from app.nightmare_dice import boogie_on as _nightmare_boogie_on
 from app.nightmare_dice import dice_on as _nightmare_dice_on
 from app.nightmare_dice import nightmare_dice_step
+from app.nightmare_dice import pending as _nightmare_pending
 from app.play_style import (
     hud_net,
     hud_situation,
@@ -1275,7 +1277,8 @@ def run_play(
                 last[field] = text
                 hits[field] = 1
                 deadline = max(deadline, time.time() + 2.5)
-            if hits[field] >= 2:
+            need = 1 if field == "coin" else 2
+            if hits[field] >= need:
                 seen[field] = True
                 _publish_money(field, text)
 
@@ -1309,6 +1312,8 @@ def run_play(
                 and not shot.isNull()
                 and _match_start_button(shot) is not None
             )
+            if on_start and seen["coin"]:
+                break
             field, text = _read_scene_money(frame_rgb)
             if field == "coin" and not on_result and not on_start:
                 take("coin", text)
@@ -1358,21 +1363,33 @@ def run_play(
         play_frame[0] = shot
         play_frame[1] = rgb_now
         play_frame_at[0] = time.time()
-        if _nightmare_dice_on(rgb_now) or _nightmare_boogie_on(rgb_now):
-            nightmare_dice["block"] = True
-            if _nightmare_dice_on(rgb_now):
-                nightmare_dice_step(shot, rgb_now, nightmare_dice, say, stop, watch_hit)
-            return True
+        if not _in_play_hud(shot):
+            _note_scene_money(rgb_now)
+        if (
+            _nightmare_dice_on(rgb_now)
+            or _nightmare_boogie_on(rgb_now)
+            or _nightmare_pending(nightmare_dice)
+        ):
+            nightmare_dice_step(shot, rgb_now, nightmare_dice, say, stop, watch_hit)
+            return bool(nightmare_dice.get("block"))
         nightmare_dice["block"] = False
         return False
 
     def press_skill_now(point, bombs_ok: bool = False) -> None:
-        nonlocal fan_taps, last_fan_at
+        nonlocal fan_taps, last_fan_at, bomb_taps, last_bomb_at
         if before_start[0] or not saw_board:
             return
-        if not bombs_ok and board_bombs[0] != 0:
-            return
         if point is None or skill_busy[0] or watch_hit.is_set():
+            return
+        bombs: list[dict[str, int]] = []
+        if skill_is_nightmare(used_tsum):
+            bombs = [
+                piece
+                for piece in _bombs_on_board(pieces, game)
+                if _piece_cell(piece) not in skip_bomb_cells
+            ]
+            bombs_ok = True
+        if not bombs_ok and board_bombs[0] != 0:
             return
         now = time.time()
         with skill_press_lock:
@@ -1381,12 +1398,30 @@ def run_play(
             next_skill_at[0] = now + SKILL_GAP
         skill_tap_at[0] = now
         try:
-            tap_skill(
-                int(point[0]),
-                int(point[1]),
-                screen_w=int(point[2]),
-                screen_h=int(point[3]),
-            )
+            if skill_is_nightmare(used_tsum) and bombs:
+                bomb = max(
+                    bombs,
+                    key=lambda piece: int(piece.get("r") or 0) ** 2,
+                )
+                say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+                tap_together(
+                    [
+                        (int(bomb["x"]), int(bomb["y"])),
+                        (int(point[0]), int(point[1])),
+                    ],
+                    screen_w=int(point[2]),
+                    screen_h=int(point[3]),
+                )
+                skip_bomb_cells.add(_piece_cell(bomb))
+                bomb_taps += 1
+                last_bomb_at = time.time()
+            else:
+                tap_skill(
+                    int(point[0]),
+                    int(point[1]),
+                    screen_w=int(point[2]),
+                    screen_h=int(point[3]),
+                )
         except Exception:
             with skill_press_lock:
                 next_skill_at[0] = time.time() + 0.5
@@ -1424,6 +1459,8 @@ def run_play(
 
     def _clear_bombs_before_skill() -> None:
         nonlocal bomb_taps, last_bomb_at
+        if skill_is_nightmare(used_tsum):
+            return
         if not board_bombs[0]:
             return
         if skill_is_namine(used_tsum):
@@ -1458,7 +1495,8 @@ def run_play(
         last_bomb_at = time.time()
 
     def _press_ready_skill() -> None:
-        _clear_bombs_before_skill()
+        if not skill_is_nightmare(used_tsum):
+            _clear_bombs_before_skill()
         button = _skill_button_square(skill)
         press_skill_now(
             (
@@ -1589,7 +1627,12 @@ def run_play(
                 left,
             ):
                 ready = False
-            if ready and not skill_is_gadget(used_tsum) and not skill_busy[0]:
+            if (
+                ready
+                and not skill_is_gadget(used_tsum)
+                and not skill_is_nightmare(used_tsum)
+                and not skill_busy[0]
+            ):
                 button = _skill_button_square(skill)
                 press_skill_now(
                     (
@@ -1674,7 +1717,7 @@ def run_play(
             latest_gauge[5] = my_erase
             latest_gauge[6] = tap_at
             latest_gauge[7] = fever_hold
-            if ready and not skill_is_gadget(used_tsum):
+            if ready and not skill_is_gadget(used_tsum) and not skill_is_nightmare(used_tsum):
                 press_skill_now(tap_at)
             full_n = skill_full_n()
             meter_skill = _meter_skill_fill(shot_rgb, skill)
@@ -1858,6 +1901,8 @@ def run_play(
                 and not image.isNull()
                 and _in_play_hud(image)
             )
+            if saw_board and not play_hud and not on_pause:
+                _note_scene_money(rgb)
             retry_now = (
                 saw_board
                 and image is not None
@@ -1918,6 +1963,7 @@ def run_play(
                 ended = True
             if ended:
                 credit_pending(rgb)
+                _watch_money_screens()
                 flush_idle(True)
                 flush_bomb()
                 flush_skill()
@@ -1946,7 +1992,6 @@ def run_play(
                 duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
                 waits = sorted(wait_times, reverse=True)[:3]
                 again = _continue_after_game()
-                _watch_money_screens()
                 earned_now[0] = shown_money["coin"]
                 if not again:
                     _replay_after_timeup(say, stop, stop_at_start=True)
@@ -2241,7 +2286,16 @@ def run_play(
                     while queue or need_more:
                         skill_busy[0] = True
                         _check_stop(stop)
-                        if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                        left_now = _read_timer(None, rgb, timer)
+                        if watch_hit.is_set() and (
+                            left_now == 0
+                            or (
+                                left_now is None
+                                and image is not None
+                                and not image.isNull()
+                                and not _in_play_hud(image)
+                            )
+                        ):
                             timeup = True
                             break
                         if not queue:
@@ -2264,7 +2318,16 @@ def run_play(
                                     queue.append(item)
                             if queue:
                                 continue
-                            if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                            left_now = _read_timer(None, rgb, timer)
+                            if watch_hit.is_set() and (
+                                left_now == 0
+                                or (
+                                    left_now is None
+                                    and image is not None
+                                    and not image.isNull()
+                                    and not _in_play_hud(image)
+                                )
+                            ):
                                 timeup = True
                                 break
                             if _nightmare_live_dice():
@@ -2283,12 +2346,11 @@ def run_play(
                                 break
                             if rgb is None or image.isNull():
                                 break
-                            if skill_is_nightmare(used_tsum) and _nightmare_dice_on(rgb):
-                                nightmare_dice_step(image, rgb, nightmare_dice, say, stop, watch_hit)
-                                break
                             play_frame[0] = image
                             play_frame[1] = rgb
                             play_frame_at[0] = time.time()
+                            if _nightmare_live_dice():
+                                break
                             if not _in_play_hud(image):
                                 break
                             skill_busy[0] = False
@@ -2399,7 +2461,11 @@ def run_play(
                             ):
                                 ready = False
                                 fills = False
-                            if skill_is_nightmare(used_tsum) and _nightmare_dice_on(rgb):
+                            if skill_is_nightmare(used_tsum) and (
+                                _nightmare_dice_on(rgb)
+                                or _nightmare_boogie_on(rgb)
+                                or _nightmare_pending(nightmare_dice)
+                            ):
                                 ready = False
                                 fills = False
                             if not ready and not fills:
@@ -2464,10 +2530,18 @@ def run_play(
                             and about_to_fill_skill(chain)
                             and sure
                         ):
-                            _clear_bombs_before_skill()
+                            if skill_is_nightmare(used_tsum):
+                                _press_ready_skill()
+                                if skill_pressed is not None and skill_pressed.is_set():
+                                    apply_checker_skill(True)
+                                    skip_after_skill = True
+                                    break
+                            else:
+                                _clear_bombs_before_skill()
                         if (
                             not already_pending
                             and about_to_fill_skill(chain)
+                            and not skill_is_nightmare(used_tsum)
                             and mash_skill_until_on(sure)
                         ):
                             if skill_pressed is not None:
@@ -2609,6 +2683,9 @@ def run_play(
                             say("TIME UP / " + _counts_line(clears, swipes))
                 if timeup:
                     credit_pending(check_rgb)
+                    if check_rgb is not None:
+                        _note_scene_money(check_rgb)
+                    _watch_money_screens()
                     flush_idle(True)
                     flush_bomb()
                     flush_skill()
@@ -2636,7 +2713,6 @@ def run_play(
                     duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
                     waits = sorted(wait_times, reverse=True)[:3]
                     again = _continue_after_game()
-                    _watch_money_screens()
                     earned_now[0] = shown_money["coin"]
                     if not again:
                         _replay_after_timeup(say, stop, stop_at_start=True)

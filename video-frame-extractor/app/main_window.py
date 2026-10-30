@@ -352,11 +352,13 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.browse_coin_train_btn)
         self.server_save_btn = QPushButton("サーバーに保存")
         self.elsa_skill_save_btn = QPushButton("エルサスキル画像に保存")
+        self.dice_save_btn = QPushButton("サイコロの画像を保存")
         data_grid = QGridLayout()
         data_grid.setHorizontalSpacing(6)
         data_grid.setVerticalSpacing(6)
         data_grid.addWidget(self.server_save_btn, 0, 0, 1, 2)
         data_grid.addWidget(self.elsa_skill_save_btn, 1, 0, 1, 2)
+        data_grid.addWidget(self.dice_save_btn, 2, 0, 1, 2)
         left_layout.addLayout(data_grid)
         left_layout.addStretch(1)
         left.setMinimumWidth(260)
@@ -653,6 +655,7 @@ class MainWindow(QMainWindow):
         self.send_all_btn.clicked.connect(self.send_all_to_tsumtsum)
         self.server_save_btn.clicked.connect(self.upload_data_to_server)
         self.elsa_skill_save_btn.clicked.connect(self.save_elsa_skill_image)
+        self.dice_save_btn.clicked.connect(self.save_dice_image)
         self._update_buttons()
 
     def save_elsa_skill_image(self) -> None:
@@ -671,6 +674,32 @@ class MainWindow(QMainWindow):
         if frame <= 0 and self._preview_point is not None:
             frame = int(getattr(self._preview_point, "frame", 0) or 0)
         stem = f"frame_{frame:06d}" if frame > 0 else datetime.now().strftime("elsa_%Y%m%d_%H%M%S")
+        dest = folder / f"{stem}.png"
+        extra = 1
+        while dest.exists():
+            extra += 1
+            dest = folder / f"{stem}_{extra}.png"
+        if not self._full_pixmap.save(str(dest), "PNG"):
+            self.statusBar().showMessage("保存できませんでした", 3000)
+            return
+        self.statusBar().showMessage(f"保存しました {dest.name}", 4000)
+
+    def save_dice_image(self) -> None:
+        if self._full_pixmap is None or self._full_pixmap.isNull():
+            self.statusBar().showMessage("プレビューに画像がありません", 3000)
+            return
+        folder = (
+            Path(__file__).resolve().parent
+            / "assets"
+            / "images"
+            / "skills"
+            / "dice"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        frame = int(self._play_frame or 0)
+        if frame <= 0 and self._preview_point is not None:
+            frame = int(getattr(self._preview_point, "frame", 0) or 0)
+        stem = f"frame_{frame:06d}" if frame > 0 else datetime.now().strftime("dice_%Y%m%d_%H%M%S")
         dest = folder / f"{stem}.png"
         extra = 1
         while dest.exists():
@@ -731,6 +760,7 @@ class MainWindow(QMainWindow):
         self.kind_combo.setEnabled(not busy)
         self.server_save_btn.setEnabled(not busy)
         self.elsa_skill_save_btn.setEnabled(not busy)
+        self.dice_save_btn.setEnabled(not busy)
         training = isinstance(self.worker, SceneTrainWorker)
         digit_training = isinstance(self.worker, DigitTrainWorker)
         tsum_training = isinstance(self.worker, TsumTrainWorker)

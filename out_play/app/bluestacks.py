@@ -461,6 +461,101 @@ def tap_skill(x: int, y: int, screen_w: int = 0, screen_h: int = 0) -> None:
     _adb_tap(int(x), int(y), 180)
 
 
+def tap_together(
+    points: list[tuple[int, int]],
+    screen_w: int = 0,
+    screen_h: int = 0,
+    hold_ms: int = 220,
+) -> None:
+    cleaned = [(int(x), int(y)) for x, y in points]
+    if not cleaned:
+        return
+    width, height = screen_w, screen_h
+    if (width < 2 or height < 2) and _last_cap_size is not None:
+        width, height = _last_cap_size
+    if len(cleaned) == 1:
+        tap(cleaned[0][0], cleaned[0][1], hold_ms=hold_ms, screen_w=width, screen_h=height)
+        return
+    if _tap_together_hold_mouse(cleaned[0], cleaned[1:], width, height):
+        return
+    hold_x, hold_y = cleaned[0]
+    taps = cleaned[1:]
+    hold_for = max(180, int(hold_ms))
+    from threading import Thread
+
+    def hold_point() -> None:
+        xi, yi = str(hold_x), str(hold_y)
+        adb(
+            ["shell", "input", "swipe", xi, yi, xi, yi, str(hold_for)],
+            timeout=6,
+        )
+
+    holder = Thread(target=hold_point, daemon=True)
+    holder.start()
+    time.sleep(0.05)
+    for x, y in taps:
+        _adb_tap(int(x), int(y), 80)
+    holder.join(timeout=6)
+
+
+def _tap_together_hold_mouse(
+    hold: tuple[int, int],
+    taps: list[tuple[int, int]],
+    screen_w: int,
+    screen_h: int,
+) -> bool:
+    if sys.platform != "win32" or screen_w < 2 or screen_h < 2:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+    user32 = ctypes.windll.user32
+    mapped = _map_to_view([hold], screen_w, screen_h, user32, wintypes)
+    if not mapped:
+        return False
+    if not _mouse_lock.acquire(blocking=False):
+        return False
+    try:
+        hwnd = _player_hwnd(user32, wintypes)
+        if hwnd:
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.02)
+        user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
+        user32.SendInput.restype = ctypes.c_uint
+        vx = user32.GetSystemMetrics(76)
+        vy = user32.GetSystemMetrics(77)
+        vw = max(1, user32.GetSystemMetrics(78) - 1)
+        vh = max(1, user32.GetSystemMetrics(79) - 1)
+        move = 0x0001 | 0x8000 | 0x4000
+        down = move | 0x0002
+        up = move | 0x0004
+
+        def emit(x: int, y: int, flags: int) -> None:
+            ax = int((x - vx) * 65535 / vw)
+            ay = int((y - vy) * 65535 / vh)
+            inp = _INPUT(type=0, union=_INPUTunion(mi=_MOUSEINPUT(ax, ay, 0, flags, 0, None)))
+            user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
+
+        x0, y0 = mapped[0]
+        emit(x0, y0, move)
+        time.sleep(0.01)
+        emit(x0, y0, down)
+        time.sleep(0.03)
+        for x, y in taps:
+            _adb_tap(int(x), int(y), 80)
+        time.sleep(0.03)
+        emit(x0, y0, up)
+        return True
+    except Exception:
+        return False
+    finally:
+        _mouse_lock.release()
+
+
 def _adb_tap(x: int, y: int, hold_ms: int) -> None:
     xi, yi = str(int(x)), str(int(y))
     result = adb(["shell", "input", "tap", xi, yi], timeout=6)
@@ -494,6 +589,7 @@ def swipe_path(
     abort=None,
     point_s: float | None = None,
     center_s: float | None = None,
+    while_down=None,
 ) -> str:
     if stop is not None and stop.is_set():
         return "停止"
@@ -501,7 +597,16 @@ def swipe_path(
     if len(points) < 3:
         return "点が3未満"
     dense = _dense_points(points, step=14)
-    how = _swipe_mouse(dense, screen_w, screen_h, points, abort=abort, point_s=point_s, center_s=center_s)
+    how = _swipe_mouse(
+        dense,
+        screen_w,
+        screen_h,
+        points,
+        abort=abort,
+        point_s=point_s,
+        center_s=center_s,
+        while_down=while_down,
+    )
     if how:
         return how
     if stop is not None and stop.is_set():
@@ -530,6 +635,7 @@ def _swipe_mouse(
     abort=None,
     point_s: float | None = None,
     center_s: float | None = None,
+    while_down=None,
 ) -> str:
     if sys.platform != "win32" or screen_w < 2 or screen_h < 2:
         return ""
@@ -552,7 +658,7 @@ def _swipe_mouse(
     if anchors:
         held = _map_to_view(anchors, screen_w, screen_h, user32, wintypes)
         hold = {(int(x), int(y)) for x, y in held}
-    if not _send_mouse_path(user32, mapped, hold, abort, point_s, center_s):
+    if not _send_mouse_path(user32, mapped, hold, abort, point_s, center_s, while_down):
         return ""
     return f"マウス {len(dense)}点"
 
@@ -564,9 +670,12 @@ def _send_mouse_path(
     abort=None,
     point_s: float | None = None,
     center_s: float | None = None,
+    while_down=None,
 ) -> bool:
     with _mouse_lock:
-        return _send_mouse_path_locked(user32, mapped, hold, abort, point_s, center_s)
+        return _send_mouse_path_locked(
+            user32, mapped, hold, abort, point_s, center_s, while_down
+        )
 
 
 def _send_mouse_path_locked(
@@ -576,6 +685,7 @@ def _send_mouse_path_locked(
     abort=None,
     point_s: float | None = None,
     center_s: float | None = None,
+    while_down=None,
 ) -> bool:
     user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
     user32.SendInput.restype = ctypes.c_uint
@@ -608,12 +718,29 @@ def _send_mouse_path_locked(
     if abort is not None and abort.is_set():
         emit(x0, y0, up)
         return True
-    for x, y in mapped[1:]:
+    fired = False
+    for index, (x, y) in enumerate(mapped[1:], start=1):
         if abort is not None and abort.is_set():
             emit(x, y, up)
             return True
         emit(x, y, move)
         time.sleep(center if (x, y) in hold else point)
+        if (
+            not fired
+            and while_down is not None
+            and index >= 1
+            and (abort is None or not abort.is_set())
+        ):
+            fired = True
+            try:
+                while_down()
+            except Exception:
+                pass
+    if not fired and while_down is not None and (abort is None or not abort.is_set()):
+        try:
+            while_down()
+        except Exception:
+            pass
     time.sleep(0.02)
     xl, yl = mapped[-1]
     emit(xl, yl, up)

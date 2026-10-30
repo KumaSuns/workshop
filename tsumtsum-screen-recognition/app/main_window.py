@@ -96,6 +96,7 @@ from app.regions import (
 from app.skill_export import registered_skills_by_sample, save_skill_image, skill_tsum_choices
 from app.train_effect import TrainEffect
 from app.tsum_chain import CANDIDATE_COUNT
+from app.tsum_info import TsumInfoWindow
 from app.train_worker import MIN_TRAIN_SAMPLES, TRAIN_EPOCHS, TrainWorker
 
 LIST_STATUS_WIDTHS = {
@@ -1140,6 +1141,7 @@ class MainWindow(QMainWindow):
         self.current_id: str | None = None
         self._active_key = "game"
         self.train_worker: TrainWorker | None = None
+        self._named_train_worker: CoinReadWorker | None = None
         self._predict_worker: PredictWorker | None = None
         self._coin_worker: CoinReadWorker | None = None
         self._train_started_at: float | None = None
@@ -1192,6 +1194,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(title)
         top_layout.addWidget(self.hint_label, 1)
 
+        self.tsum_info_btn = QPushButton("ツム情報登録")
         self.open_btn = QPushButton("画像を開く")
         self.paste_btn = QPushButton("貼り付け")
         self.confirm_btn = QPushButton("この範囲を保存")
@@ -1206,6 +1209,7 @@ class MainWindow(QMainWindow):
         self.train_btn.setObjectName("primary")
         self.train_shutdown_btn = QPushButton("学習してシャットダウン")
         for button in (
+            self.tsum_info_btn,
             self.open_btn,
             self.paste_btn,
             self.confirm_btn,
@@ -1218,6 +1222,7 @@ class MainWindow(QMainWindow):
             self.train_shutdown_btn,
         ):
             top_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
+        self._tsum_info_window: TsumInfoWindow | None = None
         layout.addWidget(top)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1247,6 +1252,8 @@ class MainWindow(QMainWindow):
         self.name_en = QLineEdit()
         self.name_en.setPlaceholderText("英語")
         self.name_save_btn = QPushButton("登録")
+        self.name_train_btn = QPushButton("学習する")
+        self.name_train_btn.setObjectName("primary")
         self.name_saved_list = QListWidget()
         self.name_saved_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.name_saved_list.setWordWrap(True)
@@ -1260,6 +1267,7 @@ class MainWindow(QMainWindow):
         name_layout.addWidget(self.name_ja)
         name_layout.addWidget(self.name_en)
         name_layout.addWidget(self.name_save_btn)
+        name_layout.addWidget(self.name_train_btn)
         self.name_panel.hide()
         self._name_window = QDialog(self)
         self._name_window.setWindowTitle("ツム名")
@@ -1509,6 +1517,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self.statusBar().showMessage("準備完了")
 
+        self.tsum_info_btn.clicked.connect(self.open_tsum_info)
         self.open_btn.clicked.connect(self.open_files)
         self.paste_btn.clicked.connect(self.paste_clipboard)
         self.confirm_btn.clicked.connect(self.confirm_current)
@@ -1545,6 +1554,7 @@ class MainWindow(QMainWindow):
         self.name_mode_btn.toggled.connect(self._toggle_name_mode)
         self.named_circle_btn.toggled.connect(self._toggle_named_circle_mode)
         self.name_save_btn.clicked.connect(self._register_circle_name)
+        self.name_train_btn.clicked.connect(self.start_named_training)
         self.name_ja.textChanged.connect(lambda text: self._show_existing_name("ja", text))
         self.name_en.textChanged.connect(lambda text: self._show_existing_name("en", text))
         self.name_saved_list.itemClicked.connect(self._open_saved_circle_name)
@@ -2556,6 +2566,16 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self.canvas.set_run_mark(pieces, lines)
         self.statusBar().showMessage(f"ツム {sum(1 for piece in pieces if str(piece.get('kind')) != 'bomb')} 個、3チェーン {len(lines)} 本", 4000)
+
+    def open_tsum_info(self) -> None:
+        window = self._tsum_info_window
+        if window is None:
+            window = TsumInfoWindow(self, STYLESHEET)
+            self._tsum_info_window = window
+        window.reload()
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def open_files(self) -> None:
         if self._block_if_training():
@@ -3631,6 +3651,49 @@ class MainWindow(QMainWindow):
         self._restyle_sample_row(sample.id)
         self.statusBar().showMessage(f"No. {group}  {ja}  {en}", 4000)
 
+    def start_named_training(self) -> None:
+        if self._block_if_training():
+            return
+        from app.named_tsum_test import train as train_named_tsum
+
+        self.name_train_btn.setEnabled(False)
+        self.name_train_btn.setText("学習中")
+        self.name_save_btn.setEnabled(False)
+        self.train_btn.setEnabled(False)
+        self.statusBar().showMessage("ツム名を学習しています")
+        self._keep_display_awake(True)
+        worker = CoinReadWorker(train_named_tsum)
+        self._named_train_worker = worker
+        worker.finished_ok.connect(self._on_named_train_finished)
+        worker.failed.connect(self._on_named_train_failed)
+        worker.finished.connect(self._on_named_train_thread_finished)
+        worker.start()
+
+    def _on_named_train_finished(self, payload: object) -> None:
+        from app.named_tsum_test import TEST_MODEL_PATH
+
+        data = payload if isinstance(payload, dict) else {}
+        examples = int(data.get("examples") or 0)
+        names = data.get("names") if isinstance(data.get("names"), list) else []
+        self.predictor.use_named_tsum_model(TEST_MODEL_PATH)
+        self.statusBar().showMessage(
+            f"ツム名の学習が終わりました  {examples}枚  {len(names)}種類",
+            8000,
+        )
+
+    def _on_named_train_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "ツム名の学習", message or "学習に失敗しました")
+        self.statusBar().showMessage(message or "ツム名の学習に失敗しました", 8000)
+
+    def _on_named_train_thread_finished(self) -> None:
+        self._named_train_worker = None
+        self._keep_display_awake(False)
+        self.name_train_btn.setText("学習する")
+        self.name_train_btn.setEnabled(True)
+        self.name_save_btn.setEnabled(True)
+        if not self._is_training():
+            self.train_btn.setEnabled(True)
+
     def _show_name_state(self, sample: Sample | None, group: int) -> None:
         saved: dict[str, str] = {}
         if sample is not None:
@@ -4332,6 +4395,9 @@ class MainWindow(QMainWindow):
     def _is_training(self) -> bool:
         return self.train_worker is not None and self.train_worker.isRunning()
 
+    def _is_named_training(self) -> bool:
+        return self._named_train_worker is not None and self._named_train_worker.isRunning()
+
     def _training_lock_widgets(self) -> tuple:
         return (
             self.open_btn,
@@ -4358,6 +4424,8 @@ class MainWindow(QMainWindow):
             self.list_widget,
             self.canvas,
             self.spin_group,
+            self.name_save_btn,
+            self.name_train_btn,
         )
 
     def _keep_display_awake(self, on: bool) -> None:
@@ -4426,7 +4494,7 @@ class MainWindow(QMainWindow):
         self.train_shutdown_btn.setEnabled(bool(self._trainable_jobs(self._file_tsum)) and self.train_worker is None)
 
     def _block_if_training(self) -> bool:
-        if not self._is_training():
+        if not self._is_training() and not self._is_named_training():
             return False
         self.statusBar().showMessage("学習中です。終わるまで操作できません", 3000)
         return True
@@ -4606,7 +4674,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("train_sec_per_batch", rate)
 
     def start_training(self, *, shutdown_after: bool = False) -> None:
-        if self._is_training():
+        if self._is_training() or self._is_named_training():
             return
         selected = self._selected_place_keys()
         used = None
@@ -4777,7 +4845,7 @@ class MainWindow(QMainWindow):
         return samples
 
     def start_coin_crop_training(self) -> None:
-        if self._is_training():
+        if self._is_training() or self._is_named_training():
             return
         entries = self._accepted_coin_crop_entries()
         if len(entries) < MIN_TRAIN_SAMPLES:

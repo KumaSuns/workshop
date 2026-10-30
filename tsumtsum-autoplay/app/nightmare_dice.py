@@ -7,7 +7,9 @@ from PySide6.QtGui import QImage
 from app.bluestacks import tap
 from app.intro import _check_stop
 
+
 _HOLD_SEC = 4.0
+_WAIT_DICE_SEC = 8.0
 
 
 def _blank() -> dict:
@@ -25,6 +27,7 @@ def _blank() -> dict:
         "block": False,
         "high": False,
         "centers": None,
+        "had_dice": False,
     }
 
 
@@ -35,6 +38,16 @@ def _reset(state: dict) -> None:
 
 def _hold(state: dict) -> None:
     state["block"] = True
+
+
+def pending(state: dict) -> bool:
+    return bool(
+        state.get("seen")
+        or state.get("had_dice")
+        or state.get("roll")
+        or state.get("tapped")
+        or state.get("block")
+    )
 
 
 def _pips(arr, labels, index: int, red_area: int) -> int:
@@ -187,6 +200,7 @@ def nightmare_dice_step(image: QImage, rgb, state: dict, say, stop, watch_hit) -
     if faces is not None:
         _hold(state)
         state["face_at"] = time.time()
+        state["had_dice"] = True
         counts = (int(faces[0][0]), int(faces[1][0]))
         total = counts[0] + counts[1]
         if any(item < 1 or item > 6 for item in counts):
@@ -216,27 +230,28 @@ def nightmare_dice_step(image: QImage, rgb, state: dict, say, stop, watch_hit) -
     if time.time() - float(state.get("face_at") or 0.0) < 0.45 and state.get("face_at"):
         _hold(state)
         return True
-    if faces is None:
-        try:
-            boogie = boogie_on(rgb)
-        except Exception:
-            boogie = False
-        if boogie:
-            state["seen"] = True
-            state["seen_at"] = time.time()
-            if roll == 0 and not tapped and not state.get("said"):
-                say("ブギー")
-                state["said"] = True
-        if state.get("seen") and roll == 0 and not tapped:
-            if boogie or time.time() - float(state.get("seen_at") or 0.0) < _HOLD_SEC:
-                _hold(state)
-                return True
-            _reset(state)
-            return False
+    try:
+        boogie = boogie_on(rgb)
+    except Exception:
+        boogie = False
+    if boogie:
+        state["seen"] = True
+        state["seen_at"] = time.time()
+        if not state.get("said"):
+            say("ブギー")
+            state["said"] = True
+        _hold(state)
+        return True
+    if state.get("seen") and not state.get("had_dice"):
+        if time.time() - float(state.get("seen_at") or 0.0) < _WAIT_DICE_SEC:
+            _hold(state)
+            return True
+        _reset(state)
+        return False
     if tapped and roll < 2 and time.time() < float(state.get("hold_until") or 0.0):
         _hold(state)
         return True
-    if roll or tapped:
+    if roll or tapped or state.get("had_dice"):
         _reset(state)
         return False
     state["block"] = False

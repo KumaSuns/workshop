@@ -10,5 +10,9 @@
   "namine": {
     "kind": "normal",
     "charm": false
+  },
+  "KH2Cloud": {
+    "kind": "normal",
+    "charm": false
   }
 }

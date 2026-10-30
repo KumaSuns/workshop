@@ -312,8 +312,24 @@ class DebugWindow(QWidget):
         normal = QTextCharFormat()
         red = QTextCharFormat()
         red.setForeground(QColor(220, 0, 0))
+        green = QTextCharFormat()
+        green.setForeground(QColor(0, 100, 0))
+        boogie = QTextCharFormat()
+        boogie.setForeground(QColor("#009900"))
         cursor.setCharFormat(normal)
         cursor.insertText(f"{now}  ")
+        if text == "ブギー":
+            cursor.insertText(text, boogie)
+            cursor.setCharFormat(normal)
+            self._log.setTextCursor(cursor)
+            self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+            return
+        if text.startswith("サイコロ") or text == "振り直し":
+            cursor.insertText(text, green)
+            cursor.setCharFormat(normal)
+            self._log.setTextCursor(cursor)
+            self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+            return
         mark = "TIME UP"
         rest = text
         while mark in rest:
