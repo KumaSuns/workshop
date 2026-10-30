@@ -205,6 +205,12 @@ def _logo_source() -> QPixmap:
     )
 
 
+def _coin_number_text(value) -> str:
+    if value is None:
+        return "－"
+    return f"{int(value):,}"
+
+
 def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
     names = item.get("items") or []
     if isinstance(names, str):
@@ -213,21 +219,21 @@ def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
         items_text = "、".join(str(name) for name in names if str(name))
     coin = item.get("coin")
     result = item.get("result_coin")
+    result_text = _coin_number_text(result)
+    coin_text = _coin_number_text(coin)
     if result is not None and coin is not None and int(coin) > 0:
-        rate = int(result) / int(coin)
-        shown = f"{int(result)} * {rate:.1f} GET {int(coin)}"
-    elif result is not None and coin is not None:
-        shown = f"{int(result)} * － GET {int(coin)}"
-    elif result is not None:
-        shown = f"{int(result)} * － GET －"
-    elif coin is not None:
-        shown = f"－ * － GET {int(coin)}"
+        rate_text = f"{int(result) / int(coin):.1f}"
     else:
-        shown = "－"
+        rate_text = "－"
     return [
         (str(item.get("started") or ""), False),
         (f"  使用アイテム {items_text}", False),
-        (f"  コイン {shown}", False),
+        ("  コイン ", False),
+        (result_text, True),
+        (" * ", False),
+        (rate_text, True),
+        (" GET ", False),
+        (coin_text, True),
     ]
 
 
@@ -975,10 +981,11 @@ class MenuWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         labels = []
-        for text, _right in parts:
+        for text, right in parts:
             label = QLabel(text)
             label.setAlignment(
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                (Qt.AlignmentFlag.AlignRight if right else Qt.AlignmentFlag.AlignLeft)
+                | Qt.AlignmentFlag.AlignVCenter
             )
             labels.append(label)
             layout.addWidget(label)
@@ -1026,9 +1033,11 @@ class MenuWindow(QMainWindow):
                 continue
             widget = self._game_list.itemWidget(listed)
             labels = getattr(widget, "_record_labels", None) if widget is not None else None
-            if labels is not None:
+            if labels is not None and len(labels) == len(parts):
                 for label, (text, _right) in zip(labels, parts):
                     label.setText(text)
+            else:
+                self._game_list.setItemWidget(listed, self._record_row(parts))
             self._align_game_records()
             return
         entry = QListWidgetItem()
