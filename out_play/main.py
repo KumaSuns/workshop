@@ -71,6 +71,15 @@ ITEM_NAMES = (
     "5＞4",
     "+Combo",
 )
+ITEM_COIN_COST = {
+    "+Score": 500,
+    "+Coin": 500,
+    "+Exp": 500,
+    "+Time": 1000,
+    "+Bomb": 1500,
+    "5＞4": 1800,
+    "+Combo": 1200,
+}
 ITEM_DIM = 0.6
 ITEM_MIST = 0.6
 TITLE_POINT = 12
@@ -211,29 +220,43 @@ def _coin_number_text(value) -> str:
     return f"{int(value):,}"
 
 
-def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
+def _item_names(item: dict) -> list[str]:
     names = item.get("items") or []
     if isinstance(names, str):
-        items_text = names
-    else:
-        items_text = "、".join(str(name) for name in names if str(name))
+        return [names] if names else []
+    return [str(name) for name in names if str(name)]
+
+
+def _item_coin_cost(names: list[str]) -> int:
+    return sum(int(ITEM_COIN_COST.get(name, 0) or 0) for name in names)
+
+
+def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
+    names = _item_names(item)
+    items_text = "、".join(names)
     coin = item.get("coin")
     result = item.get("result_coin")
-    result_text = _coin_number_text(result)
     coin_text = _coin_number_text(coin)
+    result_text = _coin_number_text(result)
     if result is not None and coin is not None and int(coin) > 0:
-        rate_text = f"{int(result) / int(coin):.1f}"
+        rate_text = f"×{int(result) / int(coin):.1f}"
     else:
-        rate_text = "－"
+        rate_text = "×－"
+    if result is not None:
+        get_text = _coin_number_text(int(result) - _item_coin_cost(names))
+    else:
+        get_text = "－"
     return [
         (str(item.get("started") or ""), False),
         (f"  使用アイテム {items_text}", False),
         ("  コイン ", False),
+        (coin_text, True),
+        (" / ", False),
         (result_text, True),
-        (" * ", False),
+        (" / ", False),
         (rate_text, True),
         (" GET ", False),
-        (coin_text, True),
+        (get_text, True),
     ]
 
 
