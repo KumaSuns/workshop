@@ -273,6 +273,48 @@ def _cbuzz_pose_on(image: QImage) -> bool:
     return best / (height_n * width_n) >= 0.03
 
 
+def _cbuzz_red_marks_on(image: QImage) -> bool:
+    width = image.width()
+    height = image.height()
+    if width < 2 or height < 2:
+        return False
+    left = int(width * 0.25)
+    right = int(width * 0.70)
+    top = int(height * 0.79)
+    bottom = int(height * 0.85)
+    if right - left < 16 or bottom - top < 4:
+        return False
+    hits = [0] * width
+    for y in range(top, bottom):
+        for x in range(left, right):
+            color = image.pixel(x, y)
+            red = (color >> 16) & 255
+            green = (color >> 8) & 255
+            blue = color & 255
+            if red >= 160 and red >= green + 50 and red >= blue + 50:
+                hits[x] += 1
+    smooth = [0] * width
+    for x in range(left, right):
+        smooth[x] = sum(hits[max(left, x - 2) : min(right, x + 3)])
+    min_sep = max(12, int(width * 0.035))
+    need = max(8, (bottom - top) // 2)
+    peaks: list[int] = []
+    for x in range(left + 3, right - 3):
+        value = smooth[x]
+        if value < need:
+            continue
+        if value < smooth[x - 1] or value < smooth[x + 1]:
+            continue
+        if value <= smooth[x - 3] or value <= smooth[x + 3]:
+            continue
+        if peaks and x - peaks[-1] < min_sep:
+            if value > smooth[peaks[-1]]:
+                peaks[-1] = x
+            continue
+        peaks.append(x)
+    return 4 <= len(peaks) <= 6
+
+
 def _wait_cbuzz_b(start: float, stop, watch_hit, pose_seen: bool = False) -> bool:
     del watch_hit
     fallback = float(start) + 2.5
@@ -291,6 +333,8 @@ def _wait_cbuzz_b(start: float, stop, watch_hit, pose_seen: bool = False) -> boo
                 return True
             time.sleep(0.02)
             continue
+        if _cbuzz_red_marks_on(shot):
+            return True
         on = _cbuzz_pose_on(shot)
         if on:
             saw = True
@@ -314,6 +358,7 @@ def _after_cbuzz(image: QImage, rgb, say: SayFn, stop, watch_hit, game, started_
     start = float(started_at) if started_at else time.time()
     if not _wait_cbuzz_b(start, stop, watch_hit, pose_seen):
         return
+    say("タップ開始")
     first = True
     for frac, delay, label in cbuzz_steps():
         if not first:
