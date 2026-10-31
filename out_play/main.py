@@ -369,6 +369,7 @@ class MenuWindow(QMainWindow):
         self._play_games = None
         self._play_current = None
         self._play_api = None
+        self._play_api_load = None
         self._used_tsum_name = ""
         self._tsum_body = None
         self._used_tsum_label = None
@@ -1586,7 +1587,42 @@ class MenuWindow(QMainWindow):
             self._set_activity("プレイするゲーム数がありません。")
             QMessageBox.information(self, "オートプレイ", "プレイするゲーム数がありません。")
             return
-        _start_play_here(self, games)
+        self._play_games = games
+        self._begin_play_after_items()
+
+    def _begin_play_after_items(self) -> None:
+        if self._play_stop.is_set() or not self._autoplay_alive:
+            return
+        if self._play_api is not None:
+            self._set_activity("プレイを準備しています")
+            _start_play_here(self, self._play_games)
+            return
+        if self._play_api_load is not None:
+            return
+        self._set_activity("プレイの準備をしています")
+        worker = _PlayApiLoad(self)
+        worker.ready.connect(self._on_play_api_ready)
+        worker.failed.connect(self._on_play_api_fail)
+        self._play_api_load = worker
+        worker.start()
+
+    def _on_play_api_ready(self, api: object) -> None:
+        self._play_api_load = None
+        self._play_api = api
+        if self._play_stop.is_set() or not self._autoplay_alive:
+            return
+        self._set_activity("プレイを準備しています")
+        _start_play_here(self, self._play_games)
+
+    def _on_play_api_fail(self, message: str) -> None:
+        self._play_api_load = None
+        self._autoplay_alive = False
+        text = str(message or "プレイの準備に失敗しました。")
+        self._set_activity(text)
+        self._set_flow_lamp("システム終了")
+        if self._autoplay_button is not None:
+            self._autoplay_button.setEnabled(True)
+        QMessageBox.critical(self, "オートプレイ", text)
 
     def _on_intro_ok(self) -> None:
         if self._play_stop.is_set():
@@ -2359,7 +2395,9 @@ def _start_play_here(window: MenuWindow, games: int | None) -> None:
     if window._intro is not None and window._intro.isRunning():
         return
     if window._play_api is None:
-        window._play_api = _load_play_api()
+        window._play_games = games
+        window._begin_play_after_items()
+        return
     start_tsum, tsum_is_running, _intro_cls, _play_cls, _read_kinds = window._play_api
     window._play_games = games
     window._play_stop.clear()
@@ -2828,6 +2866,17 @@ class _ItemCheck(QThread):
 
     def run(self) -> None:
         self.found.emit(_recognized_items())
+
+
+class _PlayApiLoad(QThread):
+    ready = Signal(object)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.ready.emit(_load_play_api())
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc) or "プレイの準備に失敗しました。")
 
 
 class _ModelFetch(QThread):
