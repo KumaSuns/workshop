@@ -50,6 +50,7 @@ from app.elsa_skill import run_elsa_skill
 from app.namine_skill import run_namine_skill
 from app.skill_tsum import (
     _cbuzz_pose_on,
+    _cbuzz_red_marks_on,
     after_skill_tap,
     cbuzz_press_to_b,
     skill_breaks_bombs,
@@ -107,6 +108,9 @@ SKILL_FILL_SPENT = 0.40
 GADGET_FEVER_SKILL_MIN = 0.30
 GADGET_TIMER_SKILL = 6
 GADGET_SKILL_TSUMS = 14
+CBUZZ_SKILL_TSUMS = 16
+CBUZZ_BOMB_CANCEL_MASH = 3
+CBUZZ_BOMB_CANCEL_BEFORE = 3
 TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
@@ -382,11 +386,24 @@ def run_play(
         raise RuntimeError("TIME UP のモデルがありません。")
 
     last_named = ""
+    named_flips: dict[str, int] = {}
 
     def note_named(found: list) -> None:
         nonlocal last_named
         if named_line is None or use_named is None or not use_named():
             return
+        shaky: set[str] = set()
+        for piece in found:
+            if not _is_tsum(piece) or not piece.get("name_unstable"):
+                continue
+            name = str(piece.get("tsum_name") or "").strip()
+            if name:
+                shaky.add(name)
+            rival = str(piece.get("name_rival") or "").strip()
+            if rival:
+                shaky.add(rival)
+        for name in shaky:
+            named_flips[name] = int(named_flips.get(name, 0)) + 1
         limit = int(getattr(predictor, "named_limit", 0) or 0)
         open_names = [
             str(name).strip()
@@ -407,7 +424,13 @@ def run_play(
                 parts = list(open_names)
             cap = limit if limit > 0 else 5
             parts = parts[:cap]
-        shown = "\n".join(parts)
+        marked: list[str] = []
+        for part in parts:
+            if int(named_flips.get(part, 0)) >= 2:
+                marked.append(f"{part} 不安定")
+            else:
+                marked.append(part)
+        shown = "\n".join(marked)
         if not shown or shown == last_named:
             return
         last_named = shown
@@ -537,6 +560,7 @@ def run_play(
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
         nonlocal go_at, used_items, wait_times, pieces
+        nonlocal last_named, named_flips
         game = None
         skill = None
         fever = None
@@ -621,6 +645,8 @@ def run_play(
         skill_saw_empty = False
         nightmare_dice.clear()
         nightmare_dice.update(_nightmare_blank())
+        last_named = ""
+        named_flips = {}
         watch_hit.clear()
         watching.clear()
         _watcher_timeup[0] = False
@@ -803,6 +829,8 @@ def run_play(
         bombs = _bombs_on_board(pieces, game)
         if not bombs:
             return False
+        if skill_breaks_bombs(used_tsum) and len(bombs) <= 1:
+            return False
         live = {_piece_cell(piece) for piece in bombs}
         skip_bomb_cells.intersection_update(live)
         sit_bomb = bomb_situation(sit, len(bombs))
@@ -890,6 +918,7 @@ def run_play(
             nonlocal skill_used, press_counted
             skill_used += 1
             press_counted = True
+            say("スキル発動")
 
         if skill_pressed is None or not skill_pressed.is_set():
             return False
@@ -911,12 +940,12 @@ def run_play(
             skill_taps += 1
             last_skill_at = time.time()
             skill_wait_empty = True
-            say("スキル発動")
             if skill_is_cinderella(used_tsum):
                 if not _cinderella_ring_off(skill, stop, watch_hit):
                     skill_ring_hold[0] = False
                     return False
                 skip_loss = True
+                note_used()
                 swipes += run_cinderella_skill(
                     predict=lambda rgb: predictor.predict_pieces(
                         Path("."), game, rgb=rgb, inner=False, assign_groups=False
@@ -930,13 +959,13 @@ def run_play(
                     gpu_lock=_gpu_lock,
                     skill_lamp=skill_lamp,
                 )
-                note_used()
                 return True
             if skill_is_elsa(used_tsum):
                 skip_loss = True
+                _wait_skill_spent(skill, stop, watch_hit)
                 swipes += run_elsa_skill(
                     predict=lambda shot: predictor.predict_pieces(
-                        Path("."), game, rgb=shot
+                        Path("."), game, rgb=shot, inner=False
                     ),
                     game=game,
                     say=say,
@@ -986,6 +1015,8 @@ def run_play(
                 activated, pose_seen = _cbuzz_activated(skill, start, stop, watch_hit)
                 if not activated:
                     return False
+                skill_my_n = 0
+                skill_saw_empty = False
                 skip_loss = True
                 _sleep_stop(0.12, stop)
                 if not tsum_unspecified:
@@ -1159,6 +1190,8 @@ def run_play(
     def skill_full_n() -> int | None:
         if skill_is_gadget(used_tsum):
             return GADGET_SKILL_TSUMS
+        if skill_breaks_bombs(used_tsum):
+            return CBUZZ_SKILL_TSUMS
         if skill_my_full is not None and int(skill_my_full) > 0:
             return int(skill_my_full)
         return None
@@ -1642,6 +1675,122 @@ def run_play(
         finally:
             skill_busy[0] = False
 
+    def _cbuzz_gauge_before_full(shot_rgb=None) -> bool:
+        use = rgb if shot_rgb is None else shot_rgb
+        if skill is None or use is None:
+            return False
+        yellow, _blue = _skill_ring_yellow_blue(use, _skill_button_square(skill))
+        if yellow >= SLOT_ON:
+            return False
+        fill = _meter_skill_fill(use, skill)
+        if fill is not None and fill >= SKILL_FILL_READY:
+            return False
+        return True
+
+    def about_to_fill_cbuzz(added: int, after: int) -> bool:
+        if not skill_breaks_bombs(used_tsum) or skill is None:
+            return False
+        if not skill_saw_empty or added <= 0 or watch_hit.is_set():
+            return False
+        if after < CBUZZ_SKILL_TSUMS:
+            return False
+        return _cbuzz_gauge_before_full()
+
+    def mash_skill_cbuzz(*, after_bomb: bool = False) -> bool:
+        nonlocal last_fan_at, fan_taps
+        if skill is None or not skill_breaks_bombs(used_tsum):
+            return False
+        if time.time() < next_skill_at[0]:
+            return False
+        if not after_bomb and not _cbuzz_gauge_before_full():
+            return False
+        button = _skill_button_square(skill)
+        point = (
+            int(button["x"] + max(1, int(button["w"])) / 2),
+            int(button["y"] + max(1, int(button["h"])) / 2),
+            int(image.width()),
+            int(image.height()),
+        )
+        skill_busy[0] = True
+        try:
+            say("スキルを連打します")
+            for index in range(CBUZZ_BOMB_CANCEL_MASH):
+                _check_stop(stop)
+                if watch_hit.is_set():
+                    return False
+                if index == 0:
+                    skill_tap_at[0] = time.time()
+                try:
+                    tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
+                except Exception:
+                    return False
+                if index == 0 and fan is not None:
+                    shot = play_frame[0]
+                    fan_image = shot if shot is not None and not shot.isNull() else image
+                    _tap_fan(fan, fan_image, say, stop)
+                    fan_taps += 1
+                    last_fan_at = time.time()
+                if index + 1 < CBUZZ_BOMB_CANCEL_MASH:
+                    time.sleep(0.04)
+            with skill_press_lock:
+                next_skill_at[0] = time.time() + SKILL_GAP
+            skill_ring_hold[0] = True
+            return True
+        finally:
+            skill_busy[0] = False
+
+    def bomb_cancel_cbuzz(
+        added: int, after: int, *, before_chain: bool = False
+    ) -> bool:
+        nonlocal bomb_taps, last_bomb_at
+        if not skill_breaks_bombs(used_tsum) or skill is None:
+            return False
+        if not skill_saw_empty or added <= 0 or watch_hit.is_set():
+            return False
+        if time.time() < next_skill_at[0]:
+            return False
+        full = CBUZZ_SKILL_TSUMS
+        near = full - CBUZZ_BOMB_CANCEL_BEFORE
+        if before_chain:
+            if after < near:
+                return False
+        else:
+            if after < near or after >= full:
+                return False
+        check_rgb = rgb
+        now_image = image
+        if not before_chain:
+            try:
+                now_image = capture_play_frame()
+                check_rgb = _qimage_rgb(now_image)
+            except Exception:
+                return False
+            if now_image is None or now_image.isNull() or check_rgb is None:
+                return False
+        if not _cbuzz_gauge_before_full(check_rgb):
+            return False
+        bombs = [
+            piece
+            for piece in _bombs_on_board(pieces, game)
+            if _piece_cell(piece) not in skip_bomb_cells
+        ]
+        if not bombs:
+            return False
+        bomb = max(bombs, key=lambda piece: int(piece.get("r") or 0) ** 2)
+        say(f"ボムキャン {after}/{full}")
+        say(f"ボムをタップ {int(bomb['x'])},{int(bomb['y'])}")
+        tap(
+            int(bomb["x"]),
+            int(bomb["y"]),
+            hold_ms=40,
+            screen_w=now_image.width(),
+            screen_h=now_image.height(),
+        )
+        skip_bomb_cells.add(_piece_cell(bomb))
+        bomb_taps += 1
+        last_bomb_at = time.time()
+        return mash_skill_cbuzz(after_bomb=True)
+
     latest_gauge = [None, None, False, None, 0, False, None, False]
     play_frame = [None, None]
     play_frame_at = [0.0]
@@ -2031,7 +2180,7 @@ def run_play(
                     used_items,
                     None if go_at is None else max(0, int(round(time.time() - go_at))),
                     sorted(wait_times, reverse=True)[:3],
-                    upload=not tsum_unspecified,
+                    upload=True,
                     defer_coin=True,
                 )
                 watch_hit.clear()
@@ -2051,7 +2200,7 @@ def run_play(
                         used_items,
                         duration,
                         waits,
-                        not tsum_unspecified,
+                        True,
                         result_text=shown_money["result"],
                     )
                     stop_watch.set()
@@ -2068,7 +2217,7 @@ def run_play(
                     used_items,
                     duration,
                     waits,
-                    not tsum_unspecified,
+                    True,
                     result_text=shown_money["result"],
                 )
                 fresh_match()
@@ -2535,6 +2684,21 @@ def run_play(
                             and skill_my_full > 0
                             and skill_my_n + added >= skill_my_full
                         )
+                        if (
+                            not already_pending
+                            and skill_breaks_bombs(used_tsum)
+                            and fills_full
+                        ):
+                            after_my = int(skill_my_n) + int(burst_my_n) + int(added)
+                            if bomb_cancel_cbuzz(
+                                added, after_my, before_chain=True
+                            ):
+                                set_my_lamp("off")
+                                if skill_pressed is not None:
+                                    skill_pressed.set()
+                                apply_checker_skill(True)
+                                skip_after_skill = True
+                                break
                         try:
                             swiped = _swipe_chain(
                                 chain,
@@ -2571,6 +2735,18 @@ def run_play(
                             apply_checker_skill(True)
                             skip_after_skill = True
                             break
+                        if not already_pending and skill_breaks_bombs(used_tsum):
+                            after_my = int(skill_my_n) + int(burst_my_n)
+                            did_cbuzz = bomb_cancel_cbuzz(added, after_my)
+                            if not did_cbuzz and about_to_fill_cbuzz(added, after_my):
+                                say("連打繰り越し")
+                                did_cbuzz = mash_skill_cbuzz()
+                            if did_cbuzz:
+                                if skill_pressed is not None:
+                                    skill_pressed.set()
+                                apply_checker_skill(True)
+                                skip_after_skill = True
+                                break
                         if (
                             not already_pending
                             and about_to_fill_skill(chain)
@@ -2753,7 +2929,7 @@ def run_play(
                         used_items,
                         None if go_at is None else max(0, int(round(time.time() - go_at))),
                         sorted(wait_times, reverse=True)[:3],
-                        upload=not tsum_unspecified,
+                        upload=True,
                         defer_coin=True,
                     )
                     duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
@@ -2772,7 +2948,7 @@ def run_play(
                             used_items,
                             duration,
                             waits,
-                            not tsum_unspecified,
+                            True,
                             result_text=shown_money["result"],
                         )
                         stop_watch.set()
@@ -2789,7 +2965,7 @@ def run_play(
                         used_items,
                         duration,
                         waits,
-                        not tsum_unspecified,
+                        True,
                         result_text=shown_money["result"],
                     )
                     fresh_match()
@@ -3221,8 +3397,11 @@ def _cbuzz_activated(
             shot = capture_play_frame()
         except Exception:
             shot = None
-        if shot is not None and not shot.isNull() and _cbuzz_pose_on(shot):
-            return True, True
+        if shot is not None and not shot.isNull():
+            if _cbuzz_red_marks_on(shot):
+                return True, True
+            if _cbuzz_pose_on(shot):
+                return True, True
         rgb = None if shot is None or shot.isNull() else _qimage_rgb(shot)
         if rgb is not None:
             button = _skill_button_square(skill)
@@ -3285,6 +3464,26 @@ def _skill_tap_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit
         fill = _skill_fill(_qimage_rgb(image), skill)
         if fill is not None and fill < SKILL_FILL_SPENT:
             return True
+    return False
+
+
+def _wait_skill_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
+    if skill is None:
+        return False
+    limit = time.time() + SKILL_GAP
+    while time.time() < limit:
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        try:
+            image = capture_play_frame()
+        except Exception:
+            time.sleep(0.05)
+            continue
+        fill = _skill_fill(_qimage_rgb(image), skill)
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            return True
+        time.sleep(0.05)
     return False
 
 

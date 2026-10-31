@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,16 +14,45 @@ from urllib.parse import urlparse
 from app.paths import APP_ROOT
 
 LOG_PATH = APP_ROOT / "data" / "play_log.jsonl"
+PC_ID_PATH = APP_ROOT / "data" / "pc_id.txt"
 PORT = 8766
 REMOTE_API = "https://hokkai-syabusyabu.com/home_page/admin/tsumtsum_ai/api.php"
 REMOTE_TOKEN = "kumadesk-workshop-local"
 _lock = threading.Lock()
 _server: ThreadingHTTPServer | None = None
 _thread: threading.Thread | None = None
+_pc_id: str | None = None
 
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def pc_id() -> str:
+    global _pc_id
+    if _pc_id:
+        return _pc_id
+    with _lock:
+        if _pc_id:
+            return _pc_id
+        PC_ID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if PC_ID_PATH.is_file():
+            text = PC_ID_PATH.read_text(encoding="utf-8").strip()
+            if text:
+                _pc_id = text
+                return _pc_id
+        made = uuid.uuid4().hex
+        PC_ID_PATH.write_text(made + "\n", encoding="utf-8")
+        _pc_id = made
+        return _pc_id
+
+
+def pc_host() -> str:
+    try:
+        name = socket.gethostname().strip()
+    except OSError:
+        return ""
+    return name
 
 
 def load_plays() -> list[dict]:
@@ -57,6 +88,8 @@ def append_play(
 ) -> dict:
     item = {
         "at": _now(),
+        "pc_id": pc_id(),
+        "host": pc_host(),
         "tsum": str(tsum or ""),
         "items": [str(name) for name in (items or []) if str(name)],
         "clears": int(clears),
