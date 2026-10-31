@@ -1064,9 +1064,56 @@ def run_play(
     def count_skill_on() -> bool:
         return count_skill is not None and count_skill()
 
+    def _pin_my_group() -> int:
+        pin = str(getattr(predictor, "named_pin", "") or "").strip()
+        if not pin or not tsums:
+            return 0
+        for piece in tsums:
+            if str(piece.get("tsum_name") or "").strip() != pin:
+                continue
+            group = int(piece.get("group") or 0)
+            if group > 0:
+                return group
+        return 0
+
+    def _vec_my_group() -> int:
+        target = my_vec if my_vec is not None else skill_face
+        if target is None or not tsums:
+            return 0
+        means = _group_means(tsums)
+        if not means:
+            return 0
+        return int(max(means, key=lambda group: _cosine(target, means[group])))
+
+    def _resolve_my_group() -> int:
+        pinned = _pin_my_group()
+        if pinned > 0:
+            return pinned
+        keyed = _vec_my_group()
+        if keyed > 0:
+            return keyed
+        return my_group
+
+    def _chain_is_my(chain: list[dict[str, int]]) -> bool:
+        if not chain:
+            return False
+        pin = str(getattr(predictor, "named_pin", "") or "").strip()
+        if pin and str(chain[0].get("tsum_name") or "").strip() == pin:
+            return True
+        mine = _resolve_my_group()
+        return mine > 0 and int(chain[0].get("group") or 0) == mine
+
     def look_mytsum() -> None:
-        nonlocal my_group, skill_face, last_skill_look
-        if my_group > 0 or skill is None:
+        nonlocal my_group, skill_face, last_skill_look, my_vec
+        pinned = _pin_my_group()
+        if pinned > 0:
+            my_group = pinned
+        keyed = _vec_my_group()
+        if keyed > 0:
+            my_group = keyed
+        if skill is None:
+            return
+        if my_group > 0 and skill_face is not None:
             return
         now_look = time.time()
         if now_look - last_skill_look < 2.0:
@@ -1078,6 +1125,7 @@ def run_play(
         add_idle("pred", time.perf_counter() - t0)
         if face is not None:
             skill_face = face
+            my_vec = _lock_my_vec(tsums, face, my_vec)
         if looked > 0:
             my_group = looked
 
@@ -1110,9 +1158,7 @@ def run_play(
     def mytsum_in_chain(chain: list[dict[str, int]]) -> int:
         if skill_is_nightmare(used_tsum):
             return len(chain)
-        if my_group <= 0 or not chain:
-            return 0
-        if int(chain[0].get("group") or 0) != my_group:
+        if not chain or not _chain_is_my(chain):
             return 0
         return len(chain)
 
@@ -1141,6 +1187,7 @@ def run_play(
         return 10
 
     def _chain_pref(chain: list[dict[str, int]]) -> tuple:
+        is_my = _chain_is_my(chain)
         if skill_is_nightmare(used_tsum):
             aim = _nightmare_chain_n()
             n = len(chain)
@@ -1152,9 +1199,9 @@ def run_play(
                 band = 1
             else:
                 band = 0
-            return (band, -abs(n - aim))
+            return (is_my, band, -abs(n - aim))
         return (
-            my_group > 0 and int(chain[0].get("group") or 0) == my_group,
+            is_my,
             len(chain),
         )
 
@@ -2762,6 +2809,7 @@ def run_play(
                 add_idle("pred", time.perf_counter() - t0)
                 if face is not None:
                     skill_face = face
+                    my_vec = _lock_my_vec(tsums, face, my_vec)
                 if looked > 0:
                     my_group = looked
                     t0 = time.perf_counter()
