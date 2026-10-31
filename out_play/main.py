@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -306,6 +307,13 @@ class MenuWindow(QMainWindow):
         header_layout = QHBoxLayout(self._header)
         header_layout.setContentsMargins(50, 0, 0, 0)
         header_layout.addWidget(self._logo, 1)
+        request_button = QPushButton("リクエスト")
+        request_button.clicked.connect(self._open_tsum_request)
+        header_layout.addWidget(
+            request_button,
+            0,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
         settings_button = QPushButton("設定")
         settings_button.clicked.connect(self._open_type_settings)
         header_layout.addWidget(
@@ -2068,6 +2076,35 @@ class MenuWindow(QMainWindow):
             return
         self._light_items([part.strip() for part in text.split("、")])
 
+    def _open_tsum_request(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("リクエスト")
+        column = QVBoxLayout(dialog)
+        column.addWidget(QLabel("学習または強化してほしいツム名"))
+        fields: list[QLineEdit] = []
+        for _ in range(10):
+            field = QLineEdit()
+            fields.append(field)
+            column.addWidget(field)
+        send = QPushButton("送信")
+        column.addWidget(send)
+
+        def submit() -> None:
+            names = [field.text().strip() for field in fields if field.text().strip()]
+            if not names:
+                QMessageBox.information(dialog, "リクエスト", "ツム名を入力してください。")
+                return
+            try:
+                _upload_tsum_request(names)
+            except Exception as exc:
+                QMessageBox.warning(dialog, "リクエスト", str(exc) or "送れませんでした。")
+                return
+            QMessageBox.information(dialog, "リクエスト", "サーバーに送りました。")
+            dialog.accept()
+
+        send.clicked.connect(submit)
+        dialog.exec()
+
     def _open_type_settings(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("設定")
@@ -2544,6 +2581,36 @@ def _model_token() -> str:
     except Exception:
         return "kumadesk-workshop-local"
     return str(api_token() or "").strip() or "kumadesk-workshop-local"
+
+
+def _upload_tsum_request(names: list[str]) -> None:
+    token = _model_token()
+    query = urllib.parse.urlencode({"action": "request_put"})
+    body = json.dumps({"names": names}, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        f"{MODELS_API}?{query}",
+        data=body,
+        headers={
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Workshop-Token": token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore").strip()
+        try:
+            payload = json.loads(detail) if detail else {}
+        except json.JSONDecodeError:
+            payload = {}
+        message = str(payload.get("error") or detail or "送れませんでした。")
+        raise RuntimeError(message) from exc
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        raise RuntimeError("サーバーに接続できませんでした。") from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise RuntimeError(str((payload or {}).get("error") or "送れませんでした。"))
 
 
 def _server_model_shas(token: str) -> dict[str, str]:
