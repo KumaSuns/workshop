@@ -10,5 +10,6 @@ alwaysApply: true
 - 1つ目は workshop。`C:/projects/workshop` を `https://github.com/KumaSuns/workshop` の master に送る。
 - 2つ目は auto_play。`C:/projects/workshop/out_play` を `https://github.com/KumaSuns/auto_play` の master に送る。
 - out_play は workshop の中にある別のリポジトリである。workshop にコミットしても auto_play には入らない。out_play の変更は、それぞれのリポジトリでコミットしてから送る。
+- 未完成の作業中に out_play / auto_play を触るな。完成してから入れる。完成前に合わせるな。
 - 送るのは、そのとき頼まれた変更だけ。一時ファイルや、頼まれていない差分は入れない。
 - その変更が片方に無いときは、無いほうを送ったことにしない。あるほうは送る。

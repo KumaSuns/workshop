@@ -451,6 +451,11 @@ def tap_skill(x: int, y: int, screen_w: int = 0, screen_h: int = 0) -> None:
     _adb_tap(int(x), int(y), 180)
 
 
+def tap_skill_adb(x: int, y: int, screen_w: int = 0, screen_h: int = 0) -> None:
+    del screen_w, screen_h
+    _adb_tap(int(x), int(y), 180)
+
+
 def tap_together(
     points: list[tuple[int, int]],
     screen_w: int = 0,
@@ -709,6 +714,7 @@ def _send_mouse_path_locked(
         emit(x0, y0, up)
         return True
     fired = False
+    fire_at = max(1, (len(mapped) - 1) * 2 // 3)
     for index, (x, y) in enumerate(mapped[1:], start=1):
         if abort is not None and abort.is_set():
             emit(x, y, up)
@@ -718,7 +724,7 @@ def _send_mouse_path_locked(
         if (
             not fired
             and while_down is not None
-            and index >= 1
+            and index >= fire_at
             and (abort is None or not abort.is_set())
         ):
             fired = True

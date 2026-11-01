@@ -26,6 +26,7 @@ from app.bluestacks import (
     swipe_path,
     tap,
     tap_skill,
+    tap_skill_adb,
     tap_together,
 )
 from app.intro import (
@@ -109,8 +110,10 @@ GADGET_FEVER_SKILL_MIN = 0.30
 GADGET_TIMER_SKILL = 6
 GADGET_SKILL_TSUMS = 14
 CBUZZ_SKILL_TSUMS = 16
-CBUZZ_BOMB_CANCEL_MASH = 3
-CBUZZ_BOMB_CANCEL_BEFORE = 3
+BOMB_CANCEL_MASH = 3
+BOMB_CANCEL_BEFORE = 3
+CBUZZ_BOMB_CANCEL_MASH = BOMB_CANCEL_MASH
+CBUZZ_BOMB_CANCEL_BEFORE = BOMB_CANCEL_BEFORE
 TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
@@ -501,6 +504,7 @@ def run_play(
     fan_fall_moved = False
     resumed_pause = False
     match_over = False
+    last_close_at: tuple[int, int] | None = None
     clears = 0
     swipes = 0
     coin = 0
@@ -560,7 +564,7 @@ def run_play(
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
         nonlocal go_at, used_items, wait_times, pieces
-        nonlocal last_named, named_flips
+        nonlocal last_named, named_flips, last_close_at
         game = None
         skill = None
         fever = None
@@ -591,6 +595,7 @@ def run_play(
         fan_fall_n = None
         fan_fall_moved = False
         resumed_pause = False
+        last_close_at = None
         pieces = []
         watching.clear()
         clears = 0
@@ -829,7 +834,10 @@ def run_play(
         bombs = _bombs_on_board(pieces, game)
         if not bombs:
             return False
-        if skill_breaks_bombs(used_tsum) and len(bombs) <= 1:
+        if (
+            (skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum))
+            and len(bombs) <= 1
+        ):
             return False
         live = {_piece_cell(piece) for piece in bombs}
         skip_bomb_cells.intersection_update(live)
@@ -1084,6 +1092,7 @@ def run_play(
     skill_my_full: int | None = None
     skill_my_held = False
     skill_saw_empty = False
+    carry_cool_until = 0.0
     kinds = 5
 
     def count_skill_on() -> bool:
@@ -1156,6 +1165,7 @@ def run_play(
 
     def tick_skill_count() -> None:
         nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty, skill_wait_empty
+        nonlocal carry_cool_until
         if skill is None or rgb is None:
             return
         fill = _meter_skill_fill(rgb, skill)
@@ -1179,6 +1189,7 @@ def run_play(
                     skill_my_full = None
                     skill_my_held = False
             skill_saw_empty = True
+            carry_cool_until = 0.0
 
     def mytsum_in_chain(chain: list[dict[str, int]]) -> int:
         if skill_is_nightmare(used_tsum):
@@ -1587,36 +1598,70 @@ def run_play(
             bombs_ok=True,
         )
 
-    def about_to_fill_skill(chain: list[dict[str, int]]) -> bool:
-        if skill_is_gadget(used_tsum) or skill_breaks_bombs(used_tsum):
+    def about_to_fill_skill(
+        chain: list[dict[str, int]],
+        after_n: int | None = None,
+        *,
+        need_n: int | None = None,
+        chain_n: int | None = None,
+    ) -> bool:
+        added = int(chain_n) if chain_n is not None else mytsum_in_chain(chain)
+        if skill is None or added <= 0 or watch_hit.is_set():
             return False
-        added = mytsum_in_chain(chain)
-        if skill is None or added <= 0 or not skill_saw_empty or watch_hit.is_set():
+        if not skill_saw_empty or skill_ring_hold[0]:
             return False
-        if skill_my_full is None or skill_my_full <= 0 or not skill_my_held:
-            return False
-        if skill_my_n + added < skill_my_full:
-            return False
+        need = need_n
         fill = _meter_skill_fill(rgb, skill)
-        if fill is None or fill < SKILL_FILL_SPENT or fill >= SKILL_FILL_READY:
-            return False
-        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
-        return yellow < SLOT_ON
-
-    def mash_skill_until_on(sure: bool) -> bool:
-        nonlocal skill_my_n, skill_saw_empty
-        if skill is None or not sure or skill_breaks_bombs(used_tsum):
-            return False
-        if time.time() < next_skill_at[0]:
-            return False
-        fill_now = _meter_skill_fill(rgb, skill)
-        if fill_now is None or fill_now < SKILL_FILL_SPENT or fill_now >= SKILL_FILL_READY:
+        if fill is None:
             return False
         yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
         if yellow >= SLOT_ON:
             return False
-        skill_my_n = 0
-        skill_saw_empty = False
+        if time.time() < carry_cool_until:
+            return False
+        if need is None:
+            full = skill_full_n()
+            if full is None or int(full) <= 0:
+                return False
+            if (
+                not skill_is_gadget(used_tsum)
+                and not skill_breaks_bombs(used_tsum)
+                and not skill_my_held
+            ):
+                return False
+            pct = max(0, min(100, round(float(fill) * 100)))
+            need = max(0, round(int(full) * (100 - pct) / 100))
+        if need is None or int(need) <= 0:
+            return False
+        after = int(added) if after_n is None else int(after_n)
+        before = after - int(added)
+        # 過剰: 残りより多く消すときだけ。ちょうど残りでは連打しない。
+        if before >= int(need) or after <= int(need):
+            return False
+        return True
+
+    def mash_skill_carry() -> bool:
+        nonlocal carry_cool_until, last_fan_at, fan_taps
+        if skill is None or skill_is_nightmare(used_tsum):
+            return False
+        if time.time() < next_skill_at[0] or skill_ring_hold[0]:
+            return False
+        if time.time() < carry_cool_until:
+            return False
+        if not skill_saw_empty:
+            return False
+        if skill_is_gadget(used_tsum) and _gadget_skill_hold(
+            _fever_playing(rgb, game),
+            _meter_fever_fill(rgb, fever, skill, fan),
+            _read_timer(None, rgb, timer),
+        ):
+            return False
+        fill = _meter_skill_fill(rgb, skill)
+        if fill is None:
+            return False
+        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+        if yellow >= SLOT_ON:
+            return False
         button = _skill_button_square(skill)
         point = (
             int(button["x"] + max(1, int(button["w"])) / 2),
@@ -1624,56 +1669,53 @@ def run_play(
             int(image.width()),
             int(image.height()),
         )
-        skill_busy[0] = True
-        say("スキルを連打します")
-        base = _window_skill_fill(skill)
-        seen_charged = base is not None and base >= SKILL_FILL_SPENT
-        tapped = False
-        still = 0
         try:
-            while True:
+            say("スキルを連打します")
+            for index in range(BOMB_CANCEL_MASH):
                 _check_stop(stop)
                 if watch_hit.is_set():
                     return False
-                now = time.time()
-                if not tapped:
-                    skill_tap_at[0] = now
-                if _nightmare_live_dice():
-                    return False
+                if index == 0:
+                    skill_tap_at[0] = time.time()
                 try:
-                    tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
+                    tap_skill_adb(
+                        point[0], point[1], screen_w=point[2], screen_h=point[3]
+                    )
                 except Exception:
                     return False
-                if not tapped:
-                    tap_cinderella_fan(image)
-                tapped = True
-                fill = _window_skill_fill(skill)
-                if fill is not None and fill >= SKILL_FILL_SPENT:
-                    seen_charged = True
-                    if base is None or fill > base:
-                        still = 0
-                        base = fill
-                if seen_charged and fill is not None and fill < SKILL_FILL_SPENT:
-                    with skill_press_lock:
-                        next_skill_at[0] = time.time() + SKILL_GAP
-                    return True
-                if fill is not None and fill >= SKILL_FILL_READY:
-                    with skill_press_lock:
-                        next_skill_at[0] = time.time() + SKILL_GAP
-                    return True
-                if (
-                    not sure
-                    and not seen_charged
-                    and tapped
-                    and fill is not None
-                    and fill < SKILL_FILL_READY
-                    and (base is None or fill <= base)
-                ):
-                    still += 1
-                    if still >= 2:
-                        return False
-        finally:
-            skill_busy[0] = False
+                if index == 0:
+                    if skill_breaks_bombs(used_tsum) and fan is not None:
+                        _tap_fan(fan, image, say, stop)
+                        fan_taps += 1
+                        last_fan_at = time.time()
+                    else:
+                        tap_cinderella_fan(image)
+                if index + 1 < BOMB_CANCEL_MASH:
+                    time.sleep(0.12)
+            with skill_press_lock:
+                next_skill_at[0] = time.time() + SKILL_GAP
+            skill_ring_hold[0] = True
+            # 発動失敗でも skill_saw_empty は落とさない。クールだけ置く。
+            carry_cool_until = time.time() + SKILL_GAP
+            return True
+        except Exception:
+            return False
+
+    def mash_skill_until_on(sure: bool) -> bool:
+        if not sure:
+            return False
+        return mash_skill_carry()
+
+    def _bomb_cancel_ok() -> bool:
+        return skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum)
+
+    def _bomb_cancel_full() -> int:
+        full = skill_full_n()
+        if full is not None and int(full) > 0:
+            return int(full)
+        if skill_is_gadget(used_tsum):
+            return GADGET_SKILL_TSUMS
+        return CBUZZ_SKILL_TSUMS
 
     def _cbuzz_gauge_before_full(shot_rgb=None) -> bool:
         use = rgb if shot_rgb is None else shot_rgb
@@ -1688,69 +1730,38 @@ def run_play(
         return True
 
     def about_to_fill_cbuzz(added: int, after: int) -> bool:
-        if not skill_breaks_bombs(used_tsum) or skill is None:
+        if not _bomb_cancel_ok() or skill is None:
             return False
         if not skill_saw_empty or added <= 0 or watch_hit.is_set():
             return False
-        if after < CBUZZ_SKILL_TSUMS:
+        if after < _bomb_cancel_full():
             return False
-        return _cbuzz_gauge_before_full()
+        yellow, _blue = _skill_ring_yellow_blue(rgb, _skill_button_square(skill))
+        return yellow < SLOT_ON
 
     def mash_skill_cbuzz(*, after_bomb: bool = False) -> bool:
-        nonlocal last_fan_at, fan_taps
-        if skill is None or not skill_breaks_bombs(used_tsum):
+        if not _bomb_cancel_ok():
             return False
-        if time.time() < next_skill_at[0]:
-            return False
-        if not after_bomb and not _cbuzz_gauge_before_full():
-            return False
-        button = _skill_button_square(skill)
-        point = (
-            int(button["x"] + max(1, int(button["w"])) / 2),
-            int(button["y"] + max(1, int(button["h"])) / 2),
-            int(image.width()),
-            int(image.height()),
-        )
-        skill_busy[0] = True
-        try:
-            say("スキルを連打します")
-            for index in range(CBUZZ_BOMB_CANCEL_MASH):
-                _check_stop(stop)
-                if watch_hit.is_set():
-                    return False
-                if index == 0:
-                    skill_tap_at[0] = time.time()
-                try:
-                    tap(point[0], point[1], screen_w=point[2], screen_h=point[3])
-                except Exception:
-                    return False
-                if index == 0 and fan is not None:
-                    shot = play_frame[0]
-                    fan_image = shot if shot is not None and not shot.isNull() else image
-                    _tap_fan(fan, fan_image, say, stop)
-                    fan_taps += 1
-                    last_fan_at = time.time()
-                if index + 1 < CBUZZ_BOMB_CANCEL_MASH:
-                    time.sleep(0.04)
-            with skill_press_lock:
-                next_skill_at[0] = time.time() + SKILL_GAP
-            skill_ring_hold[0] = True
-            return True
-        finally:
-            skill_busy[0] = False
+        return mash_skill_carry()
 
     def bomb_cancel_cbuzz(
         added: int, after: int, *, before_chain: bool = False
     ) -> bool:
         nonlocal bomb_taps, last_bomb_at
-        if not skill_breaks_bombs(used_tsum) or skill is None:
+        if not _bomb_cancel_ok() or skill is None:
             return False
         if not skill_saw_empty or added <= 0 or watch_hit.is_set():
             return False
         if time.time() < next_skill_at[0]:
             return False
-        full = CBUZZ_SKILL_TSUMS
-        near = full - CBUZZ_BOMB_CANCEL_BEFORE
+        if skill_is_gadget(used_tsum) and _gadget_skill_hold(
+            _fever_playing(rgb, game),
+            _meter_fever_fill(rgb, fever, skill, fan),
+            _read_timer(None, rgb, timer),
+        ):
+            return False
+        full = _bomb_cancel_full()
+        near = full - BOMB_CANCEL_BEFORE
         if before_chain:
             if after < near:
                 return False
@@ -2266,14 +2277,26 @@ def run_play(
                     play = None if image.isNull() else _play_button(image)
                     if play is not None:
                         say("プレイをクリックします")
+                        last_close_at = None
                         _slow_tap(play.center().x(), play.center().y())
                         _sleep_stop(2.0, stop)
                     continue
                 if match_over:
                     close = None if image.isNull() else _close_button(image)
                     if close is not None:
+                        point = (close.center().x(), close.center().y())
+                        same_close = (
+                            last_close_at is not None
+                            and abs(point[0] - last_close_at[0]) < image.width() * 0.08
+                            and abs(point[1] - last_close_at[1]) < image.height() * 0.08
+                        )
+                        if same_close:
+                            say("プレイを待っています")
+                            _sleep_stop(0.4, stop)
+                            continue
                         say("とじるをクリックします")
-                        _slow_tap(close.center().x(), close.center().y())
+                        _slow_tap(point[0], point[1])
+                        last_close_at = point
                         _sleep_stop(1.2, stop)
                         continue
                 start = None if image.isNull() else _match_start_button(image)
@@ -2306,6 +2329,7 @@ def run_play(
                 play = None if image.isNull() else _play_button(image)
                 if play is not None:
                     say("プレイをクリックします")
+                    last_close_at = None
                     _slow_tap(play.center().x(), play.center().y())
                     _sleep_stop(2.0, stop)
                     continue
@@ -2461,6 +2485,7 @@ def run_play(
                 last_chain: list[dict[str, int]] | None = None
                 burst = 0
                 burst_my_n = 0
+                burst_need: int | None = None
                 burst_max = 0
                 screen_swipes = 0
                 screen_max = 0
@@ -2615,6 +2640,7 @@ def run_play(
                         chain_n = added if added > 0 else counted
                         full_n = skill_full_n()
                         remain = None
+                        meter_skill = None
                         if full_n is not None and skill is not None and rgb is not None:
                             meter_skill = _meter_skill_fill(rgb, skill)
                             if meter_skill is not None:
@@ -2626,79 +2652,70 @@ def run_play(
                             and remain > 0
                             and chain_n >= remain
                         )
+                        if (
+                            not already_pending
+                            and added > 0
+                            and remain is not None
+                            and remain > 0
+                            and burst_need is None
+                            and skill_saw_empty
+                            and not skill_ring_hold[0]
+                            and meter_skill is not None
+                            and meter_skill < SKILL_FILL_READY
+                        ):
+                            burst_need = int(remain)
                         if fills_full:
                             set_my_lamp("red")
                         elif added > 0 or counted > 0:
                             set_my_lamp("on")
                         else:
                             set_my_lamp("off")
-                        second_finger = [False]
+                        my_add = int(added) if added > 0 else int(counted)
+                        carry_done = [False]
 
-                        def press_skill_while_down() -> None:
-                            if second_finger[0] or skill is None:
+                        def mash_while_down() -> None:
+                            if carry_done[0] or already_pending or my_add <= 0:
                                 return
-                            if watch_hit.is_set() or skill_ring_hold[0]:
+                            if skill_is_nightmare(used_tsum):
                                 return
-                            if time.time() < next_skill_at[0]:
+                            if remain is None or remain <= 0:
                                 return
-                            if skill_is_namine(used_tsum):
-                                return
-                            ready = skill_ready_now(rgb)
-                            fills = (
-                                not already_pending
-                                and about_to_fill_skill(chain)
-                                and sure_now
-                            )
-                            if skill_is_gadget(used_tsum) and _gadget_skill_hold(
-                                _fever_playing(rgb, game),
-                                _meter_fever_fill(rgb, fever, skill, fan),
-                                latest_gauge[3],
+                            after = int(burst_my_n) + int(my_add)
+                            if not about_to_fill_skill(
+                                chain,
+                                after,
+                                need_n=int(remain),
+                                chain_n=int(my_add),
                             ):
-                                ready = False
-                                fills = False
-                            if skill_is_nightmare(used_tsum) and (
-                                _nightmare_dice_on(rgb)
-                                or _nightmare_boogie_on(rgb)
-                                or _nightmare_pending(nightmare_dice)
-                            ):
-                                ready = False
-                                fills = False
-                            if not ready and not fills:
                                 return
-                            button = _skill_button_square(skill)
-                            tap_skill(
-                                int(button["x"] + max(1, int(button["w"])) / 2),
-                                int(button["y"] + max(1, int(button["h"])) / 2),
-                                screen_w=image.width(),
-                                screen_h=image.height(),
-                            )
-                            if skill_pressed is not None:
-                                skill_pressed.set()
-                            skill_ring_hold[0] = True
-                            with skill_press_lock:
-                                next_skill_at[0] = time.time() + SKILL_GAP
-                            second_finger[0] = True
+                            if mash_skill_carry():
+                                say("連打繰り越し")
+                                carry_done[0] = True
 
-                        sure_now = (
-                            skill_my_full is not None
-                            and skill_my_full > 0
-                            and skill_my_n + added >= skill_my_full
+                        will_carry = (
+                            not already_pending
+                            and my_add > 0
+                            and remain is not None
+                            and remain > 0
+                            and not skill_is_nightmare(used_tsum)
+                            and about_to_fill_skill(
+                                chain,
+                                int(burst_my_n) + int(my_add),
+                                need_n=int(remain),
+                                chain_n=int(my_add),
+                            )
                         )
                         if (
                             not already_pending
-                            and skill_breaks_bombs(used_tsum)
-                            and fills_full
+                            and my_add > 0
+                            and remain is not None
+                            and remain > 0
                         ):
-                            after_my = int(skill_my_n) + int(burst_my_n) + int(added)
-                            if bomb_cancel_cbuzz(
-                                added, after_my, before_chain=True
-                            ):
-                                set_my_lamp("off")
-                                if skill_pressed is not None:
-                                    skill_pressed.set()
-                                apply_checker_skill(True)
-                                skip_after_skill = True
-                                break
+                            say(
+                                f"繰り越し判定 残り{int(remain)} "
+                                f"この鎖{my_add} 累計{int(burst_my_n) + my_add} "
+                                f"{'する' if will_carry else 'しない'}"
+                            )
                         try:
                             swiped = _swipe_chain(
                                 chain,
@@ -2709,7 +2726,7 @@ def run_play(
                                 say,
                                 stop,
                                 None,
-                                while_down=press_skill_while_down,
+                                while_down=mash_while_down if will_carry else None,
                             )
                         finally:
                             set_my_lamp("off")
@@ -2725,52 +2742,10 @@ def run_play(
                                 counted = _count_mytsum(chain, tsums, my_vec)
                             my_erase += counted
                         if not already_pending:
-                            burst_my_n += added
-                        sure = (
-                            skill_my_full is not None
-                            and skill_my_full > 0
-                            and skill_my_n + added >= skill_my_full
-                        )
-                        if second_finger[0]:
-                            apply_checker_skill(True)
-                            skip_after_skill = True
-                            break
-                        if not already_pending and skill_breaks_bombs(used_tsum):
-                            after_my = int(skill_my_n) + int(burst_my_n)
-                            did_cbuzz = bomb_cancel_cbuzz(added, after_my)
-                            if not did_cbuzz and about_to_fill_cbuzz(added, after_my):
-                                say("連打繰り越し")
-                                did_cbuzz = mash_skill_cbuzz()
-                            if did_cbuzz:
-                                if skill_pressed is not None:
-                                    skill_pressed.set()
-                                apply_checker_skill(True)
-                                skip_after_skill = True
-                                break
-                        if (
-                            not already_pending
-                            and about_to_fill_skill(chain)
-                            and sure
-                        ):
-                            if skill_is_nightmare(used_tsum):
-                                _press_ready_skill()
-                                if skill_pressed is not None and skill_pressed.is_set():
-                                    apply_checker_skill(True)
-                                    skip_after_skill = True
-                                    break
-                            else:
-                                _clear_bombs_before_skill()
-                        if (
-                            not already_pending
-                            and about_to_fill_skill(chain)
-                            and not skill_is_nightmare(used_tsum)
-                            and mash_skill_until_on(sure)
-                        ):
-                            if skill_pressed is not None:
-                                skill_pressed.set()
-                            apply_checker_skill(True)
-                            skip_after_skill = True
-                            break
+                            burst_my_n += my_add
+                        if carry_done[0]:
+                            burst_need = None
+                            burst_my_n = 0
                         burst += 1
                         burst_max = max(burst_max, len(chain))
                         screen_swipes += 1
@@ -5441,6 +5416,7 @@ def _click_start_or_continue(
     stable_result = ""
     stable_hits = 0
     odd_top_tapped = False
+    last_close_at: tuple[int, int] | None = None
     while stop_at_start or time.time() < deadline:
         _check_stop(stop)
         try:
@@ -5564,8 +5540,19 @@ def _click_start_or_continue(
             ):
                 _sleep_stop(0.25, stop)
                 continue
+            point = (close.center().x(), close.center().y())
+            same_close = (
+                last_close_at is not None
+                and abs(point[0] - last_close_at[0]) < image.width() * 0.08
+                and abs(point[1] - last_close_at[1]) < image.height() * 0.08
+            )
+            if same_close:
+                say("プレイを待っています")
+                _sleep_stop(0.4, stop)
+                continue
             say("とじるをクリックします")
-            _slow_tap(close.center().x(), close.center().y())
+            _slow_tap(point[0], point[1])
+            last_close_at = point
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue
@@ -5580,6 +5567,7 @@ def _click_start_or_continue(
         play = _play_button(image)
         if play is not None:
             say("プレイをクリックします")
+            last_close_at = None
             _slow_tap(play.center().x(), play.center().y())
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)

@@ -120,7 +120,9 @@ _VK_Q = 0x51
 _VK_F5 = 0x74
 _VK_F8 = 0x77
 _VK_F11 = 0x7A
+_VK_NUMPAD1 = 0x61
 _MOD_NOREPEAT = 0x4000
+_SKILL_KEY_LOG = APP_ROOT / "data" / "skill_key_log.jsonl"
 _NOT_CHARM_TSUMS = frozenset(
     {
         "ナミネ",
@@ -316,6 +318,8 @@ class DebugWindow(QWidget):
         green.setForeground(QColor(0, 100, 0))
         boogie = QTextCharFormat()
         boogie.setForeground(QColor("#009900"))
+        orange = QTextCharFormat()
+        orange.setForeground(QColor(255, 140, 0))
         cursor.setCharFormat(normal)
         cursor.insertText(f"{now}  ")
         if text == "ブギー":
@@ -326,6 +330,12 @@ class DebugWindow(QWidget):
             return
         if text.startswith("サイコロ") or text == "振り直し":
             cursor.insertText(text, green)
+            cursor.setCharFormat(normal)
+            self._log.setTextCursor(cursor)
+            self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+            return
+        if "繰り越し" in text:
+            cursor.insertText(text, orange)
             cursor.setCharFormat(normal)
             self._log.setTextCursor(cursor)
             self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
@@ -570,6 +580,12 @@ class MainWindow(QMainWindow):
         self._play_key_at = 0.0
         self._f8_down = False
         self._f11_down = False
+        self._num1_down = False
+        self._meter_skill_fill = None
+        self._meter_skill_need = None
+        self._meter_skill_n = None
+        self._meter_skill_ok = None
+        self._meter_left = None
         self._capture_at = 0.0
         self._grab_at = 0.0
         self._capture_key_timer = QTimer(self)
@@ -821,6 +837,11 @@ class MainWindow(QMainWindow):
         _tap_at,
         skill_need=None,
     ) -> None:
+        self._meter_skill_fill = skill_fill
+        self._meter_skill_need = skill_need
+        self._meter_skill_n = _skill_n
+        self._meter_skill_ok = _skill_ok
+        self._meter_left = left
         if left is None:
             self._info_time_value.setText("－")
         else:
@@ -855,6 +876,36 @@ class MainWindow(QMainWindow):
             self._info_erase_value.setText("－")
         else:
             self._info_erase_value.setText(str(int(_skill_ok)))
+
+    def _log_skill_key(self, key: str = "numpad1") -> None:
+        fill = self._meter_skill_fill
+        need = self._meter_skill_need
+        row = {
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "key": key,
+            "skill_fill": None if fill is None else round(float(fill), 4),
+            "skill_pct": None
+            if fill is None
+            else max(0, min(100, round(float(fill) * 100))),
+            "skill_need": None if need is None else int(need),
+            "skill_n": None
+            if self._meter_skill_n is None
+            else int(self._meter_skill_n),
+            "skill_ok": None
+            if self._meter_skill_ok is None
+            else int(self._meter_skill_ok),
+            "timer": None if self._meter_left is None else int(self._meter_left),
+        }
+        try:
+            _SKILL_KEY_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with _SKILL_KEY_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        pct = row["skill_pct"]
+        need_s = "－" if need is None else str(int(need))
+        pct_s = "－" if pct is None else f"{pct}％"
+        self._set_status(f"テンキー1 {pct_s} 残り{need_s}")
 
     def _set_skill_lamp(self, on: bool) -> None:
         if on:
@@ -991,6 +1042,27 @@ class MainWindow(QMainWindow):
         if ask_kinds:
             self._play.need_kinds.connect(self._on_need_kinds)
             self._play.need_used_tsum.connect(self._on_need_used_tsum)
+        self._meter_skill_fill = None
+        self._meter_skill_need = None
+        self._meter_skill_n = None
+        self._meter_skill_ok = None
+        self._meter_left = None
+        self._num1_down = False
+        try:
+            _SKILL_KEY_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with _SKILL_KEY_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                            "event": "play_start",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except OSError:
+            pass
         self._play.start()
         if self._want_record:
             self._start_record()
@@ -1584,6 +1656,9 @@ class MainWindow(QMainWindow):
             self._f5_down = down
             if pressed:
                 self.on_play_now()
+            self._num1_down = bool(
+                ctypes.windll.user32.GetAsyncKeyState(_VK_NUMPAD1) & 0x8000
+            )
             return
         down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F8) & 0x8000)
         pressed = down and not self._f8_down
@@ -1595,6 +1670,11 @@ class MainWindow(QMainWindow):
         self._f11_down = down
         if pressed:
             self.on_grab_board()
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_NUMPAD1) & 0x8000)
+        pressed = down and not self._num1_down
+        self._num1_down = down
+        if pressed:
+            self._log_skill_key("numpad1")
 
     def nativeEvent(self, eventType, message):
         if sys.platform == "win32":

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from queue import Queue
 
-from PySide6.QtCore import QObject, QRectF, QSize, QStandardPaths, Qt, QTimer, QEvent, Signal
+from PySide6.QtCore import QObject, QRectF, QSettings, QSize, QStandardPaths, Qt, QTimer, QEvent, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
@@ -124,7 +124,9 @@ _VK_F7 = 0x76
 _VK_F8 = 0x77
 _VK_F9 = 0x78
 _VK_F11 = 0x7A
+_VK_NUMPAD1 = 0x61
 _MOD_NOREPEAT = 0x4000
+_SKILL_KEY_LOG = APP_ROOT / "data" / "skill_key_log.jsonl"
 _NOT_CHARM_TSUMS = frozenset(
     {
         "ナミネ",
@@ -328,6 +330,8 @@ class DebugWindow(QWidget):
         boogie.setForeground(QColor("#009900"))
         blue = QTextCharFormat()
         blue.setForeground(QColor(0, 0, 220))
+        orange = QTextCharFormat()
+        orange.setForeground(QColor(255, 140, 0))
         cursor.setCharFormat(normal)
         cursor.insertText(f"{now}  ")
         if text == "ブギー":
@@ -344,6 +348,12 @@ class DebugWindow(QWidget):
             return
         if text == "システム終了":
             cursor.insertText(text, blue)
+            cursor.setCharFormat(normal)
+            self._log.setTextCursor(cursor)
+            self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+            return
+        if "繰り越し" in text:
+            cursor.insertText(text, orange)
             cursor.setCharFormat(normal)
             self._log.setTextCursor(cursor)
             self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
@@ -631,8 +641,7 @@ class MainWindow(QMainWindow):
         self._record: RecordWorker | None = None
         self._want_record = False
         self._selected_used_tsum = ""
-        self._use_dedicated_model = True
-        self._use_named_model = False
+        self._use_dedicated_model, self._use_named_model = _load_play_model()
         self._placed = False
         self._enter_yes = None
         self._key_buttons = None
@@ -651,6 +660,12 @@ class MainWindow(QMainWindow):
         self._f8_down = False
         self._f9_down = False
         self._f11_down = False
+        self._num1_down = False
+        self._meter_skill_fill = None
+        self._meter_skill_need = None
+        self._meter_skill_n = None
+        self._meter_skill_ok = None
+        self._meter_left = None
         self._capture_at = 0.0
         self._grab_at = 0.0
         self._capture_key_timer = QTimer(self)
@@ -913,6 +928,11 @@ class MainWindow(QMainWindow):
         _tap_at,
         skill_need=None,
     ) -> None:
+        self._meter_skill_fill = skill_fill
+        self._meter_skill_need = skill_need
+        self._meter_skill_n = _skill_n
+        self._meter_skill_ok = _skill_ok
+        self._meter_left = left
         if left is None:
             self._info_time_value.setText("－")
         else:
@@ -947,6 +967,36 @@ class MainWindow(QMainWindow):
             self._info_erase_value.setText("－")
         else:
             self._info_erase_value.setText(str(int(_skill_ok)))
+
+    def _log_skill_key(self, key: str = "numpad1") -> None:
+        fill = self._meter_skill_fill
+        need = self._meter_skill_need
+        row = {
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "key": key,
+            "skill_fill": None if fill is None else round(float(fill), 4),
+            "skill_pct": None
+            if fill is None
+            else max(0, min(100, round(float(fill) * 100))),
+            "skill_need": None if need is None else int(need),
+            "skill_n": None
+            if self._meter_skill_n is None
+            else int(self._meter_skill_n),
+            "skill_ok": None
+            if self._meter_skill_ok is None
+            else int(self._meter_skill_ok),
+            "timer": None if self._meter_left is None else int(self._meter_left),
+        }
+        try:
+            _SKILL_KEY_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with _SKILL_KEY_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        pct = row["skill_pct"]
+        need_s = "－" if need is None else str(int(need))
+        pct_s = "－" if pct is None else f"{pct}％"
+        self._set_status(f"テンキー1 {pct_s} 残り{need_s}")
 
     def _coin_rate(self, coin, result) -> str:
         try:
@@ -1137,6 +1187,27 @@ class MainWindow(QMainWindow):
         self._play.need_used_tsum.connect(self._on_need_used_tsum)
         if ask_kinds:
             self._play.need_kinds.connect(self._on_need_kinds)
+        self._meter_skill_fill = None
+        self._meter_skill_need = None
+        self._meter_skill_n = None
+        self._meter_skill_ok = None
+        self._meter_left = None
+        self._num1_down = False
+        try:
+            _SKILL_KEY_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with _SKILL_KEY_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                            "event": "play_start",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except OSError:
+            pass
         self._play.start()
         if self._want_record:
             self._start_record()
@@ -1171,15 +1242,15 @@ class MainWindow(QMainWindow):
         if play is None:
             return
         screen = Path(path) if path else None
-        self._use_dedicated_model = True
-        self._use_named_model = False
-        self._set_model_label(None, True)
+        self._use_dedicated_model, self._use_named_model = _load_play_model()
+        self._set_model_label(None, self._use_dedicated_model, self._use_named_model)
         name = self._confirm_used_tsum(guess, screen, pick_only)
         if name is None:
             play.provide_used_tsum(None)
             self.on_stop()
             return
         self._selected_used_tsum = name
+        self._use_dedicated_model, self._use_named_model = _load_play_model()
         self._set_model_label(name, self._use_dedicated_model, self._use_named_model)
         play.provide_used_tsum(name, self._use_dedicated_model, self._use_named_model)
 
@@ -1245,10 +1316,6 @@ class MainWindow(QMainWindow):
             saved = self._save_used_tsum_choice(path, guess, None)
             if saved is None:
                 return None
-            choice = self._ask_dedicated_model(saved)
-            if choice is None:
-                return None
-            self._use_dedicated_model, self._use_named_model = choice
             return saved
         if result == 2:
             return self._pick_used_tsum(guess, path)
@@ -1256,63 +1323,6 @@ class MainWindow(QMainWindow):
             return self._register_used_tsum(path)
         if result == 4:
             return ""
-        return None
-
-    def _ask_dedicated_model(self, name: str) -> tuple[bool, bool] | None:
-        dialog = QDialog()
-        dialog.setWindowTitle("今すぐプレイ")
-        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
-        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("どのモデルを使いますか？"))
-        buttons = QDialogButtonBox()
-        own = buttons.addButton(f"{name} のモデル", QDialogButtonBox.ButtonRole.ActionRole)
-        named = buttons.addButton("ツム名のモデル", QDialogButtonBox.ButtonRole.ActionRole)
-        shared = buttons.addButton(
-            "専用のモデルではない", QDialogButtonBox.ButtonRole.ActionRole
-        )
-        cancel = buttons.addButton("キャンセル", QDialogButtonBox.ButtonRole.RejectRole)
-        own.setAutoDefault(False)
-        named.setAutoDefault(False)
-        shared.setAutoDefault(False)
-        cancel.setAutoDefault(False)
-        layout.addWidget(buttons)
-        own.clicked.connect(lambda: dialog.done(1))
-        shared.clicked.connect(lambda: dialog.done(2))
-        named.clicked.connect(lambda: dialog.done(3))
-        buttons.rejected.connect(dialog.reject)
-        self._arm_key_buttons([own, named, shared, cancel])
-        self._front_timer.stop()
-        self._debug.setEnabled(False)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        if sys.platform == "win32":
-            import ctypes
-
-            hwnd = int(dialog.winId())
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040
-            )
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-        dialog.grabKeyboard()
-        current = self._focused_key_button()
-        if current is not None:
-            current.setFocus(Qt.FocusReason.OtherFocusReason)
-        try:
-            result = dialog.exec()
-        finally:
-            dialog.releaseKeyboard()
-            self._enter_yes = None
-            self._key_buttons = None
-            self._debug.setEnabled(True)
-            self._front_timer.start()
-        if result == 1:
-            return True, False
-        if result == 2:
-            return False, False
-        if result == 3:
-            return False, True
         return None
 
     def _choose_used_tsum(self, path: Path | None) -> str | None:
@@ -1360,10 +1370,50 @@ class MainWindow(QMainWindow):
 
     def _open_swipe_settings(self) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("なぞるスピード")
+        dialog.setWindowTitle("設定")
         dialog.setModal(True)
         dialog.setMinimumWidth(320)
         layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("どのモデルを使いますか？"))
+        dedicated = QRadioButton("使用ツムのモデル")
+        named = QRadioButton("ツム名のモデル")
+        shared = QRadioButton("専用のモデルではない")
+        model_group = QButtonGroup(dialog)
+        model_group.addButton(dedicated)
+        model_group.addButton(named)
+        model_group.addButton(shared)
+        use_dedicated, use_named = _load_play_model()
+        if use_named:
+            named.setChecked(True)
+        elif use_dedicated:
+            dedicated.setChecked(True)
+        else:
+            shared.setChecked(True)
+        layout.addWidget(dedicated)
+        layout.addWidget(named)
+        layout.addWidget(shared)
+
+        def save_model(checked: bool) -> None:
+            if not checked:
+                return
+            if named.isChecked():
+                _save_play_model(False, True)
+            elif dedicated.isChecked():
+                _save_play_model(True, False)
+            else:
+                _save_play_model(False, False)
+            self._use_dedicated_model, self._use_named_model = _load_play_model()
+            if self._selected_used_tsum:
+                self._set_model_label(
+                    self._selected_used_tsum,
+                    self._use_dedicated_model,
+                    self._use_named_model,
+                )
+
+        dedicated.toggled.connect(save_model)
+        named.toggled.connect(save_model)
+        shared.toggled.connect(save_model)
+
         layout.addWidget(QLabel("あいだの点（秒）"))
         point_edit = QLineEdit()
         layout.addWidget(point_edit)
@@ -1388,7 +1438,7 @@ class MainWindow(QMainWindow):
         def save() -> None:
             speeds = read()
             if speeds is None:
-                QMessageBox.information(dialog, "なぞるスピード", "0以上の秒数を入力してください。")
+                QMessageBox.information(dialog, "設定", "0以上の秒数を入力してください。")
                 return
             set_swipe_speeds(speeds[0], speeds[1])
             dialog.accept()
@@ -1863,6 +1913,9 @@ class MainWindow(QMainWindow):
             self._f5_down = down
             if pressed:
                 self.on_play_now()
+            self._num1_down = bool(
+                ctypes.windll.user32.GetAsyncKeyState(_VK_NUMPAD1) & 0x8000
+            )
             return
         down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F7) & 0x8000)
         pressed = down and not self._f7_down
@@ -1884,6 +1937,11 @@ class MainWindow(QMainWindow):
         self._f11_down = down
         if pressed:
             self.on_grab_board()
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_NUMPAD1) & 0x8000)
+        pressed = down and not self._num1_down
+        self._num1_down = down
+        if pressed:
+            self._log_skill_key("numpad1")
 
     def nativeEvent(self, eventType, message):
         if sys.platform == "win32":
@@ -2099,3 +2157,26 @@ class MainWindow(QMainWindow):
             if path.is_file():
                 return path
         return None
+
+
+def _play_model_settings() -> QSettings:
+    return QSettings("workshop", "AutoPlay")
+
+
+def _load_play_model() -> tuple[bool, bool]:
+    stored = str(_play_model_settings().value("play_model", "dedicated") or "dedicated")
+    if stored == "named":
+        return False, True
+    if stored == "shared":
+        return False, False
+    return True, False
+
+
+def _save_play_model(dedicated: bool, named: bool) -> None:
+    if named:
+        value = "named"
+    elif dedicated:
+        value = "dedicated"
+    else:
+        value = "shared"
+    _play_model_settings().setValue("play_model", value)
