@@ -41,6 +41,51 @@ def format_timecode(seconds: float) -> str:
     return f"{minutes:02d}:{secs:05.2f}"
 
 
+def _probe_frame_count(cap: cv2.VideoCapture, fps: float, reported: int) -> int:
+    count = max(0, int(reported))
+    try:
+        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1.0)
+        pos_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+        pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+        if pos_frames > count:
+            count = pos_frames
+        if pos_msec > 0.0 and fps > 1e-3:
+            from_msec = int(pos_msec * fps / 1000.0) + 1
+            if from_msec > count:
+                count = from_msec
+    except Exception:
+        pass
+    if count <= 0:
+        return 0
+    start = max(count - 1, 0)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, float(start))
+    ok, _image = cap.read()
+    if ok:
+        # 末尾が少し短く報告されている分だけ伸ばす
+        index = start + 1
+        limit = count + max(1, int(round(max(fps, 1.0) * 2.0)))
+        while index < limit:
+            ok, _image = cap.read()
+            if not ok:
+                break
+            index += 1
+        return index
+    # 報告が長すぎるとき、読める最後へ戻す
+    low = 0
+    high = max(count - 1, 0)
+    readable = 0
+    while low <= high:
+        mid = (low + high) // 2
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(mid))
+        ok, _image = cap.read()
+        if ok:
+            readable = mid + 1
+            low = mid + 1
+        else:
+            high = mid - 1
+    return readable if readable > 0 else count
+
+
 def read_video_info(path: Path) -> VideoInfo:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
@@ -52,6 +97,7 @@ def read_video_info(path: Path) -> VideoInfo:
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if fps <= 1e-3:
             fps = 30.0
+        frame_count = _probe_frame_count(cap, fps, frame_count)
         if frame_count <= 0:
             raise ValueError("フレーム数を取得できませんでした")
         duration = frame_count / fps

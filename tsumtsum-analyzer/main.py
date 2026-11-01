@@ -7,6 +7,7 @@ from pathlib import Path
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("QT_MEDIA_BACKEND", "windows")
 
 from PySide6.QtCore import QDir, QLockFile
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -55,7 +56,8 @@ def _acquire_instance_lock() -> QLockFile | None:
 
 
 def main() -> None:
-    sys.path.insert(0, str(ANALYZE_ROOT))
+    if not getattr(sys, "frozen", False):
+        sys.path.insert(0, str(ANALYZE_ROOT))
     from tsumtsum_analyze.roots import set_roots
     from app.paths import ASSETS_DIR, DATA_DIR
 
@@ -81,6 +83,8 @@ def main() -> None:
 
     window = MainWindow()
     window.showMaximized()
+    window.raise_()
+    window.activateWindow()
     sys.exit(app.exec())
 
 
