@@ -114,6 +114,8 @@ BOMB_CANCEL_MASH = 3
 BOMB_CANCEL_BEFORE = 3
 CBUZZ_BOMB_CANCEL_MASH = BOMB_CANCEL_MASH
 CBUZZ_BOMB_CANCEL_BEFORE = BOMB_CANCEL_BEFORE
+# 連打・ボムキャン・繋げたまま すべてオフ
+SKILL_CARRY_ON = False
 TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
@@ -1605,6 +1607,8 @@ def run_play(
         need_n: int | None = None,
         chain_n: int | None = None,
     ) -> bool:
+        if not SKILL_CARRY_ON:
+            return False
         added = int(chain_n) if chain_n is not None else mytsum_in_chain(chain)
         if skill is None or added <= 0 or watch_hit.is_set():
             return False
@@ -1642,6 +1646,8 @@ def run_play(
 
     def mash_skill_carry() -> bool:
         nonlocal carry_cool_until, last_fan_at, fan_taps
+        if not SKILL_CARRY_ON:
+            return False
         if skill is None or skill_is_nightmare(used_tsum):
             return False
         if time.time() < next_skill_at[0] or skill_ring_hold[0]:
@@ -1730,6 +1736,8 @@ def run_play(
         return True
 
     def about_to_fill_cbuzz(added: int, after: int) -> bool:
+        if not SKILL_CARRY_ON:
+            return False
         if not _bomb_cancel_ok() or skill is None:
             return False
         if not skill_saw_empty or added <= 0 or watch_hit.is_set():
@@ -1740,6 +1748,8 @@ def run_play(
         return yellow < SLOT_ON
 
     def mash_skill_cbuzz(*, after_bomb: bool = False) -> bool:
+        if not SKILL_CARRY_ON:
+            return False
         if not _bomb_cancel_ok():
             return False
         return mash_skill_carry()
@@ -1748,6 +1758,8 @@ def run_play(
         added: int, after: int, *, before_chain: bool = False
     ) -> bool:
         nonlocal bomb_taps, last_bomb_at
+        if not SKILL_CARRY_ON:
+            return False
         if not _bomb_cancel_ok() or skill is None:
             return False
         if not skill_saw_empty or added <= 0 or watch_hit.is_set():
