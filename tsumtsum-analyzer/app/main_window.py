@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap, QResizeEvent
+from PySide6.QtGui import QCloseEvent, QFont, QImage, QPixmap, QResizeEvent
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,14 +21,18 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QHeaderView,
     QPushButton,
+    QDialog,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QSlider,
     QVBoxLayout,
     QWidget,
 )
 
-from app.paths import APP_NAME, APP_ROOT, EXE_PATH, VIDEO_EXTENSIONS
+from app.paths import APP_NAME, APP_ROOT, DATA_DIR, EXE_PATH, VIDEO_EXTENSIONS
 from tsumtsum_analyze.extractor import (
     VideoInfo,
     format_timecode,
@@ -105,6 +109,54 @@ QLabel#lamp_value {
     color: #1c2430;
     font-weight: 700;
 }
+QFrame#calc_result {
+    background: #ffffff;
+    border: 1px solid #1c2430;
+}
+QLabel#calc_result_text {
+    color: #1c2430;
+    background: transparent;
+    border: none;
+}
+QWidget#play_host {
+    background: #ffffff;
+}
+QTableWidget#play_table {
+    background: #ffffff;
+    color: #1c2430;
+    border: none;
+    border-right: 1px solid #1c2430;
+    gridline-color: transparent;
+    font-size: 7pt;
+}
+QTableWidget#play_table::item {
+    padding: 0 0.5em;
+    border: none;
+    border-left: 1px solid #1c2430;
+    border-bottom: 1px solid #1c2430;
+    color: #1c2430;
+}
+QTableWidget#play_table::item:selected {
+    background: #ffffff;
+    color: #1c2430;
+}
+QTableWidget#play_table QLineEdit {
+    color: #1c2430;
+    background: #ffffff;
+    selection-color: #1c2430;
+    selection-background-color: #d7e4ff;
+}
+QTableWidget#play_table QHeaderView::section {
+    background: #ffffff;
+    color: #1c2430;
+    border: none;
+    border-left: 1px solid #1c2430;
+    border-top: 1px solid #1c2430;
+    border-bottom: 1px solid #1c2430;
+    padding: 0 0.5em;
+    font-weight: 700;
+    font-size: 7pt;
+}
 """
 
 START_SCREEN_LAMP = "スタート画面"
@@ -134,6 +186,14 @@ COIN_READ_KEYS = (
     (COIN_SCENE_KEY, COIN_LAMP, "coin"),
     (RESULT_SCENE_KEY, RESULT_LAMP, "result_coin"),
 )
+
+
+def format_go_timeup(elapsed_sec: float) -> str:
+    total = int(float(elapsed_sec) + 0.5)
+    if total < 0:
+        total = 0
+    minutes, seconds = divmod(total, 60)
+    return f"GO > TIME UP : {minutes:02d} 分 {seconds:02d}秒"
 
 
 class ExeBuildWorker(QThread):
@@ -214,7 +274,6 @@ class MainWindow(QMainWindow):
         self._scene_transform = None
         self._tsum_reader = None
         self._item_store = None
-        self._coin_reader = None
         self._lamp_lit: dict[str, bool] = {}
         self._lamp_armed: dict[str, bool] = {}
         self._fever_count = 0
@@ -227,6 +286,8 @@ class MainWindow(QMainWindow):
         self._skill_prototypes: list | None = None
         self._skill_limit = 0.0
         self._analyze_next_frame = 0
+        self._go_frame: int | None = None
+        self._timeup_frame: int | None = None
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._player_tick)
         self._audio_out = QAudioOutput(self)
@@ -234,6 +295,10 @@ class MainWindow(QMainWindow):
         self._audio_player.setAudioOutput(self._audio_out)
         self._audio_player.errorOccurred.connect(self._on_audio_error)
         self._audio_player.mediaStatusChanged.connect(self._on_audio_status)
+        self._play_fitting = False
+        self._play_refreshing = False
+        self._play_base_font = QFont()
+        self._play_host: QWidget | None = None
         self._cell2: QFrame | None = None
         self._cell6: QFrame | None = None
         self._display_frame: QFrame | None = None
@@ -269,8 +334,11 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         self._apply_cell2_size()
         self._apply_cell6_lamp_size()
+        QTimer.singleShot(0, self._fit_play_columns)
 
     def eventFilter(self, watched, event) -> bool:
+        if watched is getattr(self, "_play_window", None) and event.type() == QEvent.Type.Resize:
+            self._fit_play_columns()
         if (
             event.type() == QEvent.Type.MouseButtonPress
             and event.button() == Qt.MouseButton.LeftButton
@@ -284,6 +352,16 @@ class MainWindow(QMainWindow):
                 return True
         return super().eventFilter(watched, event)
 
+    def _calc_result_height(self) -> int:
+        frame = getattr(self, "_calc_result_frame", None)
+        label = getattr(self, "_calc_result_value", None)
+        box = getattr(self, "_calc_result_box", None)
+        if frame is None or label is None or box is None:
+            return 0
+        line = max(1, label.fontMetrics().lineSpacing())
+        margins = box.contentsMargins()
+        return line * 3 + margins.top() + margins.bottom() + frame.frameWidth() * 2
+
     def _apply_cell6_lamp_size(self) -> None:
         cell = getattr(self, "_cell6", None)
         lamps = getattr(self, "_cell6_lamps", None)
@@ -294,11 +372,19 @@ class MainWindow(QMainWindow):
         margins = box.contentsMargins()
         spacing = box.spacing()
         count = len(lamps)
+        result = getattr(self, "_calc_result_frame", None)
+        result_h = 0
+        extra = 0
+        if result is not None:
+            result_h = self._calc_result_height()
+            result.setFixedHeight(result_h)
+            extra = 1
         avail_h = (
             cell.height()
             - margins.top()
             - margins.bottom()
-            - spacing * max(0, count - 1)
+            - spacing * max(0, count - 1 + extra)
+            - result_h
         )
         height = max(1, avail_h // count)
         width = max(1, int(cell.width() / 3))
@@ -343,8 +429,95 @@ class MainWindow(QMainWindow):
         put_num(top, "0")
 
         c1 = make_cell()
-        grid.addWidget(c1, 1, 0)
-        put_num(c1, "1")
+        grid.addWidget(c1, 1, 0, 2, 1)
+        c1_box = QVBoxLayout(c1)
+        c1_box.setContentsMargins(12, 12, 12, 12)
+        c1_box.setSpacing(0)
+        play_button = QPushButton("DATA")
+        play_button.clicked.connect(self._show_play_table)
+        c1_box.addWidget(
+            play_button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        c1_box.addStretch(1)
+        self._play_button = play_button
+        play_table = QTableWidget(0, 14)
+        play_table.setObjectName("play_table")
+        play_table.setFrameShape(QFrame.Shape.NoFrame)
+        play_table.setShowGrid(False)
+        play_table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked
+            | QTableWidget.EditTrigger.SelectedClicked
+            | QTableWidget.EditTrigger.EditKeyPressed
+            | QTableWidget.EditTrigger.AnyKeyPressed
+        )
+        play_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        play_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        play_table.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        play_table.itemChanged.connect(self._on_play_item_changed)
+        play_table.verticalHeader().setVisible(False)
+        play_table.setHorizontalHeaderLabels(
+            [
+                "動画のファイル名",
+                "使用ツム",
+                "アイテム",
+                "プレイ時間",
+                "素コイン",
+                "コイン",
+                "倍率",
+                "コイン利益",
+                "素コイン合計",
+                "コイン合計",
+                "利益合計",
+                "効率（素）",
+                "効率（仮想）",
+                "効率（現実）",
+            ]
+        )
+        play_table.horizontalHeader().setHighlightSections(False)
+        play_table.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+        )
+        for col in range(play_table.columnCount()):
+            header_item = play_table.horizontalHeaderItem(col)
+            if header_item is not None:
+                header_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+                )
+        play_table.horizontalHeader().setStretchLastSection(False)
+        play_table.horizontalHeader().setMinimumSectionSize(1)
+        play_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        play_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        play_table.setWordWrap(False)
+        play_table.setMinimumWidth(0)
+        play_table.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        play_host = QWidget()
+        play_host.setObjectName("play_host")
+        play_box = QVBoxLayout(play_host)
+        play_box.setContentsMargins(0, 0, 0, 0)
+        play_box.setSpacing(0)
+        play_line = QHBoxLayout()
+        play_line.setContentsMargins(0, 0, 0, 0)
+        play_line.setSpacing(0)
+        play_line.addStretch(1)
+        play_line.addWidget(play_table, 0, Qt.AlignmentFlag.AlignTop)
+        play_line.addStretch(1)
+        play_box.addLayout(play_line)
+        play_box.addStretch(1)
+        play_window = QDialog(self)
+        play_window.setWindowTitle("DATA")
+        play_window.setModal(False)
+        play_window_box = QVBoxLayout(play_window)
+        play_window_box.setContentsMargins(0, 0, 0, 0)
+        play_window_box.setSpacing(0)
+        play_window_box.addWidget(play_host)
+        play_window.installEventFilter(self)
+        self._play_window = play_window
+        self._play_host = play_host
+        self._play_table = play_table
+        self._play_base_font = QFont(play_table.font())
+        self._play_base_font.setPointSize(7)
         c2 = make_cell()
         c2.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         grid.addWidget(c2, 1, 1, 2, 1)
@@ -462,9 +635,6 @@ class MainWindow(QMainWindow):
         volume_row.addWidget(self.volume_value)
         c3_box.addLayout(volume_row)
 
-        c4 = make_cell()
-        grid.addWidget(c4, 2, 0)
-        put_num(c4, "4")
         c6 = make_cell()
         grid.addWidget(c6, 2, 2)
         c6_box = QVBoxLayout(c6)
@@ -524,6 +694,26 @@ class MainWindow(QMainWindow):
             self._cell6_lamps_by_name[label] = lamp
             self._cell6_values_by_name[label] = value
             self._lamp_armed[label] = True
+        calc = QFrame()
+        calc.setObjectName("calc_result")
+        calc.setFrameShape(QFrame.Shape.Box)
+        calc.setFrameShadow(QFrame.Shadow.Plain)
+        calc.setLineWidth(1)
+        calc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        calc_box = QVBoxLayout(calc)
+        calc_box.setContentsMargins(8, 2, 8, 2)
+        calc_box.setSpacing(0)
+        calc_value = QLabel("")
+        calc_value.setObjectName("calc_result_text")
+        calc_value.setWordWrap(True)
+        calc_value.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        calc_box.addWidget(calc_value)
+        c6_box.addWidget(calc)
+        self._calc_result_frame = calc
+        self._calc_result_box = calc_box
+        self._calc_result_value = calc_value
         self._apply_cell6_lamp_size()
         c7 = make_cell()
         grid.addWidget(c7, 3, 0)
@@ -555,6 +745,285 @@ class MainWindow(QMainWindow):
         for col in range(3):
             grid.setColumnStretch(col, 1)
         self.setCentralWidget(root)
+        self._refresh_play_list()
+
+    def _show_play_table(self) -> None:
+        window = self._play_window
+        screen = window.screen() or self.screen() or QApplication.primaryScreen()
+        geo = screen.availableGeometry() if screen is not None else None
+        if geo is not None:
+            window.setGeometry(
+                int(geo.x()),
+                int(geo.y()),
+                max(1, int(geo.width() * 2 // 3)),
+                int(geo.height()),
+            )
+        window.show()
+        window.raise_()
+        self._fit_play_columns()
+
+    def _plays_path(self) -> Path:
+        return DATA_DIR / "plays.json"
+
+    def _load_plays(self) -> list[dict]:
+        path = self._plays_path()
+        if not path.is_file():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, dict)]
+
+    def _write_plays(self, plays: list[dict]) -> None:
+        path = self._plays_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(plays, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _play_cell_align(self, col: int):
+        if col == 6:
+            return Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+        if col in {3, 4, 5, 7, 8, 9, 10, 11, 12, 13}:
+            return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        return Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+
+    def _play_duration_parts(self, text: str) -> tuple[int, int] | None:
+        raw = str(text or "")
+        if "分" not in raw or "秒" not in raw:
+            return None
+        left, right = raw.split("分", 1)
+        minutes = self._play_int(left)
+        seconds = self._play_int(right.split("秒", 1)[0])
+        if minutes is None or seconds is None:
+            return None
+        return minutes, seconds
+
+    def _play_per_min_text(self, amount: int | None, duration_sec: int | None) -> str:
+        if amount is None or not duration_sec:
+            return ""
+        return f"{(amount / duration_sec) * 60.0:.2f}"
+
+    def _play_int(self, text: str) -> int | None:
+        digits = "".join(char for char in str(text or "") if char.isdigit())
+        if not digits:
+            return None
+        return int(digits)
+
+    def _play_items_text(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw or raw == "なし":
+            return ""
+        return " ".join(part for part in raw.replace("、", " ").split() if part)
+
+    def _play_item_cost(self, text: str) -> int:
+        from tsumtsum_analyze.item_slots import ITEM_COIN_COST, ITEM_RESULT_NAMES
+
+        by_name = {
+            name: int(ITEM_COIN_COST.get(slot, 0))
+            for slot, name in ITEM_RESULT_NAMES.items()
+        }
+        by_name["5＞4"] = by_name.get("5>4", 0)
+        total = 0
+        for part in self._play_items_text(text).split():
+            total += by_name.get(part, 0)
+        return total
+
+    def _play_profit(self, record: dict) -> int | None:
+        result_n = self._play_int(str(record.get("result") or ""))
+        if result_n is None:
+            return None
+        return result_n - self._play_item_cost(str(record.get("item") or ""))
+
+    def _play_row_cells(
+        self, record: dict, coin_sum: int, result_sum: int, profit_sum: int
+    ) -> list[str]:
+        coin_n = self._play_int(str(record.get("coin") or ""))
+        result_n = self._play_int(str(record.get("result") or ""))
+        profit_n = self._play_profit(record)
+        coin_text = f"{coin_n:,}" if coin_n is not None else ""
+        result_text = f"{result_n:,}" if result_n is not None else ""
+        profit_text = f"{profit_n:,}" if profit_n is not None else ""
+        if coin_n is not None and result_n is not None and coin_n > 0:
+            rate = f"×{result_n / coin_n:.1f}"
+        else:
+            rate = ""
+        parts = self._play_duration_parts(str(record.get("go_timeup") or ""))
+        if parts is None:
+            duration_sec = None
+            play_time = ""
+        else:
+            minutes, seconds = parts
+            duration_sec = minutes * 60 + seconds
+            play_time = f"{minutes:02d} 分 {seconds:02d}秒"
+        return [
+            str(record.get("video") or "").strip(),
+            str(record.get("tsum") or "").strip(),
+            self._play_items_text(str(record.get("item") or "")),
+            play_time,
+            coin_text,
+            result_text,
+            rate,
+            profit_text,
+            f"{coin_sum:,}",
+            f"{result_sum:,}",
+            f"{profit_sum:,}",
+            self._play_per_min_text(coin_n, duration_sec),
+            self._play_per_min_text(result_n, duration_sec),
+            self._play_per_min_text(profit_n, duration_sec),
+        ]
+
+    def _refresh_play_list(self) -> None:
+        table = getattr(self, "_play_table", None)
+        if table is None:
+            return
+        self._play_refreshing = True
+        try:
+            self._fill_play_list(table)
+        finally:
+            self._play_refreshing = False
+
+    def _fill_play_list(self, table: QTableWidget) -> None:
+        plays = list(reversed(self._load_plays()))
+        table.setRowCount(len(plays))
+        coin_sum = 0
+        result_sum = 0
+        profit_sum = 0
+        for row, record in enumerate(plays):
+            coin_n = self._play_int(str(record.get("coin") or ""))
+            result_n = self._play_int(str(record.get("result") or ""))
+            profit_n = self._play_profit(record)
+            if coin_n is not None:
+                coin_sum += coin_n
+            if result_n is not None:
+                result_sum += result_n
+            if profit_n is not None:
+                profit_sum += profit_n
+            for col, text in enumerate(
+                self._play_row_cells(record, coin_sum, result_sum, profit_sum)
+            ):
+                cell = QTableWidgetItem(text)
+                cell.setTextAlignment(self._play_cell_align(col))
+                flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                if col in {1, 4, 5}:
+                    flags |= Qt.ItemFlag.ItemIsEditable
+                cell.setFlags(flags)
+                table.setItem(row, col, cell)
+        table.resizeRowsToContents()
+        self._fit_play_columns()
+
+    def _on_play_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._play_refreshing:
+            return
+        col = item.column()
+        if col == 1:
+            key = "tsum"
+            value = item.text().strip()
+        elif col == 4:
+            key = "coin"
+            number = self._play_int(item.text())
+            value = f"{number:,}" if number is not None else ""
+        elif col == 5:
+            key = "result"
+            number = self._play_int(item.text())
+            value = f"{number:,}" if number is not None else ""
+        else:
+            return
+        plays = self._load_plays()
+        file_index = len(plays) - 1 - item.row()
+        if file_index < 0 or file_index >= len(plays):
+            return
+        stored = str(plays[file_index].get(key) or "")
+        if stored != value:
+            plays[file_index][key] = value
+            self._write_plays(plays)
+        if stored != value or item.text() != value:
+            self._refresh_play_list()
+
+    def _play_columns_width(self, font: QFont) -> int:
+        table = self._play_table
+        header = table.horizontalHeader()
+        table.setFont(font)
+        header.setFont(font)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.resizeColumnsToContents()
+        table.resizeRowsToContents()
+        return sum(table.columnWidth(col) for col in range(table.columnCount()))
+
+    def _play_content_height(self) -> int:
+        table = self._play_table
+        height = table.horizontalHeader().height() + table.frameWidth() * 2
+        for row in range(table.rowCount()):
+            height += table.rowHeight(row)
+        return height
+
+    def _place_play_table(self) -> None:
+        table = self._play_table
+        host = self._play_host
+        if host is None or host.height() < 20:
+            return
+        width = sum(table.columnWidth(col) for col in range(table.columnCount()))
+        width += table.frameWidth() * 2
+        height = self._play_content_height()
+        if host.height() > 20 and height > host.height():
+            height = host.height()
+            width += table.verticalScrollBar().sizeHint().width()
+        table.setFixedSize(max(1, width), max(1, height))
+
+    def _fit_play_columns(self) -> None:
+        table = getattr(self, "_play_table", None)
+        if table is None or self._play_fitting:
+            return
+        if not table.isVisible():
+            return
+        self._play_fitting = True
+        try:
+            header = table.horizontalHeader()
+            self._play_columns_width(self._play_base_font)
+            widths = [table.columnWidth(col) for col in range(table.columnCount())]
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+            for col, width in enumerate(widths):
+                header.resizeSection(col, width)
+            self._place_play_table()
+        finally:
+            self._play_fitting = False
+
+    def _lamp_text(self, name: str) -> str:
+        value = self._cell6_values_by_name.get(name)
+        if value is None:
+            return ""
+        return value.text().strip()
+
+    def _current_play_record(self) -> dict | None:
+        record = {
+            "video": self._video_path.name if self._video_path is not None else "",
+            "tsum": self._lamp_text(MY_TSUM_LAMP),
+            "item": self._lamp_text(USED_ITEM_LAMP),
+            "fever": self._lamp_text(FEVER_LAMP),
+            "skill": self._lamp_text(SKILL_LAMP),
+            "coin": self._lamp_text(COIN_LAMP),
+            "result": self._lamp_text(RESULT_LAMP),
+            "go_timeup": self._calc_result_value.text().strip(),
+        }
+        if not any(record[key] for key in record if key != "video"):
+            return None
+        return record
+
+    def _save_current_play(self) -> None:
+        record = self._current_play_record()
+        if record is None:
+            return
+        plays = self._load_plays()
+        video = record["video"]
+        if video:
+            plays = [item for item in plays if item.get("video") != video]
+        plays.insert(0, record)
+        self._write_plays(plays)
+        self._refresh_play_list()
 
     def _set_player_enabled(self, enabled: bool) -> None:
         self.player_slider.setEnabled(enabled)
@@ -595,6 +1064,9 @@ class MainWindow(QMainWindow):
         self._skill_prototypes = None
         self._skill_limit = 0.0
         self._analyze_next_frame = 0
+        self._go_frame = None
+        self._timeup_frame = None
+        self._set_calc_result("")
         for lamp in self._cell6_lamps:
             dot = lamp.property("lamp_dot")
             if isinstance(dot, QLabel):
@@ -655,6 +1127,32 @@ class MainWindow(QMainWindow):
         if value is None:
             return
         value.setText(text)
+
+    def _set_calc_result(self, text: str) -> None:
+        label = getattr(self, "_calc_result_value", None)
+        if label is None:
+            return
+        label.setText(text)
+
+    def _note_go_timeup(self, lamp: str) -> None:
+        if lamp == GO_LAMP and self._go_frame is None:
+            self._go_frame = self._play_frame
+        elif (
+            lamp == TIMEUP_LAMP
+            and self._timeup_frame is None
+            and self._go_frame is not None
+            and self._play_frame > self._go_frame
+        ):
+            self._timeup_frame = self._play_frame
+        self._update_go_timeup_text()
+
+    def _update_go_timeup_text(self) -> None:
+        if self._go_frame is None or self._timeup_frame is None or self.info is None:
+            return
+        if self.info.fps <= 0 or self._timeup_frame <= self._go_frame:
+            return
+        elapsed = (self._timeup_frame - self._go_frame) / self.info.fps
+        self._set_calc_result(format_go_timeup(elapsed))
 
     def _ensure_scene_model(self) -> bool:
         if self._scene_model is not None:
@@ -746,12 +1244,19 @@ class MainWindow(QMainWindow):
         for key, lamp in SCENE_LAMP_KEYS:
             if not self._is_lamp_armed(lamp):
                 continue
-            if self._lamp_lit.get(lamp):
+            waiting_time = (
+                lamp == GO_LAMP and self._go_frame is None
+            ) or (
+                lamp == TIMEUP_LAMP and self._timeup_frame is None
+            )
+            if self._lamp_lit.get(lamp) and not waiting_time:
                 continue
             score = _class_score(probs, self._scene_classes, key)
             if score < KIND_THRESHOLD:
                 continue
-            self._set_lamp_on(lamp, True)
+            if not self._lamp_lit.get(lamp):
+                self._set_lamp_on(lamp, True)
+            self._note_go_timeup(lamp)
         full_rgb = None
         if self._skill_prototypes is not None and self._is_lamp_armed(SKILL_LAMP):
             full_rgb = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
@@ -802,26 +1307,13 @@ class MainWindow(QMainWindow):
 
     def _read_coin_number(self, image, read_key: str) -> str:
         from PIL import Image
-        from tsumtsum_analyze.coin_read import CoinReader
+        from app.play_coin import read_play_coin
 
-        if self._coin_reader is None:
-            self._coin_reader = CoinReader()
         rgb = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        path = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
-                path = Path(handle.name)
-            rgb.save(path, format="PNG")
-            _box, number = self._coin_reader.inspect_path(path, read_key)
-            return number or ""
+            return read_play_coin(rgb, read_key)
         except Exception:
             return ""
-        finally:
-            if path is not None:
-                try:
-                    path.unlink(missing_ok=True)
-                except Exception:
-                    pass
 
     def _prepare_skill_detector(self, tsum_name: str) -> None:
         from tsumtsum_analyze.item_teach import tsum_id_for_name
@@ -1109,8 +1601,11 @@ class MainWindow(QMainWindow):
         self._refresh_analyze_enabled()
 
     def _player_stop(self) -> None:
+        was_analyzing = self._analyzing
         self._play_timer.stop()
         self._stop_audio()
+        if was_analyzing:
+            self._save_current_play()
         self._analyzing = False
         self._audio_clock = True
         self.player_play_btn.setText("再生")
@@ -1130,8 +1625,7 @@ class MainWindow(QMainWindow):
             dur = int(self._audio_player.duration())
             nxt = self._frame_from_ms(pos)
             if dur > 0 and pos >= max(0, dur - 40):
-                if not self._show_frame(nxt, sync_audio=False, allow_past_end=True):
-                    self._show_frame(self._play_frame, sync_audio=False)
+                self._show_frame(nxt, sync_audio=False, allow_past_end=True)
                 self._player_stop()
                 return
             if not self._show_frame(nxt, sync_audio=False, allow_past_end=True):
@@ -1161,6 +1655,12 @@ class MainWindow(QMainWindow):
         self._player_stop()
         self._show_frame(int(value))
 
+    def _keep_shown_frame(self, allow_past_end: bool, frame: int) -> bool:
+        if allow_past_end and frame > self._play_frame:
+            return True
+        pixmap = self.preview.pixmap()
+        return pixmap is not None and not pixmap.isNull()
+
     def _show_frame(
         self, frame: int, *, sync_audio: bool = True, allow_past_end: bool = False
     ) -> bool:
@@ -1171,13 +1671,13 @@ class MainWindow(QMainWindow):
             frame = min(frame, self._last_frame())
         image = self._read_frame(frame)
         if image is None:
-            if allow_past_end and frame > self._play_frame:
+            if self._keep_shown_frame(allow_past_end, frame):
                 return False
             self.preview.setText("この位置の画像を取得できませんでした")
             return False
         pixmap = self._to_preview_pixmap(image)
         if pixmap is None:
-            if allow_past_end and frame > self._play_frame:
+            if self._keep_shown_frame(allow_past_end, frame):
                 return False
             self.preview.setText("この位置の画像を取得できませんでした")
             return False
@@ -1269,6 +1769,7 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._apply_cell2_size()
         self._apply_cell6_lamp_size()
+        self._fit_play_columns()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._player_stop()
