@@ -756,20 +756,17 @@ class MainWindow(QMainWindow):
         if self._skill_prototypes is not None and self._is_lamp_armed(SKILL_LAMP):
             full_rgb = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             self._analyze_skill_frame(full_rgb)
-        need_coin = any(
-            self._is_lamp_armed(lamp) and not self._lamp_lit.get(lamp)
-            for _scene, lamp, _read in COIN_READ_KEYS
-        )
-        if need_coin:
-            for scene_key, lamp, read_key in COIN_READ_KEYS:
-                if not self._is_lamp_armed(lamp) or self._lamp_lit.get(lamp):
-                    continue
-                score = _class_score(probs, self._scene_classes, scene_key)
-                if score < KIND_THRESHOLD:
-                    continue
-                number = self._read_coin_number(image, read_key)
-                self._set_lamp_on(lamp, True)
-                self._set_lamp_value(lamp, number or "—")
+        for scene_key, lamp, read_key in COIN_READ_KEYS:
+            if not self._is_lamp_armed(lamp):
+                continue
+            score = _class_score(probs, self._scene_classes, scene_key)
+            if score < KIND_THRESHOLD:
+                continue
+            number = self._read_coin_number(image, read_key)
+            if not number:
+                continue
+            self._set_lamp_on(lamp, True)
+            self._set_lamp_value(lamp, number)
         if not on_start:
             return
         if not need_my and not need_item:

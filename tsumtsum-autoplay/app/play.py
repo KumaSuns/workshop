@@ -504,6 +504,8 @@ def run_play(
     hud_gone_seen = False
     fan_fall_n: int | None = None
     fan_fall_moved = False
+    gadget_bomb_fall = False
+    gadget_fall_at = 0.0
     resumed_pause = False
     match_over = False
     last_close_at: tuple[int, int] | None = None
@@ -552,11 +554,12 @@ def run_play(
     pending_used: set[tuple[int, int]] = set()
     match_picks: list[tuple[list[int], int]] = []
     pieces: list[dict[str, int]] = []
+    tsums: list[dict[str, int]] = []
 
     def fresh_match() -> None:
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
-        nonlocal ignore_start_until, saw_board, odd_top_tapped, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
+        nonlocal ignore_start_until, saw_board, odd_top_tapped, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
         nonlocal clears, swipes, coin, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
@@ -565,7 +568,7 @@ def run_play(
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
-        nonlocal go_at, used_items, wait_times, pieces
+        nonlocal go_at, used_items, wait_times, pieces, tsums
         nonlocal last_named, named_flips, last_close_at
         game = None
         skill = None
@@ -596,9 +599,12 @@ def run_play(
         hud_gone_seen = False
         fan_fall_n = None
         fan_fall_moved = False
+        gadget_bomb_fall = False
+        gadget_fall_at = 0.0
         resumed_pause = False
         last_close_at = None
         pieces = []
+        tsums = []
         watching.clear()
         clears = 0
         swipes = 0
@@ -832,7 +838,8 @@ def run_play(
         skill_acc = 0.0
 
     def try_bomb(sit: str, force: bool = False, target: dict[str, int] | None = None) -> bool:
-        nonlocal last_bomb_at, bomb_taps
+        nonlocal last_bomb_at, bomb_taps, fan_fall_n, fan_fall_moved
+        nonlocal gadget_bomb_fall, gadget_fall_at
         bombs = _bombs_on_board(pieces, game)
         if not bombs:
             return False
@@ -871,6 +878,12 @@ def run_play(
         bomb_taps += 1
         last_bomb_at = time.time()
         pending_hud.append((sit, "bomb", True))
+        if skill_is_gadget(used_tsum):
+            # ボム割りのあとも落ちてからスキルを押す
+            fan_fall_n = len(tsums)
+            fan_fall_moved = False
+            gadget_bomb_fall = True
+            gadget_fall_at = time.time()
         return True
 
     def tap_bombs_after_chains(swipes_n: int, longest: int) -> None:
@@ -908,6 +921,7 @@ def run_play(
 
     def break_to_one() -> bool:
         nonlocal bomb_taps, last_bomb_at, bomb_after_long, skip_bomb_cells
+        nonlocal fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at
         bombs = _bombs_on_board(pieces, game)
         if len(bombs) < BOMB_MANY:
             return False
@@ -917,6 +931,11 @@ def run_play(
             last_bomb_at = time.time()
             skip_bomb_cells.clear()
             bomb_after_long = False
+            if skill_is_gadget(used_tsum):
+                fan_fall_n = len(tsums)
+                fan_fall_moved = False
+                gadget_bomb_fall = True
+                gadget_fall_at = time.time()
         return taps > 0
 
     def apply_checker_skill(has_chain: bool) -> bool:
@@ -1587,7 +1606,8 @@ def run_play(
         last_bomb_at = time.time()
 
     def _press_ready_skill() -> None:
-        if not skill_is_nightmare(used_tsum):
+        # ガジェットは直前のボム割りで帯が空くので、押す直前には割らない
+        if not skill_is_nightmare(used_tsum) and not skill_is_gadget(used_tsum):
             _clear_bombs_before_skill()
         button = _skill_button_square(skill)
         press_skill_now(
@@ -1599,6 +1619,49 @@ def run_play(
             ),
             bombs_ok=True,
         )
+
+    def _gadget_want_skill(fall_settled: bool = False) -> bool:
+        if not skill_is_gadget(used_tsum) or skill is None:
+            return False
+        if watch_hit.is_set() or skill_busy[0]:
+            return False
+        if not skill_ready_now(rgb):
+            return False
+        if _gadget_skill_hold(
+            _fever_playing(rgb, game),
+            _meter_fever_fill(rgb, fever, skill, fan),
+            latest_gauge[3],
+        ):
+            return False
+        return True
+
+    def _gadget_fall_over() -> bool:
+        if gadget_fall_at <= 0:
+            return False
+        return time.time() - gadget_fall_at >= 0.5
+
+    def _gadget_fall_waiting(fall_settled: bool = False) -> bool:
+        # スキルを押す待ちのときだけなぞらない。落ち切るまで待つ。
+        if not _gadget_want_skill(fall_settled):
+            return False
+        if pending_spots is not None:
+            return time.time() - pending_at < 0.5
+        if fall_settled or _gadget_fall_over():
+            return False
+        return fan_fall_n is not None or fan_fall_moved
+
+    def _gadget_may_press(fall_settled: bool = False) -> bool:
+        nonlocal gadget_bomb_fall
+        if not _gadget_want_skill(fall_settled):
+            return False
+        if pending_spots is not None:
+            return time.time() - pending_at >= 0.5
+        if fan_fall_n is not None or fan_fall_moved:
+            if not fall_settled and not _gadget_fall_over():
+                return False
+            gadget_bomb_fall = False
+            return _gadget_center_has_tsum(tsums, game)
+        return _gadget_center_has_tsum(tsums, game)
 
     def about_to_fill_skill(
         chain: list[dict[str, int]],
@@ -2371,18 +2434,31 @@ def run_play(
                 latest_gauge[3],
             ):
                 skill_now = False
-            elif (
+            gadget_fall_pending = (
+                skill_is_gadget(used_tsum)
+                and (
+                    (
+                        pending_spots is not None
+                        and time.time() - pending_at < 0.5
+                    )
+                    or fan_fall_n is not None
+                    or fan_fall_moved
+                )
+            )
+            # 落ち待ちが無いときは盤面予測の前に押す判断をする
+            if (
                 skill_now
-                and skill_is_gadget(used_tsum)
-                and pending_spots is not None
-                and time.time() - pending_at < 0.5
+                and not skill_is_namine(used_tsum)
+                and (not skill_is_gadget(used_tsum) or not gadget_fall_pending)
             ):
-                continue
-            if skill_now and not skill_is_namine(used_tsum) and not skill_is_gadget(used_tsum):
-                _press_ready_skill()
-                if skill_pressed is not None and skill_pressed.is_set():
-                    apply_checker_skill(False)
-                    continue
+                if (
+                    not skill_is_gadget(used_tsum)
+                    or _gadget_center_has_tsum(tsums, game)
+                ):
+                    _press_ready_skill()
+                    if skill_pressed is not None and skill_pressed.is_set():
+                        if apply_checker_skill(False):
+                            continue
             t0 = time.perf_counter()
             heat_s = 0.0
             type_s = 0.0
@@ -2410,6 +2486,16 @@ def run_play(
             skip_chains = _prune_skip(skip_chains, tsums)
             look_mytsum()
             tick_skill_count()
+            board_bombs[0] = len(_bombs_on_board(pieces, game))
+            # 落ち待ち中は、落ち判定の直後に押す
+            if _gadget_may_press(_fall_settled):
+                gadget_bomb_fall = False
+                _press_ready_skill()
+                if skill_pressed is not None and skill_pressed.is_set():
+                    if apply_checker_skill(False):
+                        continue
+            if _gadget_fall_waiting(_fall_settled):
+                continue
             pick_opts: list[int] = []
             pick_n = 0
             t0 = time.perf_counter()
@@ -2425,37 +2511,13 @@ def run_play(
                         pick_n = len(found[0])
                         pick_opts = [len(item) for item in found]
             add_idle("find", time.perf_counter() - t0)
-            board_bombs[0] = len(_bombs_on_board(pieces, game))
-            if (
-                skill_is_gadget(used_tsum)
-                and skill is not None
-                and not watch_hit.is_set()
-                and not skill_busy[0]
-                and (pending_spots is None or time.time() - pending_at >= 0.5)
-                and skill_ready_now(rgb)
-                and not _gadget_skill_hold(
-                    _fever_playing(rgb, game),
-                    _meter_fever_fill(rgb, fever, skill, fan),
-                    latest_gauge[3],
-                )
-                and _gadget_center_has_tsum(tsums, game)
-            ):
-                _press_ready_skill()
-            if (
-                skill is not None
-                and not skill_is_gadget(used_tsum)
-                and not watch_hit.is_set()
-                and not skill_busy[0]
-                and skill_ready_now(rgb)
-            ):
-                _press_ready_skill()
             if not found and skill_pressed is not None and skill_pressed.is_set():
                 t0 = time.perf_counter()
                 did_skill = apply_checker_skill(False)
                 add_idle("act", time.perf_counter() - t0)
                 if did_skill:
                     skip_after_skill = True
-                continue
+                    continue
             if found:
                 say("候補 " + " / ".join(str(len(item)) for item in found))
                 looked_after_skill = skip_after_skill
@@ -2468,9 +2530,8 @@ def run_play(
                 )
                 did_skill = armed and apply_checker_skill(True)
                 add_idle("act", time.perf_counter() - t0)
-                if did_skill or armed:
-                    if did_skill:
-                        skip_after_skill = True
+                if did_skill:
+                    skip_after_skill = True
                     continue
                 skill_fill = _skill_fill(rgb, skill)
                 emit_gauges(skill_fill)
@@ -2565,12 +2626,6 @@ def run_play(
                             if _nightmare_live_dice():
                                 break
                             tap_bombs_after_chains(screen_swipes, screen_max)
-                            if (
-                                skill_is_gadget(used_tsum)
-                                and pending_spots is not None
-                                and time.time() - pending_at < 0.5
-                            ):
-                                break
                             try:
                                 image = capture_play_frame()
                                 rgb = _qimage_rgb(image)
@@ -2587,17 +2642,21 @@ def run_play(
                                 break
                             skill_busy[0] = False
                             if (
+                                skill_is_gadget(used_tsum)
+                                and skill_ready_now(rgb)
+                                and not _gadget_skill_hold(
+                                    _fever_playing(rgb, game),
+                                    _meter_fever_fill(rgb, fever, skill, fan),
+                                    latest_gauge[3],
+                                )
+                            ):
+                                # スキルを押すときはメインの落ち待ちへ
+                                break
+                            if (
                                 skill is not None
+                                and not skill_is_gadget(used_tsum)
                                 and not watch_hit.is_set()
                                 and skill_ready_now(rgb)
-                                and not (
-                                    skill_is_gadget(used_tsum)
-                                    and _gadget_skill_hold(
-                                        _fever_playing(rgb, game),
-                                        _meter_fever_fill(rgb, fever, skill, fan),
-                                        latest_gauge[3],
-                                    )
-                                )
                             ):
                                 _press_ready_skill()
                                 if skill_pressed is not None and skill_pressed.is_set():
@@ -2665,7 +2724,8 @@ def run_play(
                             and chain_n >= remain
                         )
                         if (
-                            not already_pending
+                            SKILL_CARRY_ON
+                            and not already_pending
                             and added > 0
                             and remain is not None
                             and remain > 0
@@ -2686,6 +2746,8 @@ def run_play(
                         carry_done = [False]
 
                         def mash_while_down() -> None:
+                            if not SKILL_CARRY_ON:
+                                return
                             if carry_done[0] or already_pending or my_add <= 0:
                                 return
                             if skill_is_nightmare(used_tsum):
@@ -2704,30 +2766,32 @@ def run_play(
                                 say("連打繰り越し")
                                 carry_done[0] = True
 
-                        will_carry = (
-                            not already_pending
-                            and my_add > 0
-                            and remain is not None
-                            and remain > 0
-                            and not skill_is_nightmare(used_tsum)
-                            and about_to_fill_skill(
-                                chain,
-                                int(burst_my_n) + int(my_add),
-                                need_n=int(remain),
-                                chain_n=int(my_add),
+                        will_carry = False
+                        if SKILL_CARRY_ON:
+                            will_carry = (
+                                not already_pending
+                                and my_add > 0
+                                and remain is not None
+                                and remain > 0
+                                and not skill_is_nightmare(used_tsum)
+                                and about_to_fill_skill(
+                                    chain,
+                                    int(burst_my_n) + int(my_add),
+                                    need_n=int(remain),
+                                    chain_n=int(my_add),
+                                )
                             )
-                        )
-                        if (
-                            not already_pending
-                            and my_add > 0
-                            and remain is not None
-                            and remain > 0
-                        ):
-                            say(
-                                f"繰り越し判定 残り{int(remain)} "
-                                f"この鎖{my_add} 累計{int(burst_my_n) + my_add} "
-                                f"{'する' if will_carry else 'しない'}"
-                            )
+                            if (
+                                not already_pending
+                                and my_add > 0
+                                and remain is not None
+                                and remain > 0
+                            ):
+                                say(
+                                    f"繰り越し判定 残り{int(remain)} "
+                                    f"この鎖{my_add} 累計{int(burst_my_n) + my_add} "
+                                    f"{'する' if will_carry else 'しない'}"
+                                )
                         try:
                             swiped = _swipe_chain(
                                 chain,
@@ -2824,6 +2888,7 @@ def run_play(
                     bomb_asked_sit = ""
                     fan_fall_n = len(tsums)
                     fan_fall_moved = False
+                    gadget_fall_at = time.time()
                 if last_chain is not None and preview is not None:
                     preview(_draw_plan(image, pieces, last_chain, game))
                 if timeup:
