@@ -91,6 +91,7 @@ TITLE_POINT = 12
 TITLE_MARGIN = 16
 EXTERNAL_PORT = 8765
 EXTERNAL_PAGE = "https://hokkai-syabusyabu.com/home_page/user/index.php"
+EXTERNAL_SITE = "https://hokkai-syabusyabu.com/home_page/user/external.php"
 FLOW_LAMPS = (
     "システム開始",
     "BLUE STACK 起動確認",
@@ -284,12 +285,44 @@ def _windows_msg_type(event_type) -> bytes:
         return b""
 
 
+class _ExternalPoll(QThread):
+    commands = Signal(list)
+
+    def __init__(self, token: str, parent=None) -> None:
+        super().__init__(parent)
+        self._token = token
+        self._stopped = False
+
+    def stop(self) -> None:
+        self._stopped = True
+
+    def run(self) -> None:
+        while not self._stopped:
+            try:
+                body = _external_site(self._token, {"action": "poll"})
+                names = body.get("commands") if isinstance(body, dict) else None
+                if isinstance(names, list) and names:
+                    self.commands.emit([str(name) for name in names])
+            except Exception:
+                pass
+            for _ in range(10):
+                if self._stopped:
+                    return
+                self.msleep(100)
+
+
 class MenuWindow(QMainWindow):
     tsum_icon_ready = Signal(str)
+    external_commands = Signal(list)
+    external_arm_ok = Signal()
+    external_arm_fail = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self.tsum_icon_ready.connect(self._on_tsum_icon_ready)
+        self.external_commands.connect(self._on_external_commands)
+        self.external_arm_ok.connect(self._on_external_armed)
+        self.external_arm_fail.connect(self._on_external_arm_failed)
         self.setWindowTitle("AUTO PLAY")
         root = QWidget()
         _plain_surface(root)
@@ -400,6 +433,7 @@ class MenuWindow(QMainWindow):
         self._external_buffers = {}
         self._external_pin = ""
         self._external_open = False
+        self._external_poll = None
         self._activity = None
         self._launch_button = None
         self._game_list = None
@@ -1536,6 +1570,7 @@ class MenuWindow(QMainWindow):
             self._external_pin = ""
             self._external_open = False
             self._stop_external_server()
+            self._stop_external_site()
             return
         pin = self._ask_external_pin()
         if not pin:
@@ -1550,7 +1585,67 @@ class MenuWindow(QMainWindow):
             return
         self._external_pin = pin
         self._external_open = False
-        self._start_external_server()
+        self._arm_external_site(pin)
+
+    def _arm_external_site(self, pin: str) -> None:
+        token = self._model_token_value
+        window = self
+
+        def work() -> None:
+            try:
+                _external_site(token, {"action": "arm", "pin": pin})
+            except Exception as exc:
+                window.external_arm_fail.emit(str(exc) or "外部操作を開けませんでした。")
+                return
+            window.external_arm_ok.emit()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_external_armed(self) -> None:
+        poll = self._external_poll
+        if poll is not None:
+            poll.stop()
+            poll.wait(1000)
+        worker = _ExternalPoll(self._model_token_value, self)
+        worker.commands.connect(self._on_external_commands)
+        self._external_poll = worker
+        worker.start()
+
+    def _on_external_arm_failed(self, text: str) -> None:
+        self._external_pin = ""
+        self._external_open = False
+        button = self._external_button
+        if button is not None:
+            button.blockSignals(True)
+            button.setChecked(False)
+            button.blockSignals(False)
+        self._set_activity(text or "外部操作を開けませんでした。")
+
+    def _on_external_commands(self, names: list) -> None:
+        for name in names:
+            action = str(name)
+            if action == "autoplay":
+                self._on_autoplay()
+            elif action == "end":
+                self._end_after_this_play()
+            elif action == "stop":
+                self._stop_play()
+
+    def _stop_external_site(self) -> None:
+        poll = self._external_poll
+        self._external_poll = None
+        if poll is not None:
+            poll.stop()
+            poll.wait(1000)
+        token = self._model_token_value
+
+        def work() -> None:
+            try:
+                _external_site(token, {"action": "off"})
+            except Exception:
+                return
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _show_external_qr(self) -> None:
         dialog = QDialog(self)
@@ -1735,6 +1830,7 @@ class MenuWindow(QMainWindow):
         self._external_reply(socket, "404 Not Found", {"ok": False})
 
     def closeEvent(self, event) -> None:
+        self._stop_external_site()
         self._stop_external_server()
         self._unregister_tsum_hotkeys()
         self._unregister_stop_hotkey()
@@ -2954,6 +3050,29 @@ def _file_sha1(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _external_site(token: str, payload: dict) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        EXTERNAL_SITE,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-Workshop-Token": token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+    body = json.loads(raw or "{}")
+    if not isinstance(body, dict) or body.get("ok") is False:
+        message = body.get("error") if isinstance(body, dict) else ""
+        raise RuntimeError(str(message or "外部操作を開けませんでした。"))
+    return body
 
 
 def _model_token() -> str:
