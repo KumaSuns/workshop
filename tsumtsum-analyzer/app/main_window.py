@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.paths import APP_NAME, APP_ROOT, DATA_DIR, EXE_PATH, VIDEO_EXTENSIONS
+from app.coin_model_sync import CoinModelCheckWorker, CoinModelSyncWorker
 from tsumtsum_analyze.extractor import (
     VideoInfo,
     format_timecode,
@@ -308,6 +309,44 @@ class MainWindow(QMainWindow):
         self._apply_cell6_lamp_size()
         self._set_player_enabled(False)
         self._apply_volume(int(self._settings.value("volume", 80) or 80))
+        self._coin_sync: CoinModelSyncWorker | None = None
+        self._coin_check: CoinModelCheckWorker | None = None
+        self._start_coin_model_check()
+
+    def _start_coin_model_check(self) -> None:
+        worker = CoinModelCheckWorker(self)
+        worker.checked.connect(self._on_coin_models_checked)
+        self._coin_check = worker
+        worker.start()
+
+    def _on_coin_models_checked(self, differs: bool) -> None:
+        button = getattr(self, "_coin_update_button", None)
+        if button is None:
+            return
+        button.setText("更新あり" if differs else "更新なし")
+        button.setEnabled(bool(differs))
+
+    def _update_coin_models(self) -> None:
+        running = self._coin_sync
+        if running is not None and running.isRunning():
+            return
+        button = self._coin_update_button
+        button.setEnabled(False)
+        worker = CoinModelSyncWorker(self)
+        worker.updated.connect(self._on_coin_models_updated)
+        worker.failed.connect(self._on_coin_models_failed)
+        self._coin_sync = worker
+        worker.start()
+
+    def _on_coin_models_updated(self, names: list) -> None:
+        if names:
+            from app.play_coin import reset_play_predictor
+
+            reset_play_predictor()
+        self._on_coin_models_checked(False)
+
+    def _on_coin_models_failed(self) -> None:
+        self._on_coin_models_checked(True)
 
     def _screen_size(self) -> tuple[int, int]:
         screen = self.screen()
@@ -720,7 +759,15 @@ class MainWindow(QMainWindow):
         put_num(c7, "7")
         c8 = make_cell()
         grid.addWidget(c8, 3, 1)
-        put_num(c8, "8")
+        c8_box = QVBoxLayout(c8)
+        c8_box.setContentsMargins(12, 12, 12, 12)
+        coin_update_button = QPushButton("")
+        coin_update_button.setEnabled(False)
+        coin_update_button.clicked.connect(self._update_coin_models)
+        c8_box.addStretch(1)
+        c8_box.addWidget(coin_update_button)
+        c8_box.addStretch(1)
+        self._coin_update_button = coin_update_button
         bottom_right = make_cell()
         grid.addWidget(bottom_right, 3, 2)
         br = QVBoxLayout(bottom_right)

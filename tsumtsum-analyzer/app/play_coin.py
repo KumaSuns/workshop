@@ -185,6 +185,12 @@ def _load_screen_predictor():
             predictor._trainer_modules = keep
 
 
+def reset_play_predictor() -> None:
+    global _predictor, _predictor_failed
+    _predictor = None
+    _predictor_failed = False
+
+
 def play_predictor():
     global _predictor, _predictor_failed
     if _predictor is not None or _predictor_failed:
