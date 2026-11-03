@@ -285,6 +285,24 @@ def _windows_msg_type(event_type) -> bytes:
         return b""
 
 
+class _ExternalArm(QThread):
+    ok = Signal()
+    failed = Signal(str)
+
+    def __init__(self, token: str, pin: str, parent=None) -> None:
+        super().__init__(parent)
+        self._token = token
+        self._pin = pin
+
+    def run(self) -> None:
+        try:
+            _external_site(self._token, {"action": "arm", "pin": self._pin})
+        except Exception as exc:
+            self.failed.emit(str(exc) or "外部操作を開けませんでした。")
+            return
+        self.ok.emit()
+
+
 class _ExternalPoll(QThread):
     commands = Signal(list)
 
@@ -434,6 +452,7 @@ class MenuWindow(QMainWindow):
         self._external_pin = ""
         self._external_open = False
         self._external_poll = None
+        self._external_arm = None
         self._activity = None
         self._launch_button = None
         self._game_list = None
@@ -1588,18 +1607,11 @@ class MenuWindow(QMainWindow):
         self._arm_external_site(pin)
 
     def _arm_external_site(self, pin: str) -> None:
-        token = self._model_token_value
-        window = self
-
-        def work() -> None:
-            try:
-                _external_site(token, {"action": "arm", "pin": pin})
-            except Exception as exc:
-                window.external_arm_fail.emit(str(exc) or "外部操作を開けませんでした。")
-                return
-            window.external_arm_ok.emit()
-
-        threading.Thread(target=work, daemon=True).start()
+        worker = _ExternalArm(self._model_token_value, pin, self)
+        worker.ok.connect(self._on_external_armed)
+        worker.failed.connect(self._on_external_arm_failed)
+        self._external_arm = worker
+        worker.start()
 
     def _on_external_armed(self) -> None:
         poll = self._external_poll
