@@ -2067,9 +2067,16 @@ class MenuWindow(QMainWindow):
         if square is None or host is None:
             return
         rect = host.contentsRect()
-        side = min(rect.width(), max(0, rect.height() - TITLE_MARGIN))
-        if side < 1:
+        full = min(rect.width(), max(0, rect.height() - TITLE_MARGIN))
+        if full < 1:
             return
+        side = full * 3 // 4
+        if side < 1:
+            side = 1
+        gap = full - side
+        body = self._tsum_body
+        if body is not None:
+            body.setContentsMargins(gap, gap, 0, 0)
         square.setFixedSize(side, side)
 
     def _fit_center(self) -> None:
