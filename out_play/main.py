@@ -388,6 +388,8 @@ class MenuWindow(QMainWindow):
         self._center_blank = None
         self._center_square = None
         self._top_square_host = None
+        self._square_under = None
+        self._square_side_buttons = []
         self._activity = None
         self._launch_button = None
         self._game_list = None
@@ -745,11 +747,34 @@ class MenuWindow(QMainWindow):
         self._tsum_body.setSpacing(0)
         self._center_square = QFrame()
         _soft_box(self._center_square)
-        self._tsum_body.addWidget(
+        square_column = QVBoxLayout()
+        square_column.setContentsMargins(0, 0, 0, 0)
+        square_column.setSpacing(0)
+        square_column.addWidget(
             self._center_square,
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
+        under = QPushButton("1")
+        under.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._square_under = under
+        square_column.addWidget(under, 0, Qt.AlignmentFlag.AlignLeft)
+        side_column = QVBoxLayout()
+        side_column.setContentsMargins(0, 0, 0, 0)
+        side_column.setSpacing(0)
+        self._square_side_buttons = []
+        for number in range(2, 7):
+            button = QPushButton(str(number))
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            side_column.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self._square_side_buttons.append(button)
+        square_row = QHBoxLayout()
+        square_row.setContentsMargins(0, 0, 0, 0)
+        square_row.setSpacing(0)
+        square_row.addLayout(square_column)
+        square_row.addLayout(side_column)
+        square_row.setAlignment(side_column, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._tsum_body.addLayout(square_row)
         right.addLayout(self._tsum_body, 1)
         self._top_square_host = right_box
         self._tsum_actions = QVBoxLayout()
@@ -2067,17 +2092,31 @@ class MenuWindow(QMainWindow):
         if square is None or host is None:
             return
         rect = host.contentsRect()
-        full = min(rect.width(), max(0, rect.height() - TITLE_MARGIN))
+        usable_w = rect.width()
+        usable_h = max(0, rect.height() - TITLE_MARGIN)
+        full = min(usable_w, usable_h)
         if full < 1:
             return
         side = full * 3 // 4
         if side < 1:
             side = 1
         gap = full - side
+        row = max(1, side // 5)
+        if TITLE_MARGIN + side + row > usable_h:
+            room = max(1, usable_h - TITLE_MARGIN)
+            side = max(1, room * 5 // 6)
+            row = max(1, side // 5)
+        if gap + side + row > usable_w:
+            gap = max(0, usable_w - side - row)
         body = self._tsum_body
         if body is not None:
-            body.setContentsMargins(gap, gap, 0, 0)
+            body.setContentsMargins(gap, TITLE_MARGIN, 0, 0)
         square.setFixedSize(side, side)
+        under = self._square_under
+        if under is not None:
+            under.setFixedSize(side, row)
+        for button in self._square_side_buttons:
+            button.setFixedSize(row, row)
 
     def _fit_center(self) -> None:
         slot = self._center_slot
