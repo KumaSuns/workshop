@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -11,6 +12,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+import qrcode
 
 from PySide6.QtCore import QDir, QEvent, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtNetwork import QHostAddress, QLocalServer, QLocalSocket, QTcpServer
@@ -87,6 +90,7 @@ ITEM_MIST = 0.6
 TITLE_POINT = 12
 TITLE_MARGIN = 16
 EXTERNAL_PORT = 8765
+EXTERNAL_PAGE = "https://hokkai-syabusyabu.com/home_page/user/index.php"
 FLOW_LAMPS = (
     "システム開始",
     "BLUE STACK 起動確認",
@@ -761,8 +765,9 @@ class MenuWindow(QMainWindow):
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
-        under = QPushButton("1")
+        under = QPushButton("QRコード")
         under.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        under.clicked.connect(self._show_external_qr)
         self._square_under = under
         square_column.addWidget(under, 0, Qt.AlignmentFlag.AlignLeft)
         side_column = QVBoxLayout()
@@ -1546,6 +1551,31 @@ class MenuWindow(QMainWindow):
         self._external_pin = pin
         self._external_open = False
         self._start_external_server()
+
+    def _show_external_qr(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("QRコード")
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        column = QVBoxLayout(dialog)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image = qrcode.make(EXTERNAL_PAGE)
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        pix = QPixmap()
+        pix.loadFromData(buf.getvalue())
+        under = self._square_under
+        side = under.width() if under is not None and under.width() > 1 else pix.width()
+        label.setPixmap(
+            pix.scaled(
+                side,
+                side,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        column.addWidget(label)
+        dialog.exec()
 
     def _ask_external_pin(self) -> str | None:
         dialog = QDialog(self)
