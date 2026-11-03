@@ -372,6 +372,8 @@ class MenuWindow(QMainWindow):
         self._play_api_load = None
         self._used_tsum_name = ""
         self._tsum_body = None
+        self._tsum_window = None
+        self._tsum_window_layout = None
         self._used_tsum_label = None
         self._used_tsum_icon = None
         self._tsum_box = None
@@ -1679,6 +1681,41 @@ class MenuWindow(QMainWindow):
         self._tsum_prompt = None
         if self._tsum_blink_timer is not None:
             self._tsum_blink_timer.stop()
+        self._close_tsum_window()
+
+    def _close_tsum_window(self) -> None:
+        dialog = self._tsum_window
+        self._tsum_window = None
+        self._tsum_window_layout = None
+        if dialog is None:
+            return
+        dialog.blockSignals(True)
+        dialog.close()
+        dialog.deleteLater()
+
+    def _begin_tsum_window(self) -> QVBoxLayout:
+        self._close_tsum_window()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("使用ツム")
+        dialog.setWindowFlag(Qt.WindowType.Window, True)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        dialog.setModal(False)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        self._tsum_window = dialog
+        self._tsum_window_layout = layout
+        dialog.rejected.connect(self._cancel_used_tsum)
+        return layout
+
+    def _present_tsum_window(self) -> None:
+        dialog = self._tsum_window
+        if dialog is None:
+            return
+        dialog.adjustSize()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _clear_nested(self, layout) -> None:
         while layout.count():
@@ -1732,8 +1769,9 @@ class MenuWindow(QMainWindow):
             shortcut.setAutoRepeat(False)
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(activate)
-        if self._tsum_body is not None:
-            self._tsum_body.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout = self._tsum_window_layout if self._tsum_window_layout is not None else self._tsum_body
+        if layout is not None:
+            layout.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
         return button
 
     def _show_tsum_press(self, button: QPushButton, slot) -> None:
@@ -1788,10 +1826,8 @@ class MenuWindow(QMainWindow):
     def _show_tsum_guess(self, guess: str) -> None:
         self._set_activity("使用ツムの問いに答えてください")
         self._clear_tsum_frame()
-        if self._tsum_body is None:
-            return
-        self._tsum_body.addStretch(1)
-        self._tsum_body.addWidget(self._tsum_question(f"使用ツムは {guess} ですか？"))
+        layout = self._begin_tsum_window()
+        layout.addWidget(self._tsum_question(f"使用ツムは {guess} ですか？"))
         buttons = (
             self._add_tsum_button(
                 self._tsum_button_text("はい", "Enter"),
@@ -1813,7 +1849,7 @@ class MenuWindow(QMainWindow):
         height = max(button.minimumHeight() for button in buttons)
         for button in buttons:
             button.setFixedSize(width, height)
-        self._tsum_body.addStretch(1)
+        self._present_tsum_window()
         self._register_tsum_hotkeys(buttons[0].click, buttons[1].click, buttons[2].click)
 
     def _show_tsum_list(self, skip_name: str = "") -> None:
@@ -1822,10 +1858,9 @@ class MenuWindow(QMainWindow):
         if skip_name:
             names = [name for name in names if name != skip_name]
         self._clear_tsum_frame()
-        if self._tsum_body is None:
-            return
+        layout = self._begin_tsum_window()
         question = self._tsum_question("使用ツムはどれですか？")
-        self._tsum_body.addWidget(question)
+        layout.addWidget(question)
         name_list = QListWidget()
         pad = name_list.fontMetrics().horizontalAdvance("あ")
         gap = question.fontMetrics().height() // 2
@@ -1836,10 +1871,11 @@ class MenuWindow(QMainWindow):
             name_list.setCurrentRow(0)
         name_list.itemDoubleClicked.connect(lambda *_: self._accept_listed_tsum())
         self._tsum_list = name_list
-        self._tsum_body.addWidget(name_list, 1)
+        name_list.setMinimumWidth(max(240, question.sizeHint().width()))
+        layout.addWidget(name_list, 1)
         below = QWidget()
         below.setFixedHeight(gap)
-        self._tsum_body.addWidget(below)
+        layout.addWidget(below)
         buttons = (
             self._add_tsum_button("これにします", self._accept_listed_tsum),
             self._add_tsum_button("やめる", self._cancel_used_tsum),
@@ -1848,6 +1884,7 @@ class MenuWindow(QMainWindow):
         height = max(button.minimumHeight() for button in buttons)
         for button in buttons:
             button.setFixedSize(width, height)
+        self._present_tsum_window()
 
     def _accept_listed_tsum(self) -> None:
         row = self._tsum_list.currentItem() if self._tsum_list is not None else None
@@ -1939,8 +1976,9 @@ class MenuWindow(QMainWindow):
         try:
             saved = _save_used_tsum(path, name, folder_id)
         except Exception as exc:  # noqa: BLE001
-            if self._tsum_body is not None:
-                self._tsum_body.addWidget(QLabel(str(exc)))
+            target = self._tsum_window_layout if self._tsum_window_layout is not None else self._tsum_body
+            if target is not None:
+                target.addWidget(QLabel(str(exc)))
             return None
         return saved or name
 
