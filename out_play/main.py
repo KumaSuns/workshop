@@ -1691,9 +1691,8 @@ class MenuWindow(QMainWindow):
         column = QVBoxLayout(dialog)
         column.addWidget(QLabel("4桁の暗証番号"))
         field = QLineEdit()
-        field.setEchoMode(QLineEdit.EchoMode.Password)
         field.setMaxLength(4)
-        field.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9]*")))
+        field.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9０-９]*")))
         column.addWidget(field)
         row = QHBoxLayout()
         ok = QPushButton("入力")
@@ -1704,8 +1703,8 @@ class MenuWindow(QMainWindow):
         chosen: dict[str, str | None] = {"pin": None}
 
         def accept() -> None:
-            text = field.text().strip()
-            if len(text) != 4 or not text.isdigit():
+            text = _ascii_digits(field.text())
+            if len(text) != 4:
                 return
             chosen["pin"] = text
             dialog.accept()
@@ -3062,6 +3061,11 @@ def _file_sha1(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _ascii_digits(text: str) -> str:
+    table = str.maketrans("０１２３４５６７８９", "0123456789")
+    return "".join(ch for ch in text.translate(table) if ch.isdigit())
 
 
 def _external_site(token: str, payload: dict) -> dict:
