@@ -394,6 +394,8 @@ class MenuWindow(QMainWindow):
         self._external_button = None
         self._external_server = None
         self._external_buffers = {}
+        self._external_pin = ""
+        self._external_open = False
         self._activity = None
         self._launch_button = None
         self._game_list = None
@@ -1525,16 +1527,66 @@ class MenuWindow(QMainWindow):
         return super().nativeEvent(eventType, message)
 
     def _set_external_control(self, on: bool) -> None:
-        if on:
-            self._start_external_server()
-        else:
+        if not on:
+            self._external_pin = ""
+            self._external_open = False
             self._stop_external_server()
+            return
+        pin = self._ask_external_pin()
+        if not pin:
+            button = self._external_button
+            if button is not None:
+                button.blockSignals(True)
+                button.setChecked(False)
+                button.blockSignals(False)
+            self._external_pin = ""
+            self._external_open = False
+            self._stop_external_server()
+            return
+        self._external_pin = pin
+        self._external_open = False
+        self._start_external_server()
+
+    def _ask_external_pin(self) -> str | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("外部操作")
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        column = QVBoxLayout(dialog)
+        column.addWidget(QLabel("4桁の暗証番号"))
+        field = QLineEdit()
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        field.setMaxLength(4)
+        field.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9]*")))
+        column.addWidget(field)
+        row = QHBoxLayout()
+        ok = QPushButton("入力")
+        cancel = QPushButton("やめる")
+        row.addWidget(ok)
+        row.addWidget(cancel)
+        column.addLayout(row)
+        chosen: dict[str, str | None] = {"pin": None}
+
+        def accept() -> None:
+            text = field.text().strip()
+            if len(text) != 4 or not text.isdigit():
+                return
+            chosen["pin"] = text
+            dialog.accept()
+
+        ok.clicked.connect(accept)
+        cancel.clicked.connect(dialog.reject)
+        field.returnPressed.connect(accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return chosen["pin"]
 
     def _start_external_server(self) -> None:
         if self._external_server is not None:
             return
         server = QTcpServer(self)
         if not server.listen(QHostAddress.SpecialAddress.LocalHost, EXTERNAL_PORT):
+            self._external_pin = ""
+            self._external_open = False
             button = self._external_button
             if button is not None:
                 button.blockSignals(True)
@@ -1618,15 +1670,27 @@ class MenuWindow(QMainWindow):
             self._external_reply(socket, "204 No Content", b"")
             return
         if method == "GET" and path in ("/", "/status"):
-            self._external_reply(socket, "200 OK", {"on": True})
+            self._external_reply(socket, "200 OK", {"on": True, "open": self._external_open})
             return
         if method == "POST" and path == "/command":
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
             except json.JSONDecodeError:
-                self._external_reply(socket, "400 Bad Request", {"ok": False})
+                self._external_reply(socket, "400 Bad Request", {"ok": False, "open": False})
                 return
             action = str(payload.get("action") or "")
+            if action == "pin":
+                pin = str(payload.get("pin") or "")
+                self._external_open = pin == self._external_pin and len(pin) == 4
+                self._external_reply(
+                    socket,
+                    "200 OK",
+                    {"ok": self._external_open, "open": self._external_open},
+                )
+                return
+            if not self._external_open:
+                self._external_reply(socket, "200 OK", {"ok": False, "open": False})
+                return
             if action == "autoplay":
                 self._on_autoplay()
             elif action == "end":
@@ -1636,7 +1700,7 @@ class MenuWindow(QMainWindow):
             else:
                 self._external_reply(socket, "400 Bad Request", {"ok": False, "error": "不明な操作です"})
                 return
-            self._external_reply(socket, "200 OK", {"ok": True})
+            self._external_reply(socket, "200 OK", {"ok": True, "open": True})
             return
         self._external_reply(socket, "404 Not Found", {"ok": False})
 
