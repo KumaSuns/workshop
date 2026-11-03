@@ -386,6 +386,7 @@ class MenuWindow(QMainWindow):
         self._tsum_blink_timer = None
         self._center_input = None
         self._center_blank = None
+        self._center_square = None
         self._activity = None
         self._launch_button = None
         self._game_list = None
@@ -1150,12 +1151,22 @@ class MenuWindow(QMainWindow):
         self._center_blank = QFrame()
         _soft_box(self._center_blank)
         blank_layout = QVBoxLayout(self._center_blank)
-        blank_layout.setContentsMargins(TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN)
+        blank_layout.setContentsMargins(0, 0, 0, 0)
         blank_layout.setSpacing(0)
+        self._center_square = QFrame()
+        _soft_box(self._center_square)
+        square_layout = QVBoxLayout(self._center_square)
+        square_layout.setContentsMargins(TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN, TITLE_MARGIN)
+        square_layout.setSpacing(0)
         self._activity = QLabel("")
         self._activity.setWordWrap(True)
         self._activity.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        blank_layout.addWidget(self._activity, 1)
+        square_layout.addWidget(self._activity, 1)
+        blank_layout.addWidget(
+            self._center_square,
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
         stop_hint = QLabel("プレイ中の停止は Q")
         hint_font = stop_hint.font()
         hint_point = hint_font.pointSize()
@@ -2075,7 +2086,13 @@ class MenuWindow(QMainWindow):
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if self._center_blank is not None:
-            self._center_blank.setFixedSize(width * 6, height * 3)
+            blank_w = width * 6
+            blank_h = height * 3
+            self._center_blank.setFixedSize(blank_w, blank_h)
+            square = self._center_square
+            if square is not None:
+                side = min(blank_w, blank_h)
+                square.setFixedSize(max(1, side), max(1, side))
 
     def _section_title(self, text: str, top: int = TITLE_MARGIN, bottom: int = TITLE_MARGIN) -> QWidget:
         wrap = QWidget()
