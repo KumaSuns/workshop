@@ -42,8 +42,7 @@ def _dir_name(name: str) -> str:
     return cleaned or "tsum"
 
 
-def _load_registry() -> dict[str, str]:
-    path = _registry_path()
+def _read_registry(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
     try:
@@ -53,6 +52,10 @@ def _load_registry() -> dict[str, str]:
     if not isinstance(payload, dict):
         return {}
     return {str(key): str(value) for key, value in payload.items()}
+
+
+def _load_registry() -> dict[str, str]:
+    return _read_registry(_registry_path())
 
 
 def _save_registry(registry: dict[str, str]) -> None:
@@ -203,6 +206,74 @@ def save_tsum_screen(
     return tsum_image_count(), tsum_display_name(tsum_id)
 
 
+# 900x1600 の顔を、黄色いツム枠の下の金の塊に対する位置にしたもの。
+# 1320x2868 の画面全体に 900x1600 の比を当てると、顔の下の青を切る。
+_FACE_IN_YELLOW = (0.2643, 0.1491, 0.4405, 0.5590)
+_SCREEN_ASPECT = 1600 / 900
+
+
+def _yellow_blob(image: Image.Image) -> tuple[int, int, int, int] | None:
+    width, height = image.size
+    pixels = image.load()
+    x0 = int(width * 0.50)
+    y0 = int(height * 0.50)
+    y1 = int(height * 0.95)
+    seen: set[tuple[int, int]] = set()
+    best: tuple[int, int, int, int, int] | None = None
+    for y in range(y0, y1, 2):
+        for x in range(x0, width, 2):
+            if (x, y) in seen:
+                continue
+            red, green, blue = pixels[x, y]
+            if not (red > 200 and green > 150 and blue < 90 and red > blue + 100):
+                continue
+            stack = [(x, y)]
+            seen.add((x, y))
+            min_x = max_x = x
+            min_y = max_y = y
+            count = 0
+            while stack:
+                cx, cy = stack.pop()
+                count += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                for nx, ny in ((cx - 2, cy), (cx + 2, cy), (cx, cy - 2), (cx, cy + 2)):
+                    if nx < x0 or nx >= width or ny < y0 or ny >= y1 or (nx, ny) in seen:
+                        continue
+                    rr, gg, bb = pixels[nx, ny]
+                    if rr > 200 and gg > 150 and bb < 90 and rr > bb + 100:
+                        seen.add((nx, ny))
+                        stack.append((nx, ny))
+            if best is None or count > best[0]:
+                best = (count, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+    if best is None or best[0] < 200:
+        return None
+    return best[1], best[2], best[3], best[4]
+
+
+def crop_used_face(image: Image.Image) -> Image.Image | None:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    if width < 1 or height < 1:
+        return None
+    if abs(height / width - _SCREEN_ASPECT) <= 0.08:
+        return _crop_screen_tsum(rgb)
+    blob = _yellow_blob(rgb)
+    if blob is None:
+        return None
+    x, y, blob_w, blob_h = blob
+    rx, ry, rw, rh = _FACE_IN_YELLOW
+    left = int(x + rx * blob_w)
+    top = int(y + ry * blob_h)
+    right = min(width, int(left + rw * blob_w))
+    bottom = min(height, int(top + rh * blob_h))
+    if right <= left or bottom <= top:
+        return None
+    return rgb.crop((left, top, right, bottom))
+
+
 def _crop_screen_tsum(image: Image.Image) -> Image.Image:
     width, height = image.size
     if width < 400 or height < 700:
@@ -312,15 +383,16 @@ class TsumTrainWorker(QThread):
 
 
 class TsumReader:
-    def __init__(self) -> None:
+    def __init__(self, models_root: Path | None = None) -> None:
+        self._models_root = Path(models_root) if models_root is not None else None
         self._display: dict[str, str] = {}
         self._prototypes: dict[str, list[list[float]]] = {}
         self.reload()
 
     def reload(self) -> None:
-        self._display = _load_registry()
+        root = self._models_root if self._models_root is not None else _models_root()
+        self._display = _read_registry(root / "registry.json")
         self._prototypes = {}
-        root = _models_root()
         if not root.is_dir():
             return
         for tsum_dir in sorted(path for path in root.iterdir() if path.is_dir()):
@@ -336,7 +408,7 @@ class TsumReader:
             if feats:
                 self._prototypes[tsum_dir.name] = feats
 
-    def read_crop(self, crop: Image.Image) -> str:
+    def read_crop(self, crop: Image.Image, max_dist: float | None = None) -> str:
         if not self._prototypes:
             return ""
         target = _image_to_feature(crop.convert("RGB"))
@@ -349,7 +421,15 @@ class TsumReader:
                 best_id = tsum_id
         if not best_id:
             return ""
+        if max_dist is not None and best_dist > max_dist:
+            return ""
         return self._display.get(best_id, best_id)
 
     def read_screen(self, image: Image.Image) -> str:
         return self.read_crop(_crop_screen_tsum(image.convert("RGB")))
+
+    def read_video(self, image: Image.Image, max_dist: float = 0.12) -> str:
+        crop = crop_used_face(image)
+        if crop is None:
+            return ""
+        return self.read_crop(crop, max_dist=max_dist)

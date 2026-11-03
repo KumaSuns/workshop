@@ -139,8 +139,9 @@ def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key:
     if right - left < 4 or bottom - top < 4:
         return ""
     crop = rgb.crop((left, top, right, bottom))
+    digit_key = "coin" if key == "result_coin" else key
     try:
-        raw = str(predict(crop, key) or "")
+        raw = str(predict(crop, digit_key) or "")
     except Exception:
         return ""
     return "".join(char for char in raw if char.isdigit())
@@ -201,6 +202,69 @@ def play_predictor():
         return None
     _predictor = predictor
     return predictor
+
+
+_timer_digit_reader = None
+
+
+def _read_timer_digits():
+    global _timer_digit_reader
+    if _timer_digit_reader is not None:
+        return _timer_digit_reader
+    import importlib.util
+
+    path = WORKSHOP_ROOT / "tsumtsum-autoplay" / "app" / "timer_digits.py"
+    spec = importlib.util.spec_from_file_location("autoplay_timer_digits", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _timer_digit_reader = module.read_timer_digits
+    return _timer_digit_reader
+
+
+def read_play_timer(rgb, box: dict[str, int] | None = None) -> tuple[int | None, dict[str, int] | None]:
+    predictor = play_predictor()
+    if predictor is None or rgb is None:
+        return None, box
+    image = rgb if getattr(rgb, "mode", "") == "RGB" else rgb.convert("RGB")
+    if box is None:
+        box = _region_box(predictor, image, "timer")
+    if not box:
+        return None, None
+    width, height = image.size
+    left = max(0, int(box["x"]))
+    top = max(0, int(box["y"]))
+    right = min(width, left + max(1, int(box["w"])))
+    bottom = min(height, top + max(1, int(box["h"])))
+    if right - left < 4 or bottom - top < 4:
+        return None, box
+    crop = image.crop((left, top, right, bottom))
+    value = _timer_value(crop)
+    if value is None:
+        from PIL import ImageOps
+
+        value = _timer_value(ImageOps.autocontrast(crop, cutoff=2))
+    if value is None:
+        return None, box
+    return value, box
+
+
+def _timer_value(crop) -> int | None:
+    reader = _read_timer_digits()
+    if reader is None:
+        return None
+    try:
+        text = reader(crop)
+    except Exception:
+        return None
+    digits = "".join(char for char in str(text or "") if char.isdigit())
+    if not digits:
+        return None
+    value = int(digits)
+    if value > 180:
+        return None
+    return value
 
 
 def read_play_coin(rgb, key: str) -> str:

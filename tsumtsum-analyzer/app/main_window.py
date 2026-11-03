@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.paths import APP_NAME, APP_ROOT, DATA_DIR, EXE_PATH, VIDEO_EXTENSIONS
+from app.paths import APP_NAME, APP_ROOT, DATA_DIR, EXE_PATH, VIDEO_EXTENSIONS, WORKSHOP_ROOT
 from app.coin_model_sync import CoinModelCheckWorker, CoinModelSyncWorker
 from tsumtsum_analyze.extractor import (
     VideoInfo,
@@ -269,6 +269,15 @@ class MainWindow(QMainWindow):
         self._audio_ok = False
         self._audio_clock = True
         self._analyzing = False
+        self._timer_seek = False
+        self._closing = False
+        self._coin_ranges: list[tuple[int, int, int]] = []
+        self._coin_timer = QTimer(self)
+        self._coin_timer.setInterval(40)
+        self._coin_timer.timeout.connect(self._coin_scan_step)
+        self._coin_cap = None
+        self._coin_save_pending = False
+        self._timer_done = False
         self._scene_model = None
         self._scene_classes: tuple[str, ...] = ()
         self._scene_device = None
@@ -732,7 +741,8 @@ class MainWindow(QMainWindow):
             self._cell6_lamps.append(lamp)
             self._cell6_lamps_by_name[label] = lamp
             self._cell6_values_by_name[label] = value
-            self._lamp_armed[label] = True
+            self._lamp_armed[label] = self._stored_lamp_armed(label)
+            self._set_lamp_armed_style(label)
         calc = QFrame()
         calc.setObjectName("calc_result")
         calc.setFrameShape(QFrame.Shape.Box)
@@ -1125,6 +1135,13 @@ class MainWindow(QMainWindow):
         for value in self._cell6_values_by_name.values():
             value.setText("")
 
+    def _lamp_armed_key(self, name: str) -> str:
+        return f"lamp_armed/{name}"
+
+    def _stored_lamp_armed(self, name: str) -> bool:
+        raw = self._settings.value(self._lamp_armed_key(name), "1")
+        return str(raw).strip().lower() not in ("0", "false", "no")
+
     def _is_lamp_armed(self, name: str) -> bool:
         return bool(self._lamp_armed.get(name, True))
 
@@ -1147,6 +1164,7 @@ class MainWindow(QMainWindow):
     def _toggle_lamp_armed(self, name: str) -> None:
         armed = not self._is_lamp_armed(name)
         self._lamp_armed[name] = armed
+        self._settings.setValue(self._lamp_armed_key(name), "1" if armed else "0")
         if not armed:
             self._set_lamp_on(name, False)
             self._set_lamp_value(name, "")
@@ -1308,17 +1326,8 @@ class MainWindow(QMainWindow):
         if self._skill_prototypes is not None and self._is_lamp_armed(SKILL_LAMP):
             full_rgb = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             self._analyze_skill_frame(full_rgb)
-        for scene_key, lamp, read_key in COIN_READ_KEYS:
-            if not self._is_lamp_armed(lamp):
-                continue
-            score = _class_score(probs, self._scene_classes, scene_key)
-            if score < KIND_THRESHOLD:
-                continue
-            number = self._read_coin_number(image, read_key)
-            if not number:
-                continue
-            self._set_lamp_on(lamp, True)
-            self._set_lamp_value(lamp, number)
+        self._apply_coin_result(image, probs)
+        self._maybe_jump_by_timer(image)
         if not on_start:
             return
         if not need_my and not need_item:
@@ -1327,8 +1336,16 @@ class MainWindow(QMainWindow):
             full_rgb = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         if need_my:
             if self._tsum_reader is None:
-                self._tsum_reader = TsumReader()
-            name = self._tsum_reader.read_screen(full_rgb)
+                models = (
+                    WORKSHOP_ROOT
+                    / "video-frame-extractor"
+                    / "app"
+                    / "assets"
+                    / "models"
+                    / "use_tsum"
+                )
+                self._tsum_reader = TsumReader(models if models.is_dir() else None)
+            name = self._tsum_reader.read_video(full_rgb)
             if name:
                 self._set_lamp_on(MY_TSUM_LAMP, True)
                 self._set_lamp_value(MY_TSUM_LAMP, shown_tsum_name(name))
@@ -1351,6 +1368,136 @@ class MainWindow(QMainWindow):
                 self._set_lamp_value(
                     USED_ITEM_LAMP, "、".join(used) if used else "なし"
                 )
+
+    def _apply_coin_result(self, image, probs) -> None:
+        from tsumtsum_analyze.scene_scan import KIND_THRESHOLD, _class_score
+
+        for scene_key, lamp, read_key in COIN_READ_KEYS:
+            if not self._is_lamp_armed(lamp):
+                continue
+            score = _class_score(probs, self._scene_classes, scene_key)
+            if score < KIND_THRESHOLD:
+                continue
+            if lamp == RESULT_LAMP and self._lamp_text(RESULT_LAMP):
+                continue
+            number = self._read_coin_number(image, read_key)
+            if not number:
+                continue
+            self._set_lamp_on(lamp, True)
+            self._set_lamp_value(lamp, number)
+
+    def _scene_probs(self, image):
+        if not self._ensure_scene_model():
+            return None
+        from PIL import Image
+        import torch
+        from tsumtsum_analyze.scene_scan import SCENE_INPUT
+
+        small = cv2.resize(
+            image, (SCENE_INPUT, SCENE_INPUT), interpolation=cv2.INTER_AREA
+        )
+        scene_rgb = Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+        tensor = self._scene_transform(scene_rgb).unsqueeze(0).to(self._scene_device)
+        with torch.inference_mode():
+            return torch.softmax(self._scene_model(tensor), dim=1)[0]
+
+    def _release_coin_cap(self) -> None:
+        cap = self._coin_cap
+        if cap is not None:
+            cap.release()
+        self._coin_cap = None
+
+    def _read_coin_frame(self, frame_index: int):
+        if self.info is None:
+            return None
+        cap = self._coin_cap
+        if cap is None or not cap.isOpened():
+            cap = cv2.VideoCapture(str(self.info.path))
+            self._coin_cap = cap
+        if cap is None or not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_index)))
+        ok, image = cap.read()
+        if not ok or image is None:
+            return None
+        return image
+
+    def _coins_found(self) -> bool:
+        return bool(self._lamp_lit.get(COIN_LAMP) and self._lamp_lit.get(RESULT_LAMP))
+
+    def _finish_coin_scan(self) -> None:
+        self._coin_ranges.clear()
+        self._coin_timer.stop()
+        self._release_coin_cap()
+        if self._coin_save_pending:
+            self._coin_save_pending = False
+            self._save_current_play()
+
+    def _queue_coin_range(self, start: int, end: int) -> None:
+        if self.info is None or end <= start:
+            return
+        step = max(1, int(round(self.info.fps * 0.4)))
+        self._coin_ranges.append((end - 1, start, step))
+        if not self._coin_timer.isActive():
+            self._coin_timer.start()
+
+    def _coin_scan_step(self) -> None:
+        if self._closing or self._timer_seek or self.info is None:
+            return
+        if self._coins_found():
+            self._finish_coin_scan()
+            return
+        if not self._coin_ranges:
+            self._finish_coin_scan()
+            return
+        frame, start, step = self._coin_ranges[-1]
+        if frame <= start:
+            self._coin_ranges.pop()
+            return
+        self._coin_ranges[-1] = (frame - step, start, step)
+        image = self._read_coin_frame(frame)
+        if image is None:
+            return
+        probs = self._scene_probs(image)
+        if probs is not None:
+            self._apply_coin_result(image, probs)
+        if self._coins_found():
+            self._finish_coin_scan()
+
+    def _maybe_jump_by_timer(self, image) -> None:
+        if not self._analyzing or self.info is None or self._go_frame is None:
+            return
+        if self._timer_done or self._timer_seek or self._play_frame < self._go_frame:
+            return
+        from PIL import Image
+
+        from app.play_coin import read_play_timer
+
+        rgb = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        try:
+            value, _box = read_play_timer(rgb, None)
+        except Exception:
+            return
+        if value is None:
+            return
+        if value <= 3:
+            self._timer_done = True
+            return
+        target = self._play_frame + int(round(self.info.fps * value))
+        target = min(target, self._last_frame())
+        if target <= self._play_frame:
+            return
+        self._timer_seek = True
+        self._queue_coin_range(self._play_frame, target)
+        QTimer.singleShot(0, lambda frame=target: self._jump_analyze_to(frame))
+
+    def _jump_analyze_to(self, frame: int) -> None:
+        self._timer_seek = False
+        if not self._analyzing or frame <= self._play_frame:
+            return
+        self._show_frame(frame, allow_past_end=True)
+        if self._audio_ok and self._play_timer.isActive():
+            self._sync_audio_position()
 
     def _read_coin_number(self, image, read_key: str) -> str:
         from PIL import Image
@@ -1415,7 +1562,7 @@ class MainWindow(QMainWindow):
             self._skill_episode = False
 
     def start_analyze(self) -> None:
-        if self.info is None or self._play_timer.isActive():
+        if self.info is None or self._play_timer.isActive() or self._timer_seek:
             return
         if not self._ensure_scene_model():
             QMessageBox.warning(
@@ -1424,12 +1571,21 @@ class MainWindow(QMainWindow):
                 "画面のモデルがありません。画像を教えて学習してください。",
             )
             return
+        if self._coin_save_pending:
+            self._coin_save_pending = False
+            self._save_current_play()
         self._analyzing = True
+        self._timer_seek = False
+        self._timer_done = False
+        self._coin_ranges.clear()
+        self._coin_timer.stop()
+        self._release_coin_cap()
         self._audio_clock = False
         self._analyze_next_frame = 0
         self._set_mode_button_active(self.player_analyze_btn, True)
         QApplication.processEvents()
         self._reset_lamps()
+        self._analyze_next_frame = 0
         self._show_frame(0)
         self._start_audio()
         self._play_timer.start()
@@ -1595,6 +1751,12 @@ class MainWindow(QMainWindow):
         self._load_video(Path(path))
 
     def _load_video(self, path: Path) -> None:
+        if self._coin_save_pending:
+            self._coin_save_pending = False
+            self._save_current_play()
+        self._coin_ranges.clear()
+        self._coin_timer.stop()
+        self._release_coin_cap()
         self._player_stop()
         self._release_cap()
         self._audio_ok = False
@@ -1651,10 +1813,13 @@ class MainWindow(QMainWindow):
         was_analyzing = self._analyzing
         self._play_timer.stop()
         self._stop_audio()
-        if was_analyzing:
-            self._save_current_play()
         self._analyzing = False
+        self._timer_seek = False
         self._audio_clock = True
+        if was_analyzing and self._coin_ranges:
+            self._coin_save_pending = True
+        elif was_analyzing:
+            self._save_current_play()
         self.player_play_btn.setText("再生")
         self._refresh_analyze_enabled()
 
@@ -1819,6 +1984,10 @@ class MainWindow(QMainWindow):
         self._fit_play_columns()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._closing = True
+        self._coin_ranges.clear()
+        self._coin_timer.stop()
+        self._release_coin_cap()
         self._player_stop()
         self._audio_player.stop()
         self._release_cap()
