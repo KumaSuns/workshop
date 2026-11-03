@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import QDir, QEvent, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtNetwork import QHostAddress, QLocalServer, QLocalSocket, QTcpServer
 from PySide6.QtGui import (
     QColor,
     QFontMetrics,
@@ -86,6 +86,7 @@ ITEM_DIM = 0.6
 ITEM_MIST = 0.6
 TITLE_POINT = 12
 TITLE_MARGIN = 16
+EXTERNAL_PORT = 8765
 FLOW_LAMPS = (
     "システム開始",
     "BLUE STACK 起動確認",
@@ -390,6 +391,9 @@ class MenuWindow(QMainWindow):
         self._top_square_host = None
         self._square_under = None
         self._square_side_buttons = []
+        self._external_button = None
+        self._external_server = None
+        self._external_buffers = {}
         self._activity = None
         self._launch_button = None
         self._game_list = None
@@ -764,8 +768,19 @@ class MenuWindow(QMainWindow):
         side_column.setSpacing(0)
         self._square_side_buttons = []
         for number in range(2, 7):
-            button = QPushButton(str(number))
+            label = "外部操作" if number == 2 else str(number)
+            button = QPushButton(label)
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            if number == 2:
+                button.setCheckable(True)
+                button.setStyleSheet(
+                    "QPushButton:checked {"
+                    " background: palette(highlight);"
+                    " color: palette(highlighted-text);"
+                    "}"
+                )
+                button.toggled.connect(self._set_external_control)
+                self._external_button = button
             side_column.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             self._square_side_buttons.append(button)
         square_row = QHBoxLayout()
@@ -1509,7 +1524,124 @@ class MenuWindow(QMainWindow):
                         return True, 0
         return super().nativeEvent(eventType, message)
 
+    def _set_external_control(self, on: bool) -> None:
+        if on:
+            self._start_external_server()
+        else:
+            self._stop_external_server()
+
+    def _start_external_server(self) -> None:
+        if self._external_server is not None:
+            return
+        server = QTcpServer(self)
+        if not server.listen(QHostAddress.SpecialAddress.LocalHost, EXTERNAL_PORT):
+            button = self._external_button
+            if button is not None:
+                button.blockSignals(True)
+                button.setChecked(False)
+                button.blockSignals(False)
+            self._set_activity("外部操作を開けませんでした。")
+            return
+        server.newConnection.connect(self._accept_external)
+        self._external_server = server
+
+    def _stop_external_server(self) -> None:
+        server = self._external_server
+        self._external_server = None
+        self._external_buffers.clear()
+        if server is None:
+            return
+        server.close()
+        server.deleteLater()
+
+    def _accept_external(self) -> None:
+        server = self._external_server
+        if server is None:
+            return
+        while server.hasPendingConnections():
+            socket = server.nextPendingConnection()
+            socket.readyRead.connect(lambda s=socket: self._read_external(s))
+            socket.disconnected.connect(lambda s=socket: self._drop_external(s))
+
+    def _drop_external(self, socket) -> None:
+        self._external_buffers.pop(id(socket), None)
+        socket.deleteLater()
+
+    def _external_reply(self, socket, status: str, body) -> None:
+        if isinstance(body, dict):
+            raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            content_type = "application/json; charset=utf-8"
+        else:
+            raw = body if isinstance(body, bytes) else str(body).encode("utf-8")
+            content_type = "text/plain; charset=utf-8"
+        head = (
+            f"HTTP/1.1 {status}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(raw)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        socket.write(head + raw)
+        socket.disconnectFromHost()
+
+    def _read_external(self, socket) -> None:
+        key = id(socket)
+        buf = self._external_buffers.get(key, b"") + bytes(socket.readAll())
+        if b"\r\n\r\n" not in buf:
+            self._external_buffers[key] = buf
+            return
+        head, rest = buf.split(b"\r\n\r\n", 1)
+        lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
+        if not lines or len(lines[0].split(" ")) < 2:
+            self._external_buffers.pop(key, None)
+            self._external_reply(socket, "400 Bad Request", {"ok": False})
+            return
+        method, target = lines[0].split(" ", 2)[:2]
+        method = method.upper()
+        path = target.split("?", 1)[0]
+        length = 0
+        for line in lines[1:]:
+            if line.lower().startswith("content-length:"):
+                try:
+                    length = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    length = 0
+        if len(rest) < length:
+            self._external_buffers[key] = buf
+            return
+        body = rest[:length]
+        self._external_buffers.pop(key, None)
+        if method == "OPTIONS":
+            self._external_reply(socket, "204 No Content", b"")
+            return
+        if method == "GET" and path in ("/", "/status"):
+            self._external_reply(socket, "200 OK", {"on": True})
+            return
+        if method == "POST" and path == "/command":
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._external_reply(socket, "400 Bad Request", {"ok": False})
+                return
+            action = str(payload.get("action") or "")
+            if action == "autoplay":
+                self._on_autoplay()
+            elif action == "end":
+                self._end_after_this_play()
+            elif action == "stop":
+                self._stop_play()
+            else:
+                self._external_reply(socket, "400 Bad Request", {"ok": False, "error": "不明な操作です"})
+                return
+            self._external_reply(socket, "200 OK", {"ok": True})
+            return
+        self._external_reply(socket, "404 Not Found", {"ok": False})
+
     def closeEvent(self, event) -> None:
+        self._stop_external_server()
         self._unregister_tsum_hotkeys()
         self._unregister_stop_hotkey()
         super().closeEvent(event)
@@ -2102,12 +2234,20 @@ class MenuWindow(QMainWindow):
             side = 1
         gap = full - side
         row = max(1, side // 5)
+        external_w = row
+        external = self._external_button
+        if external is not None:
+            external_w = external.fontMetrics().horizontalAdvance(external.text())
+            external_w += external.fontMetrics().height()
+            external_w = max(row, external_w)
         if TITLE_MARGIN + side + row > usable_h:
             room = max(1, usable_h - TITLE_MARGIN)
             side = max(1, room * 5 // 6)
             row = max(1, side // 5)
-        if gap + side + row > usable_w:
-            gap = max(0, usable_w - side - row)
+            if external is not None:
+                external_w = max(row, external_w)
+        if gap + side + external_w > usable_w:
+            gap = max(0, usable_w - side - external_w)
         body = self._tsum_body
         if body is not None:
             body.setContentsMargins(gap, TITLE_MARGIN, 0, 0)
@@ -2115,8 +2255,11 @@ class MenuWindow(QMainWindow):
         under = self._square_under
         if under is not None:
             under.setFixedSize(side, row)
-        for button in self._square_side_buttons:
-            button.setFixedSize(row, row)
+        for index, button in enumerate(self._square_side_buttons):
+            if index == 0:
+                button.setFixedSize(external_w, row)
+            else:
+                button.setFixedSize(row, row)
 
     def _fit_center(self) -> None:
         slot = self._center_slot
