@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -1701,8 +1702,9 @@ class MenuWindow(QMainWindow):
         dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         dialog.setModal(False)
         layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(12)
+        layout.setContentsMargins(28, 22, 28, 22)
+        layout.setSpacing(14)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
         self._tsum_window = dialog
         self._tsum_window_layout = layout
         dialog.rejected.connect(self._cancel_used_tsum)
@@ -1788,9 +1790,7 @@ class MenuWindow(QMainWindow):
     def _tsum_question(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setWordWrap(True)
-        label.setMinimumWidth(0)
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        label.setWordWrap(False)
         font = label.font()
         point = font.pointSize()
         if point < 1:
@@ -1799,6 +1799,8 @@ class MenuWindow(QMainWindow):
         font.setPointSize(self._tsum_prompt_pt)
         font.setBold(True)
         label.setFont(font)
+        label.setMinimumWidth(QFontMetrics(font).horizontalAdvance(text))
+        label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         label.setContentsMargins(0, 0, 0, label.fontMetrics().height() // 2)
         self._tsum_prompt = label
         self._tsum_blink_on = True
