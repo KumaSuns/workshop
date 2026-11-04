@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -3596,10 +3596,10 @@ class MainWindow(QMainWindow):
             self.tsum_name_list.hide()
             self._set_place_tools_visible(False)
             self._load_circle_name_fields()
-            self._refresh_saved_names()
             self._name_window.show()
             self._name_window.raise_()
             self._name_window.activateWindow()
+            self._refresh_saved_names()
             return
         self._name_window.hide()
         self.region_list.show()
@@ -3797,6 +3797,7 @@ class MainWindow(QMainWindow):
                     continue
                 grouped.setdefault((ja, en), []).append((sample, str(key)))
         self.name_saved_list.clear()
+        boards: dict[str, QPixmap | None] = {}
         select = -1
         for (ja, en), rows in grouped.items():
             row = QWidget()
@@ -3808,7 +3809,12 @@ class MainWindow(QMainWindow):
             grid.setSpacing(4)
             face_count = 0
             for sample, key in rows:
-                pixmap = self._sample_board(sample)
+                if sample.id not in boards:
+                    boards[sample.id] = self._sample_board(sample)
+                    QApplication.processEvents(
+                        QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+                    )
+                pixmap = boards[sample.id]
                 if pixmap is None:
                     continue
                 skipped = self._named_out(sample, key)
@@ -3847,6 +3853,7 @@ class MainWindow(QMainWindow):
             self.name_saved_list.setItemWidget(item, row)
             if ja == current_ja and en == current_en and (current_ja or current_en):
                 select = self.name_saved_list.count() - 1
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         if select >= 0:
             self.name_saved_list.setCurrentRow(select)
 

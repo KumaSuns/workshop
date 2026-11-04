@@ -145,6 +145,7 @@ class PlayWorker(QThread):
     gauges = Signal(object, object, object, object, object, object, object, object, object, object)
     money = Signal(object, object)
     named_tsums = Signal(str)
+    named_confused = Signal(object)
     timeup_lamp = Signal(bool)
     skill_lamp = Signal(bool)
     my_lamp = Signal(str)
@@ -183,6 +184,7 @@ class PlayWorker(QThread):
         self._used_named = False
         self.skill_pressed = Event()
         self.timeup_seen = Event()
+        self.grab_board = Event()
 
     def provide_kinds(self, kinds: int | None) -> None:
         self._kinds_answer = kinds
@@ -239,7 +241,9 @@ class PlayWorker(QThread):
                 my_lamp=self.my_lamp.emit,
                 money=self.money.emit,
                 named_line=self.named_tsums.emit,
+                named_confused=self.named_confused.emit,
                 timeup_lamp=self.timeup_lamp.emit,
+                grab_board=self.grab_board,
             )
         except Stopped:
             self.stopped.emit()
@@ -279,7 +283,9 @@ def run_play(
     my_lamp: Callable[[str], None] | None = None,
     money: Callable[[object, object], None] | None = None,
     named_line: Callable[[str], None] | None = None,
+    named_confused: Callable[[object], None] | None = None,
     timeup_lamp: Callable[[bool], None] | None = None,
+    grab_board: Event | None = None,
 ) -> None:
     def say(text: str) -> None:
         if not SHOW_SWIPE_LINES and (
@@ -391,24 +397,22 @@ def run_play(
         raise RuntimeError("TIME UP のモデルがありません。")
 
     last_named = ""
-    named_flips: dict[str, int] = {}
+    named_confused_pairs: list[tuple[str, str]] = []
 
     def note_named(found: list) -> None:
         nonlocal last_named
         if named_line is None or use_named is None or not use_named():
             return
-        shaky: set[str] = set()
         for piece in found:
             if not _is_tsum(piece) or not piece.get("name_unstable"):
                 continue
             name = str(piece.get("tsum_name") or "").strip()
-            if name:
-                shaky.add(name)
             rival = str(piece.get("name_rival") or "").strip()
-            if rival:
-                shaky.add(rival)
-        for name in shaky:
-            named_flips[name] = int(named_flips.get(name, 0)) + 1
+            if not name or not rival:
+                continue
+            pair = (name, rival)
+            if pair not in named_confused_pairs:
+                named_confused_pairs.append(pair)
         limit = int(getattr(predictor, "named_limit", 0) or 0)
         open_names = [
             str(name).strip()
@@ -429,17 +433,15 @@ def run_play(
                 parts = list(open_names)
             cap = limit if limit > 0 else 5
             parts = parts[:cap]
-        marked: list[str] = []
-        for part in parts:
-            if int(named_flips.get(part, 0)) >= 2:
-                marked.append(f"{part} 不安定")
-            else:
-                marked.append(part)
-        shown = "\n".join(marked)
+        shown = "\n".join(parts)
         if not shown or shown == last_named:
             return
         last_named = shown
         named_line(shown)
+
+    def publish_confused() -> None:
+        if named_confused is not None:
+            named_confused(list(named_confused_pairs))
 
     def _sync_named() -> None:
         if use_named is None or not use_named():
@@ -513,6 +515,7 @@ def run_play(
     swipes = 0
     coin = 0
     shown_money = {"coin": "", "result": ""}
+    coin_read_at = 0.0
     earned_now = [""]
     timeup_lit = [False]
     watcher_told = [False]
@@ -568,8 +571,8 @@ def run_play(
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
-        nonlocal go_at, used_items, wait_times, pieces, tsums
-        nonlocal last_named, named_flips, last_close_at
+        nonlocal go_at, used_items, wait_times, pieces, tsums, coin_read_at
+        nonlocal last_named, last_close_at
         game = None
         skill = None
         fever = None
@@ -659,7 +662,8 @@ def run_play(
         nightmare_dice.clear()
         nightmare_dice.update(_nightmare_blank())
         last_named = ""
-        named_flips = {}
+        named_confused_pairs.clear()
+        coin_read_at = 0.0
         watch_hit.clear()
         watching.clear()
         _watcher_timeup[0] = False
@@ -2182,6 +2186,17 @@ def run_play(
                 and not image.isNull()
                 and _in_play_hud(image)
             )
+            if play_hud and time.time() >= coin_read_at:
+                coin_read_at = time.time() + 1.0
+                try:
+                    with _gpu_lock:
+                        text = _money_digits(
+                            _read_coin_key(predictor, rgb, last_boxes, "coin", save=False)
+                        )
+                except Exception:
+                    text = ""
+                if text:
+                    _publish_money("coin", text)
             if saw_board and not play_hud and not on_pause:
                 _note_scene_money(rgb)
             retry_now = (
@@ -2274,6 +2289,7 @@ def run_play(
                 waits = sorted(wait_times, reverse=True)[:3]
                 again = _continue_after_game()
                 earned_now[0] = shown_money["coin"]
+                publish_confused()
                 if not again:
                     _replay_after_timeup(say, stop, stop_at_start=True)
                     _commit_earned(
@@ -2469,6 +2485,27 @@ def run_play(
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
+            if grab_board is not None and grab_board.is_set():
+                grab_board.clear()
+                hud = dict(last_boxes) if isinstance(last_boxes, dict) else {}
+                hud.update(_hud_boxes(game, skill, fever, timer, fan))
+                try:
+                    learned = save_play_board(
+                        predictor,
+                        image,
+                        game,
+                        boxes=hud,
+                        pieces=pieces,
+                        rgb=rgb,
+                        used_tsum=used_tsum,
+                        used_tsum_id=_used_tsum_folder(used_tsum),
+                    )
+                except Exception:
+                    learned = False
+                if learned:
+                    say("盤面を取り込みました" + (f" {used_tsum}" if used_tsum else ""))
+                else:
+                    say("盤面を取り込めませんでした")
             note_named(tsums)
             add_idle("pred", time.perf_counter() - t0)
             add_idle("heat", heat_s)
@@ -2988,6 +3025,7 @@ def run_play(
                     waits = sorted(wait_times, reverse=True)[:3]
                     again = _continue_after_game()
                     earned_now[0] = shown_money["coin"]
+                    publish_confused()
                     if not again:
                         _replay_after_timeup(say, stop, stop_at_start=True)
                         _commit_earned(
@@ -4804,7 +4842,9 @@ def _save_coin_crop(key: str, crop, digits: str) -> None:
         return
 
 
-def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
+def _read_coin_key(
+    predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str, save: bool = True
+) -> str:
     if rgb is None:
         return ""
     predict = getattr(predictor, "predict_coin_digits", None)
@@ -4833,7 +4873,8 @@ def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key:
     except Exception:
         return ""
     digits = "".join(char for char in raw if char.isdigit())
-    _save_coin_crop(key, crop, digits)
+    if save:
+        _save_coin_crop(key, crop, digits)
     return digits
 
 

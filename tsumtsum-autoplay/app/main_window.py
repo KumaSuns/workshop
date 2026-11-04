@@ -527,6 +527,16 @@ class MainWindow(QMainWindow):
         self._info_named.setFont(named_font)
         self._info_named.hide()
         money_col.addWidget(self._info_named)
+        self._info_confused = QPushButton("迷ったツム")
+        self._info_confused.setEnabled(False)
+        self._info_confused.clicked.connect(self._show_named_confused)
+        confused_row = QHBoxLayout()
+        confused_row.addStretch(1)
+        confused_row.addWidget(self._info_confused)
+        confused_row.addStretch(1)
+        money_col.addLayout(confused_row)
+        self._named_confused: list[tuple[str, str]] = []
+        self._confused_dialog: QDialog | None = None
         money_col.addStretch(1)
         info_row.addWidget(self._info_money, 1)
         self._info_count = QFrame()
@@ -727,15 +737,7 @@ class MainWindow(QMainWindow):
         if self._play is None or not self._play.isRunning():
             self._set_status("プレイ中ではありません")
             return
-        try:
-            image = capture_play_frame()
-        except Exception as exc:  # noqa: BLE001
-            self._set_status(str(exc))
-            return
-        if image is None or image.isNull():
-            self._set_status("画面を取れませんでした。")
-            return
-        self._board_grabs.put(image.copy())
+        self._play.grab_board.set()
 
     def _add_tsum(self) -> None:
         self._register_used_tsum(None, title="ツムを追加", allow_skip=False)
@@ -1028,6 +1030,33 @@ class MainWindow(QMainWindow):
         self._info_named.setText("\n".join(lines))
         self._info_named.show()
 
+    def _set_named_confused(self, pairs) -> None:
+        shown: list[tuple[str, str]] = []
+        for item in pairs or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            name = str(item[0]).strip()
+            rival = str(item[1]).strip()
+            if name and rival and (name, rival) not in shown:
+                shown.append((name, rival))
+        self._named_confused = shown
+        self._info_confused.setEnabled(True)
+
+    def _show_named_confused(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("迷ったツム")
+        dialog.setModal(False)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        layout = QVBoxLayout(dialog)
+        lines = QListWidget()
+        for name, rival in self._named_confused:
+            lines.addItem(f"{name}  {rival}")
+        layout.addWidget(lines)
+        self._confused_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _set_timeup_lamp(self, on: bool) -> None:
         if on:
             self._info_timeup.setStyleSheet("QPushButton { background: red; color: white; }")
@@ -1177,6 +1206,7 @@ class MainWindow(QMainWindow):
         self._play.gauges.connect(self._show_meters)
         self._play.money.connect(self._show_money)
         self._play.named_tsums.connect(self._show_named_tsums)
+        self._play.named_confused.connect(self._set_named_confused)
         self._play.timeup_lamp.connect(self._set_timeup_lamp)
         self._play.skill_lamp.connect(self._set_skill_lamp)
         self._play.my_lamp.connect(self._set_my_lamp)
