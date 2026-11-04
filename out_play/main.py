@@ -4,7 +4,7 @@ import hashlib
 import io
 import json
 import os
-import socket
+import re
 import subprocess
 import sys
 import threading
@@ -625,7 +625,8 @@ class MenuWindow(QMainWindow):
         self._external_pin = ""
         self._external_open = False
         self._external_tsum = None
-        self._external_public = ""
+        self._external_url = ""
+        self._external_tunnel = None
         self._external_poll = None
         self._external_arm = None
         self._activity = None
@@ -1832,7 +1833,11 @@ class MenuWindow(QMainWindow):
         column = QVBoxLayout(dialog)
         label = QLabel()
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        image = qrcode.make(self._external_page_url())
+        image_url = self._external_page_url()
+        if not image_url:
+            self._set_activity("外から開く住所は、まだありません。")
+            return
+        image = qrcode.make(image_url)
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         pix = QPixmap()
@@ -1898,26 +1903,75 @@ class MenuWindow(QMainWindow):
             return
         server.newConnection.connect(self._accept_external)
         self._external_server = server
-        self._external_public = ""
-        self._set_activity("外部の住所を確認しています")
-        threading.Thread(target=self._read_external_public, daemon=True).start()
+        self._external_url = ""
+        self._set_activity("外から開く住所を開いています")
+        threading.Thread(target=self._open_external_tunnel, daemon=True).start()
 
-    def _read_external_public(self) -> None:
-        host = _external_public_host()
-        if self._external_server is None:
+    def _open_external_tunnel(self) -> None:
+        try:
+            proc = subprocess.Popen(
+                [
+                    "ssh",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-o",
+                    "ServerAliveInterval=30",
+                    "-R",
+                    f"80:127.0.0.1:{EXTERNAL_PORT}",
+                    "nokey@localhost.run",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            QTimer.singleShot(0, self._show_external_address)
             return
-        self._external_public = host
-        QTimer.singleShot(0, self._show_external_address)
+        self._external_tunnel = proc
+        stream = proc.stdout
+        if stream is None:
+            QTimer.singleShot(0, self._show_external_address)
+            return
+        for line in stream:
+            if self._external_tunnel is not proc:
+                break
+            found = re.search(r"https://[A-Za-z0-9.-]+", line)
+            if found is None or self._external_url:
+                continue
+            self._external_url = found.group(0)
+            QTimer.singleShot(0, self._show_external_address)
+        if self._external_server is not None and not self._external_url:
+            QTimer.singleShot(0, self._show_external_address)
 
     def _show_external_address(self) -> None:
         if self._external_server is None:
             return
-        if self._external_public:
+        if self._external_url:
             self._set_activity(self._external_page_url())
             return
         self._set_activity("外から開く住所が取れませんでした。")
 
+    def _stop_external_tunnel(self) -> None:
+        proc = self._external_tunnel
+        self._external_tunnel = None
+        self._external_url = ""
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
     def _stop_external_server(self) -> None:
+        self._stop_external_tunnel()
         server = self._external_server
         self._external_server = None
         self._external_buffers.clear()
@@ -1940,8 +1994,7 @@ class MenuWindow(QMainWindow):
         socket.deleteLater()
 
     def _external_page_url(self) -> str:
-        host = str(getattr(self, "_external_public", "") or "") or _external_host()
-        return f"http://{host}:{EXTERNAL_PORT}/"
+        return str(self._external_url or "")
 
     def _external_body(self, ok: bool | None = None) -> dict:
         games = ""
@@ -3315,38 +3368,6 @@ def _file_sha1(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _external_public_host() -> str:
-    try:
-        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as response:
-            host = response.read().decode("ascii", "replace").strip()
-    except Exception:
-        return ""
-    parts = host.split(".")
-    if len(parts) != 4 or not all(part.isdigit() and 0 <= int(part) <= 255 for part in parts):
-        return ""
-    if host.startswith("127.") or host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
-        return ""
-    if host.startswith("172."):
-        second = int(parts[1])
-        if 16 <= second <= 31:
-            return ""
-    return host
-
-
-def _external_host() -> str:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        host = str(sock.getsockname()[0] or "")
-    except OSError:
-        host = ""
-    finally:
-        sock.close()
-    if host and not host.startswith("127."):
-        return host
-    return "127.0.0.1"
 
 
 def _ascii_digits(text: str) -> str:
