@@ -625,6 +625,7 @@ class MenuWindow(QMainWindow):
         self._external_pin = ""
         self._external_open = False
         self._external_tsum = None
+        self._external_public = ""
         self._external_poll = None
         self._external_arm = None
         self._activity = None
@@ -1897,7 +1898,24 @@ class MenuWindow(QMainWindow):
             return
         server.newConnection.connect(self._accept_external)
         self._external_server = server
-        self._set_activity(self._external_page_url())
+        self._external_public = ""
+        self._set_activity("外部の住所を確認しています")
+        threading.Thread(target=self._read_external_public, daemon=True).start()
+
+    def _read_external_public(self) -> None:
+        host = _external_public_host()
+        if self._external_server is None:
+            return
+        self._external_public = host
+        QTimer.singleShot(0, self._show_external_address)
+
+    def _show_external_address(self) -> None:
+        if self._external_server is None:
+            return
+        if self._external_public:
+            self._set_activity(self._external_page_url())
+            return
+        self._set_activity("外から開く住所が取れませんでした。")
 
     def _stop_external_server(self) -> None:
         server = self._external_server
@@ -1922,7 +1940,8 @@ class MenuWindow(QMainWindow):
         socket.deleteLater()
 
     def _external_page_url(self) -> str:
-        return f"http://{_external_host()}:{EXTERNAL_PORT}/"
+        host = str(getattr(self, "_external_public", "") or "") or _external_host()
+        return f"http://{host}:{EXTERNAL_PORT}/"
 
     def _external_body(self, ok: bool | None = None) -> dict:
         games = ""
@@ -3296,6 +3315,24 @@ def _file_sha1(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _external_public_host() -> str:
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as response:
+            host = response.read().decode("ascii", "replace").strip()
+    except Exception:
+        return ""
+    parts = host.split(".")
+    if len(parts) != 4 or not all(part.isdigit() and 0 <= int(part) <= 255 for part in parts):
+        return ""
+    if host.startswith("127.") or host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
+        return ""
+    if host.startswith("172."):
+        second = int(parts[1])
+        if 16 <= second <= 31:
+            return ""
+    return host
 
 
 def _external_host() -> str:
