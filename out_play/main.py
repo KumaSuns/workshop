@@ -1017,7 +1017,7 @@ class MenuWindow(QMainWindow):
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
-        under = QPushButton("")
+        under = QPushButton("1")
         under.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._square_under = under
         square_column.addWidget(under, 0, Qt.AlignmentFlag.AlignLeft)
