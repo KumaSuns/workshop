@@ -154,6 +154,7 @@ class PlayWorker(QThread):
     need_used_tsum = Signal(str, str, bool)
     recorded = Signal(object)
     play_progress = Signal(int, object)
+    external_phase = Signal(str)
 
     def __init__(
         self,
@@ -244,6 +245,8 @@ class PlayWorker(QThread):
                 show_recognized=self.recognized.emit,
                 mark=self.flow.emit,
                 show_progress=self.play_progress.emit,
+                note_board=lambda: self.external_phase.emit("board"),
+                note_end=lambda: self.external_phase.emit("end"),
             )
         except Stopped:
             self.stopped.emit()
@@ -346,6 +349,8 @@ def run_play(
     show_recognized: Callable[[int], None] | None = None,
     mark: Callable[[str], None] | None = None,
     show_progress: Callable[[int, int | None], None] | None = None,
+    note_board: Callable[[], None] | None = None,
+    note_end: Callable[[], None] | None = None,
 ) -> None:
     global _flow_mark
     _flow_mark = mark
@@ -494,6 +499,8 @@ def run_play(
     last_save_at = 0.0
     ignore_start_until = 0.0
     saw_board = False
+    board_told = False
+    end_told = False
     odd_top_tapped = False
     saw_timer = False
     hud_gone_seen = False
@@ -555,7 +562,7 @@ def run_play(
     def fresh_match() -> None:
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
-        nonlocal ignore_start_until, saw_board, odd_top_tapped, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
+        nonlocal ignore_start_until, saw_board, board_told, end_told, odd_top_tapped, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
         nonlocal clears, swipes, coin, earned_coin, coin_read_at, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
         nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
@@ -589,6 +596,8 @@ def run_play(
         last_save_at = 0.0
         ignore_start_until = time.time() + 6
         saw_board = False
+        board_told = False
+        end_told = False
         odd_top_tapped = False
         saw_timer = False
         hud_gone_seen = False
@@ -2022,6 +2031,10 @@ def run_play(
     try:
         while True:
             _check_stop(stop)
+            if saw_board and not board_told:
+                board_told = True
+                if note_board is not None:
+                    note_board()
             _sync_named()
             if next_frame is not None:
                 image, rgb = next_frame
@@ -2203,6 +2216,10 @@ def run_play(
                 say("TIME UP / " + _counts_line(clears, swipes, coin))
                 ended = True
             if ended:
+                if not end_told:
+                    end_told = True
+                    if note_end is not None:
+                        note_end()
                 credit_pending(rgb)
                 if not play_hud:
                     note_scene_money(rgb)
@@ -2915,6 +2932,10 @@ def run_play(
                                 coin = _read_coin(predictor, check_rgb, last_boxes)
                             say("TIME UP / " + _counts_line(clears, swipes, coin))
                 if timeup:
+                    if not end_told:
+                        end_told = True
+                        if note_end is not None:
+                            note_end()
                     credit_pending(check_rgb)
                     if check_rgb is not None:
                         note_scene_money(check_rgb)

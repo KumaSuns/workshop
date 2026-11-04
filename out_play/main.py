@@ -254,9 +254,9 @@ function refresh() {
 function applyPlay(body) {
     if (!playBox) return;
     var lines = [];
-    if (body && body.play === "play") lines.push("プレイ");
-    else if (body && body.play === "end") lines.push("プレイ終了");
-    if (body && body.result) lines.push(body.result);
+    if (body && body.play) lines.push(body.play);
+    if (body && body.play === "プレイ開始" && body.tsum_line) lines.push(body.tsum_line);
+    if (body && body.play === "結果" && body.result) lines.push(body.result);
     playBox.textContent = lines.join("\\n");
 }
 pinButton.addEventListener("click", function () {
@@ -628,6 +628,7 @@ class MenuWindow(QMainWindow):
         self._center_input = None
         self._center_blank = None
         self._center_square = None
+        self._square_qr = None
         self._top_square_host = None
         self._square_under = None
         self._square_side_buttons = []
@@ -640,6 +641,7 @@ class MenuWindow(QMainWindow):
         self._external_url = ""
         self._external_tunnel = None
         self._external_play = ""
+        self._external_tsum_line = ""
         self._external_result = ""
         self._external_result_id = None
         self._external_poll = None
@@ -1001,6 +1003,12 @@ class MenuWindow(QMainWindow):
         self._tsum_body.setSpacing(0)
         self._center_square = QFrame()
         _soft_box(self._center_square)
+        square_layout = QVBoxLayout(self._center_square)
+        square_layout.setContentsMargins(0, 0, 0, 0)
+        square_layout.setSpacing(0)
+        self._square_qr = QLabel()
+        self._square_qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        square_layout.addWidget(self._square_qr)
         square_column = QVBoxLayout()
         square_column.setContentsMargins(0, 0, 0, 0)
         square_column.setSpacing(0)
@@ -1009,9 +1017,8 @@ class MenuWindow(QMainWindow):
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
-        under = QPushButton("QRコード")
+        under = QPushButton("")
         under.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        under.clicked.connect(self._show_external_qr)
         self._square_under = under
         square_column.addWidget(under, 0, Qt.AlignmentFlag.AlignLeft)
         side_column = QVBoxLayout()
@@ -1405,17 +1412,34 @@ class MenuWindow(QMainWindow):
         if total is not None:
             self._play_games = int(total)
         self._show_play_count()
-        self._external_play = "play"
+
+    def _clear_external_phase(self) -> None:
+        self._external_play = ""
+        self._external_tsum_line = ""
+        self._external_result = ""
+        self._external_result_id = None
+
+    def _note_external_tsum(self, name: str) -> None:
+        shown = str(name or "").strip() or "—"
+        self._external_tsum_line = f"使用ツム : {shown}"
+        self._external_play = "プレイ開始"
+        self._external_result = ""
+        self._external_result_id = None
+
+    def _on_external_phase(self, name: str) -> None:
+        if name == "board":
+            self._external_play = "プレイ中"
+            return
+        if name == "end":
+            self._external_play = "プレイ終了"
 
     def _report_external_record(self, item: object) -> None:
         if not isinstance(item, dict):
             return
         record_id = item.get("id")
-        same = record_id is not None and record_id == self._external_result_id
         self._external_result_id = record_id
         self._external_result = "".join(text for text, _right in _game_record_parts(item))
-        if not same:
-            self._external_play = "end"
+        self._external_play = "結果"
 
     def _show_tsum_recognition(self, count: int) -> None:
         label = getattr(self, "_tsum_recognition", None)
@@ -1622,6 +1646,8 @@ class MenuWindow(QMainWindow):
             return
         if text.startswith("LossTime "):
             return
+        if text == "プレイを開始します" and self._used_tsum_name:
+            self._note_external_tsum(self._used_tsum_name)
         self._activity.setText(text)
         lamp = self._lamp_for_activity(text)
         if lamp:
@@ -1852,24 +1878,25 @@ class MenuWindow(QMainWindow):
             poll.stop()
             poll.wait(1000)
 
-    def _show_external_qr(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("QRコード")
-        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        column = QVBoxLayout(dialog)
-        label = QLabel()
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        image_url = self._external_page_url()
-        if not image_url:
-            self._set_activity("外から開く住所は、まだありません。")
+    def _paint_square_qr(self) -> None:
+        label = self._square_qr
+        square = self._center_square
+        if label is None or square is None:
             return
-        image = qrcode.make(image_url)
+        url = self._external_page_url()
+        if not url:
+            label.clear()
+            return
+        side = square.contentsRect().width()
+        if side < 1:
+            side = square.width()
+        if side < 1:
+            return
+        image = qrcode.make(url)
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         pix = QPixmap()
         pix.loadFromData(buf.getvalue())
-        under = self._square_under
-        side = under.width() if under is not None and under.width() > 1 else pix.width()
         label.setPixmap(
             pix.scaled(
                 side,
@@ -1878,8 +1905,6 @@ class MenuWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
-        column.addWidget(label)
-        dialog.exec()
 
     def _ask_external_pin(self) -> str | None:
         dialog = QDialog(self)
@@ -1981,8 +2006,10 @@ class MenuWindow(QMainWindow):
             return
         if self._external_url:
             self._set_activity(self._external_page_url())
+            self._paint_square_qr()
             return
         self._set_activity("外から開く住所が取れませんでした。")
+        self._paint_square_qr()
 
     def _stop_external_tunnel(self) -> None:
         proc = self._external_tunnel
@@ -1998,6 +2025,7 @@ class MenuWindow(QMainWindow):
 
     def _stop_external_server(self) -> None:
         self._stop_external_tunnel()
+        self._paint_square_qr()
         server = self._external_server
         self._external_server = None
         self._external_buffers.clear()
@@ -2033,6 +2061,7 @@ class MenuWindow(QMainWindow):
             "games": games,
             "ask": self._external_tsum,
             "play": self._external_play,
+            "tsum_line": self._external_tsum_line,
             "result": self._external_result,
         }
         if ok is not None:
@@ -2269,6 +2298,10 @@ class MenuWindow(QMainWindow):
             return
         if self._autoplay_button is not None:
             self._autoplay_button.setEnabled(False)
+        self._external_play = "システム起動"
+        self._external_tsum_line = ""
+        self._external_result = ""
+        self._external_result_id = None
         self._set_activity("アイテムの画面を確認しています")
         worker = _ItemCheck(self)
         worker.found.connect(self._on_items_checked)
@@ -2280,6 +2313,7 @@ class MenuWindow(QMainWindow):
         if self._play_stop.is_set() or not self._autoplay_alive:
             if self._autoplay_button is not None:
                 self._autoplay_button.setEnabled(True)
+            self._clear_external_phase()
             return
         if self._autoplay_button is not None:
             self._autoplay_button.setEnabled(True)
@@ -2289,6 +2323,7 @@ class MenuWindow(QMainWindow):
         ok, games = self._game_count()
         if not ok:
             self._autoplay_alive = False
+            self._clear_external_phase()
             self._set_activity("プレイするゲーム数がありません。")
             QMessageBox.information(self, "オートプレイ", "プレイするゲーム数がありません。")
             return
@@ -2322,6 +2357,7 @@ class MenuWindow(QMainWindow):
     def _on_play_api_fail(self, message: str) -> None:
         self._play_api_load = None
         self._autoplay_alive = False
+        self._clear_external_phase()
         text = str(message or "プレイの準備に失敗しました。")
         self._set_activity(text)
         self._set_flow_lamp("システム終了")
@@ -2337,6 +2373,7 @@ class MenuWindow(QMainWindow):
     def _on_intro_fail(self, message: str) -> None:
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
+        self._clear_external_phase()
         self._set_activity(message)
         self._set_flow_lamp("システム終了")
         QMessageBox.critical(self, "オートプレイ", message)
@@ -2346,6 +2383,7 @@ class MenuWindow(QMainWindow):
         self._unregister_stop_hotkey()
         self._play_current = None
         self._show_play_count()
+        self._clear_external_phase()
         self._set_activity(message)
         self._set_flow_lamp("システム終了")
         QMessageBox.critical(self, "オートプレイ", message)
@@ -2359,6 +2397,7 @@ class MenuWindow(QMainWindow):
             return
         saved = self._used_tsum_name
         if saved:
+            self._note_external_tsum(saved)
             worker.provide_used_tsum(saved)
             return
         self._tsum_path = Path(path) if path else None
@@ -2608,6 +2647,7 @@ class MenuWindow(QMainWindow):
     def _finish_used_tsum(self, name: str) -> None:
         worker = self._play_worker
         self._used_tsum_name = name
+        self._note_external_tsum(name)
         self._clear_tsum_frame()
         if self._used_tsum_label is not None:
             self._used_tsum_label.setText(name)
@@ -2796,6 +2836,7 @@ class MenuWindow(QMainWindow):
                 button.setFixedSize(external_w, row)
             else:
                 button.setFixedSize(row, row)
+        self._paint_square_qr()
 
     def _fit_center(self) -> None:
         slot = self._center_slot
@@ -3362,6 +3403,7 @@ def _start_match(window: MenuWindow) -> None:
     worker.flow.connect(window._set_flow_lamp)
     worker.recorded.connect(window._show_game_record)
     worker.recorded.connect(window._report_external_record)
+    worker.external_phase.connect(window._on_external_phase)
     worker.play_progress.connect(window._on_play_progress)
     worker.items.connect(window._on_play_items)
     worker.need_used_tsum.connect(window._on_need_used_tsum)
