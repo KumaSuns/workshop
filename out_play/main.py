@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -92,6 +93,90 @@ TITLE_MARGIN = 16
 EXTERNAL_PORT = 8765
 EXTERNAL_PAGE = "https://hokkai-syabusyabu.com/home_page/user/index.php"
 EXTERNAL_SITE = "https://hokkai-syabusyabu.com/home_page/user/external.php"
+EXTERNAL_HTML = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>外部操作</title>
+<style>
+body { font: 16px sans-serif; margin: 1em; }
+.row { display: flex; gap: 0.5em; margin: 0.5em 0; }
+input { width: 6em; font: inherit; }
+button { font: inherit; padding: 0.4em 0.8em; }
+</style>
+</head>
+<body>
+<p id="external_state">暗証番号を入力してください。</p>
+<div class="row">
+<input id="external_pin" type="text" inputmode="numeric" maxlength="4" autocomplete="off">
+<button type="button" id="external_pin_send">入力</button>
+</div>
+<div class="row">
+<button type="button" id="external_autoplay" disabled>オートプレイ</button>
+<button type="button" id="external_end" disabled>このプレイでやめる</button>
+<button type="button" id="external_stop" disabled>停止</button>
+</div>
+<script>
+var state = document.getElementById("external_state");
+var pinField = document.getElementById("external_pin");
+var pinButton = document.getElementById("external_pin_send");
+var buttons = {
+    autoplay: document.getElementById("external_autoplay"),
+    end: document.getElementById("external_end"),
+    stop: document.getElementById("external_stop")
+};
+var wrongPin = false;
+function digits(value) {
+    return String(value == null ? "" : value).replace(/[０-９]/g, function (ch) {
+        return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
+    }).replace(/\\D/g, "");
+}
+function show(body) {
+    if (wrongPin) return;
+    var open = !!(body && body.open);
+    state.textContent = open ? "操作できます。" : "暗証番号を入力してください。";
+    pinField.disabled = open;
+    pinButton.disabled = open;
+    buttons.autoplay.disabled = !open;
+    buttons.end.disabled = !open;
+    buttons.stop.disabled = !open;
+}
+function send(action, extra) {
+    var payload = extra || {action: action};
+    fetch("/command", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+    }).then(function (response) {
+        return response.json();
+    }).then(function (body) {
+        if (action === "pin" && !(body && body.open)) {
+            wrongPin = true;
+            state.textContent = "暗証番号が違います。";
+            return;
+        }
+        wrongPin = false;
+        show(body);
+    });
+}
+pinButton.addEventListener("click", function () {
+    wrongPin = false;
+    send("pin", {action: "pin", pin: digits(pinField.value)});
+});
+pinField.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") {
+        wrongPin = false;
+        send("pin", {action: "pin", pin: digits(pinField.value)});
+    }
+});
+buttons.autoplay.addEventListener("click", function () { send("autoplay"); });
+buttons.end.addEventListener("click", function () { send("end"); });
+buttons.stop.addEventListener("click", function () { send("stop"); });
+</script>
+</body>
+</html>
+"""
 FLOW_LAMPS = (
     "システム開始",
     "BLUE STACK 起動確認",
@@ -1604,7 +1689,7 @@ class MenuWindow(QMainWindow):
             return
         self._external_pin = pin
         self._external_open = False
-        self._arm_external_site(pin)
+        self._start_external_server()
 
     def _arm_external_site(self, pin: str) -> None:
         worker = _ExternalArm(self._model_token_value, pin, self)
@@ -1649,15 +1734,6 @@ class MenuWindow(QMainWindow):
         if poll is not None:
             poll.stop()
             poll.wait(1000)
-        token = self._model_token_value
-
-        def work() -> None:
-            try:
-                _external_site(token, {"action": "off"})
-            except Exception:
-                return
-
-        threading.Thread(target=work, daemon=True).start()
 
     def _show_external_qr(self) -> None:
         dialog = QDialog(self)
@@ -1666,7 +1742,7 @@ class MenuWindow(QMainWindow):
         column = QVBoxLayout(dialog)
         label = QLabel()
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        image = qrcode.make(EXTERNAL_PAGE)
+        image = qrcode.make(self._external_page_url())
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         pix = QPixmap()
@@ -1720,7 +1796,7 @@ class MenuWindow(QMainWindow):
         if self._external_server is not None:
             return
         server = QTcpServer(self)
-        if not server.listen(QHostAddress.SpecialAddress.LocalHost, EXTERNAL_PORT):
+        if not server.listen(QHostAddress.SpecialAddress.AnyIPv4, EXTERNAL_PORT):
             self._external_pin = ""
             self._external_open = False
             button = self._external_button
@@ -1732,6 +1808,7 @@ class MenuWindow(QMainWindow):
             return
         server.newConnection.connect(self._accept_external)
         self._external_server = server
+        self._set_activity(self._external_page_url())
 
     def _stop_external_server(self) -> None:
         server = self._external_server
@@ -1755,13 +1832,16 @@ class MenuWindow(QMainWindow):
         self._external_buffers.pop(id(socket), None)
         socket.deleteLater()
 
-    def _external_reply(self, socket, status: str, body) -> None:
+    def _external_page_url(self) -> str:
+        return f"http://{_external_host()}:{EXTERNAL_PORT}/"
+
+    def _external_reply(self, socket, status: str, body, content_type: str | None = None) -> None:
         if isinstance(body, dict):
             raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
-            content_type = "application/json; charset=utf-8"
+            content_type = content_type or "application/json; charset=utf-8"
         else:
             raw = body if isinstance(body, bytes) else str(body).encode("utf-8")
-            content_type = "text/plain; charset=utf-8"
+            content_type = content_type or "text/plain; charset=utf-8"
         head = (
             f"HTTP/1.1 {status}\r\n"
             f"Content-Type: {content_type}\r\n"
@@ -1805,7 +1885,15 @@ class MenuWindow(QMainWindow):
         if method == "OPTIONS":
             self._external_reply(socket, "204 No Content", b"")
             return
-        if method == "GET" and path in ("/", "/status"):
+        if method == "GET" and path == "/":
+            self._external_reply(
+                socket,
+                "200 OK",
+                EXTERNAL_HTML,
+                "text/html; charset=utf-8",
+            )
+            return
+        if method == "GET" and path == "/status":
             self._external_reply(socket, "200 OK", {"on": True, "open": self._external_open})
             return
         if method == "POST" and path == "/command":
@@ -1816,7 +1904,7 @@ class MenuWindow(QMainWindow):
                 return
             action = str(payload.get("action") or "")
             if action == "pin":
-                pin = str(payload.get("pin") or "")
+                pin = _ascii_digits(str(payload.get("pin") or ""))
                 self._external_open = pin == self._external_pin and len(pin) == 4
                 self._external_reply(
                     socket,
@@ -3061,6 +3149,20 @@ def _file_sha1(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _external_host() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        host = str(sock.getsockname()[0] or "")
+    except OSError:
+        host = ""
+    finally:
+        sock.close()
+    if host and not host.startswith("127."):
+        return host
+    return "127.0.0.1"
 
 
 def _ascii_digits(text: str) -> str:
