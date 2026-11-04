@@ -1887,9 +1887,9 @@ class MenuWindow(QMainWindow):
         if not url:
             label.clear()
             return
-        side = square.contentsRect().width()
+        side = square.width()
         if side < 1:
-            side = square.width()
+            side = square.contentsRect().width()
         if side < 1:
             return
         image = qrcode.make(url)
@@ -1897,14 +1897,14 @@ class MenuWindow(QMainWindow):
         image.save(buf, format="PNG")
         pix = QPixmap()
         pix.loadFromData(buf.getvalue())
-        label.setPixmap(
-            pix.scaled(
-                side,
-                side,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        shown = pix.scaled(
+            side,
+            side,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
+        label.setFixedSize(side, side)
+        label.setPixmap(shown)
 
     def _ask_external_pin(self) -> str | None:
         dialog = QDialog(self)
@@ -1963,6 +1963,7 @@ class MenuWindow(QMainWindow):
             proc = subprocess.Popen(
                 [
                     "ssh",
+                    "-tt",
                     "-o",
                     "StrictHostKeyChecking=accept-new",
                     "-o",
@@ -1978,9 +1979,7 @@ class MenuWindow(QMainWindow):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                bufsize=0,
             )
         except OSError:
             QTimer.singleShot(0, self._show_external_address)
@@ -1990,13 +1989,20 @@ class MenuWindow(QMainWindow):
         if stream is None:
             QTimer.singleShot(0, self._show_external_address)
             return
-        for line in stream:
-            if self._external_tunnel is not proc:
+        pending = b""
+        while self._external_tunnel is proc:
+            chunk = stream.read(256)
+            if not chunk:
                 break
-            found = re.search(r"https://[A-Za-z0-9.-]+\.lhr\.life", line)
-            if found is None or self._external_url:
+            pending += chunk
+            if self._external_url:
+                pending = b""
+                continue
+            found = re.search(r"https://[A-Za-z0-9.-]+\.lhr\.life", pending.decode("utf-8", errors="replace"))
+            if found is None:
                 continue
             self._external_url = found.group(0)
+            pending = b""
             QTimer.singleShot(0, self._show_external_address)
         if self._external_server is not None and not self._external_url:
             QTimer.singleShot(0, self._show_external_address)
