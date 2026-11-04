@@ -1942,7 +1942,7 @@ class MenuWindow(QMainWindow):
         for line in stream:
             if self._external_tunnel is not proc:
                 break
-            found = re.search(r"https://[A-Za-z0-9.-]+", line)
+            found = re.search(r"https://[A-Za-z0-9.-]+\.lhr\.life", line)
             if found is None or self._external_url:
                 continue
             self._external_url = found.group(0)
