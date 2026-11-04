@@ -123,6 +123,7 @@ button { font: inherit; padding: 0.4em 0.8em; }
 <button type="button" id="external_stop" disabled>停止</button>
 </div>
 <div id="external_ask" hidden></div>
+<p id="external_play" style="white-space: pre-wrap;"></p>
 <script>
 var state = document.getElementById("external_state");
 var pinField = document.getElementById("external_pin");
@@ -130,6 +131,7 @@ var pinButton = document.getElementById("external_pin_send");
 var gamesRow = document.getElementById("external_games_row");
 var games = document.getElementById("external_games");
 var askBox = document.getElementById("external_ask");
+var playBox = document.getElementById("external_play");
 var buttons = {
     autoplay: document.getElementById("external_autoplay"),
     end: document.getElementById("external_end"),
@@ -214,6 +216,7 @@ function show(body) {
     opened = open;
     if (open) applyAsk(body ? body.ask : null);
     else applyAsk(null);
+    applyPlay(body);
 }
 function send(action, extra) {
     var payload = extra || {action: action};
@@ -245,7 +248,16 @@ function refresh() {
             return;
         }
         applyAsk(body.ask);
+        applyPlay(body);
     });
+}
+function applyPlay(body) {
+    if (!playBox) return;
+    var lines = [];
+    if (body && body.play === "play") lines.push("プレイ");
+    else if (body && body.play === "end") lines.push("プレイ終了");
+    if (body && body.result) lines.push(body.result);
+    playBox.textContent = lines.join("\\n");
 }
 pinButton.addEventListener("click", function () {
     wrongPin = false;
@@ -627,6 +639,9 @@ class MenuWindow(QMainWindow):
         self._external_tsum = None
         self._external_url = ""
         self._external_tunnel = None
+        self._external_play = ""
+        self._external_result = ""
+        self._external_result_id = None
         self._external_poll = None
         self._external_arm = None
         self._activity = None
@@ -1390,6 +1405,17 @@ class MenuWindow(QMainWindow):
         if total is not None:
             self._play_games = int(total)
         self._show_play_count()
+        self._external_play = "play"
+
+    def _report_external_record(self, item: object) -> None:
+        if not isinstance(item, dict):
+            return
+        record_id = item.get("id")
+        same = record_id is not None and record_id == self._external_result_id
+        self._external_result_id = record_id
+        self._external_result = "".join(text for text, _right in _game_record_parts(item))
+        if not same:
+            self._external_play = "end"
 
     def _show_tsum_recognition(self, count: int) -> None:
         label = getattr(self, "_tsum_recognition", None)
@@ -2006,6 +2032,8 @@ class MenuWindow(QMainWindow):
             "open": bool(self._external_open),
             "games": games,
             "ask": self._external_tsum,
+            "play": self._external_play,
+            "result": self._external_result,
         }
         if ok is not None:
             body["ok"] = ok
@@ -3333,6 +3361,7 @@ def _start_match(window: MenuWindow) -> None:
     worker.recognized.connect(window._show_tsum_recognition)
     worker.flow.connect(window._set_flow_lamp)
     worker.recorded.connect(window._show_game_record)
+    worker.recorded.connect(window._report_external_record)
     worker.play_progress.connect(window._on_play_progress)
     worker.items.connect(window._on_play_items)
     worker.need_used_tsum.connect(window._on_need_used_tsum)
