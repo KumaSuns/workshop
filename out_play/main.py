@@ -640,6 +640,7 @@ class MenuWindow(QMainWindow):
         self._external_tsum = None
         self._external_url = ""
         self._external_tunnel = None
+        self._external_qr_timer = None
         self._external_play = ""
         self._external_tsum_line = ""
         self._external_result = ""
@@ -1003,12 +1004,9 @@ class MenuWindow(QMainWindow):
         self._tsum_body.setSpacing(0)
         self._center_square = QFrame()
         _soft_box(self._center_square)
-        square_layout = QVBoxLayout(self._center_square)
-        square_layout.setContentsMargins(0, 0, 0, 0)
-        square_layout.setSpacing(0)
-        self._square_qr = QLabel()
+        self._square_qr = QLabel(self._center_square)
         self._square_qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        square_layout.addWidget(self._square_qr)
+        self._square_qr.setScaledContents(True)
         square_column = QVBoxLayout()
         square_column.setContentsMargins(0, 0, 0, 0)
         square_column.setSpacing(0)
@@ -1884,14 +1882,14 @@ class MenuWindow(QMainWindow):
         if label is None or square is None:
             return
         url = self._external_page_url()
-        if not url:
+        rect = square.contentsRect()
+        if rect.width() < 1 or rect.height() < 1:
+            rect = square.rect()
+        label.setGeometry(rect)
+        if not url or rect.width() < 1 or rect.height() < 1:
             label.clear()
             return
-        side = square.width()
-        if side < 1:
-            side = square.contentsRect().width()
-        if side < 1:
-            return
+        side = min(rect.width(), rect.height())
         image = qrcode.make(url)
         buf = io.BytesIO()
         image.save(buf, format="PNG")
@@ -1903,7 +1901,6 @@ class MenuWindow(QMainWindow):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        label.setFixedSize(side, side)
         label.setPixmap(shown)
 
     def _ask_external_pin(self) -> str | None:
@@ -1956,6 +1953,12 @@ class MenuWindow(QMainWindow):
         self._external_server = server
         self._external_url = ""
         self._set_activity("外から開く住所を開いています")
+        timer = self._external_qr_timer
+        if timer is None:
+            timer = QTimer(self)
+            timer.timeout.connect(self._paint_square_qr)
+            self._external_qr_timer = timer
+        timer.start(500)
         threading.Thread(target=self._open_external_tunnel, daemon=True).start()
 
     def _open_external_tunnel(self) -> None:
@@ -1990,15 +1993,22 @@ class MenuWindow(QMainWindow):
             QTimer.singleShot(0, self._show_external_address)
             return
         pending = b""
+        fd = stream.fileno()
         while self._external_tunnel is proc:
-            chunk = stream.read(256)
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
             if not chunk:
                 break
             pending += chunk
             if self._external_url:
                 pending = b""
                 continue
-            found = re.search(r"https://[A-Za-z0-9.-]+\.lhr\.life", pending.decode("utf-8", errors="replace"))
+            found = re.search(
+                r"https://[A-Za-z0-9.-]+\.lhr\.life",
+                pending.decode("utf-8", errors="replace"),
+            )
             if found is None:
                 continue
             self._external_url = found.group(0)
@@ -2030,6 +2040,9 @@ class MenuWindow(QMainWindow):
             proc.kill()
 
     def _stop_external_server(self) -> None:
+        timer = self._external_qr_timer
+        if timer is not None:
+            timer.stop()
         self._stop_external_tunnel()
         self._paint_square_qr()
         server = self._external_server
@@ -2415,7 +2428,7 @@ class MenuWindow(QMainWindow):
     def _clear_tsum_frame(self) -> None:
         self._external_tsum = None
         self._unregister_tsum_hotkeys()
-        for layout in (self._tsum_body, self._tsum_actions):
+        for layout in (self._tsum_actions,):
             if layout is None:
                 continue
             while layout.count():
