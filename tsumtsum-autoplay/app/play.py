@@ -2283,6 +2283,8 @@ def run_play(
                     sorted(wait_times, reverse=True)[:3],
                     upload=True,
                     defer_coin=True,
+                    earned=shown_money["coin"],
+                    result_text=shown_money["result"],
                 )
                 watch_hit.clear()
                 duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
@@ -3020,6 +3022,8 @@ def run_play(
                         sorted(wait_times, reverse=True)[:3],
                         upload=True,
                         defer_coin=True,
+                        earned=shown_money["coin"],
+                        result_text=shown_money["result"],
                     )
                     duration = None if go_at is None else max(0, int(round(time.time() - go_at)))
                     waits = sorted(wait_times, reverse=True)[:3]
@@ -4654,13 +4658,27 @@ def _note_match_end(
     waits: list[float] | None = None,
     upload: bool = True,
     defer_coin: bool = False,
+    earned: str = "",
+    result_text: str = "",
 ) -> int:
     if skill_wait_empty:
         fill = _skill_fill(rgb, skill)
         if fill is not None and fill < SKILL_FILL_SPENT:
             skill_ok += 1
     if defer_coin:
-        record_play(clears, swipes, skill_taps, skill_ok, bomb_taps, fan_taps, None, waits)
+        earned_n = play_coin(earned) if earned else None
+        result_n = play_coin(result_text) if result_text else None
+        record_play(
+            clears,
+            swipes,
+            skill_taps,
+            skill_ok,
+            bomb_taps,
+            fan_taps,
+            earned_n,
+            waits,
+            result_coin=result_n,
+        )
         return skill_ok
     got = coin
     if not got:
