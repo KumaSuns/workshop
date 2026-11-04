@@ -102,8 +102,9 @@ EXTERNAL_HTML = """<!DOCTYPE html>
 <style>
 body { font: 16px sans-serif; margin: 1em; }
 .row { display: flex; gap: 0.5em; margin: 0.5em 0; }
-input { width: 6em; font: inherit; }
+input, select { font: inherit; }
 button { font: inherit; padding: 0.4em 0.8em; }
+#external_games { min-width: 5em; }
 </style>
 </head>
 <body>
@@ -112,25 +113,90 @@ button { font: inherit; padding: 0.4em 0.8em; }
 <input id="external_pin" type="text" inputmode="numeric" maxlength="4" autocomplete="off">
 <button type="button" id="external_pin_send">入力</button>
 </div>
+<div class="row" id="external_games_row" hidden>
+<label for="external_games">プレイ数</label>
+<select id="external_games"></select>
+</div>
 <div class="row">
 <button type="button" id="external_autoplay" disabled>オートプレイ</button>
 <button type="button" id="external_end" disabled>このプレイでやめる</button>
 <button type="button" id="external_stop" disabled>停止</button>
 </div>
+<div id="external_ask" hidden></div>
 <script>
 var state = document.getElementById("external_state");
 var pinField = document.getElementById("external_pin");
 var pinButton = document.getElementById("external_pin_send");
+var gamesRow = document.getElementById("external_games_row");
+var games = document.getElementById("external_games");
+var askBox = document.getElementById("external_ask");
 var buttons = {
     autoplay: document.getElementById("external_autoplay"),
     end: document.getElementById("external_end"),
     stop: document.getElementById("external_stop")
 };
 var wrongPin = false;
+var opened = false;
+var askKey = "";
+for (var n = 1; n <= 100; n++) {
+    var opt = document.createElement("option");
+    opt.value = String(n);
+    opt.textContent = String(n);
+    games.appendChild(opt);
+}
+var forever = document.createElement("option");
+forever.value = "∞";
+forever.textContent = "∞";
+games.appendChild(forever);
 function digits(value) {
     return String(value == null ? "" : value).replace(/[０-９]/g, function (ch) {
         return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
     }).replace(/\\D/g, "");
+}
+function buttonEl(label, run) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", run);
+    return button;
+}
+function applyAsk(ask) {
+    var key = ask ? JSON.stringify(ask) : "";
+    if (key === askKey) return;
+    askKey = key;
+    askBox.textContent = "";
+    if (!ask) {
+        askBox.hidden = true;
+        return;
+    }
+    askBox.hidden = false;
+    var line = document.createElement("p");
+    if (ask.kind === "guess") {
+        line.textContent = "使用ツムは " + ask.name + " ですか？";
+        askBox.appendChild(line);
+        var row = document.createElement("div");
+        row.className = "row";
+        row.appendChild(buttonEl("はい", function () { send("tsum_yes"); }));
+        row.appendChild(buttonEl("いいえ", function () { send("tsum_no"); }));
+        row.appendChild(buttonEl("やめる", function () { send("tsum_cancel"); }));
+        askBox.appendChild(row);
+        return;
+    }
+    line.textContent = "使用ツムはどれですか？";
+    askBox.appendChild(line);
+    var pick = document.createElement("select");
+    (ask.names || []).forEach(function (name) {
+        var item = document.createElement("option");
+        item.value = name;
+        item.textContent = name;
+        pick.appendChild(item);
+    });
+    askBox.appendChild(pick);
+    var listRow = document.createElement("div");
+    listRow.className = "row";
+    listRow.appendChild(buttonEl("これにします", function () { send("tsum_pick", {action: "tsum_pick", name: pick.value}); }));
+    listRow.appendChild(buttonEl("やめる", function () { send("tsum_cancel"); }));
+    askBox.appendChild(listRow);
 }
 function show(body) {
     if (wrongPin) return;
@@ -138,12 +204,20 @@ function show(body) {
     state.textContent = open ? "操作できます。" : "暗証番号を入力してください。";
     pinField.disabled = open;
     pinButton.disabled = open;
+    gamesRow.hidden = !open;
     buttons.autoplay.disabled = !open;
     buttons.end.disabled = !open;
     buttons.stop.disabled = !open;
+    if (open && !opened && body && body.games) {
+        games.value = body.games;
+    }
+    opened = open;
+    if (open) applyAsk(body ? body.ask : null);
+    else applyAsk(null);
 }
 function send(action, extra) {
     var payload = extra || {action: action};
+    if (action === "autoplay") payload = {action: "autoplay", games: games.value};
     fetch("/command", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -160,6 +234,19 @@ function send(action, extra) {
         show(body);
     });
 }
+function refresh() {
+    if (!opened) return;
+    fetch("/status").then(function (response) {
+        return response.json();
+    }).then(function (body) {
+        if (!(body && body.open)) {
+            opened = false;
+            show(body);
+            return;
+        }
+        applyAsk(body.ask);
+    });
+}
 pinButton.addEventListener("click", function () {
     wrongPin = false;
     send("pin", {action: "pin", pin: digits(pinField.value)});
@@ -173,6 +260,7 @@ pinField.addEventListener("keydown", function (event) {
 buttons.autoplay.addEventListener("click", function () { send("autoplay"); });
 buttons.end.addEventListener("click", function () { send("end"); });
 buttons.stop.addEventListener("click", function () { send("stop"); });
+setInterval(refresh, 1000);
 </script>
 </body>
 </html>
@@ -536,6 +624,7 @@ class MenuWindow(QMainWindow):
         self._external_buffers = {}
         self._external_pin = ""
         self._external_open = False
+        self._external_tsum = None
         self._external_poll = None
         self._external_arm = None
         self._activity = None
@@ -1835,6 +1924,33 @@ class MenuWindow(QMainWindow):
     def _external_page_url(self) -> str:
         return f"http://{_external_host()}:{EXTERNAL_PORT}/"
 
+    def _external_body(self, ok: bool | None = None) -> dict:
+        games = ""
+        box = self._center_input
+        if box is not None:
+            games = box.currentText().strip()
+        body = {
+            "on": True,
+            "open": bool(self._external_open),
+            "games": games,
+            "ask": self._external_tsum,
+        }
+        if ok is not None:
+            body["ok"] = ok
+        return body
+
+    def _set_external_games(self, text: str) -> bool:
+        box = self._center_input
+        if box is None:
+            return False
+        if text != "∞" and not (text.isdigit() and 1 <= int(text) <= 100):
+            return False
+        index = box.findText(text)
+        if index < 0:
+            return False
+        box.setCurrentIndex(index)
+        return True
+
     def _external_reply(self, socket, status: str, body, content_type: str | None = None) -> None:
         if isinstance(body, dict):
             raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -1894,7 +2010,7 @@ class MenuWindow(QMainWindow):
             )
             return
         if method == "GET" and path == "/status":
-            self._external_reply(socket, "200 OK", {"on": True, "open": self._external_open})
+            self._external_reply(socket, "200 OK", self._external_body())
             return
         if method == "POST" and path == "/command":
             try:
@@ -1906,25 +2022,53 @@ class MenuWindow(QMainWindow):
             if action == "pin":
                 pin = _ascii_digits(str(payload.get("pin") or ""))
                 self._external_open = pin == self._external_pin and len(pin) == 4
-                self._external_reply(
-                    socket,
-                    "200 OK",
-                    {"ok": self._external_open, "open": self._external_open},
-                )
+                body_out = self._external_body(self._external_open)
+                self._external_reply(socket, "200 OK", body_out)
                 return
             if not self._external_open:
                 self._external_reply(socket, "200 OK", {"ok": False, "open": False})
                 return
             if action == "autoplay":
+                games = str(payload.get("games") or "").strip()
+                if games and not self._set_external_games(games):
+                    failed = self._external_body(False)
+                    failed["error"] = "プレイ数がありません。"
+                    self._external_reply(socket, "200 OK", failed)
+                    return
                 self._on_autoplay()
             elif action == "end":
                 self._end_after_this_play()
             elif action == "stop":
                 self._stop_play()
+            elif action == "tsum_yes":
+                ask = self._external_tsum
+                if not isinstance(ask, dict) or ask.get("kind") != "guess":
+                    self._external_reply(socket, "200 OK", self._external_body(False))
+                    return
+                self._accept_used_tsum(str(ask.get("name") or ""), None)
+            elif action == "tsum_no":
+                ask = self._external_tsum
+                if not isinstance(ask, dict) or ask.get("kind") != "guess":
+                    self._external_reply(socket, "200 OK", self._external_body(False))
+                    return
+                self._show_tsum_list(str(ask.get("name") or ""))
+            elif action == "tsum_cancel":
+                if not self._external_tsum:
+                    self._external_reply(socket, "200 OK", self._external_body(False))
+                    return
+                self._cancel_used_tsum()
+            elif action == "tsum_pick":
+                ask = self._external_tsum
+                name = str(payload.get("name") or "")
+                names = ask.get("names") if isinstance(ask, dict) else None
+                if not isinstance(names, list) or name not in names:
+                    self._external_reply(socket, "200 OK", self._external_body(False))
+                    return
+                self._accept_used_tsum(name, None)
             else:
                 self._external_reply(socket, "400 Bad Request", {"ok": False, "error": "不明な操作です"})
                 return
-            self._external_reply(socket, "200 OK", {"ok": True, "open": True})
+            self._external_reply(socket, "200 OK", self._external_body(True))
             return
         self._external_reply(socket, "404 Not Found", {"ok": False})
 
@@ -2124,6 +2268,7 @@ class MenuWindow(QMainWindow):
         self._show_tsum_guess(guess)
 
     def _clear_tsum_frame(self) -> None:
+        self._external_tsum = None
         self._unregister_tsum_hotkeys()
         for layout in (self._tsum_body, self._tsum_actions):
             if layout is None:
@@ -2286,6 +2431,7 @@ class MenuWindow(QMainWindow):
     def _show_tsum_guess(self, guess: str) -> None:
         self._set_activity("使用ツムの問いに答えてください")
         self._clear_tsum_frame()
+        self._external_tsum = {"kind": "guess", "name": guess}
         layout = self._begin_tsum_window()
         layout.addWidget(self._tsum_question(f"使用ツムは {guess} ですか？"))
         buttons = (
@@ -2318,6 +2464,7 @@ class MenuWindow(QMainWindow):
         if skip_name:
             names = [name for name in names if name != skip_name]
         self._clear_tsum_frame()
+        self._external_tsum = {"kind": "list", "names": names}
         layout = self._begin_tsum_window()
         question = self._tsum_question("使用ツムはどれですか？")
         layout.addWidget(question)
