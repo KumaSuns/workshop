@@ -48,8 +48,16 @@ from app.intro import (
     _slow_tap,
 )
 from app.cinderella_skill import run_cinderella_skill
+from app.cruella_skill import run_cruella_skill
 from app.elsa_skill import run_elsa_skill
-from app.namine_skill import run_namine_skill
+from app.namine_skill import (
+    _SKILL_SEC,
+    _is_sora,
+    _namine_face,
+    _other_kind,
+    _others_became_sora,
+    namine_skill_step,
+)
 from app.skill_tsum import (
     _cbuzz_pose_on,
     _cbuzz_red_marks_on,
@@ -58,6 +66,7 @@ from app.skill_tsum import (
     skill_breaks_bombs,
     skill_is_cinderella,
     skill_is_cloud,
+    skill_is_cruella,
     skill_is_elsa,
     skill_is_gadget,
     skill_is_namine,
@@ -83,8 +92,10 @@ from app.play_style import (
     record_rl_length,
     record_rl_wait,
     flush_style,
+    record_reach,
     record_rl_bomb,
     record_rl_skill,
+    reach_ratio,
     set_last_play_coins,
     set_last_result_coin,
     should_bomb,
@@ -475,7 +486,16 @@ def run_play(
     tried_libs = False
     while True:
         try:
-            predictor, candidates = load_play_tools()
+            predictor, chain_best, gap_ratio = load_play_tools()
+            reach_now: list[float | None] = [None]
+
+            def candidates(pieces, limit=8):
+                return chain_best(
+                    pieces,
+                    limit,
+                    reach_ratio=reach_now[0],
+                    expand=False,
+                )
             break
         except ModuleNotFoundError as exc:
             missing = (exc.name or "").split(".", 1)[0]
@@ -534,6 +554,11 @@ def run_play(
     skip_loss = False
     skill_busy = [False]
     skill_ring_hold = [False]
+    namine_until = 0.0
+    namine_circles = 0
+    namine_arm = False
+    namine_saw_face = False
+    namine_bombs: list[dict] = []
     pooh_long = False
     bomb_after_long = False
     last_fan_at = 0.0
@@ -560,7 +585,6 @@ def run_play(
     swipes = 0
     coin = 0
     earned_coin: int | None = None
-    coin_read_at = 0.0
     last_record_id: list[int | None] = [None]
     last_has_result = [False]
     skill_taps = 0
@@ -591,6 +615,7 @@ def run_play(
     pending_hud: list[tuple[str, str, bool]] = []
     last_boxes: dict[str, dict[str, int]] = {}
     pending_spots: list[tuple[int, int, int, tuple[float, float, float] | None]] | None = None
+    pending_reach: float | None = None
     pending_key: frozenset[tuple[int, int]] | None = None
     pending_n = 0
     pending_at = 0.0
@@ -607,14 +632,15 @@ def run_play(
         nonlocal game, skill, fever, fever_full_w, fever_seen, fever_cache, timer, fan, hud_ready
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
         nonlocal ignore_start_until, saw_board, board_told, end_told, odd_top_tapped, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
-        nonlocal clears, swipes, coin, earned_coin, coin_read_at, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
-        nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
+        nonlocal clears, swipes, coin, earned_coin, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
+        nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_reach, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
         nonlocal my_group, skill_face, my_vec, match_picks, idle_pick, idle_acc, idle_since
         nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
+        nonlocal namine_until, namine_circles, namine_arm, namine_saw_face
         nonlocal go_at, used_items, wait_times, pieces, tsums
         game = None
         skill = None
@@ -628,6 +654,11 @@ def run_play(
         last_skill_at = 0.0
         skill_wait_empty = False
         skill_ring_hold[0] = False
+        namine_until = 0.0
+        namine_circles = 0
+        namine_arm = False
+        namine_saw_face = False
+        namine_bombs.clear()
         skip_after_skill = False
         skip_loss = False
         skill_busy[0] = False
@@ -659,7 +690,6 @@ def run_play(
         earned_coin = None
         early_money["coin"] = ""
         early_money["result"] = ""
-        coin_read_at = 0.0
         skill_taps = 0
         skill_ok = 0
         skill_used = 0
@@ -687,6 +717,9 @@ def run_play(
         pending_lesson = None
         pending_hud = []
         last_boxes = {}
+        if pending_reach is not None and time.time() - pending_at >= 0.5:
+            record_reach(pending_reach, False)
+        pending_reach = None
         pending_spots = None
         pending_key = None
         pending_n = 0
@@ -712,6 +745,7 @@ def run_play(
         watch_hit.clear()
         watching.clear()
         _watcher_timeup[0] = False
+        _watcher_ended[0] = False
         if timeup_seen is not None:
             timeup_seen.clear()
         go_at = None
@@ -850,7 +884,7 @@ def run_play(
         set_my_lamp("off")
 
     def credit_pending(after=None, by_count: bool = False) -> bool:
-        nonlocal clears, skill_my_n
+        nonlocal clears, skill_my_n, pending_reach
         if pending_spots is None:
             return False
         if by_count:
@@ -861,12 +895,22 @@ def run_play(
             gone = not _spots_lingered(after, pending_spots)
         if not gone:
             return False
+        if pending_reach is not None:
+            record_reach(pending_reach, True)
+            pending_reach = None
         clears += max(1, int(pending_burst))
         if skill_saw_empty and pending_my_n > 0:
             skill_my_n += pending_my_n
         settle_pending(True)
         say(_counts_line(clears, swipes, coin))
         return True
+
+    def note_reach_left() -> None:
+        nonlocal pending_reach
+        if pending_reach is None or time.time() - pending_at < 0.5:
+            return
+        record_reach(pending_reach, False)
+        pending_reach = None
 
     def ask_bomb(sit: str, default: bool) -> bool:
         nonlocal bomb_asked, bomb_asked_sit
@@ -892,7 +936,11 @@ def run_play(
         if not bombs:
             return False
         if (
-            (skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum))
+            (
+                skill_breaks_bombs(used_tsum)
+                or skill_is_gadget(used_tsum)
+                or skill_is_namine(used_tsum)
+            )
             and len(bombs) <= 1
         ):
             return False
@@ -935,6 +983,19 @@ def run_play(
         return True
 
     def tap_bombs_after_chains(swipes_n: int, longest: int) -> None:
+        if skill_is_namine(used_tsum):
+            sit = skill_sit(False)
+            while True:
+                left = [
+                    piece
+                    for piece in _bombs_on_board(pieces, game)
+                    if _piece_cell(piece) not in skip_bomb_cells
+                ]
+                if len(left) <= 1:
+                    return
+                if not try_bomb(sit, force=True):
+                    return
+            return
         if swipes_n < 2 and longest < time_bomb_number(used_items):
             if swipes_n >= 1:
                 try_bomb(skill_sit(False), force=False)
@@ -959,7 +1020,10 @@ def run_play(
         nonlocal bomb_taps, last_bomb_at, bomb_after_long, skip_bomb_cells
         nonlocal fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at
         bombs = _bombs_on_board(pieces, game)
-        if len(bombs) < BOMB_MANY:
+        if skill_is_namine(used_tsum):
+            if len(bombs) <= 1:
+                return False
+        elif len(bombs) < BOMB_MANY:
             return False
         taps = _break_bombs_until_one(predictor, game, say, stop, watch_hit)
         if taps:
@@ -978,6 +1042,7 @@ def run_play(
         nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps, skill_used, press_counted
         nonlocal bomb_taps, last_bomb_at, skip_loss, pooh_long, swipes
         nonlocal skill_my_n, skill_saw_empty
+        nonlocal namine_until, namine_circles, namine_arm, namine_saw_face
 
         def note_used() -> None:
             nonlocal skill_used, press_counted
@@ -1042,31 +1107,95 @@ def run_play(
                 note_used()
                 return True
             if skill_is_namine(used_tsum):
-                done = run_namine_skill(
+                namine_until = 0.0
+                namine_circles = 0
+                namine_arm = True
+                namine_saw_face = False
+                skip_loss = True
+                note_used()
+                return True
+            if skill_is_cruella(used_tsum):
+                skip_loss = True
+
+                def find_three(found_pieces):
+                    tsums = [piece for piece in found_pieces if _is_tsum(piece)]
+                    if len(tsums) < 3:
+                        return []
+                    radii = [max(4, int(piece.get("r") or 12)) for piece in tsums]
+                    typical = sorted(radii)[len(radii) // 2]
+                    nearest: list[float] = []
+                    for index, piece in enumerate(tsums):
+                        ax, ay = int(piece["x"]), int(piece["y"])
+                        best = None
+                        for other_index, other in enumerate(tsums):
+                            if other_index == index:
+                                continue
+                            dist = math.hypot(int(other["x"]) - ax, int(other["y"]) - ay)
+                            if best is None or dist < best:
+                                best = dist
+                        if best:
+                            nearest.append(best)
+                    nearest.sort()
+                    spacing = nearest[len(nearest) // 2] if nearest else 0.0
+                    reach = typical * 2.6
+                    if 0 < spacing <= typical * 3.0:
+                        reach = max(reach, spacing * 1.32)
+                    reach = min(reach, typical * 2.9)
+                    min_dist = typical * 0.4
+                    xs = [int(piece["x"]) for piece in tsums]
+                    ys = [int(piece["y"]) for piece in tsums]
+                    groups = [int(piece.get("group") or 1) for piece in tsums]
+                    count = len(tsums)
+                    links: list[list[int]] = [[] for _ in range(count)]
+                    for left in range(count):
+                        for right in range(left + 1, count):
+                            if groups[right] != groups[left]:
+                                continue
+                            dist = math.hypot(xs[right] - xs[left], ys[right] - ys[left])
+                            if dist < min_dist or dist > reach:
+                                continue
+                            links[left].append(right)
+                            links[right].append(left)
+                    used: set[int] = set()
+                    chains = []
+                    for left in range(count):
+                        for mid in links[left]:
+                            for right in links[mid]:
+                                if right == left or left > right:
+                                    continue
+                                if left in used or mid in used or right in used:
+                                    continue
+                                vx1 = xs[mid] - xs[left]
+                                vy1 = ys[mid] - ys[left]
+                                vx2 = xs[right] - xs[mid]
+                                vy2 = ys[right] - ys[mid]
+                                denom = math.hypot(vx1, vy1) * math.hypot(vx2, vy2)
+                                if denom > 1e-6 and (vx1 * vx2 + vy1 * vy2) / denom < -0.5:
+                                    continue
+                                used.add(left)
+                                used.add(mid)
+                                used.add(right)
+                                chains.append([tsums[left], tsums[mid], tsums[right]])
+                    return chains
+
+                done_swipes, done_bombs = run_cruella_skill(
                     predict=lambda shot: predictor.predict_pieces(
                         Path("."), game, rgb=shot, inner=False
                     ),
                     game=game,
-                    my_group=my_group,
-                    before_pieces=list(pieces),
                     say=say,
                     stop=stop,
                     watch_hit=watch_hit,
                     preview=preview,
                     draw=_draw_plan,
                     gpu_lock=_gpu_lock,
+                    find_three=find_three,
                     skill_lamp=skill_lamp,
-                    find_my=lambda shot, found: _mytsum_group(
-                        predictor,
-                        _qimage_rgb(shot),
-                        [piece for piece in found if _is_tsum(piece)],
-                        skill,
-                    )[0],
                 )
-                if done is None:
-                    return False
-                skip_loss = True
-                swipes += done
+                swipes += done_swipes
+                bomb_taps += done_bombs
+                if done_bombs:
+                    last_bomb_at = time.time()
                 note_used()
                 return True
             if skill_is_cloud(used_tsum):
@@ -1304,6 +1433,7 @@ def run_play(
         extra: list[frozenset[tuple[int, int]]] | None = None,
         used_spots: set[tuple[int, int]] | None = None,
     ) -> list[list[dict[str, int]]]:
+        reach_now[0] = reach_ratio()
         gone = set(used_spots or ())
         live = [
             piece
@@ -1369,6 +1499,16 @@ def run_play(
     watching = Event()
     watch_hit = Event()
     stop_watch = Event()
+    _timeup_arm_hit[0] = watch_hit
+    _timeup_watching[0] = watching
+
+    def _on_grabbed(ok: bool, name: str) -> None:
+        if ok:
+            say("盤面を取り込みました" + (f" {name}" if name else ""))
+        else:
+            say("盤面を取り込めませんでした")
+
+    _grab_note[0] = _on_grabbed
 
     def arm_timeup() -> None:
         _ensure_timeup_app(watch_hit, watching)
@@ -1970,19 +2110,6 @@ def run_play(
             daemon=True,
         ).start()
 
-    def read_earned(frame_rgb, boxes) -> None:
-        nonlocal earned_coin
-        if frame_rgb is None or not boxes:
-            return
-        try:
-            with _gpu_lock:
-                text = _read_coin_key(predictor, frame_rgb, boxes, "coin")
-        except Exception:
-            return
-        kept = _kept_coin(text)
-        if kept is not None:
-            earned_coin = kept
-
     def publish(item: dict) -> None:
         record_id = item.get("id")
         last_record_id[0] = int(record_id) if record_id is not None else None
@@ -2040,6 +2167,7 @@ def run_play(
             roster = ["サリー", "ジャックN", "ゼロ", "パンプキンキング", "ブギー", "メイヤー"]
             join = ["ジャックN", "ゼロ"]
             limit = len(roster)
+        _grab_play["limit"] = int(limit)
         setter(limit, used_tsum, roster, join)
 
     def _settle_after_timeup(
@@ -2084,6 +2212,8 @@ def run_play(
                 board_told = True
                 if note_board is not None:
                     note_board()
+            _grab_play["name"] = str(used_tsum or "")
+            _grab_play["named"] = bool(use_named)
             _sync_named()
             if next_frame is not None:
                 image, rgb = next_frame
@@ -2205,9 +2335,6 @@ def run_play(
             )
             if saw_board and not play_hud and not on_pause:
                 note_scene_money(rgb)
-            if play_hud and time.time() >= coin_read_at:
-                coin_read_at = time.time() + 1.0
-                read_earned(rgb, last_boxes)
             retry_now = (
                 saw_board
                 and image is not None
@@ -2239,8 +2366,12 @@ def run_play(
                 (model_hit and (saw_timer or timer_left == 0))
                 or (watch_hit.is_set() and (timer_left == 0 or board_left))
             )
-            if retry_now or timeup_now:
+            if _watcher_ended[0] and saw_board:
+                _watcher_ended[0] = False
+                ended = True
+            elif retry_now or timeup_now:
                 credit_pending(rgb)
+                note_reach_left()
                 ended = _end_on_timeup(
                     predictor,
                     image,
@@ -2267,6 +2398,7 @@ def run_play(
                     if note_end is not None:
                         note_end()
                 credit_pending(rgb)
+                note_reach_left()
                 if not play_hud:
                     note_scene_money(rgb)
                 coin_text, result_text = _watch_money_screens(predictor, say, stop)
@@ -2280,8 +2412,6 @@ def run_play(
                 flush_idle(True)
                 flush_bomb()
                 flush_skill()
-                if play_hud and not retry_now:
-                    read_earned(rgb, last_boxes)
                 _note_match_end(
                     predictor,
                     rgb,
@@ -2472,10 +2602,8 @@ def run_play(
                 )
             )
             # 落ち待ちが無いときは盤面予測の前に押す判断をする
-            if (
-                skill_now
-                and not skill_is_namine(used_tsum)
-                and (not skill_is_gadget(used_tsum) or not gadget_fall_pending)
+            if skill_now and (
+                not skill_is_gadget(used_tsum) or not gadget_fall_pending
             ):
                 if (
                     not skill_is_gadget(used_tsum)
@@ -2501,6 +2629,13 @@ def run_play(
             _check_stop(stop)
             if credit_pending(by_count=True):
                 erased_now = True
+            if (
+                not erased_now
+                and pending_reach is not None
+                and time.time() - pending_at >= 0.5
+            ):
+                record_reach(pending_reach, False)
+                pending_reach = None
             fan_fall_n, fan_fall_moved, _fall_settled = _note_fall(
                 len(tsums), erased_now, fan_fall_n, fan_fall_moved
             )
@@ -2512,6 +2647,54 @@ def run_play(
             look_mytsum()
             tick_skill_count()
             board_bombs[0] = len(_bombs_on_board(pieces, game))
+            if skill_is_namine(used_tsum) and namine_arm and namine_until <= 0:
+                if _namine_face(rgb, game):
+                    namine_saw_face = True
+                    continue
+                if namine_saw_face and _others_became_sora(tsums, my_group):
+                    namine_arm = False
+                    namine_saw_face = False
+                    namine_until = time.time() + _SKILL_SEC
+                    namine_circles = 0
+                    if skill_lamp is not None:
+                        skill_lamp(True)
+                elif namine_saw_face and not _other_kind(tsums, my_group):
+                    continue
+            if namine_until <= 0:
+                seen_bombs = _bombs_on_board(pieces, game)
+                if seen_bombs:
+                    namine_bombs.clear()
+                    namine_bombs.extend(seen_bombs)
+            if namine_until > 0 and time.time() >= namine_until:
+                namine_until = 0.0
+                if skill_lamp is not None:
+                    skill_lamp(False)
+            elif namine_until > 0 and skill_is_namine(used_tsum):
+                if any(_is_sora(piece) for piece in tsums):
+                    while time.time() < namine_until:
+                        if (stop is not None and stop.is_set()) or watch_hit.is_set():
+                            break
+                        circled, tapped = namine_skill_step(
+                            image=image,
+                            pieces=pieces,
+                            game=game,
+                            my_group=my_group,
+                            say=say,
+                            stop=stop,
+                            watch_hit=watch_hit,
+                            bombs_ready=namine_bombs,
+                        )
+                        if tapped:
+                            bomb_taps += 1
+                            last_bomb_at = time.time()
+                        if not circled:
+                            break
+                        swipes += 1
+                        namine_circles += 1
+                    if time.time() >= namine_until:
+                        namine_until = 0.0
+                        if skill_lamp is not None:
+                            skill_lamp(False)
             # 落ち待ち中は、落ち判定の直後に押す
             if _gadget_may_press(_fall_settled):
                 gadget_bomb_fall = False
@@ -2602,6 +2785,9 @@ def run_play(
                     board = pieces
                     need_more = False
                     while queue or need_more:
+                        if _watcher_ended[0]:
+                            timeup = True
+                            break
                         skill_busy[0] = True
                         _check_stop(stop)
                         left_now = _read_timer(None, rgb, timer)
@@ -2903,6 +3089,9 @@ def run_play(
                     if pending_spots is not None:
                         extra = pending_burst + burst
                         extra_my = pending_my_n + burst_my_n
+                    if pending_reach is not None and time.time() - pending_at >= 0.5:
+                        record_reach(pending_reach, False)
+                    pending_reach = gap_ratio(last_chain, pieces)
                     pending_spots = _chain_spots(rgb, last_chain)
                     pending_key = _chain_key(last_chain)
                     pending_n = len(tsums)
@@ -2919,6 +3108,10 @@ def run_play(
                     gadget_fall_at = time.time()
                 if last_chain is not None and preview is not None:
                     preview(_draw_plan(image, pieces, last_chain, game))
+                if _watcher_ended[0] and saw_board:
+                    _watcher_ended[0] = False
+                    timeup = True
+                    timeup_ended = True
                 if timeup:
                     timeup = True
                     if not timeup_ended:
@@ -2985,6 +3178,7 @@ def run_play(
                         if note_end is not None:
                             note_end()
                     credit_pending(check_rgb)
+                    note_reach_left()
                     if check_rgb is not None:
                         note_scene_money(check_rgb)
                     coin_text, result_text = _watch_money_screens(predictor, say, stop)
@@ -2998,8 +3192,6 @@ def run_play(
                     flush_idle(True)
                     flush_bomb()
                     flush_skill()
-                    if check is not None and not check.isNull() and _in_play_hud(check) and not retry_on_check:
-                        read_earned(check_rgb, last_boxes)
                     _note_match_end(
                         predictor,
                         check_rgb,
@@ -3123,6 +3315,8 @@ def run_play(
             continue
     finally:
         _watcher_timeup[0] = False
+        _watcher_ended[0] = False
+        _grab_note[0] = None
         grab_done.set()
         checker_alive[0] = False
         _stop_timeup_app()
@@ -4425,7 +4619,12 @@ def _qimage_rgb(image: QImage):
 
 
 _timeup_proc: list[subprocess.Popen | None] = [None]
+_timeup_arm_hit: list = [None]
+_timeup_watching: list = [None]
+_grab_note: list = [None]
+_grab_play: dict[str, object] = {"name": "", "named": False, "limit": 0}
 _watcher_timeup: list[bool] = [False]
+_watcher_ended: list[bool] = [False]
 
 
 def _ensure_timeup_app(hit: Event, watching: Event) -> None:
@@ -4437,6 +4636,7 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
     proc = subprocess.Popen(
         [sys.executable, str(script)],
         cwd=str(script.parent),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         creationflags=flags,
@@ -4448,11 +4648,46 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
         if out is None:
             return
         for line in out:
-            if line.strip() == b"TIMEUP" and watching.is_set():
+            text = line.strip()
+            if text == b"ENDED" and watching.is_set():
+                _watcher_ended[0] = True
+                continue
+            if text == b"TIMEUP" and watching.is_set():
                 hit.set()
                 _watcher_timeup[0] = True
+                continue
+            if text == b"GRAB_FAIL" or text.startswith(b"GRABBED"):
+                ok = text.startswith(b"GRABBED")
+                grabbed = ""
+                if ok:
+                    grabbed = text[len(b"GRABBED") :].strip().decode("utf-8", "replace")
+                note = _grab_note[0]
+                if note is not None:
+                    note(ok, grabbed)
 
     Thread(target=read, daemon=True).start()
+
+
+def request_board_grab() -> bool:
+    hit = _timeup_arm_hit[0]
+    watching = _timeup_watching[0]
+    if not isinstance(hit, Event) or not isinstance(watching, Event):
+        return False
+    _ensure_timeup_app(hit, watching)
+    proc = _timeup_proc[0]
+    if proc is None or proc.poll() is not None or proc.stdin is None:
+        return False
+    name = str(_grab_play.get("name") or "")
+    named = "1" if _grab_play.get("named") else "0"
+    limit = int(_grab_play.get("limit") or 0)
+    safe_name = name.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+    line = f"GRAB\t{safe_name}\t{named}\t{limit}\n"
+    try:
+        proc.stdin.write(line.encode("utf-8"))
+        proc.stdin.flush()
+    except Exception:
+        return False
+    return True
 
 
 def _stop_timeup_app() -> None:

@@ -40,6 +40,7 @@ from app.intro import (
     _highscore_close_button,
     _in_play_hud,
     _is_extend_dialog,
+    _dice_board,
     _match_start_button,
     _pause_continue_button,
     _play_button,
@@ -512,7 +513,6 @@ def run_play(
     swipes = 0
     coin = 0
     shown_money = {"coin": "", "result": ""}
-    coin_read_at = 0.0
     earned_now = [""]
     timeup_lit = [False]
     watcher_told = [False]
@@ -568,7 +568,7 @@ def run_play(
         nonlocal idle_cap, idle_pred, idle_heat, idle_type, idle_find, idle_act
         nonlocal bomb_pick, bomb_acc, bomb_asked, bomb_asked_sit
         nonlocal skill_pick, skill_acc
-        nonlocal go_at, used_items, wait_times, pieces, tsums, coin_read_at
+        nonlocal go_at, used_items, wait_times, pieces, tsums
         nonlocal last_named, last_close_at
         game = None
         skill = None
@@ -660,10 +660,10 @@ def run_play(
         nightmare_dice.update(_nightmare_blank())
         last_named = ""
         named_confused_pairs.clear()
-        coin_read_at = 0.0
         watch_hit.clear()
         watching.clear()
         _watcher_timeup[0] = False
+        _watcher_ended[0] = False
         watcher_told[0] = False
         if timeup_seen is not None:
             timeup_seen.clear()
@@ -845,7 +845,11 @@ def run_play(
         if not bombs:
             return False
         if (
-            (skill_breaks_bombs(used_tsum) or skill_is_gadget(used_tsum))
+            (
+                skill_breaks_bombs(used_tsum)
+                or skill_is_gadget(used_tsum)
+                or skill_is_namine(used_tsum)
+            )
             and len(bombs) <= 1
         ):
             return False
@@ -888,6 +892,19 @@ def run_play(
         return True
 
     def tap_bombs_after_chains(swipes_n: int, longest: int) -> None:
+        if skill_is_namine(used_tsum):
+            sit = skill_sit(False)
+            while True:
+                left = [
+                    piece
+                    for piece in _bombs_on_board(pieces, game)
+                    if _piece_cell(piece) not in skip_bomb_cells
+                ]
+                if len(left) <= 1:
+                    return
+                if not try_bomb(sit, force=True):
+                    return
+            return
         if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
             return
         sit = skill_sit(False)
@@ -924,7 +941,10 @@ def run_play(
         nonlocal bomb_taps, last_bomb_at, bomb_after_long, skip_bomb_cells
         nonlocal fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at
         bombs = _bombs_on_board(pieces, game)
-        if len(bombs) < BOMB_MANY:
+        if skill_is_namine(used_tsum):
+            if len(bombs) <= 1:
+                return False
+        elif len(bombs) < BOMB_MANY:
             return False
         taps = _break_bombs_until_one(predictor, game, say, stop, watch_hit)
         if taps:
@@ -953,8 +973,14 @@ def run_play(
         if skill_pressed is None or not skill_pressed.is_set():
             return False
         skill_pressed.clear()
-        if watch_hit.is_set() or skill is None:
+        if skill is None:
             return False
+        if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+            return False
+        _skill_play[0] = True
+        watch_hit.clear()
+        _watcher_timeup[0] = False
+        show_timeup(False)
         if skill_wait_empty:
             fill = _skill_fill(rgb, skill)
             if fill is not None and fill < SKILL_FILL_SPENT:
@@ -1080,6 +1106,7 @@ def run_play(
             note_used()
             return True
         finally:
+            _skill_play[0] = False
             skill_busy[0] = False
 
     def take_timer() -> int | None:
@@ -1978,10 +2005,7 @@ def run_play(
             fever_on = _fever_playing(shot_rgb, game)
             meter_fever = _meter_fever_fill(shot_rgb, fever, skill, fan)
             left = _read_timer(predictor, shot_rgb, timer)
-            if _watcher_timeup[0] or watch_hit.is_set():
-                left = 0
-                last_left = 0
-            elif left is None:
+            if left is None:
                 left = last_left
             else:
                 last_left = left
@@ -2199,11 +2223,13 @@ def run_play(
             timer_running = timer_left is not None and timer_left > 0
             if timer_running:
                 saw_timer = True
-            if timer_running and not _watcher_timeup[0]:
-                if watch_hit.is_set():
+            if timer_running:
+                if watch_hit.is_set() or _watcher_timeup[0]:
                     watch_hit.clear()
-                show_timeup(False)
-            if _watcher_timeup[0] and not watcher_told[0]:
+                    _watcher_timeup[0] = False
+                    show_timeup(False)
+                    watcher_told[0] = False
+            elif _watcher_timeup[0] and timer_left == 0 and not watcher_told[0]:
                 watcher_told[0] = True
                 say("TIME UP")
                 if timeup_seen is not None:
@@ -2214,17 +2240,6 @@ def run_play(
                 and not image.isNull()
                 and _in_play_hud(image)
             )
-            if play_hud and time.time() >= coin_read_at:
-                coin_read_at = time.time() + 1.0
-                try:
-                    with _gpu_lock:
-                        text = _money_digits(
-                            _read_coin_key(predictor, rgb, last_boxes, "coin", save=False)
-                        )
-                except Exception:
-                    text = ""
-                if text:
-                    _publish_money("coin", text)
             if saw_board and not play_hud and not on_pause:
                 _note_scene_money(rgb)
             retry_now = (
@@ -2260,10 +2275,13 @@ def run_play(
                 (model_hit and (saw_timer or timer_left == 0))
                 or (
                     watch_hit.is_set()
-                    and (timer_left == 0 or board_left or _watcher_timeup[0])
+                    and (timer_left == 0 or board_left)
                 )
             )
-            if retry_now or timeup_now:
+            if _watcher_ended[0] and saw_board:
+                _watcher_ended[0] = False
+                ended = True
+            elif retry_now or timeup_now:
                 credit_pending(rgb)
                 ended = _end_on_timeup(
                     predictor,
@@ -2492,10 +2510,8 @@ def run_play(
                 )
             )
             # 落ち待ちが無いときは盤面予測の前に押す判断をする
-            if (
-                skill_now
-                and not skill_is_namine(used_tsum)
-                and (not skill_is_gadget(used_tsum) or not gadget_fall_pending)
+            if skill_now and (
+                not skill_is_gadget(used_tsum) or not gadget_fall_pending
             ):
                 if (
                     not skill_is_gadget(used_tsum)
@@ -2631,6 +2647,9 @@ def run_play(
                     board = pieces
                     need_more = False
                     while queue or need_more:
+                        if _watcher_ended[0]:
+                            timeup = True
+                            break
                         skill_busy[0] = True
                         _check_stop(stop)
                         left_now = _read_timer(None, rgb, timer)
@@ -2952,6 +2971,10 @@ def run_play(
                     gadget_fall_at = time.time()
                 if last_chain is not None and preview is not None:
                     preview(_draw_plan(image, pieces, last_chain, game))
+                if _watcher_ended[0] and saw_board:
+                    _watcher_ended[0] = False
+                    timeup = True
+                    timeup_ended = True
                 if timeup:
                     timeup = True
                     if not timeup_ended:
@@ -2963,9 +2986,9 @@ def run_play(
                             check_rgb = rgb
                         if _dismiss_extend_dialog(check, say, stop):
                             timeup = False
-                            if not _watcher_timeup[0]:
-                                watch_hit.clear()
-                                show_timeup(False)
+                            watch_hit.clear()
+                            _watcher_timeup[0] = False
+                            show_timeup(False)
                             continue
                         retry_on_check = (
                             check is not None
@@ -2991,9 +3014,9 @@ def run_play(
                                 say("TIME UP / " + _counts_line(clears, swipes))
                         elif _timer_still_running(check_rgb, timer):
                             timeup = False
-                            if not _watcher_timeup[0]:
-                                watch_hit.clear()
-                                show_timeup(False)
+                            watch_hit.clear()
+                            _watcher_timeup[0] = False
+                            show_timeup(False)
                             next_frame = (check, check_rgb)
                         elif not (
                             check is not None
@@ -3179,6 +3202,7 @@ def run_play(
         _scene_money_hook[0] = None
         _scene_money_read[0] = None
         _watcher_timeup[0] = False
+        _watcher_ended[0] = False
         grab_done.set()
         checker_alive[0] = False
         _stop_timeup_app()
@@ -4541,6 +4565,8 @@ _watch_digits: list[str] = ["", ""]
 _scene_money_hook: list = [None]
 _scene_money_read: list = [None]
 _watcher_timeup: list[bool] = [False]
+_watcher_ended: list[bool] = [False]
+_skill_play: list[bool] = [False]
 
 
 def _ensure_timeup_app(hit: Event, watching: Event) -> None:
@@ -4565,7 +4591,10 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
             return
         for line in out:
             text = line.strip()
-            if text == b"TIMEUP" and watching.is_set():
+            if text == b"ENDED" and watching.is_set():
+                _watcher_ended[0] = True
+                continue
+            if text == b"TIMEUP" and watching.is_set() and not _skill_play[0]:
                 hit.set()
                 _watcher_timeup[0] = True
                 note = _timeup_lamp[0]
@@ -4974,8 +5003,6 @@ def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
 
 def _read_timer(predictor, rgb, timer: dict[str, int] | None) -> int | None:
     del predictor
-    if _watcher_timeup[0]:
-        return 0
     if timer is None or rgb is None:
         return None
     width, height = rgb.size
@@ -5785,6 +5812,11 @@ def _click_start_or_continue(
             else:
                 say("続けるを検出しました")
             return kinds, locked, "continue", used_name, items
+        if _dice_board(image):
+            say("上部から少し下へずらします")
+            _swipe_top_down(image)
+            _sleep_stop(0.8, stop)
+            continue
         if not odd_top_tapped or stop_at_start:
             if not odd_top_tapped:
                 say("上部をクリックします")
@@ -5793,6 +5825,18 @@ def _click_start_or_continue(
             _sleep_stop(0.8, stop)
         _sleep_stop(0.4, stop)
     return kinds, locked, "", used_name, items
+
+
+def _swipe_top_down(image: QImage) -> None:
+    x = image.width() // 2
+    y0 = max(1, image.height() // 10)
+    y1 = min(image.height() - 1, y0 + max(24, image.height() // 10))
+    swipe_path(
+        [(x, y0), (x, (y0 + y1) // 2), (x, y1)],
+        duration_ms=300,
+        screen_w=image.width(),
+        screen_h=image.height(),
+    )
 
 
 def _tap_start_now(say: StatusFn, stop: Event | None) -> list[str] | None:

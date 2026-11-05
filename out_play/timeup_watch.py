@@ -1,11 +1,13 @@
-"""ゲーム画面を窓から見て、TIME UP だけを知らせる。マウスは動かさない。"""
+"""ゲーム画面を窓から見て、TIME UP と盤面の取り込みを行う。マウスは動かさない。"""
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 import time
 from pathlib import Path
+from queue import Empty, Queue
 
 from PIL import Image
 from PySide6.QtGui import QImage
@@ -14,6 +16,9 @@ from PySide6.QtWidgets import QApplication
 ROOT = Path(__file__).resolve().parent
 SCREEN = ROOT / "bundled" / "screen"
 TIMEUP_SCORE = 0.70
+SCENE_KIND_SCORE = 0.18
+_grab_queue: Queue = Queue()
+_board_tools: dict[str, object] = {"predictor": None, "save": None}
 
 
 def _load_scene():
@@ -87,24 +92,100 @@ def _rgb(image: QImage) -> Image.Image | None:
     return Image.frombytes("RGB", (width, height), b"".join(rows))
 
 
-def _seen(model, transform, classes, image: Image.Image) -> bool:
+def _look(model, transform, classes, image: Image.Image) -> str:
     import torch
 
     view = _portrait(image)
     tensor = transform(view).unsqueeze(0)
     with torch.no_grad():
         probs = torch.softmax(model(tensor), dim=1)[0]
+    best_name = ""
+    best_score = 0.0
+    for index, kind in enumerate(classes):
+        if index >= int(probs.numel()):
+            break
+        kind_score = float(probs[index].item())
+        if kind == "other" or kind_score <= best_score:
+            continue
+        best_name = kind
+        best_score = kind_score
+    if best_name in ("coin", "result") and best_score >= SCENE_KIND_SCORE:
+        return "ended"
     if "timeup" in classes:
-        index = classes.index("timeup")
+        timeup_index = classes.index("timeup")
     elif int(probs.numel()) >= 3:
-        index = 2
+        timeup_index = 2
     else:
-        return False
-    if index < 0 or index >= int(probs.numel()):
-        return False
-    score = float(probs[index].item())
-    top = int(probs.argmax().item()) == index
-    return top and score >= TIMEUP_SCORE
+        timeup_index = -1
+    if 0 <= timeup_index < int(probs.numel()):
+        timeup_score = float(probs[timeup_index].item())
+        if int(probs.argmax().item()) == timeup_index and timeup_score >= TIMEUP_SCORE:
+            return "timeup"
+    return ""
+
+
+def _emit(line: str) -> None:
+    sys.stdout.buffer.write((line + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
+def _read_commands() -> None:
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return
+        text = raw.decode("utf-8", "replace").strip()
+        if not text.startswith("GRAB"):
+            continue
+        parts = text.split("\t")
+        name = parts[1] if len(parts) > 1 else ""
+        named = len(parts) > 2 and parts[2] == "1"
+        limit = int(parts[3]) if len(parts) > 3 and parts[3].lstrip("-").isdigit() else 0
+        _grab_queue.put((name, named, limit))
+
+
+def _grab_board(capture, name: str, named: bool, limit: int) -> None:
+    try:
+        if _board_tools["predictor"] is None:
+            from app.trainer_bridge import load_play_tools, save_play_board
+
+            predictor, _chain, _gap = load_play_tools()
+            _board_tools["predictor"] = predictor
+            _board_tools["save"] = save_play_board
+        predictor = _board_tools["predictor"]
+        save = _board_tools["save"]
+        if named:
+            path = Path(predictor.models_dir) / "named_tsum_test.pt"
+            if not predictor.use_named_tsum_model(path):
+                _emit("GRAB_FAIL")
+                return
+            prepare = getattr(predictor, "prepare_named", None)
+            if prepare is not None and name:
+                prepare(int(limit or 0), name)
+        frame = capture()
+        rgb = None if frame is None else _rgb(frame)
+        if frame is None or frame.isNull() or rgb is None:
+            _emit("GRAB_FAIL")
+            return
+        boxes = predictor.predict_all(Path("."), rgb=rgb)
+        game = boxes.get("game") if isinstance(boxes, dict) else None
+        pieces = []
+        if game is not None:
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False) or []
+        ok = save(
+            predictor,
+            frame,
+            game,
+            boxes=boxes if isinstance(boxes, dict) else None,
+            pieces=pieces,
+            rgb=rgb,
+        )
+        if ok:
+            _emit("GRABBED " + name)
+        else:
+            _emit("GRAB_FAIL")
+    except Exception:
+        _emit("GRAB_FAIL")
 
 
 def main() -> None:
@@ -130,6 +211,7 @@ def main() -> None:
     except Exception:
         return
     model.eval()
+    threading.Thread(target=_read_commands, daemon=True).start()
     transform = transforms.Compose(
         [
             transforms.Resize((scene.SCENE_INPUT, scene.SCENE_INPUT)),
@@ -137,10 +219,25 @@ def main() -> None:
             transforms.Normalize(scene.IMAGENET_MEAN, scene.IMAGENET_STD),
         ]
     )
+    money_on = False
     while True:
+        try:
+            job = _grab_queue.get_nowait()
+        except Empty:
+            job = None
+        if job is not None:
+            _grab_board(capture_window_frame, *job)
         frame = capture_window_frame()
         rgb = None if frame is None else _rgb(frame)
-        if rgb is not None and _seen(model, transform, classes, rgb):
+        label = "" if rgb is None else _look(model, transform, classes, rgb)
+        if label == "ended":
+            if not money_on:
+                print("ENDED", flush=True)
+            money_on = True
+            time.sleep(0.3)
+            continue
+        money_on = False
+        if label == "timeup":
             print("TIMEUP", flush=True)
             time.sleep(0.3)
         else:

@@ -129,6 +129,17 @@ def _scene_top(model, transform, classes, image: Image.Image) -> tuple[str, floa
     return name, score, timeup, scores
 
 
+def _money_ended(scores: dict[str, float]) -> bool:
+    best_name = ""
+    best_score = 0.0
+    for kind, kind_score in scores.items():
+        if kind == "other" or kind_score <= best_score:
+            continue
+        best_name = kind
+        best_score = kind_score
+    return best_name in ("coin", "result") and best_score >= SCENE_KIND_SCORE
+
+
 def _load_coin_readers():
     model_mod = _load_module("timeup_region_model", "model.py")
     digit_mod = _load_module("timeup_digit_model", "digit_model.py")
@@ -314,6 +325,7 @@ def main() -> None:
             transforms.Normalize(scene.IMAGENET_MEAN, scene.IMAGENET_STD),
         ]
     )
+    money_on = False
     while True:
         try:
             job = _grab_queue.get_nowait()
@@ -324,11 +336,20 @@ def main() -> None:
         frame = capture_window_frame()
         rgb = None if frame is None else _rgb(frame)
         if rgb is not None:
-            _name, _score, timeup, _scores = _scene_top(model, transform, classes, rgb)
+            _name, _score, timeup, scores = _scene_top(model, transform, classes, rgb)
+            if _money_ended(scores):
+                if not money_on:
+                    print("ENDED", flush=True)
+                money_on = True
+                time.sleep(0.3)
+                continue
+            money_on = False
             if timeup:
                 print("TIMEUP", flush=True)
                 time.sleep(0.3)
                 continue
+        else:
+            money_on = False
         time.sleep(0.35)
 
 
