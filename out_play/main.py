@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import io
 import json
 import os
@@ -3388,35 +3389,43 @@ def _tsum_about_text() -> str:
     except (OSError, json.JSONDecodeError, UnicodeError):
         raw_meta = None
     meta = raw_meta if isinstance(raw_meta, dict) else {}
-    lines: list[str] = []
+    blocks: list[str] = []
     for folder_id, name in payload.items():
         shown = str(name).strip() or str(folder_id)
-        lines.append(shown)
+        details: list[str] = []
         model_path = root / str(folder_id) / "model.json"
         if model_path.is_file():
-            lines.append("モデルがあります。")
+            details.append("モデルがあります。")
         else:
-            lines.append("モデルがありません。")
+            details.append("モデルがありません。")
         if _skill_during_condition(shown, str(folder_id)):
-            lines.append("スキル中の条件があります。")
+            details.append("スキル中の条件があります。")
         else:
-            lines.append("スキル中の条件はありません。")
+            details.append("スキル中の条件はありません。")
         info = meta.get(str(folder_id))
         if isinstance(info, dict):
             kind = _KIND_TEXT.get(str(info.get("kind") or ""), "")
             if kind:
-                lines.append(f"種類は{kind}です。")
+                details.append(f"種類は{kind}です。")
             else:
-                lines.append("種類は記録されていません。")
+                details.append("種類は記録されていません。")
             charm = info.get("charm")
             if charm is True:
-                lines.append("チャームツムです。")
+                details.append("チャームツムです。")
             elif charm is False:
-                lines.append("チャームツムではありません。")
+                details.append("チャームツムではありません。")
         else:
-            lines.append("種類は記録されていません。")
-        lines.append("")
-    return "\n".join(lines).strip()
+            details.append("種類は記録されていません。")
+        blocks.append(
+            '<table cellspacing="0" cellpadding="0" style="margin:0 0 1em 0;">'
+            "<tr><td "
+            f'style="color:{SURFACE_INK}; border-bottom:2px solid {SURFACE_LINE}; padding:0;">'
+            f"{html.escape(shown)}</td></tr></table>"
+            f'<p style="margin:0; color:{SURFACE_INK};">'
+            + "<br>".join(html.escape(line) for line in details)
+            + "</p>"
+        )
+    return "<br>".join(blocks)
 
 
 def _used_tsum_names() -> list[str]:
