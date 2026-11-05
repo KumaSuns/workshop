@@ -1083,30 +1083,18 @@ class MenuWindow(QMainWindow):
         if dialog is None:
             dialog = QDialog(self)
             dialog.setWindowTitle("ツムについて")
+            dialog.setWindowFlag(Qt.WindowType.Window, True)
+            dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            dialog.setModal(False)
             column = QVBoxLayout(dialog)
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            column.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
             label = QLabel()
-            label.setWordWrap(True)
-            label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            scroll.setWidget(label)
-            column.addWidget(scroll, 1)
+            column.addWidget(label)
             dialog._about_label = label
             self._tsum_about_window = dialog
         dialog._about_label.setText(_tsum_about_text())
-        if not dialog.isVisible():
-            screen = self.screen() or QApplication.primaryScreen()
-            if screen is not None:
-                area = screen.availableGeometry()
-                dialog._about_label.setMaximumWidth(max(1, area.width()))
-                dialog.setMaximumSize(area.size())
-                hint = dialog.sizeHint()
-                dialog.resize(
-                    max(1, min(hint.width(), area.width())),
-                    max(1, min(hint.height(), area.height())),
-                )
+        dialog.adjustSize()
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -2927,20 +2915,20 @@ class MenuWindow(QMainWindow):
             side = 1
         gap = full - side
         row = max(1, side // 5)
-        external_w = row
-        external = self._external_button
-        if external is not None:
-            external_w = external.fontMetrics().horizontalAdvance(external.text())
-            external_w += external.fontMetrics().height()
-            external_w = max(row, external_w)
+        side_w = row
+        for button in self._square_side_buttons:
+            text_w = button.fontMetrics().horizontalAdvance(button.text())
+            text_w += button.fontMetrics().height()
+            side_w = max(side_w, text_w)
         if TITLE_MARGIN + side + row > usable_h:
             room = max(1, usable_h - TITLE_MARGIN)
             side = max(1, room * 5 // 6)
             row = max(1, side // 5)
-            if external is not None:
-                external_w = max(row, external_w)
-        if gap + side + external_w > usable_w:
-            gap = max(0, usable_w - side - external_w)
+            side_w = max(side_w, row)
+        if side + side_w > usable_w:
+            side = max(1, usable_w - side_w)
+            row = max(1, side // 5)
+        gap = max(0, min(gap, usable_w - side - side_w))
         body = self._tsum_body
         if body is not None:
             body.setContentsMargins(gap, TITLE_MARGIN, 0, 0)
@@ -2948,11 +2936,10 @@ class MenuWindow(QMainWindow):
         under = self._square_under
         if under is not None:
             under.setFixedSize(side, row)
-        for index, button in enumerate(self._square_side_buttons):
-            if index == 0:
-                button.setFixedSize(external_w, row)
-            else:
-                button.setFixedSize(row, row)
+        for button in self._square_side_buttons:
+            text_w = button.fontMetrics().horizontalAdvance(button.text())
+            text_w += button.fontMetrics().height()
+            button.setFixedSize(max(row, text_w), row)
         self._paint_square_qr()
 
     def _fit_center(self) -> None:
