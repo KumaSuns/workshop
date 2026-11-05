@@ -184,7 +184,6 @@ class PlayWorker(QThread):
         self._used_named = False
         self.skill_pressed = Event()
         self.timeup_seen = Event()
-        self.grab_board = Event()
 
     def provide_kinds(self, kinds: int | None) -> None:
         self._kinds_answer = kinds
@@ -243,7 +242,6 @@ class PlayWorker(QThread):
                 named_line=self.named_tsums.emit,
                 named_confused=self.named_confused.emit,
                 timeup_lamp=self.timeup_lamp.emit,
-                grab_board=self.grab_board,
             )
         except Stopped:
             self.stopped.emit()
@@ -285,7 +283,6 @@ def run_play(
     named_line: Callable[[str], None] | None = None,
     named_confused: Callable[[object], None] | None = None,
     timeup_lamp: Callable[[bool], None] | None = None,
-    grab_board: Event | None = None,
 ) -> None:
     def say(text: str) -> None:
         if not SHOW_SWIPE_LINES and (
@@ -1244,11 +1241,29 @@ def run_play(
     def emit_gauges(_skill_fill: float | None) -> None:
         take_fever()
 
-    def _chain_pref(chain: list[dict[str, int]]) -> tuple:
-        return (
-            _chain_is_my(chain),
-            len(chain),
+    def _gadget_save_my() -> bool:
+        if not skill_is_gadget(used_tsum):
+            return False
+        left = latest_gauge[3]
+        return _gadget_skill_hold(
+            _fever_playing(rgb, game),
+            _meter_fever_fill(rgb, fever, skill, fan),
+            left,
         )
+
+    def _chain_pref(chain: list[dict[str, int]]) -> tuple:
+        mine = _chain_is_my(chain)
+        if _gadget_save_my():
+            return (not mine, len(chain))
+        return (mine, len(chain))
+
+    def _drop_my_chains(
+        found: list[list[dict[str, int]]],
+    ) -> list[list[dict[str, int]]]:
+        if not found or not _gadget_save_my():
+            return found
+        others = [item for item in found if not _chain_is_my(item)]
+        return others if others else found
 
     def list_found(
         pieces: list[dict[str, int]],
@@ -1290,7 +1305,7 @@ def run_play(
         if pooh_long:
             return found
         found.sort(key=_chain_pref, reverse=True)
-        return found
+        return _drop_my_chains(found)
     kinds_locked = False
     used_items: list[str] | None = start_items
     go_at: float | None = None
@@ -1317,6 +1332,16 @@ def run_play(
     watching = Event()
     watch_hit = Event()
     stop_watch = Event()
+    _timeup_arm_hit[0] = watch_hit
+    _timeup_watching[0] = watching
+
+    def _on_grabbed(ok: bool, name: str) -> None:
+        if ok:
+            say("盤面を取り込みました" + (f" {name}" if name else ""))
+        else:
+            say("盤面を取り込めませんでした")
+
+    _grab_note[0] = _on_grabbed
 
     def arm_timeup() -> None:
         _ensure_timeup_app(watch_hit, watching)
@@ -2048,6 +2073,9 @@ def run_play(
     try:
         while True:
             _check_stop(stop)
+            _grab_play["name"] = used_tsum
+            _grab_play["named"] = bool(use_named is not None and use_named())
+            _grab_play["inner"] = _groups_inner()
             _sync_named()
             coin_now = _watch_digits[0]
             result_now = _watch_digits[1]
@@ -2487,27 +2515,6 @@ def run_play(
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
-            if grab_board is not None and grab_board.is_set():
-                grab_board.clear()
-                hud = dict(last_boxes) if isinstance(last_boxes, dict) else {}
-                hud.update(_hud_boxes(game, skill, fever, timer, fan))
-                try:
-                    learned = save_play_board(
-                        predictor,
-                        image,
-                        game,
-                        boxes=hud,
-                        pieces=pieces,
-                        rgb=rgb,
-                        used_tsum=used_tsum,
-                        used_tsum_id=_used_tsum_folder(used_tsum),
-                    )
-                except Exception:
-                    learned = False
-                if learned:
-                    say("盤面を取り込みました" + (f" {used_tsum}" if used_tsum else ""))
-                else:
-                    say("盤面を取り込めませんでした")
             note_named(tsums)
             add_idle("pred", time.perf_counter() - t0)
             add_idle("heat", heat_s)
@@ -2533,12 +2540,20 @@ def run_play(
                 if skill_pressed is not None and skill_pressed.is_set():
                     if apply_checker_skill(False):
                         continue
-            if _gadget_fall_waiting(_fall_settled):
-                continue
+            waiting_clear = _gadget_fall_waiting(_fall_settled)
+            busy_spots: set[tuple[int, int]] | None = None
+            if waiting_clear:
+                busy_spots = set(pending_used)
+                if pending_spots is not None:
+                    for spot in pending_spots:
+                        busy_spots.add((int(spot[0]), int(spot[1])))
             pick_opts: list[int] = []
             pick_n = 0
             t0 = time.perf_counter()
-            found = list_found(pieces, tsums)
+            found = list_found(pieces, tsums, used_spots=busy_spots)
+            if waiting_clear and not found:
+                add_idle("find", time.perf_counter() - t0)
+                continue
             if found:
                 if pooh_long:
                     pick_opts = [len(item) for item in found]
@@ -2642,6 +2657,13 @@ def run_play(
                                     extra=burst_skip,
                                     used_spots=used,
                                 )
+                                if (
+                                    screen_swipes > 0
+                                    and more
+                                    and _gadget_save_my()
+                                    and all(_chain_is_my(item) for item in more)
+                                ):
+                                    more = []
                                 for item in more:
                                     key = _chain_key(item)
                                     if key in seen_keys:
@@ -4508,6 +4530,10 @@ def _qimage_rgb(image: QImage):
 
 
 _timeup_proc: list[subprocess.Popen | None] = [None]
+_timeup_arm_hit: list = [None]
+_timeup_watching: list = [None]
+_grab_note: list = [None]
+_grab_play: dict[str, object] = {"name": "", "named": False, "inner": True}
 _money_note: list = [None]
 _timeup_lamp: list = [None]
 _watch_money: list = [None]
@@ -4526,6 +4552,7 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
     proc = subprocess.Popen(
         [sys.executable, str(script)],
         cwd=str(script.parent),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         creationflags=flags,
@@ -4545,6 +4572,15 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
                 if note is not None:
                     note(True)
                 continue
+            if text == b"GRAB_FAIL" or text.startswith(b"GRABBED"):
+                ok = text.startswith(b"GRABBED")
+                grabbed = ""
+                if ok:
+                    grabbed = text[len(b"GRABBED") :].strip().decode("utf-8", "replace")
+                note = _grab_note[0]
+                if note is not None:
+                    note(ok, grabbed)
+                continue
             kind, _, digits = text.partition(b" ")
             if kind in (b"COIN", b"RESULT") and digits.isdigit():
                 shown = digits.decode()
@@ -4559,11 +4595,43 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
     Thread(target=read, daemon=True).start()
 
 
+def request_board_grab() -> bool:
+    hit = _timeup_arm_hit[0]
+    watching = _timeup_watching[0]
+    if not isinstance(hit, Event) or not isinstance(watching, Event):
+        return False
+    _ensure_timeup_app(hit, watching)
+    proc = _timeup_proc[0]
+    if proc is None or proc.poll() is not None or proc.stdin is None:
+        return False
+    name = str(_grab_play.get("name") or "")
+    folder = _used_tsum_folder(name)
+    named = "1" if _grab_play.get("named") else "0"
+    inner = "0" if _grab_play.get("inner") is False else "1"
+    safe_name = name.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+    safe_folder = folder.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+    line = f"GRAB\t{safe_name}\t{safe_folder}\t{named}\t{inner}\n"
+    try:
+        proc.stdin.write(line.encode("utf-8"))
+        proc.stdin.flush()
+    except Exception:
+        return False
+    return True
+
+
 def _stop_timeup_app() -> None:
     proc = _timeup_proc[0]
     _timeup_proc[0] = None
+    _timeup_arm_hit[0] = None
+    _timeup_watching[0] = None
+    _grab_note[0] = None
     if proc is None or proc.poll() is not None:
         return
+    if proc.stdin is not None:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
     proc.terminate()
     try:
         proc.wait(timeout=2)

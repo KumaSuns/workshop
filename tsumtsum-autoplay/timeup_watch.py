@@ -1,11 +1,13 @@
-"""ゲーム画面を窓から見て、TIME UP だけを知らせる。マウスは動かさない。"""
+"""ゲーム画面を窓から見て、TIME UP と盤面の取り込みを行う。マウスは動かさない。"""
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 import time
 from pathlib import Path
+from queue import Empty, Queue
 
 from PIL import Image
 from PySide6.QtGui import QImage
@@ -15,6 +17,8 @@ ROOT = Path(__file__).resolve().parent
 SCREEN = ROOT.parent / "tsumtsum-screen-recognition"
 TIMEUP_SCORE = 0.70
 SCENE_KIND_SCORE = 0.18
+_grab_queue: Queue = Queue()
+_board_tools: dict[str, object] = {"predictor": None, "save": None}
 
 
 def _load_scene():
@@ -211,6 +215,74 @@ def _read_money(readers, image: Image.Image, key: str) -> str:
     return "".join(char for char in str(text or "") if char.isdigit())
 
 
+def _emit(line: str) -> None:
+    sys.stdout.buffer.write((line + "\n").encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
+def _read_commands() -> None:
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            return
+        text = raw.decode("utf-8", "replace").strip()
+        if not text.startswith("GRAB"):
+            continue
+        parts = text.split("\t")
+        name = parts[1] if len(parts) > 1 else ""
+        folder = parts[2] if len(parts) > 2 else ""
+        named = len(parts) > 3 and parts[3] == "1"
+        inner = not (len(parts) > 4 and parts[4] == "0")
+        _grab_queue.put((name, folder, named, inner))
+
+
+def _grab_board(capture, name: str, folder: str, named: bool, inner: bool) -> None:
+    try:
+        if _board_tools["predictor"] is None:
+            from app.trainer_bridge import load_play_tools, save_play_board
+
+            predictor, _chain = load_play_tools()
+            _board_tools["predictor"] = predictor
+            _board_tools["save"] = save_play_board
+        predictor = _board_tools["predictor"]
+        save = _board_tools["save"]
+        if named:
+            path = Path(predictor.models_dir) / "named_tsum_test.pt"
+            if not predictor.use_named_tsum_model(path):
+                _emit("GRAB_FAIL")
+                return
+        else:
+            switch = getattr(predictor, "use_used_tsum_model", None)
+            if switch is not None:
+                switch(folder)
+        frame = capture()
+        rgb = None if frame is None else _rgb(frame)
+        if frame is None or frame.isNull() or rgb is None:
+            _emit("GRAB_FAIL")
+            return
+        boxes = predictor.predict_all(Path("."), rgb=rgb)
+        game = boxes.get("game") if isinstance(boxes, dict) else None
+        pieces = []
+        if game is not None:
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=inner) or []
+        ok = save(
+            predictor,
+            frame,
+            game,
+            boxes=boxes if isinstance(boxes, dict) else None,
+            pieces=pieces,
+            rgb=rgb,
+            used_tsum=name,
+            used_tsum_id=folder,
+        )
+        if ok:
+            _emit("GRABBED " + name)
+        else:
+            _emit("GRAB_FAIL")
+    except Exception:
+        _emit("GRAB_FAIL")
+
+
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     del app
@@ -234,6 +306,7 @@ def main() -> None:
     except Exception:
         return
     model.eval()
+    threading.Thread(target=_read_commands, daemon=True).start()
     transform = transforms.Compose(
         [
             transforms.Resize((scene.SCENE_INPUT, scene.SCENE_INPUT)),
@@ -242,6 +315,12 @@ def main() -> None:
         ]
     )
     while True:
+        try:
+            job = _grab_queue.get_nowait()
+        except Empty:
+            job = None
+        if job is not None:
+            _grab_board(capture_window_frame, *job)
         frame = capture_window_frame()
         rgb = None if frame is None else _rgb(frame)
         if rgb is not None:

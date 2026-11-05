@@ -387,9 +387,27 @@ class _GroupStripBody(QWidget):
         pieces: list[dict[str, int]],
         selected: int | None = None,
     ) -> None:
-        self._rows = []
+        self._pending_pieces = (pixmap, pieces, selected)
+        if getattr(self, "_filling_pieces", False):
+            return
+        self._filling_pieces = True
+        try:
+            while self._pending_pieces is not None:
+                pixmap, pieces, selected = self._pending_pieces
+                self._pending_pieces = None
+                self._fill_pieces(pixmap, pieces, selected)
+        finally:
+            self._filling_pieces = False
+
+    def _fill_pieces(
+        self,
+        pixmap: QPixmap | None,
+        pieces: list[dict[str, int]],
+        selected: int | None,
+    ) -> None:
         self._selected = selected
         if pixmap is None or pixmap.isNull() or not pieces:
+            self._rows = []
             self.setFixedSize(self.LABEL + self.CELL, self.CELL)
             self.update()
             return
@@ -397,20 +415,25 @@ class _GroupStripBody(QWidget):
         for index, piece in enumerate(pieces):
             key = "B" if piece.get("kind") == "bomb" else str(int(piece.get("group") or 1))
             grouped.setdefault(key, []).append((self._crop(pixmap, piece), index))
+            if (index + 1) % 12 == 0:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
         def sort_key(key: str) -> tuple[int, int]:
             if key == "B":
                 return (1, 0)
             return (0, int(key))
 
+        rows = []
         for key in sorted(grouped, key=sort_key):
             color = QColor("#FF5C5C") if key == "B" else QColor(tsum_group_color(int(key)))
-            self._rows.append((key, color, grouped[key]))
+            rows.append((key, color, grouped[key]))
+        self._rows = rows
         width = self.LABEL + self.COLS * (self.CELL + self.GAP)
         height = max(1, self._needed_height())
         if self.width() != width or self.height() != height:
             self.setFixedSize(width, height)
         self.update()
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def _crop(self, pixmap: QPixmap, piece: dict[str, int]) -> QPixmap:
         x, y, radius = int(piece["x"]), int(piece["y"]), max(8, int(piece.get("r") or 16))
@@ -2775,14 +2798,15 @@ class MainWindow(QMainWindow):
                 x = avail.x() + avail.width() - width
             x = max(avail.x(), x)
         self._group_window.setGeometry(x, frame.y(), width, frame.height())
+        self._group_window.show()
+        self._group_window.raise_()
+        self._group_window.activateWindow()
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         self._group_window.set_pieces(
             self.canvas.source_pixmap(),
             self.canvas.all_pieces(),
             selected=self.canvas.selected_piece_index(),
         )
-        self._group_window.show()
-        self._group_window.raise_()
-        self._group_window.activateWindow()
 
     def _remove_listed_piece(self, index: int) -> None:
         self.canvas.select_piece(index)
@@ -3599,6 +3623,7 @@ class MainWindow(QMainWindow):
             self._name_window.show()
             self._name_window.raise_()
             self._name_window.activateWindow()
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             self._refresh_saved_names()
             return
         self._name_window.hide()
@@ -3825,6 +3850,10 @@ class MainWindow(QMainWindow):
                     face = self._piece_face(pixmap, piece, 44)
                     if face.isNull():
                         continue
+                    if face_count % 8 == 0:
+                        QApplication.processEvents(
+                            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+                        )
                     label = _NamedFace(
                         face,
                         lambda sid=sample.id, g=key, x=int(piece["x"]), y=int(piece["y"]): self._exclude_named_piece(

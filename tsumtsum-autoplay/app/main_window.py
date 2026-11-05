@@ -105,6 +105,7 @@ from app.skill_tsum import (
 from app.play import (
     PlayWorker,
     read_kind_count,
+    request_board_grab,
     register_used_tsum_id,
     save_used_tsum_teach,
     used_tsum_names,
@@ -582,45 +583,66 @@ class MainWindow(QMainWindow):
         buttons = QVBoxLayout()
         buttons.setContentsMargins(0, 0, 0, 0)
         buttons.setSpacing(layout.spacing() // 2)
+        self._value_btns: list[QPushButton] = []
+
+        def add_pair(button: QPushButton) -> None:
+            number = len(self._value_btns) + 1
+            button.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                button.sizePolicy().verticalPolicy(),
+            )
+            pair = QPushButton(str(number))
+            pair.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                button.sizePolicy().verticalPolicy(),
+            )
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(buttons.spacing())
+            row.addWidget(button, 1)
+            row.addWidget(pair, 1)
+            buttons.addLayout(row)
+            self._value_btns.append(pair)
+
         self.settings_btn = QPushButton("設定")
         self.settings_btn.clicked.connect(self._open_swipe_settings)
-        buttons.addWidget(self.settings_btn)
+        add_pair(self.settings_btn)
         self.grab_board_btn = QPushButton("盤面を取り込む (F11)")
         self.grab_board_btn.clicked.connect(self.on_grab_board)
-        buttons.addWidget(self.grab_board_btn)
+        add_pair(self.grab_board_btn)
         self.grab_now_btn = QPushButton("盤面を取り込む (F9)")
         self.grab_now_btn.clicked.connect(self.on_grab_board)
-        buttons.addWidget(self.grab_now_btn)
+        add_pair(self.grab_now_btn)
         self.capture_btn = QPushButton("消す前の盤面を取り込む (F7)")
         self.capture_btn.setCheckable(True)
         self.capture_btn.toggled.connect(self._on_capture_toggled)
-        buttons.addWidget(self.capture_btn)
+        add_pair(self.capture_btn)
         self.skill_n_btn = QPushButton("スキル満タン個数")
         self.skill_n_btn.setCheckable(True)
         self.skill_n_btn.toggled.connect(self._on_skill_n_toggled)
-        buttons.addWidget(self.skill_n_btn)
+        add_pair(self.skill_n_btn)
         self.shot_btn = QPushButton("キャプチャー (F8)")
         self.shot_btn.clicked.connect(self.on_capture_screen)
-        buttons.addWidget(self.shot_btn)
+        add_pair(self.shot_btn)
         self.add_tsum_btn = QPushButton("ツムを追加")
         self.add_tsum_btn.clicked.connect(self._add_tsum)
-        buttons.addWidget(self.add_tsum_btn)
+        add_pair(self.add_tsum_btn)
         self.now_btn = QPushButton("今すぐプレイ (F5)")
         self.now_btn.clicked.connect(self.on_play_now)
-        buttons.addWidget(self.now_btn)
+        add_pair(self.now_btn)
         self.loop_btn = QPushButton("連続プレイ (F6)")
         self.loop_btn.clicked.connect(self.on_loop_play)
-        buttons.addWidget(self.loop_btn)
+        add_pair(self.loop_btn)
         self.record_btn = QPushButton("1プレイを録画")
         self.record_btn.clicked.connect(self.on_record_one)
-        buttons.addWidget(self.record_btn)
+        add_pair(self.record_btn)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.on_stop)
-        buttons.addWidget(self.stop_btn)
+        add_pair(self.stop_btn)
         self.shortcut_btn = QPushButton("起動アイコン作成")
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
-        buttons.addWidget(self.shortcut_btn)
+        add_pair(self.shortcut_btn)
         layout.addLayout(buttons)
         self.status_label = QLabel("待機中")
         self.status_label.setWordWrap(True)
@@ -737,7 +759,8 @@ class MainWindow(QMainWindow):
         if self._play is None or not self._play.isRunning():
             self._set_status("プレイ中ではありません")
             return
-        self._play.grab_board.set()
+        if not request_board_grab():
+            self._set_status("盤面を取り込めませんでした")
 
     def _add_tsum(self) -> None:
         self._register_used_tsum(None, title="ツムを追加", allow_skip=False)

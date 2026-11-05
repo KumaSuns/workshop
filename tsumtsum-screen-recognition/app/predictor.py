@@ -708,6 +708,32 @@ class Predictor:
         picked = torch.argmax(embed @ proto.index_select(0, choice).T, dim=1).tolist()
         return [indices[int(item)] for item in picked]
 
+    def _mark_named_unstable(
+        self,
+        embed: torch.Tensor,
+        tsums: list[dict[str, int]],
+        indices: list[int],
+        names: list[str],
+    ) -> None:
+        if len(indices) < 2 or self.named_prototypes is None:
+            for piece in tsums:
+                piece["name_unstable"] = False
+                piece["name_rival"] = ""
+            return
+        choice = torch.tensor(indices, device=self.named_prototypes.device, dtype=torch.long)
+        scores = embed @ self.named_prototypes.index_select(0, choice).T
+        top = torch.topk(scores, k=2, dim=1)
+        margins = (top.values[:, 0] - top.values[:, 1]).tolist()
+        seconds = top.indices[:, 1].tolist()
+        for piece, margin, second in zip(tsums, margins, seconds):
+            shaky = float(margin) < 0.08
+            piece["name_unstable"] = shaky
+            if shaky:
+                rival = indices[int(second)]
+                piece["name_rival"] = names[rival] if 0 <= rival < len(names) else ""
+            else:
+                piece["name_rival"] = ""
+
     def _assign_named_groups(self, image: Image.Image, tsums: list[dict[str, int]]) -> None:
         proto = self.named_prototypes
         names = self.named_names
@@ -722,10 +748,12 @@ class Predictor:
         open_names = self.named_open
         open_index = [self._named_index(name) for name in open_names]
         open_index = [index for index in open_index if index >= 0]
+        used_indices = open_index
         if self.named_fixed and open_index:
             labels = self._nearest_names(embed, open_index)
         else:
             labels = self._nearest_names(embed, list(range(len(names))))
+            used_indices = list(range(len(names)))
             if limit > 0:
                 counts: dict[int, int] = {}
                 for label in labels:
@@ -743,11 +771,13 @@ class Predictor:
                     allowed.append(int(label))
                 if allowed:
                     labels = self._nearest_names(embed, allowed)
+                    used_indices = allowed
                     open_names[:] = [
                         names[index]
                         for index in allowed
                         if 0 <= index < len(names) and names[index]
                     ]
+        self._mark_named_unstable(embed, tsums, used_indices, names)
         join_at = -1
         joined: list[int] = []
         if self.named_fixed and len(self.named_join) >= 2:
