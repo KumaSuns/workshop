@@ -1041,9 +1041,16 @@ class MenuWindow(QMainWindow):
         side_column.setSpacing(0)
         self._square_side_buttons = []
         for number in range(2, 7):
-            label = "外部操作" if number == 2 else str(number)
+            if number == 2:
+                label = "外部操作"
+            elif number == 6:
+                label = "ツムについて"
+            else:
+                label = str(number)
             button = QPushButton(label)
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            if number == 6:
+                button.clicked.connect(self._open_tsum_about)
             if number == 2:
                 button.setCheckable(True)
                 button.setStyleSheet(
@@ -1065,10 +1072,44 @@ class MenuWindow(QMainWindow):
         self._tsum_body.addLayout(square_row)
         right.addLayout(self._tsum_body, 1)
         self._top_square_host = right_box
+        self._tsum_about_window = None
         self._tsum_actions = QVBoxLayout()
         self._tsum_actions.setContentsMargins(0, 0, 0, 0)
         self._tsum_actions.setSpacing(0)
         right.addLayout(self._tsum_actions)
+
+    def _open_tsum_about(self) -> None:
+        dialog = self._tsum_about_window
+        if dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("ツムについて")
+            column = QVBoxLayout(dialog)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            label = QLabel()
+            label.setWordWrap(True)
+            label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            scroll.setWidget(label)
+            column.addWidget(scroll, 1)
+            dialog._about_label = label
+            self._tsum_about_window = dialog
+        dialog._about_label.setText(_tsum_about_text())
+        if not dialog.isVisible():
+            screen = self.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                dialog._about_label.setMaximumWidth(max(1, area.width()))
+                dialog.setMaximumSize(area.size())
+                hint = dialog.sizeHint()
+                dialog.resize(
+                    max(1, min(hint.width(), area.width())),
+                    max(1, min(hint.height(), area.height())),
+                )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _create_desktop_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(
@@ -3326,6 +3367,65 @@ def _start_play_here(window: MenuWindow, games: int | None) -> None:
         intro.start()
         return
     _start_match(window)
+
+
+_KIND_TEXT = {
+    "normal": "通常ツム",
+    "set": "セットツム",
+    "pair": "ペアツム",
+}
+
+
+def _tsum_about_text() -> str:
+    root = ROOT / "bundled" / "assets" / "models" / "use_tsum"
+    try:
+        payload = json.loads((root / "registry.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        payload = None
+    if not isinstance(payload, dict) or not payload:
+        return "使用ツムは登録されていません。"
+    try:
+        raw_meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        raw_meta = None
+    meta = raw_meta if isinstance(raw_meta, dict) else {}
+    lines: list[str] = []
+    for folder_id, name in payload.items():
+        shown = str(name).strip() or str(folder_id)
+        lines.append(shown)
+        model_path = root / str(folder_id) / "model.json"
+        count = None
+        readable = False
+        if model_path.is_file():
+            try:
+                model = json.loads(model_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                model = None
+            readable = isinstance(model, dict)
+            if readable and isinstance(model.get("sample_count"), int):
+                count = int(model["sample_count"])
+        if not model_path.is_file():
+            lines.append("モデルがありません。")
+        elif count is None:
+            lines.append("モデルはありますが、学習枚数は読めません。")
+        else:
+            lines.append(f"モデルがあります。学習に使った画像は {count} 枚です。")
+        info = meta.get(str(folder_id))
+        if isinstance(info, dict):
+            kind = _KIND_TEXT.get(str(info.get("kind") or ""), "")
+            if kind:
+                lines.append(f"種類は{kind}です。")
+            else:
+                lines.append("種類は記録されていません。")
+            charm = info.get("charm")
+            if charm is True:
+                lines.append("チャームツムです。")
+            elif charm is False:
+                lines.append("チャームツムではありません。")
+        else:
+            lines.append("種類は記録されていません。")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _used_tsum_names() -> list[str]:
