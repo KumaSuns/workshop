@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QRadioButton,
@@ -1083,21 +1084,36 @@ class MenuWindow(QMainWindow):
         if dialog is None:
             dialog = QDialog(self)
             dialog.setWindowTitle("ツムについて")
-            dialog.setWindowFlag(Qt.WindowType.Window, True)
-            dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-            dialog.setModal(False)
+            dialog.setWindowFlags(
+                Qt.WindowType.Dialog
+                | Qt.WindowType.Window
+                | Qt.WindowType.WindowStaysOnTopHint
+            )
+            dialog.setModal(True)
             column = QVBoxLayout(dialog)
-            column.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
-            label = QLabel()
-            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            column.addWidget(label)
-            dialog._about_label = label
+            text = QPlainTextEdit()
+            text.setReadOnly(True)
+            column.addWidget(text)
+            dialog._about_text = text
             self._tsum_about_window = dialog
-        dialog._about_label.setText(_tsum_about_text())
-        dialog.adjustSize()
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
+        dialog._about_text.setPlainText(_tsum_about_text())
+        screen = self.screen() or QApplication.primaryScreen()
+        area = None if screen is None else screen.availableGeometry()
+        metrics = dialog._about_text.fontMetrics()
+        lines = dialog._about_text.toPlainText().splitlines() or [""]
+        text_w = max(metrics.horizontalAdvance(line) for line in lines)
+        text_w += metrics.horizontalAdvance("あ") * 2
+        text_h = metrics.lineSpacing() * len(lines) + metrics.height() * 2
+        if area is not None:
+            dialog.resize(
+                max(1, min(text_w, area.width())),
+                max(1, min(text_h, area.height())),
+            )
+            dialog.move(
+                area.x() + max(0, (area.width() - dialog.width()) // 2),
+                area.y() + max(0, (area.height() - dialog.height()) // 2),
+            )
+        dialog.exec()
 
     def _create_desktop_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(
@@ -2917,9 +2933,7 @@ class MenuWindow(QMainWindow):
         row = max(1, side // 5)
         side_w = row
         for button in self._square_side_buttons:
-            text_w = button.fontMetrics().horizontalAdvance(button.text())
-            text_w += button.fontMetrics().height()
-            side_w = max(side_w, text_w)
+            side_w = max(side_w, button.sizeHint().width())
         if TITLE_MARGIN + side + row > usable_h:
             room = max(1, usable_h - TITLE_MARGIN)
             side = max(1, room * 5 // 6)
@@ -2937,9 +2951,7 @@ class MenuWindow(QMainWindow):
         if under is not None:
             under.setFixedSize(side, row)
         for button in self._square_side_buttons:
-            text_w = button.fontMetrics().horizontalAdvance(button.text())
-            text_w += button.fontMetrics().height()
-            button.setFixedSize(max(row, text_w), row)
+            button.setFixedSize(max(row, button.sizeHint().width()), row)
         self._paint_square_qr()
 
     def _fit_center(self) -> None:
