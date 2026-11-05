@@ -277,41 +277,85 @@ def _pip_run(args: list[str]) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        stdin=subprocess.DEVNULL,
         creationflags=flags,
     )
 
 
-def _pip_tail(result: subprocess.CompletedProcess[str]) -> str:
-    text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines[-8:])
+def _screen_libs_ready() -> bool:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        [_python_for_pip(), "-c", "import PIL, torch, torchvision"],
+        check=False,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    return result.returncode == 0
+
+
+_PIP_ERROR_MARKS = ("ERROR", "Error", "OSError", "WinError", "No such file", "No matching")
+
+
+def _pip_failure(result: subprocess.CompletedProcess[str], log_path: Path | None = None) -> str:
+    chunks = [result.stderr or "", result.stdout or ""]
+    if log_path is not None and log_path.is_file():
+        try:
+            chunks.append(log_path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pass
+    lines: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        for raw in chunk.splitlines():
+            line = raw.strip()
+            if not line or line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+    picked = [line for line in lines if any(mark in line for mark in _PIP_ERROR_MARKS)]
+    shown = picked or lines[-12:]
+    return f"終了コード {result.returncode}\n" + "\n".join(shown)
 
 
 def _install_screen_libs() -> str:
+    if _screen_libs_ready():
+        return ""
     probe = _pip_run(["pip", "--version"])
     if probe.returncode != 0:
         _pip_run(["ensurepip", "--upgrade"])
-    pillow = _pip_run(["pip", "install", "--disable-pip-version-check", "Pillow"])
-    if pillow.returncode != 0:
-        return _pip_tail(pillow) or "Pillow を入れられませんでした。"
-    torch = _pip_run(
+    log_path = Path(tempfile.gettempdir()) / "workshop-screen-libs-pip.log"
+
+    def install(packages: list[str]) -> subprocess.CompletedProcess[str]:
+        return _pip_run(
+            [
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--progress-bar",
+                "off",
+                "--log",
+                str(log_path),
+                *packages,
+            ]
+        )
+
+    pillow = install(["Pillow"])
+    if pillow.returncode != 0 and not _screen_libs_ready():
+        return _pip_failure(pillow, log_path) or "Pillow を入れられませんでした。"
+    torch = install(
         [
-            "pip",
-            "install",
-            "--disable-pip-version-check",
             "torch",
             "torchvision",
             "--index-url",
             "https://download.pytorch.org/whl/cpu",
         ]
     )
-    if torch.returncode != 0:
-        torch = _pip_run(
-            ["pip", "install", "--disable-pip-version-check", "torch", "torchvision"]
-        )
-    if torch.returncode != 0:
-        return _pip_tail(torch) or "torch を入れられませんでした。"
-    return ""
+    if torch.returncode != 0 and not _screen_libs_ready():
+        torch = install(["torch", "torchvision"])
+    if _screen_libs_ready():
+        return ""
+    return _pip_failure(torch, log_path) or "torch を入れられませんでした。"
 
 
 def _apply_named_type_model(predictor) -> None:

@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -667,7 +668,19 @@ class MenuWindow(QMainWindow):
             right_column.addWidget(slot, 1)
             self._slots.append(slot)
         body.addLayout(right_column, 2)
-        layout.addLayout(body, 1)
+        body_host = QWidget()
+        _plain_surface(body_host)
+        body_host.setLayout(body)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        scroll.setMinimumHeight(0)
+        _plain_surface(scroll)
+        scroll.setWidget(body_host)
+        layout.addWidget(scroll, 1)
         self._fill_model(model_box)
         self._fill_items(self._slots[0])
         self._fill_center(self._slots[1])
@@ -750,12 +763,16 @@ class MenuWindow(QMainWindow):
         half = area.width() // 2
         gap = half * 3 // 100
         outer_w = half - gap
-        self.resize(
-            max(1, outer_w - extra_w),
-            max(1, area.height() - extra_h),
-        )
+        target_w = max(1, outer_w - extra_w)
+        target_h = max(1, area.height() - extra_h)
+        self.setMaximumHeight(target_h)
+        self.resize(target_w, target_h)
         frame = self.frameGeometry()
-        self.move(area.right() - gap - frame.width() + 1, area.top())
+        x = area.right() - gap - frame.width() + 1
+        y = area.top()
+        if y + frame.height() - 1 > area.bottom():
+            y = max(area.top(), area.bottom() - frame.height() + 1)
+        self.move(x, y)
         self._fit_logo()
         QTimer.singleShot(0, self._fit_items)
         QTimer.singleShot(0, self._fit_top_square)
@@ -2382,7 +2399,7 @@ class MenuWindow(QMainWindow):
         self._set_flow_lamp("システム終了")
         if self._autoplay_button is not None:
             self._autoplay_button.setEnabled(True)
-        QMessageBox.critical(self, "オートプレイ", text)
+        self._show_screen_notice(text)
 
     def _on_intro_ok(self) -> None:
         if self._play_stop.is_set():
@@ -2395,7 +2412,7 @@ class MenuWindow(QMainWindow):
         self._clear_external_phase()
         self._set_activity(message)
         self._set_flow_lamp("システム終了")
-        QMessageBox.critical(self, "オートプレイ", message)
+        self._show_screen_notice(message)
 
     def _on_play_fail(self, message: str) -> None:
         self._autoplay_alive = False
@@ -2405,7 +2422,47 @@ class MenuWindow(QMainWindow):
         self._clear_external_phase()
         self._set_activity(message)
         self._set_flow_lamp("システム終了")
-        QMessageBox.critical(self, "オートプレイ", message)
+        self._show_screen_notice(message)
+
+    def _show_screen_notice(self, text: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("オートプレイ")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        column = QVBoxLayout(dialog)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        scroll.setWidget(label)
+        column.addWidget(scroll, 1)
+        ok = QPushButton("OK")
+        ok.clicked.connect(dialog.accept)
+        column.addWidget(ok, 0, Qt.AlignmentFlag.AlignRight)
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            label.setMaximumWidth(max(1, area.width()))
+            dialog.setMaximumSize(area.size())
+            hint = dialog.sizeHint()
+            dialog.resize(
+                max(1, min(hint.width(), area.width())),
+                max(1, min(hint.height(), area.height())),
+            )
+            frame = dialog.frameGeometry()
+            extra_w = max(0, frame.width() - dialog.width())
+            extra_h = max(0, frame.height() - dialog.height())
+            dialog.resize(
+                max(1, min(dialog.width(), area.width() - extra_w)),
+                max(1, min(dialog.height(), area.height() - extra_h)),
+            )
+            dialog.move(
+                area.center().x() - dialog.frameGeometry().width() // 2,
+                area.center().y() - dialog.frameGeometry().height() // 2,
+            )
+        dialog.exec()
 
     def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
         worker = self._play_worker
