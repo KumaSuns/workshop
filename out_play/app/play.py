@@ -4999,6 +4999,15 @@ def _watch_money_screens(predictor, say: StatusFn, stop: Event | None) -> tuple[
 def _live_board(image: QImage, rgb, predictor) -> bool:
     if image is None or image.isNull():
         return False
+    if (
+        _home_play_button(image) is not None
+        or _match_start_button(image) is not None
+        or _close_button(image) is not None
+        or _retry_button(image) is not None
+        or _pause_continue_button(image) is not None
+        or _continue_button(image) is not None
+    ):
+        return False
     if _in_play_hud(image):
         return True
     if predictor is None or rgb is None:
