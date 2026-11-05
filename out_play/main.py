@@ -1082,7 +1082,7 @@ class MenuWindow(QMainWindow):
             text = _tsum_about_text()
         except Exception as exc:
             text = str(exc) or "ツムについてを出せませんでした。"
-        self._show_screen_notice(text, "ツムについて")
+        self._show_screen_notice(text, "ツムについて", 3, 0.9)
 
     def _create_desktop_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(
@@ -2438,7 +2438,13 @@ class MenuWindow(QMainWindow):
         self._set_flow_lamp("システム終了")
         self._show_screen_notice(message)
 
-    def _show_screen_notice(self, text: str, title: str = "オートプレイ") -> None:
+    def _show_screen_notice(
+        self,
+        text: str,
+        title: str = "オートプレイ",
+        width_scale: int = 1,
+        height_ratio: float | None = None,
+    ) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -2461,9 +2467,15 @@ class MenuWindow(QMainWindow):
             label.setMaximumWidth(max(1, area.width()))
             dialog.setMaximumSize(area.size())
             hint = dialog.sizeHint()
+            if height_ratio is None:
+                width = hint.width()
+                height = hint.height()
+            else:
+                width = hint.width() * width_scale
+                height = int(screen.geometry().height() * height_ratio)
             dialog.resize(
-                max(1, min(hint.width(), area.width())),
-                max(1, min(hint.height(), area.height())),
+                max(1, min(width, area.width())),
+                max(1, min(height, area.height())),
             )
             frame = dialog.frameGeometry()
             extra_w = max(0, frame.width() - dialog.width())
@@ -3345,24 +3357,20 @@ _KIND_TEXT = {
 
 
 def _skill_during_condition(name: str, folder_id: str) -> bool:
-    from app.skill_tsum import (
-        skill_breaks_bombs,
-        skill_is_cinderella,
-        skill_is_cruella,
-        skill_is_elsa,
-        skill_is_namine,
-        skill_is_pooh,
-    )
+    from app import skill_tsum
 
+    checks = (
+        skill_tsum.skill_is_elsa,
+        skill_tsum.skill_is_namine,
+        skill_tsum.skill_is_cinderella,
+        skill_tsum.skill_is_pooh,
+        skill_tsum.skill_breaks_bombs,
+    )
+    cruella = getattr(skill_tsum, "skill_is_cruella", None)
     for label in (name, folder_id):
-        if (
-            skill_is_elsa(label)
-            or skill_is_namine(label)
-            or skill_is_cinderella(label)
-            or skill_is_cruella(label)
-            or skill_is_pooh(label)
-            or skill_breaks_bombs(label)
-        ):
+        if any(check(label) for check in checks):
+            return True
+        if cruella is not None and cruella(label):
             return True
     return False
 
