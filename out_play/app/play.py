@@ -502,7 +502,7 @@ def run_play(
 
     if start_match:
         seen_kinds, locked, arrived, seen_tsum, start_items = _click_start_or_continue(
-            say, stop, tap_start=False
+            say, stop, tap_start=False, predictor=predictor
         )
         if seen_tsum:
             used_tsum = seen_tsum
@@ -2064,7 +2064,12 @@ def run_play(
                 notify_record(updated)
         if not _continue_after_game():
             _replay_after_timeup(
-                say, stop, finish_after, on_retry=take_result, stop_at_start=True
+                say,
+                stop,
+                finish_after,
+                on_retry=take_result,
+                stop_at_start=True,
+                predictor=predictor,
             )
             stop_watch.set()
             watching.clear()
@@ -2148,9 +2153,12 @@ def run_play(
                 continue
             if saw_board:
                 played_once = True
-            if on_mission:
+            live = False
+            if not saw_board and not on_pause:
+                live = _live_board(image, rgb, predictor)
+            if on_mission and not live:
                 before_start[0] = True
-            elif saw_board:
+            elif saw_board or live:
                 before_start[0] = False
             else:
                 on_start = _match_start_button(image) is not None
@@ -2166,19 +2174,13 @@ def run_play(
                     stop_watch.set()
                     watching.clear()
                     return
-            elif not saw_board and not on_pause:
+            elif live:
+                saw_board = True
+                match_over = False
+                kinds_locked = True
+                arm_timeup()
                 if go_at is None:
-                    with _gpu_lock:
-                        scene, _score = _scene_top(predictor, rgb)
-                    if scene == "go":
-                        go_at = time.time()
-                if go_at is not None or _in_play_hud(image):
-                    saw_board = True
-                    match_over = False
-                    kinds_locked = True
-                    arm_timeup()
-                    if go_at is None:
-                        go_at = time.time()
+                    go_at = time.time()
             if saw_board and not watch_hit.is_set() and apply_checker_skill(False):
                 skip_after_skill = True
                 continue
@@ -2307,7 +2309,9 @@ def run_play(
                 watch_hit.clear()
                 if _settle_after_timeup(coin_text, result_text, watched=True):
                     return
-                _seen, replay_items = _replay_after_timeup(say, stop, finish_after, on_retry=take_result)
+                _seen, replay_items = _replay_after_timeup(
+                    say, stop, finish_after, on_retry=take_result, predictor=predictor
+                )
                 if finish_after is not None and finish_after.is_set():
                     say("このプレイでやめます")
                     stop_watch.set()
@@ -3022,7 +3026,9 @@ def run_play(
                     )
                     if _settle_after_timeup(coin_text, result_text, watched=True):
                         return
-                    _seen, replay_items = _replay_after_timeup(say, stop, finish_after, on_retry=take_result)
+                    _seen, replay_items = _replay_after_timeup(
+                    say, stop, finish_after, on_retry=take_result, predictor=predictor
+                )
                     if finish_after is not None and finish_after.is_set():
                         say("このプレイでやめます")
                         stop_watch.set()
@@ -4990,12 +4996,38 @@ def _watch_money_screens(predictor, say: StatusFn, stop: Event | None) -> tuple[
     return shown["coin"], shown["result"]
 
 
+def _live_board(image: QImage, rgb, predictor) -> bool:
+    if image is None or image.isNull():
+        return False
+    if _in_play_hud(image):
+        return True
+    if predictor is None or rgb is None:
+        return False
+    with _gpu_lock:
+        scene, _score = _scene_top(predictor, rgb)
+    if scene == "go":
+        return True
+    if scene == "timeup":
+        return False
+    with _gpu_lock:
+        boxes = predictor.predict_all(Path("."), rgb=rgb)
+    if not isinstance(boxes, dict):
+        return False
+    timer_box = boxes.get("timer")
+    game_box = boxes.get("game")
+    if not timer_box or not game_box:
+        return False
+    left = _read_timer(None, rgb, timer_box)
+    return left is not None and left > 0
+
+
 def _replay_after_timeup(
     say: StatusFn,
     stop: Event | None,
     finish_after: Event | None = None,
     on_retry: Callable[[QImage], None] | None = None,
     stop_at_start: bool = False,
+    predictor=None,
 ) -> tuple[str, list[str] | None]:
     if finish_after is not None and finish_after.is_set() and not stop_at_start:
         return "", None
@@ -5007,6 +5039,7 @@ def _replay_after_timeup(
         finish_after=None if stop_at_start else finish_after,
         on_retry=on_retry,
         stop_at_start=stop_at_start,
+        predictor=predictor,
     )
     if finish_after is not None and finish_after.is_set() and not stop_at_start:
         return "", None
@@ -5527,6 +5560,7 @@ def _click_start_or_continue(
     finish_after: Event | None = None,
     on_retry: Callable[[QImage], None] | None = None,
     stop_at_start: bool = False,
+    predictor=None,
 ) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
@@ -5557,6 +5591,9 @@ def _click_start_or_continue(
         if image.isNull():
             _sleep_stop(0.4, stop)
             continue
+        if predictor is not None and _live_board(image, _qimage_rgb(image), predictor):
+            _seen_model()
+            return kinds, locked, "", used_name, items
         used = _five_to_four_used_path(path)
         if used is not None:
             kinds = 4 if used else 5
