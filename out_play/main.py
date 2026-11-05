@@ -43,7 +43,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QRadioButton,
@@ -1073,47 +1072,17 @@ class MenuWindow(QMainWindow):
         self._tsum_body.addLayout(square_row)
         right.addLayout(self._tsum_body, 1)
         self._top_square_host = right_box
-        self._tsum_about_window = None
         self._tsum_actions = QVBoxLayout()
         self._tsum_actions.setContentsMargins(0, 0, 0, 0)
         self._tsum_actions.setSpacing(0)
         right.addLayout(self._tsum_actions)
 
     def _open_tsum_about(self) -> None:
-        dialog = self._tsum_about_window
-        if dialog is None:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("ツムについて")
-            dialog.setWindowFlags(
-                Qt.WindowType.Dialog
-                | Qt.WindowType.Window
-                | Qt.WindowType.WindowStaysOnTopHint
-            )
-            dialog.setModal(True)
-            column = QVBoxLayout(dialog)
-            text = QPlainTextEdit()
-            text.setReadOnly(True)
-            column.addWidget(text)
-            dialog._about_text = text
-            self._tsum_about_window = dialog
-        dialog._about_text.setPlainText(_tsum_about_text())
-        screen = self.screen() or QApplication.primaryScreen()
-        area = None if screen is None else screen.availableGeometry()
-        metrics = dialog._about_text.fontMetrics()
-        lines = dialog._about_text.toPlainText().splitlines() or [""]
-        text_w = max(metrics.horizontalAdvance(line) for line in lines)
-        text_w += metrics.horizontalAdvance("あ") * 2
-        text_h = metrics.lineSpacing() * len(lines) + metrics.height() * 2
-        if area is not None:
-            dialog.resize(
-                max(1, min(text_w, area.width())),
-                max(1, min(text_h, area.height())),
-            )
-            dialog.move(
-                area.x() + max(0, (area.width() - dialog.width()) // 2),
-                area.y() + max(0, (area.height() - dialog.height()) // 2),
-            )
-        dialog.exec()
+        try:
+            text = _tsum_about_text()
+        except Exception as exc:
+            text = str(exc) or "ツムについてを出せませんでした。"
+        self._show_screen_notice(text, "ツムについて")
 
     def _create_desktop_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(
@@ -2469,9 +2438,9 @@ class MenuWindow(QMainWindow):
         self._set_flow_lamp("システム終了")
         self._show_screen_notice(message)
 
-    def _show_screen_notice(self, text: str) -> None:
+    def _show_screen_notice(self, text: str, title: str = "オートプレイ") -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("オートプレイ")
+        dialog.setWindowTitle(title)
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         column = QVBoxLayout(dialog)
         scroll = QScrollArea()
