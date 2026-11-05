@@ -3376,6 +3376,29 @@ _KIND_TEXT = {
 }
 
 
+def _skill_during_condition(name: str, folder_id: str) -> bool:
+    from app.skill_tsum import (
+        skill_breaks_bombs,
+        skill_is_cinderella,
+        skill_is_cruella,
+        skill_is_elsa,
+        skill_is_namine,
+        skill_is_pooh,
+    )
+
+    for label in (name, folder_id):
+        if (
+            skill_is_elsa(label)
+            or skill_is_namine(label)
+            or skill_is_cinderella(label)
+            or skill_is_cruella(label)
+            or skill_is_pooh(label)
+            or skill_breaks_bombs(label)
+        ):
+            return True
+    return False
+
+
 def _tsum_about_text() -> str:
     root = ROOT / "bundled" / "assets" / "models" / "use_tsum"
     try:
@@ -3394,22 +3417,14 @@ def _tsum_about_text() -> str:
         shown = str(name).strip() or str(folder_id)
         lines.append(shown)
         model_path = root / str(folder_id) / "model.json"
-        count = None
-        readable = False
         if model_path.is_file():
-            try:
-                model = json.loads(model_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, UnicodeError):
-                model = None
-            readable = isinstance(model, dict)
-            if readable and isinstance(model.get("sample_count"), int):
-                count = int(model["sample_count"])
-        if not model_path.is_file():
-            lines.append("モデルがありません。")
-        elif count is None:
-            lines.append("モデルはありますが、学習枚数は読めません。")
+            lines.append("モデルがあります。")
         else:
-            lines.append(f"モデルがあります。学習に使った画像は {count} 枚です。")
+            lines.append("モデルがありません。")
+        if _skill_during_condition(shown, str(folder_id)):
+            lines.append("スキル中の条件があります。")
+        else:
+            lines.append("スキル中の条件はありません。")
         info = meta.get(str(folder_id))
         if isinstance(info, dict):
             kind = _KIND_TEXT.get(str(info.get("kind") or ""), "")
