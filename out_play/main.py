@@ -1091,8 +1091,30 @@ class MenuWindow(QMainWindow):
 
     def _send_hearts(self) -> None:
         def work() -> None:
-            from app.bluestacks import capture_screen, tap
-            from app.intro import _home_ranking_button, _item_back_button
+            from app.bluestacks import capture_screen, swipe_path, tap
+            from app.intro import (
+                _home_ranking_button,
+                _item_back_button,
+                _ranking_list,
+                _ranking_scroll_points,
+            )
+
+            def list_mark(frame) -> tuple:
+                width = frame.width()
+                height = frame.height()
+                marks = []
+                y = int(height * 0.32)
+                y1 = int(height * 0.62)
+                x0 = int(width * 0.22)
+                x1 = int(width * 0.78)
+                while y < y1:
+                    x = x0
+                    while x < x1:
+                        color = frame.pixelColor(x, y)
+                        marks.append((color.red() // 16, color.green() // 16, color.blue() // 16))
+                        x += 12
+                    y += 12
+                return tuple(marks)
 
             def shot():
                 try:
@@ -1135,6 +1157,42 @@ class MenuWindow(QMainWindow):
                 screen_h=image.height(),
             )
             self.heart_note.emit("ランキングを押しました。")
+            image = None
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                time.sleep(0.4)
+                image = shot()
+                if image is not None and _ranking_list(image):
+                    break
+                image = None
+            if image is None:
+                self.heart_note.emit("ランキングが出ませんでした。")
+                return
+            moved = False
+            previous = list_mark(image)
+            for _ in range(30):
+                swipe_path(
+                    _ranking_scroll_points(image),
+                    screen_w=image.width(),
+                    screen_h=image.height(),
+                    point_s=0.003,
+                    center_s=0.003,
+                )
+                time.sleep(0.55)
+                image = shot()
+                if image is None:
+                    continue
+                mark = list_mark(image)
+                if mark != previous:
+                    moved = True
+                    previous = mark
+                    continue
+                if moved:
+                    self.heart_note.emit("１位が出ました。")
+                    return
+            self.heart_note.emit(
+                "１位が出ませんでした。" if moved else "上にスクロールできませんでした。"
+            )
 
         threading.Thread(target=work, daemon=True).start()
 

@@ -825,6 +825,70 @@ def _home_ranking_button(image: QImage) -> QRect | None:
     return QRect(x, y, 1, 1)
 
 
+def _ranking_list(image: QImage) -> bool:
+    if image is None or image.isNull() or _match_start_button(image) is not None:
+        return False
+    width = image.width()
+    height = image.height()
+    x0 = int(width * 0.10)
+    x1 = int(width * 0.24)
+    y0 = int(height * 0.28)
+    y1 = int(height * 0.70)
+    if x1 <= x0 or y1 <= y0:
+        return False
+    seen = [[False] * (x1 - x0) for _ in range(y1 - y0)]
+
+    def face(x: int, y: int) -> bool:
+        color = image.pixelColor(x, y)
+        red, green, blue = color.red(), color.green(), color.blue()
+        return blue > 190 and green > 150 and red < 170 and blue > red + 40
+
+    for y in range(y0, y1):
+        row = seen[y - y0]
+        for x in range(x0, x1):
+            if row[x - x0] or not face(x, y):
+                continue
+            stack = [(x, y)]
+            row[x - x0] = True
+            min_x = max_x = x
+            min_y = max_y = y
+            count = 0
+            while stack:
+                cx, cy = stack.pop()
+                count += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if not (x0 <= nx < x1 and y0 <= ny < y1) or seen[ny - y0][nx - x0]:
+                        continue
+                    if not face(nx, ny):
+                        continue
+                    seen[ny - y0][nx - x0] = True
+                    stack.append((nx, ny))
+            box_w = max_x - min_x + 1
+            box_h = max_y - min_y + 1
+            if (
+                width * 0.05 < box_w < width * 0.14
+                and height * 0.02 < box_h < height * 0.08
+                and count > 80
+            ):
+                return True
+    return False
+
+
+def _ranking_scroll_points(image: QImage) -> list[tuple[int, int]]:
+    x = min(image.width() - 1, max(0, int(round(300 * image.width() / 576))))
+    y0 = min(image.height() - 1, max(0, int(round(400 * image.height() / 1024))))
+    y1 = min(image.height() - 1, max(0, int(round(680 * image.height() / 1024))))
+    count = 6
+    return [
+        (x, y0 + (y1 - y0) * index // (count - 1))
+        for index in range(count)
+    ]
+
+
 def _cancel_button(image: QImage) -> QRect | None:
     if _play_button(image) is not None:
         return None
