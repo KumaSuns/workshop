@@ -16,7 +16,7 @@ from app.paths import APP_ROOT
 TRAINER_ROOT = APP_ROOT.parent / "tsumtsum-screen-recognition"
 
 
-def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dict[str, int]]]]:
+def load_play_tools() -> tuple[object, Callable, Callable]:
     hidden = {
         key: sys.modules.pop(key)
         for key in list(sys.modules)
@@ -32,7 +32,7 @@ def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dic
     try:
         from app.dataset import Dataset
         from app.predictor import Predictor
-        from app.tsum_chain import tsum_chain_best_per_group
+        from app.tsum_chain import farthest_gap_ratio, tsum_chain_best_per_group
 
         models = TRAINER_ROOT / "data" / "models"
         piece_path = models / "pieces.pt"
@@ -42,6 +42,7 @@ def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dic
             )
         predictor = Predictor(models)
         chain_fn = tsum_chain_best_per_group
+        gap_fn = farthest_gap_ratio
         keep = {
             key: sys.modules[key]
             for key in list(sys.modules)
@@ -53,7 +54,7 @@ def load_play_tools() -> tuple[object, Callable[[list[dict[str, int]]], list[dic
             raise RuntimeError(
                 "TIME UP のモデルがありません。動画フレーム抜き出しで GO / TIME UP を学習してください。"
             )
-        return predictor, chain_fn
+        return predictor, chain_fn, gap_fn
     finally:
         if added:
             try:

@@ -48,8 +48,16 @@ from app.intro import (
     _slow_tap,
 )
 from app.cinderella_skill import run_cinderella_skill
+from app.cruella_skill import run_cruella_skill
 from app.elsa_skill import run_elsa_skill
-from app.namine_skill import run_namine_skill
+from app.namine_skill import (
+    _SKILL_SEC,
+    _is_sora,
+    _namine_face,
+    _other_kind,
+    _others_became_sora,
+    namine_skill_step,
+)
 from app.skill_tsum import (
     _cbuzz_pose_on,
     _cbuzz_red_marks_on,
@@ -58,6 +66,7 @@ from app.skill_tsum import (
     skill_breaks_bombs,
     skill_is_cinderella,
     skill_is_cloud,
+    skill_is_cruella,
     skill_is_elsa,
     skill_is_gadget,
     skill_is_namine,
@@ -84,8 +93,10 @@ from app.play_style import (
     record_rl_length,
     record_rl_wait,
     flush_style,
+    record_reach,
     record_rl_bomb,
     record_rl_skill,
+    reach_ratio,
     set_last_result_coin,
     should_bomb,
     unlike_hit,
@@ -380,8 +391,18 @@ def run_play(
 
     say("モデルを読み込み中")
     try:
-        predictor, candidates = load_play_tools()
+        predictor, chain_best, gap_ratio = load_play_tools()
         loaded_predictor[0] = predictor
+        reach_now: list[float | None] = [None]
+
+        def candidates(pieces, limit=8):
+            return chain_best(
+                pieces,
+                limit,
+                reach_ratio=reach_now[0],
+                expand=False,
+            )
+
         _apply_type_model(predictor, used_tsum, use_dedicated, use_named)
     except ModuleNotFoundError as exc:
         raise RuntimeError(
@@ -490,6 +511,11 @@ def run_play(
     skip_loss = False
     skill_busy = [False]
     skill_ring_hold = [False]
+    namine_until = 0.0
+    namine_circles = 0
+    namine_arm = False
+    namine_saw_face = False
+    namine_bombs: list[dict] = []
     pooh_long = False
     bomb_after_long = False
     last_fan_at = 0.0
@@ -544,6 +570,7 @@ def run_play(
     pending_hud: list[tuple[str, str, bool]] = []
     last_boxes: dict[str, dict[str, int]] = {}
     pending_spots: list[tuple[int, int, int, tuple[float, float, float] | None]] | None = None
+    pending_reach: float | None = None
     pending_key: frozenset[tuple[int, int]] | None = None
     pending_n = 0
     pending_at = 0.0
@@ -561,7 +588,8 @@ def run_play(
         nonlocal last_skill_at, skill_wait_empty, last_fan_at, last_bomb_at, skip_bomb_cells, last_skill_look, last_save_at
         nonlocal ignore_start_until, saw_board, odd_top_tapped, saw_timer, hud_gone_seen, fan_fall_n, fan_fall_moved, gadget_bomb_fall, gadget_fall_at, resumed_pause, skip_after_skill, skip_loss, pooh_long, bomb_after_long
         nonlocal clears, swipes, coin, skill_taps, skill_ok, skill_used, press_counted, my_erase, bomb_taps, fan_taps
-        nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_key
+        nonlocal namine_until, namine_circles, namine_arm, namine_saw_face
+        nonlocal pending_lesson, pending_hud, last_boxes, pending_spots, pending_reach, pending_key
         nonlocal pending_n, pending_at, pending_burst, pending_group, pending_my_n, pending_skip, pending_used, skip_chains, skip_born, saved_boards
         nonlocal my_group, skill_face, my_vec, match_picks, idle_pick, idle_acc, idle_since
         nonlocal skill_my_n, skill_my_full, skill_my_held, skill_saw_empty
@@ -617,6 +645,11 @@ def run_play(
         set_my_lamp("off")
         bomb_taps = 0
         fan_taps = 0
+        namine_until = 0.0
+        namine_circles = 0
+        namine_arm = False
+        namine_saw_face = False
+        namine_bombs.clear()
         idle_pick = None
         idle_acc = 0.0
         idle_since = None
@@ -636,6 +669,9 @@ def run_play(
         pending_lesson = None
         pending_hud = []
         last_boxes = {}
+        if pending_reach is not None and time.time() - pending_at >= 0.5:
+            record_reach(pending_reach, False)
+        pending_reach = None
         pending_spots = None
         pending_key = None
         pending_n = 0
@@ -803,7 +839,7 @@ def run_play(
         set_my_lamp("off")
 
     def credit_pending(after=None, by_count: bool = False) -> bool:
-        nonlocal clears, skill_my_n
+        nonlocal clears, skill_my_n, pending_reach
         if pending_spots is None:
             return False
         if by_count:
@@ -814,6 +850,9 @@ def run_play(
             gone = not _spots_lingered(after, pending_spots)
         if not gone:
             return False
+        if pending_reach is not None:
+            record_reach(pending_reach, True)
+            pending_reach = None
         clears += max(1, int(pending_burst))
         if skill_saw_empty and pending_my_n > 0:
             skill_my_n += pending_my_n
@@ -963,6 +1002,7 @@ def run_play(
         nonlocal last_skill_at, skill_wait_empty, skill_ok, skill_taps, skill_used, press_counted
         nonlocal bomb_taps, last_bomb_at, skip_loss, pooh_long, swipes
         nonlocal skill_my_n, skill_saw_empty
+        nonlocal namine_until, namine_circles, namine_arm, namine_saw_face
 
         def note_used() -> None:
             nonlocal skill_used, press_counted
@@ -1035,31 +1075,95 @@ def run_play(
                 note_used()
                 return True
             if skill_is_namine(used_tsum):
-                done = run_namine_skill(
+                namine_until = 0.0
+                namine_circles = 0
+                namine_arm = True
+                namine_saw_face = False
+                skip_loss = True
+                note_used()
+                return True
+            if skill_is_cruella(used_tsum):
+                skip_loss = True
+
+                def find_three(found_pieces):
+                    found_tsums = [piece for piece in found_pieces if _is_tsum(piece)]
+                    if len(found_tsums) < 3:
+                        return []
+                    radii = [max(4, int(piece.get("r") or 12)) for piece in found_tsums]
+                    typical = sorted(radii)[len(radii) // 2]
+                    nearest: list[float] = []
+                    for index, piece in enumerate(found_tsums):
+                        ax, ay = int(piece["x"]), int(piece["y"])
+                        best = None
+                        for other_index, other in enumerate(found_tsums):
+                            if other_index == index:
+                                continue
+                            dist = math.hypot(int(other["x"]) - ax, int(other["y"]) - ay)
+                            if best is None or dist < best:
+                                best = dist
+                        if best:
+                            nearest.append(best)
+                    nearest.sort()
+                    spacing = nearest[len(nearest) // 2] if nearest else 0.0
+                    reach = typical * 2.6
+                    if 0 < spacing <= typical * 3.0:
+                        reach = max(reach, spacing * 1.32)
+                    reach = min(reach, typical * 2.9)
+                    min_dist = typical * 0.4
+                    xs = [int(piece["x"]) for piece in found_tsums]
+                    ys = [int(piece["y"]) for piece in found_tsums]
+                    groups = [int(piece.get("group") or 1) for piece in found_tsums]
+                    count = len(found_tsums)
+                    links: list[list[int]] = [[] for _ in range(count)]
+                    for left in range(count):
+                        for right in range(left + 1, count):
+                            if groups[right] != groups[left]:
+                                continue
+                            dist = math.hypot(xs[right] - xs[left], ys[right] - ys[left])
+                            if dist < min_dist or dist > reach:
+                                continue
+                            links[left].append(right)
+                            links[right].append(left)
+                    used: set[int] = set()
+                    chains = []
+                    for left in range(count):
+                        for mid in links[left]:
+                            for right in links[mid]:
+                                if right == left or left > right:
+                                    continue
+                                if left in used or mid in used or right in used:
+                                    continue
+                                vx1 = xs[mid] - xs[left]
+                                vy1 = ys[mid] - ys[left]
+                                vx2 = xs[right] - xs[mid]
+                                vy2 = ys[right] - ys[mid]
+                                denom = math.hypot(vx1, vy1) * math.hypot(vx2, vy2)
+                                if denom > 1e-6 and (vx1 * vx2 + vy1 * vy2) / denom < -0.5:
+                                    continue
+                                used.add(left)
+                                used.add(mid)
+                                used.add(right)
+                                chains.append([found_tsums[left], found_tsums[mid], found_tsums[right]])
+                    return chains
+
+                done_swipes, done_bombs = run_cruella_skill(
                     predict=lambda shot: predictor.predict_pieces(
-                        Path("."), game, rgb=shot
+                        Path("."), game, rgb=shot, inner=False
                     ),
                     game=game,
-                    my_group=my_group,
-                    before_pieces=list(pieces),
                     say=say,
                     stop=stop,
                     watch_hit=watch_hit,
                     preview=preview,
                     draw=_draw_plan,
                     gpu_lock=_gpu_lock,
+                    find_three=find_three,
                     skill_lamp=skill_lamp,
-                    find_my=lambda shot, found: _mytsum_group(
-                        predictor,
-                        _qimage_rgb(shot),
-                        [piece for piece in found if _is_tsum(piece)],
-                        skill,
-                    )[0],
                 )
-                if done is None:
-                    return False
-                skip_loss = True
-                swipes += done
+                swipes += done_swipes
+                bomb_taps += done_bombs
+                if done_bombs:
+                    last_bomb_at = time.time()
                 note_used()
                 return True
             if skill_is_cloud(used_tsum):
@@ -1298,6 +1402,7 @@ def run_play(
         extra: list[frozenset[tuple[int, int]]] | None = None,
         used_spots: set[tuple[int, int]] | None = None,
     ) -> list[list[dict[str, int]]]:
+        reach_now[0] = reach_ratio()
         gone = set(used_spots or ())
         live = [
             piece
@@ -2538,6 +2643,13 @@ def run_play(
             _check_stop(stop)
             if credit_pending(by_count=True):
                 erased_now = True
+            if (
+                not erased_now
+                and pending_reach is not None
+                and time.time() - pending_at >= 0.5
+            ):
+                record_reach(pending_reach, False)
+                pending_reach = None
             fan_fall_n, fan_fall_moved, _fall_settled = _note_fall(
                 len(tsums), erased_now, fan_fall_n, fan_fall_moved
             )
@@ -2549,6 +2661,54 @@ def run_play(
             look_mytsum()
             tick_skill_count()
             board_bombs[0] = len(_bombs_on_board(pieces, game))
+            if skill_is_namine(used_tsum) and namine_arm and namine_until <= 0:
+                if _namine_face(rgb, game):
+                    namine_saw_face = True
+                    continue
+                if namine_saw_face and _others_became_sora(tsums, my_group):
+                    namine_arm = False
+                    namine_saw_face = False
+                    namine_until = time.time() + _SKILL_SEC
+                    namine_circles = 0
+                    if skill_lamp is not None:
+                        skill_lamp(True)
+                elif namine_saw_face and not _other_kind(tsums, my_group):
+                    continue
+            if namine_until <= 0:
+                seen_bombs = _bombs_on_board(pieces, game)
+                if seen_bombs:
+                    namine_bombs.clear()
+                    namine_bombs.extend(seen_bombs)
+            if namine_until > 0 and time.time() >= namine_until:
+                namine_until = 0.0
+                if skill_lamp is not None:
+                    skill_lamp(False)
+            elif namine_until > 0 and skill_is_namine(used_tsum):
+                if any(_is_sora(piece) for piece in tsums):
+                    while time.time() < namine_until:
+                        if (stop is not None and stop.is_set()) or watch_hit.is_set():
+                            break
+                        circled, tapped = namine_skill_step(
+                            image=image,
+                            pieces=pieces,
+                            game=game,
+                            my_group=my_group,
+                            say=say,
+                            stop=stop,
+                            watch_hit=watch_hit,
+                            bombs_ready=namine_bombs,
+                        )
+                        if tapped:
+                            bomb_taps += 1
+                            last_bomb_at = time.time()
+                        if not circled:
+                            break
+                        swipes += 1
+                        namine_circles += 1
+                    if time.time() >= namine_until:
+                        namine_until = 0.0
+                        if skill_lamp is not None:
+                            skill_lamp(False)
             # 落ち待ち中は、落ち判定の直後に押す
             if _gadget_may_press(_fall_settled):
                 gadget_bomb_fall = False
@@ -2955,6 +3115,9 @@ def run_play(
                     if pending_spots is not None:
                         extra = pending_burst + burst
                         extra_my = pending_my_n + burst_my_n
+                    if pending_reach is not None and time.time() - pending_at >= 0.5:
+                        record_reach(pending_reach, False)
+                    pending_reach = gap_ratio(last_chain, pieces)
                     pending_spots = _chain_spots(rgb, last_chain)
                     pending_key = _chain_key(last_chain)
                     pending_n = len(tsums)

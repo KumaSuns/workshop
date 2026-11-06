@@ -996,10 +996,6 @@ def run_play(
                 if not try_bomb(sit, force=True):
                     return
             return
-        if swipes_n < 2 and longest < time_bomb_number(used_items):
-            if swipes_n >= 1:
-                try_bomb(skill_sit(False), force=False)
-            return
         if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
             return
         sit = skill_sit(False)
@@ -1009,7 +1005,23 @@ def run_play(
                 for piece in _bombs_on_board(pieces, game)
                 if _piece_cell(piece) not in skip_bomb_cells
             ]
-            if not (len(left) >= BOMB_MANY or len(left) == 1):
+            if len(left) < BOMB_MANY:
+                break
+            if not try_bomb(sit, force=True):
+                return
+            if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+                return
+        if swipes_n < 2 and longest < time_bomb_number(used_items):
+            if swipes_n >= 1:
+                try_bomb(skill_sit(False), force=False)
+            return
+        while True:
+            left = [
+                piece
+                for piece in _bombs_on_board(pieces, game)
+                if _piece_cell(piece) not in skip_bomb_cells
+            ]
+            if len(left) != 1:
                 return
             if not try_bomb(sit, force=True):
                 return
@@ -1091,6 +1103,7 @@ def run_play(
                 return True
             if skill_is_elsa(used_tsum):
                 skip_loss = True
+                _wait_skill_spent(skill, stop, watch_hit)
                 swipes += run_elsa_skill(
                     predict=lambda shot: predictor.predict_pieces(
                         Path("."), game, rgb=shot, inner=False
@@ -3685,6 +3698,26 @@ def _skill_tap_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit
         fill = _skill_fill(_qimage_rgb(image), skill)
         if fill is not None and fill < SKILL_FILL_SPENT:
             return True
+    return False
+
+
+def _wait_skill_spent(skill: dict[str, int] | None, stop: Event | None, watch_hit) -> bool:
+    if skill is None:
+        return False
+    limit = time.time() + SKILL_GAP
+    while time.time() < limit:
+        _check_stop(stop)
+        if watch_hit is not None and watch_hit.is_set():
+            return False
+        try:
+            image = capture_play_frame()
+        except Exception:
+            time.sleep(0.05)
+            continue
+        fill = _skill_fill(_qimage_rgb(image), skill)
+        if fill is not None and fill < SKILL_FILL_SPENT:
+            return True
+        time.sleep(0.05)
     return False
 
 

@@ -36,11 +36,47 @@ def tsum_chain_candidates(
 def tsum_chain_best_per_group(
     pieces: list[dict[str, int]],
     limit: int = 8,
+    reach_ratio: float | None = None,
+    expand: bool = True,
 ) -> list[list[dict[str, int]]]:
-    return _pick_diverse(_blob_paths(pieces), limit)
+    return _pick_diverse(
+        _blob_paths(pieces, reach_ratio=reach_ratio, expand=expand),
+        limit,
+    )
 
 
-def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
+def farthest_gap_ratio(
+    chain: list[dict[str, int]],
+    pieces: list[dict[str, int]],
+) -> float | None:
+    tsums = [
+        piece
+        for piece in pieces
+        if is_tsum_kind(str(piece.get("kind") or ""))
+    ]
+    if len(chain) < 2:
+        return None
+    spacing = _typical_spacing(tsums or chain)
+    if spacing <= 0:
+        return None
+    far = 0.0
+    for left, right in zip(chain, chain[1:]):
+        dist = math.hypot(
+            int(left["x"]) - int(right["x"]),
+            int(left["y"]) - int(right["y"]),
+        )
+        if dist > far:
+            far = dist
+    if far <= 0:
+        return None
+    return far / spacing
+
+
+def _blob_paths(
+    pieces: list[dict[str, int]],
+    reach_ratio: float | None = None,
+    expand: bool = True,
+) -> list[list[dict[str, int]]]:
     tsums: list[dict[str, int]] = []
     for piece in pieces:
         if not is_tsum_kind(str(piece.get("kind") or "")):
@@ -57,8 +93,16 @@ def _blob_paths(pieces: list[dict[str, int]]) -> list[list[dict[str, int]]]:
         for piece in pieces
         if str(piece.get("kind") or "") == "bomb"
     ]
-    phys = _physical_links(tsums, spacing, blockers=bombs)
+    phys = _physical_links(
+        tsums,
+        spacing,
+        blockers=bombs,
+        reach_ratio=reach_ratio,
+    )
     found = _paths_from_blobs(tsums, phys)
+    if reach_ratio is not None or not expand:
+        found.sort(key=len, reverse=True)
+        return found
     longest = max((len(path) for path in found), default=0)
     biggest = 0
     counts: dict[int, int] = {}
@@ -164,6 +208,7 @@ def _physical_links(
     spacing: float,
     scale: float = 1.0,
     blockers: list[dict[str, int]] | None = None,
+    reach_ratio: float | None = None,
 ) -> list[list[int]]:
     count = len(tsums)
     radii = [max(4, int(piece.get("r") or 12)) for piece in tsums]
@@ -175,6 +220,10 @@ def _physical_links(
         close = max(close, spacing * 1.22 * scale)
     reach = min(reach, typical_r * 2.9 * scale)
     close = min(close, typical_r * 2.7 * scale)
+    if reach_ratio is not None and spacing > 0:
+        reach = spacing * float(reach_ratio)
+        if close > reach:
+            close = reach
     min_dist = typical_r * 0.4
     xs = [int(piece["x"]) for piece in tsums]
     ys = [int(piece["y"]) for piece in tsums]
