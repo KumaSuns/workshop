@@ -830,7 +830,8 @@ def _home_ranking_button(image: QImage) -> QRect | None:
     if not tabs:
         return None
     home = max(tabs, key=lambda rect: rect.width() * rect.height())
-    return QRect(home.center().x(), home.center().y(), 1, 1)
+    tap_y = min(image.height() - 1, home.y() + (home.height() * 3) // 4)
+    return QRect(home.center().x(), tap_y, 1, 1)
 
 
 def _cancel_button(image: QImage) -> QRect | None:
