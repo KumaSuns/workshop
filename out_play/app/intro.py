@@ -880,8 +880,8 @@ def _ranking_list(image: QImage) -> bool:
 
 def _ranking_scroll_points(image: QImage) -> list[tuple[int, int]]:
     x = min(image.width() - 1, max(0, int(round(300 * image.width() / 576))))
-    y0 = min(image.height() - 1, max(0, int(round(400 * image.height() / 1024))))
-    y1 = min(image.height() - 1, max(0, int(round(680 * image.height() / 1024))))
+    y0 = min(image.height() - 1, max(0, int(round(370 * image.height() / 1024))))
+    y1 = min(image.height() - 1, max(0, int(round(500 * image.height() / 1024))))
     count = 6
     return [
         (x, y0 + (y1 - y0) * index // (count - 1))
