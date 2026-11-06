@@ -830,29 +830,7 @@ def _home_ranking_button(image: QImage) -> QRect | None:
     if not tabs:
         return None
     home = max(tabs, key=lambda rect: rect.width() * rect.height())
-    x = min(image.width() - 1, max(0, home.center().x()))
-    y0 = min(image.height() - 1, home.bottom() + 1)
-    y1 = min(image.height(), y0 + home.height() * 2 + 4)
-    blues: list[int] = []
-    for y in range(y0, y1):
-        color = image.pixelColor(x, y)
-        red, green, blue = color.red(), color.green(), color.blue()
-        if blue > 140 and blue > red + 40 and blue > green:
-            blues.append(y)
-    if not blues:
-        return None
-    start = blues[0]
-    end = start
-    for y in blues[1:]:
-        if y > end + 3:
-            break
-        end = y
-    if end - start + 1 > int(home.height() * 1.3):
-        end = start + home.height() - 1
-    tap_y = start + max(1, (end - start) // 5)
-    if tap_y >= image.height():
-        return None
-    return QRect(home.x(), tap_y, max(1, home.width()), 1)
+    return QRect(home.center().x(), home.center().y(), 1, 1)
 
 
 def _cancel_button(image: QImage) -> QRect | None:
