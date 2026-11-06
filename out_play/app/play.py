@@ -2630,7 +2630,9 @@ def run_play(
             heat_s = 0.0
             type_s = 0.0
             with _gpu_lock:
-                pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+                pieces = predictor.predict_pieces(
+                    Path("."), game, rgb=rgb, inner=not use_named
+                )
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
@@ -2890,7 +2892,7 @@ def run_play(
                             skill_busy[0] = True
                             with _gpu_lock:
                                 pieces = predictor.predict_pieces(
-                                    Path("."), game, rgb=rgb, inner=False
+                                    Path("."), game, rgb=rgb, inner=not use_named
                                 )
                             tsums = [piece for piece in pieces if _is_tsum(piece)]
                             if show_recognized is not None:
@@ -3556,7 +3558,7 @@ def _import_grabbed_board(predictor, image: QImage, say: StatusFn) -> None:
         game, skill, fever, timer, fan = _merge_hud(boxes, None, None, None, None, None)
         pieces = []
         if game is not None:
-            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False) or []
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb) or []
     hud = dict(boxes) if isinstance(boxes, dict) else {}
     hud.update(_hud_boxes(game, skill, fever, timer, fan))
     try:
@@ -4497,7 +4499,7 @@ def _break_bombs_until_two(
             _sleep_stop(ERASE_WAIT, stop)
             continue
         with _gpu_lock:
-            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb, inner=False)
+            pieces = predictor.predict_pieces(Path("."), game, rgb=rgb)
         bombs = _bombs_on_board(pieces, game)
         n = len(bombs)
         tsums = [piece for piece in pieces if _is_tsum(piece)]
