@@ -798,6 +798,48 @@ def _match_start_button(image: QImage) -> QRect | None:
     return button
 
 
+def _item_back_button(image: QImage) -> QRect | None:
+    if image is None or image.isNull():
+        return None
+    start = _match_start_button(image)
+    if start is None:
+        return None
+    left = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.right() < start.x()
+        and abs(pill.center().y() - start.center().y()) < image.height() * 0.08
+    ]
+    if not left:
+        return None
+    return max(left, key=lambda rect: rect.width() * rect.height())
+
+
+def _home_ranking_button(image: QImage) -> QRect | None:
+    if image is None or image.isNull() or _match_start_button(image) is not None:
+        return None
+    if _home_play_button(image) is None:
+        return None
+    tabs = [
+        pill
+        for pill in _yellow_pills(image)
+        if pill.center().x() < image.width() * 0.18
+        and image.height() * 0.40 < pill.center().y() < image.height() * 0.62
+        and pill.width() < image.width() * 0.22
+    ]
+    if not tabs:
+        return None
+    home = max(tabs, key=lambda rect: rect.width() * rect.height())
+    rank = QRect(home.x(), home.bottom(), home.width(), home.height())
+    if rank.bottom() >= image.height():
+        return None
+    color = image.pixelColor(rank.center().x(), rank.center().y())
+    red, green, blue = color.red(), color.green(), color.blue()
+    if not (blue > 140 and blue > red + 40 and blue > green):
+        return None
+    return rank
+
+
 def _cancel_button(image: QImage) -> QRect | None:
     if _play_button(image) is not None:
         return None

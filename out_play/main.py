@@ -522,6 +522,7 @@ class MenuWindow(QMainWindow):
     external_commands = Signal(list)
     external_arm_ok = Signal()
     external_arm_fail = Signal(str)
+    heart_note = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -529,6 +530,7 @@ class MenuWindow(QMainWindow):
         self.external_commands.connect(self._on_external_commands)
         self.external_arm_ok.connect(self._on_external_armed)
         self.external_arm_fail.connect(self._on_external_arm_failed)
+        self.heart_note.connect(self._set_activity)
         self.setWindowTitle("AUTO PLAY")
         root = QWidget()
         _plain_surface(root)
@@ -1049,6 +1051,8 @@ class MenuWindow(QMainWindow):
         for number in range(2, 7):
             if number == 2:
                 label = "外部操作"
+            elif number == 3:
+                label = "ハートを送る"
             elif number == 6:
                 label = "ツムについて"
             else:
@@ -1057,6 +1061,8 @@ class MenuWindow(QMainWindow):
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             if number == 6:
                 button.clicked.connect(self._open_tsum_about)
+            if number == 3:
+                button.clicked.connect(self._send_hearts)
             if number == 2:
                 button.setCheckable(True)
                 button.setStyleSheet(
@@ -1082,6 +1088,55 @@ class MenuWindow(QMainWindow):
         self._tsum_actions.setContentsMargins(0, 0, 0, 0)
         self._tsum_actions.setSpacing(0)
         right.addLayout(self._tsum_actions)
+
+    def _send_hearts(self) -> None:
+        def work() -> None:
+            from app.bluestacks import capture_screen, tap
+            from app.intro import _home_ranking_button, _item_back_button
+
+            def shot():
+                try:
+                    image = capture_screen()
+                except Exception:
+                    return None
+                if image is None or image.isNull():
+                    return None
+                return image
+
+            image = shot()
+            if image is None:
+                self.heart_note.emit("画面を取れませんでした。")
+                return
+            back = _item_back_button(image)
+            if back is not None:
+                tap(
+                    back.center().x(),
+                    back.center().y(),
+                    screen_w=image.width(),
+                    screen_h=image.height(),
+                )
+                self.heart_note.emit("戻るを押しました。")
+                image = None
+                deadline = time.time() + 8
+                while time.time() < deadline:
+                    time.sleep(0.4)
+                    image = shot()
+                    if image is not None and _home_ranking_button(image) is not None:
+                        break
+                    image = None
+            if image is None or _home_ranking_button(image) is None:
+                self.heart_note.emit("ホームがありません。")
+                return
+            rank = _home_ranking_button(image)
+            tap(
+                rank.center().x(),
+                rank.center().y(),
+                screen_w=image.width(),
+                screen_h=image.height(),
+            )
+            self.heart_note.emit("ランキングを押しました。")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _open_tsum_about(self) -> None:
         try:
