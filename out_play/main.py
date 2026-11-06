@@ -1098,6 +1098,7 @@ class MenuWindow(QMainWindow):
                 _ranking_list,
                 _ranking_scroll_points,
             )
+            from app.player_name import read_ranking_name, save_player_name
 
             def list_mark(frame) -> tuple:
                 width = frame.width()
@@ -1188,7 +1189,12 @@ class MenuWindow(QMainWindow):
                     previous = mark
                     continue
                 if moved:
-                    self.heart_note.emit("１位が出ました。")
+                    name = read_ranking_name(image)
+                    if name:
+                        save_player_name(name)
+                        self.heart_note.emit(f"名前は{name}です。")
+                    else:
+                        self.heart_note.emit("名前が取れませんでした。")
                     return
             self.heart_note.emit(
                 "１位が出ませんでした。" if moved else "上にスクロールできませんでした。"
