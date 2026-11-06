@@ -820,18 +820,9 @@ def _home_ranking_button(image: QImage) -> QRect | None:
         return None
     if _home_play_button(image) is None:
         return None
-    tabs = [
-        pill
-        for pill in _yellow_pills(image)
-        if pill.center().x() < image.width() * 0.18
-        and image.height() * 0.40 < pill.center().y() < image.height() * 0.62
-        and pill.width() < image.width() * 0.22
-    ]
-    if not tabs:
-        return None
-    home = max(tabs, key=lambda rect: rect.width() * rect.height())
-    tap_y = min(image.height() - 1, home.y() + (home.height() * 3) // 4)
-    return QRect(home.center().x(), tap_y, 1, 1)
+    x = min(image.width() - 1, max(0, int(round(40 * image.width() / 576))))
+    y = min(image.height() - 1, max(0, int(round(605 * image.height() / 1024))))
+    return QRect(x, y, 1, 1)
 
 
 def _cancel_button(image: QImage) -> QRect | None:
