@@ -75,6 +75,7 @@ def _empty() -> dict:
         "rl_bomb": _empty_rl_length(),
         "rl_skill": _empty_rl_length(),
         "rl_skill_coin": _empty_rl_length(),
+        "rl_reach": _empty_reach(),
     }
 
 
@@ -144,6 +145,7 @@ def _load() -> dict:
         "rl_bomb": _rl_length_from(payload.get("rl_bomb")),
         "rl_skill": _rl_length_from(payload.get("rl_skill")),
         "rl_skill_coin": _skill_coin_from_plays(cleaned),
+        "rl_reach": _reach_from(payload.get("rl_reach")),
     }
     return _cache
 
@@ -169,6 +171,7 @@ def _save(data: dict, disk: bool = False) -> None:
                 "rl_bomb": data.get("rl_bomb") or _empty_rl_length(),
                 "rl_skill": data.get("rl_skill") or _empty_rl_length(),
                 "rl_skill_coin": data.get("rl_skill_coin") or _empty_rl_length(),
+                "rl_reach": data.get("rl_reach") or _empty_reach(),
             },
             ensure_ascii=False,
             indent=2,
@@ -267,6 +270,54 @@ def _play_waits(item: dict) -> list[float]:
 
 def _num_width(*nums: int) -> int:
     return max((len(str(int(n))) for n in nums), default=1)
+
+
+def _empty_reach() -> dict:
+    return {"ok": {"sum": 0.0, "n": 0}, "ng": {"sum": 0.0, "n": 0}}
+
+
+def _reach_side(raw) -> dict[str, float | int]:
+    if not isinstance(raw, dict):
+        return {"sum": 0.0, "n": 0}
+    return {"sum": float(raw.get("sum") or 0), "n": int(raw.get("n") or 0)}
+
+
+def _reach_from(raw) -> dict:
+    empty = _empty_reach()
+    if not isinstance(raw, dict):
+        return empty
+    return {"ok": _reach_side(raw.get("ok")), "ng": _reach_side(raw.get("ng"))}
+
+
+def reach_ratio() -> float | None:
+    data = _load()
+    rl = _reach_from(data.get("rl_reach"))
+    ok = rl["ok"]
+    ng = rl["ng"]
+    ok_n = int(ok["n"])
+    ng_n = int(ng["n"])
+    if ok_n <= 0 or ng_n <= 0:
+        return None
+    ok_avg = float(ok["sum"]) / ok_n
+    ng_avg = float(ng["sum"]) / ng_n
+    if random.randrange(ok_n + ng_n + 2) == 0:
+        return ok_avg if random.randrange(2) == 0 else ng_avg
+    return (ok_avg + ng_avg) / 2.0
+
+
+def record_reach(ratio: float, ok: bool) -> None:
+    gap = float(ratio)
+    if gap <= 0:
+        return
+    data = _load()
+    rl = _reach_from(data.get("rl_reach"))
+    key = "ok" if ok else "ng"
+    item = dict(rl[key])
+    item["sum"] = float(item["sum"]) + gap
+    item["n"] = int(item["n"]) + 1
+    rl[key] = item
+    data["rl_reach"] = rl
+    _save(data)
 
 
 def _rl_from(raw) -> dict:
