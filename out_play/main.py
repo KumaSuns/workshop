@@ -833,6 +833,9 @@ class MenuWindow(QMainWindow):
         self._show_model_choice()
         self._add_used_sections(left, mark_font)
         self._flow_lamps: dict[str, QPushButton] = {}
+        flow = QVBoxLayout()
+        flow.setContentsMargins(0, 0, 0, 0)
+        flow.setSpacing(2)
         for name in FLOW_LAMPS:
             lamp = QPushButton(name)
             lamp.setFont(mark_font)
@@ -842,7 +845,8 @@ class MenuWindow(QMainWindow):
             lamp.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             lamp.setStyleSheet(FLOW_LAMP_OFF)
             self._flow_lamps[name] = lamp
-            left.addWidget(lamp, 0, Qt.AlignmentFlag.AlignHCenter)
+            flow.addWidget(lamp, 0, Qt.AlignmentFlag.AlignHCenter)
+        left.addLayout(flow)
         QTimer.singleShot(0, self._fit_flow_lamps)
         left.addStretch(1)
         memory_title = QLabel("メモリ使用率")
