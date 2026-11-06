@@ -163,6 +163,12 @@ def skill_is_cinderella(name: str) -> bool:
     return key in {"シンデレラ", "Cinderella"} or key.casefold() == "cinderella"
 
 
+def skill_is_cruella(name: str) -> bool:
+    key = skill_tsum_key(name)
+    folded = key.casefold().replace(" ", "")
+    return key == "ロルカナ クルエラ" or folded == "lorcanacruella"
+
+
 def skill_is_pooh(name: str) -> bool:
     key = skill_tsum_key(name)
     handler = _AFTER.get(key) or _AFTER.get(key.casefold())
