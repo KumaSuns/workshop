@@ -95,7 +95,6 @@ from app.play_style import (
     record_reach,
     record_rl_bomb,
     record_rl_skill,
-    reach_ratio,
     set_last_play_coins,
     set_last_result_coin,
     should_bomb,
@@ -487,15 +486,9 @@ def run_play(
     while True:
         try:
             predictor, chain_best, gap_ratio = load_play_tools()
-            reach_now: list[float | None] = [None]
 
             def candidates(pieces, limit=8):
-                return chain_best(
-                    pieces,
-                    limit,
-                    reach_ratio=reach_now[0],
-                    expand=False,
-                )
+                return chain_best(pieces, limit)
             break
         except ModuleNotFoundError as exc:
             missing = (exc.name or "").split(".", 1)[0]
@@ -1446,7 +1439,6 @@ def run_play(
         extra: list[frozenset[tuple[int, int]]] | None = None,
         used_spots: set[tuple[int, int]] | None = None,
     ) -> list[list[dict[str, int]]]:
-        reach_now[0] = reach_ratio()
         gone = set(used_spots or ())
         live = [
             piece
