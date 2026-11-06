@@ -31,6 +31,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -3079,6 +3080,24 @@ class MenuWindow(QMainWindow):
         kinds.setChecked(not named.isChecked())
         column.addWidget(kinds)
         column.addWidget(named)
+        column.addWidget(QLabel("なぞるスピード"))
+        from app.bluestacks import SWIPE_SPEEDS, set_swipe_speeds, swipe_speed_name
+
+        speed_group = QButtonGroup(dialog)
+        current_speed = swipe_speed_name()
+        for name, point, center in SWIPE_SPEEDS:
+            button = QRadioButton(name)
+            button.setAutoExclusive(False)
+            speed_group.addButton(button)
+            button.setChecked(name == current_speed)
+
+            def save_speed(checked: bool, point=point, center=center) -> None:
+                if not checked:
+                    return
+                set_swipe_speeds(point, center)
+
+            button.toggled.connect(save_speed)
+            column.addWidget(button)
         gpu = _gpu_label()
         if gpu:
             column.addWidget(QLabel(gpu))

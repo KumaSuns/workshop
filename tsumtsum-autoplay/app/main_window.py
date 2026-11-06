@@ -85,10 +85,10 @@ class GaugePie(QWidget):
 from app.bluestacks import (
     capture_play_frame,
     halt_input,
-    reset_swipe_speeds,
+    SWIPE_SPEEDS,
     set_swipe_speeds,
     start_tsum,
-    swipe_speeds,
+    swipe_speed_name,
     tsum_is_running,
 )
 from app.intro import IntroWorker
@@ -1467,39 +1467,36 @@ class MainWindow(QMainWindow):
         named.toggled.connect(save_model)
         shared.toggled.connect(save_model)
 
-        layout.addWidget(QLabel("あいだの点（秒）"))
-        point_edit = QLineEdit()
-        layout.addWidget(point_edit)
-        layout.addWidget(QLabel("ツムの中心（秒）"))
-        center_edit = QLineEdit()
-        layout.addWidget(center_edit)
+        layout.addWidget(QLabel("なぞるスピード"))
+        speed_group = QButtonGroup(dialog)
+        speed_buttons: dict[str, QRadioButton] = {}
+        current_speed = swipe_speed_name()
+        for name, _point, _center in SWIPE_SPEEDS:
+            button = QRadioButton(name)
+            button.setAutoExclusive(False)
+            speed_group.addButton(button)
+            button.setChecked(name == current_speed)
+            speed_buttons[name] = button
+            layout.addWidget(button)
 
-        def show(point_s: float, center_s: float) -> None:
-            point_edit.setText(f"{point_s:.3f}")
-            center_edit.setText(f"{center_s:.3f}")
-
-        def read() -> tuple[float, float] | None:
-            try:
-                point_s = float(point_edit.text().strip())
-                center_s = float(center_edit.text().strip())
-            except ValueError:
-                return None
-            if point_s < 0 or center_s < 0:
-                return None
-            return point_s, center_s
+        def chosen() -> tuple[float, float] | None:
+            for name, point, center in SWIPE_SPEEDS:
+                if speed_buttons[name].isChecked():
+                    return point, center
+            return None
 
         def save() -> None:
-            speeds = read()
+            speeds = chosen()
             if speeds is None:
-                QMessageBox.information(dialog, "設定", "0以上の秒数を入力してください。")
+                QMessageBox.information(dialog, "設定", "なぞるスピードを選んでください。")
                 return
             set_swipe_speeds(speeds[0], speeds[1])
             dialog.accept()
 
         def reset() -> None:
-            show(*reset_swipe_speeds())
-
-        show(*swipe_speeds())
+            name, point, center = SWIPE_SPEEDS[0]
+            set_swipe_speeds(point, center)
+            speed_buttons[name].setChecked(True)
         cbuzz_btn = QPushButton("cバズの設定")
         cbuzz_btn.clicked.connect(self._open_cbuzz_settings)
         layout.addWidget(cbuzz_btn)

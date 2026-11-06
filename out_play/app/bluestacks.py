@@ -36,6 +36,11 @@ _mouse_lock = Lock()
 _cap_lock = Lock()
 SWIPE_POINT_S = 0.006
 SWIPE_CENTER_S = 0.018
+SWIPE_SPEEDS = (
+    ("標準", 0.004, 0.012),
+    ("速め", 0.002, 0.006),
+    ("超速", 0.001, 0.003),
+)
 _SWIPE_SPEED_PATH = APP_ROOT / "data" / "swipe_speed.json"
 swipe_point_s = SWIPE_POINT_S
 swipe_center_s = SWIPE_CENTER_S
@@ -65,6 +70,14 @@ def _save_swipe_speeds() -> None:
 
 def swipe_speeds() -> tuple[float, float]:
     return swipe_point_s, swipe_center_s
+
+
+def swipe_speed_name() -> str | None:
+    point_s, center_s = swipe_speeds()
+    for name, point, center in SWIPE_SPEEDS:
+        if abs(point_s - point) < 0.0005 and abs(center_s - center) < 0.0005:
+            return name
+    return None
 
 
 def set_swipe_speeds(point_s: float, center_s: float) -> None:
