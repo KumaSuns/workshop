@@ -161,7 +161,27 @@ def _find_shortcut(desktop: str) -> Path | None:
     return None
 
 
-def _hd_player_running() -> bool:
+def _proc_has_comm(*names: str) -> bool:
+    root = Path("/proc")
+    if not root.is_dir():
+        return False
+    wanted = {name for name in names}
+    short = {name[:15] for name in wanted}
+    for entry in root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            comm = (entry / "comm").read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            continue
+        if comm in wanted or comm in short:
+            return True
+    return False
+
+
+def hd_player_running() -> bool:
+    if sys.platform != "win32":
+        return _proc_has_comm("HD-Player.exe", "HD-Player")
     result = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq HD-Player.exe", "/FO", "CSV", "/NH"],
         check=False,
@@ -170,6 +190,10 @@ def _hd_player_running() -> bool:
         creationflags=_NO_WINDOW,
     )
     return "HD-Player.exe" in (result.stdout or "")
+
+
+def _hd_player_running() -> bool:
+    return hd_player_running()
 
 
 def _adb_port() -> str:

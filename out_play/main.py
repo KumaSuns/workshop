@@ -3737,15 +3737,9 @@ def _start_match(window: MenuWindow) -> None:
 
 
 def _bluestacks_running() -> bool:
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq HD-Player.exe", "/FO", "CSV", "/NH"],
-        check=False,
-        capture_output=True,
-        text=True,
-        creationflags=flags,
-    )
-    return "HD-Player.exe" in (result.stdout or "")
+    from app.bluestacks import hd_player_running
+
+    return hd_player_running()
 
 
 def _file_sha1(path: Path) -> str:
