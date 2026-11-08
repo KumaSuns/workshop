@@ -176,6 +176,7 @@ class PlayWorker(QThread):
         loop: bool = False,
         ask_kinds: bool = False,
         games: int | None = None,
+        end_after: Event | None = None,
     ) -> None:
         super().__init__(parent)
         self._stop = stop
@@ -186,6 +187,7 @@ class PlayWorker(QThread):
         self._count_skill = count_skill
         self._loop = loop
         self._games = games
+        self._end_after = end_after
         self._ask_kinds = ask_kinds
         self._kinds_gate = Event()
         self._kinds_answer: int | None = None
@@ -241,6 +243,7 @@ class PlayWorker(QThread):
                 count_skill=self._count_skill,
                 loop=self._loop,
                 games=self._games,
+                end_after=self._end_after,
                 request_kinds=self._request_kinds if self._ask_kinds else None,
                 request_used_tsum=self._request_used_tsum,
                 use_dedicated=lambda: self._used_dedicated,
@@ -282,6 +285,7 @@ def run_play(
     count_skill: Callable[[], bool] | None = None,
     loop: bool = False,
     games: int | None = None,
+    end_after: Event | None = None,
     request_kinds: Callable[[], int | None] | None = None,
     request_used_tsum: Callable[[str, Path | None, bool], str | None] | None = None,
     use_dedicated: Callable[[], bool] | None = None,
@@ -312,6 +316,8 @@ def run_play(
     def _continue_after_game() -> bool:
         nonlocal games_done
         games_done += 1
+        if end_after is not None and end_after.is_set():
+            return False
         if games is not None:
             return games_done < games
         return loop

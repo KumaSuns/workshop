@@ -591,7 +591,12 @@ class MainWindow(QMainWindow):
                 QSizePolicy.Policy.Expanding,
                 button.sizePolicy().verticalPolicy(),
             )
-            pair = QPushButton(str(number))
+            if number == 8:
+                pair = QPushButton("このプレイでやめる (F1)")
+                pair.clicked.connect(self.on_end_after_play)
+                self._end_after_btn = pair
+            else:
+                pair = QPushButton(str(number))
             pair.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 button.sizePolicy().verticalPolicy(),
@@ -662,6 +667,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self._fill_history()
         self._stop = threading.Event()
+        self._end_after = threading.Event()
         self._save_boards = threading.Event()
         self._board_grabs: Queue = Queue()
         self._count_skill = threading.Event()
@@ -785,6 +791,7 @@ class MainWindow(QMainWindow):
             return
         self._loop_play = loop
         self._stop.clear()
+        self._end_after.clear()
         self._set_running(True)
         self._set_status("連続プレイ" if loop else "PLAY")
         if not tsum_is_running():
@@ -817,6 +824,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "今すぐプレイ", "ツムツムが起動していません。")
             return
         self._stop.clear()
+        self._end_after.clear()
         self._set_running(True)
         self._set_status("今すぐプレイ")
         self._start_play(start_match=True, ask_kinds=True, loop=False)
@@ -856,6 +864,12 @@ class MainWindow(QMainWindow):
         if clicked is no:
             return False
         return None
+
+    def on_end_after_play(self) -> None:
+        if not self._is_busy():
+            return
+        self._end_after.set()
+        self._set_status("このプレイでやめます")
 
     def on_stop(self) -> None:
         if not self._is_busy():
@@ -1223,6 +1237,7 @@ class MainWindow(QMainWindow):
             loop=loop,
             ask_kinds=ask_kinds,
             games=self._play_games if loop else None,
+            end_after=self._end_after,
         )
         self._play.status.connect(self._set_status)
         self._play.preview.connect(self._debug.set_preview)
@@ -1847,6 +1862,9 @@ class MainWindow(QMainWindow):
         if event.isAutoRepeat() or QApplication.activeModalWidget() is not None:
             return False
         key = event.key()
+        if key == Qt.Key.Key_F1:
+            self.on_end_after_play()
+            return True
         if key == Qt.Key.Key_F5:
             self.on_play_now()
             return True
