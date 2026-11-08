@@ -25,6 +25,8 @@ from app.bluestacks import (
     reset_swipe_mouse,
     swipe_path,
     tap,
+    report_mem_now,
+    set_capture_mem_note,
     tap_skill,
     tap_skill_adb,
     tap_together,
@@ -159,7 +161,8 @@ class PlayWorker(QThread):
     named_confused = Signal(object)
     timeup_lamp = Signal(bool)
     skill_lamp = Signal(bool)
-    my_lamp = Signal(str)
+    my_lamp = Signal(str, int)
+    mem_use = Signal(int)
     items = Signal(str)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
@@ -229,6 +232,7 @@ class PlayWorker(QThread):
         return self._used_answer
 
     def run(self) -> None:
+        set_capture_mem_note(self.mem_use.emit)
         try:
             run_play(
                 self.status.emit,
@@ -264,6 +268,7 @@ class PlayWorker(QThread):
         else:
             self.completed.emit()
         finally:
+            set_capture_mem_note(None)
             _stop_timeup_app()
             flush_style()
 
@@ -293,7 +298,7 @@ def run_play(
     skill_pressed: Event | None = None,
     timeup_seen: Event | None = None,
     skill_lamp: Callable[[bool], None] | None = None,
-    my_lamp: Callable[[str], None] | None = None,
+    my_lamp: Callable[[str, int], None] | None = None,
     money: Callable[[object, object], None] | None = None,
     named_line: Callable[[str], None] | None = None,
     named_confused: Callable[[object], None] | None = None,
@@ -323,13 +328,16 @@ def run_play(
         return loop
 
     my_mode = "off"
+    my_shown: int | None = None
 
-    def set_my_lamp(mode: str) -> None:
-        nonlocal my_mode
-        if my_lamp is None or mode == my_mode:
+    def set_my_lamp(mode: str, count: int = 0) -> None:
+        nonlocal my_mode, my_shown
+        shown = int(count) if mode in {"red", "on"} and int(count) > 0 else None
+        if my_lamp is None or (mode == my_mode and shown == my_shown):
             return
         my_mode = mode
-        my_lamp(mode)
+        my_shown = shown
+        my_lamp(mode, 0 if shown is None else shown)
 
     def show_used(names: list[str] | None) -> None:
         if show_items is None:
@@ -415,7 +423,7 @@ def run_play(
         raise RuntimeError("TIME UP のモデルがありません。")
 
     last_named = ""
-    named_confused_pairs: list[tuple[str, str]] = []
+    named_confused_pairs: list[tuple[str, str, float, float]] = []
 
     def note_named(found: list) -> None:
         nonlocal last_named
@@ -428,9 +436,25 @@ def run_play(
             rival = str(piece.get("name_rival") or "").strip()
             if not name or not rival:
                 continue
-            pair = (name, rival)
-            if pair not in named_confused_pairs:
-                named_confused_pairs.append(pair)
+            try:
+                score = float(piece.get("name_score"))
+                rival_score = float(piece.get("name_rival_score"))
+            except (TypeError, ValueError):
+                continue
+            kept = next(
+                (
+                    index
+                    for index, item in enumerate(named_confused_pairs)
+                    if item[0] == name and item[1] == rival
+                ),
+                None,
+            )
+            if kept is None:
+                named_confused_pairs.append((name, rival, score, rival_score))
+                continue
+            old_score, old_rival = named_confused_pairs[kept][2], named_confused_pairs[kept][3]
+            if score - rival_score < old_score - old_rival:
+                named_confused_pairs[kept] = (name, rival, score, rival_score)
         limit = int(getattr(predictor, "named_limit", 0) or 0)
         open_names = [
             str(name).strip()
@@ -1019,7 +1043,6 @@ def run_play(
         _skill_play[0] = True
         watch_hit.clear()
         _watcher_timeup[0] = False
-        show_timeup(False)
         if skill_wait_empty:
             fill = _skill_fill(rgb, skill)
             if fill is not None and fill < SKILL_FILL_SPENT:
@@ -1482,6 +1505,8 @@ def run_play(
             return
         timeup_lit[0] = on
         timeup_lamp(on)
+        if on:
+            report_mem_now()
 
     def show_watch_money(kind: str, text: str) -> None:
         if kind == "COIN":
@@ -2326,12 +2351,6 @@ def run_play(
             timer_running = timer_left is not None and timer_left > 0
             if timer_running:
                 saw_timer = True
-            if timer_running:
-                if watch_hit.is_set() or _watcher_timeup[0]:
-                    watch_hit.clear()
-                    _watcher_timeup[0] = False
-                    show_timeup(False)
-                    watcher_told[0] = False
             elif _watcher_timeup[0] and timer_left == 0 and not watcher_told[0]:
                 watcher_told[0] = True
                 say("TIME UP")
@@ -2974,13 +2993,13 @@ def run_play(
                             and meter_skill < SKILL_FILL_READY
                         ):
                             burst_need = int(remain)
+                        my_add = int(added) if added > 0 else int(counted)
                         if fills_full:
-                            set_my_lamp("red")
+                            set_my_lamp("red", my_add)
                         elif added > 0 or counted > 0:
-                            set_my_lamp("on")
+                            set_my_lamp("on", my_add)
                         else:
                             set_my_lamp("off")
-                        my_add = int(added) if added > 0 else int(counted)
                         carry_done = [False]
 
                         def mash_while_down() -> None:
@@ -3175,9 +3194,6 @@ def run_play(
                                 say("TIME UP / " + _counts_line(clears, swipes))
                         elif _timer_still_running(check_rgb, timer):
                             timeup = False
-                            watch_hit.clear()
-                            _watcher_timeup[0] = False
-                            show_timeup(False)
                             next_frame = (check, check_rgb)
                         elif not (
                             check is not None
@@ -4755,12 +4771,13 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
             if text == b"ENDED" and watching.is_set():
                 _watcher_ended[0] = True
                 continue
-            if text == b"TIMEUP" and watching.is_set() and not _skill_play[0]:
-                hit.set()
-                _watcher_timeup[0] = True
+            if text == b"TIMEUP" and watching.is_set():
                 note = _timeup_lamp[0]
                 if note is not None:
                     note(True)
+                if not _skill_play[0]:
+                    hit.set()
+                    _watcher_timeup[0] = True
                 continue
             if text == b"GRAB_FAIL" or text.startswith(b"GRABBED"):
                 ok = text.startswith(b"GRABBED")

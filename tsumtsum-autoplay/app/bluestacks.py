@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from threading import Lock
 
@@ -34,6 +35,7 @@ _adb_ok = False
 _last_cap_size: tuple[int, int] | None = None
 _mouse_lock = Lock()
 _cap_lock = Lock()
+_mem_note: Callable[[int], None] | None = None
 SWIPE_POINT_S = 0.006
 SWIPE_CENTER_S = 0.018
 SWIPE_SPEEDS = (
@@ -257,6 +259,52 @@ def capture_screen_path() -> Path:
     path = _capture_pull(local)
     _remember_cap_size(path)
     return path
+
+
+def set_capture_mem_note(note: Callable[[int], None] | None) -> None:
+    global _mem_note
+    _mem_note = note
+
+
+def _working_set() -> int | None:
+    if sys.platform != "win32":
+        return None
+    counters = _MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(counters)
+    get_mem = getattr(ctypes.windll.kernel32, "K32GetProcessMemoryInfo", None)
+    if get_mem is None:
+        return None
+    get_mem.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+    get_mem.restype = ctypes.c_int
+    handle = ctypes.windll.kernel32.GetCurrentProcess()
+    if not get_mem(handle, ctypes.byref(counters), counters.cb):
+        return None
+    return int(counters.WorkingSetSize)
+
+
+def report_mem_now() -> None:
+    note = _mem_note
+    if note is None:
+        return
+    used = _working_set()
+    if used is None:
+        return
+    note(used // (1024 * 1024))
+
+
+class _MEMORY_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
 
 
 def capture_play_frame() -> QImage:

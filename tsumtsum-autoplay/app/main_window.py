@@ -10,7 +10,7 @@ from pathlib import Path
 from queue import Queue
 
 from PySide6.QtCore import QObject, QRectF, QSettings, QSize, QStandardPaths, Qt, QTimer, QEvent, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QImageReader, QPainter, QPalette, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -30,9 +31,37 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSizePolicy,
+    QSpinBox,
+    QStyle,
+    QStyleOptionHeader,
+    QStyleOptionViewItem,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+
+class LoopCountBox(QSpinBox):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setRange(0, 100)
+        self.setSpecialValueText("∞")
+        self.setValue(0)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def stepBy(self, steps: int) -> None:
+        value = self.value()
+        if steps > 0:
+            if value == 0:
+                return
+            self.setValue(0 if value <= steps else value - steps)
+            return
+        down = -steps
+        if value == 0:
+            self.setValue(min(100, down))
+            return
+        self.setValue(min(100, value + down))
 
 class GaugePie(QWidget):
     def __init__(self, extra: int = 0, parent: QWidget | None = None) -> None:
@@ -536,7 +565,7 @@ class MainWindow(QMainWindow):
         confused_row.addWidget(self._info_confused)
         confused_row.addStretch(1)
         money_col.addLayout(confused_row)
-        self._named_confused: list[tuple[str, str]] = []
+        self._named_confused: list[tuple[str, str, float, float]] = []
         self._confused_dialog: QDialog | None = None
         money_col.addStretch(1)
         info_row.addWidget(self._info_money, 1)
@@ -567,6 +596,12 @@ class MainWindow(QMainWindow):
         self._info_my_lamp.setWordWrap(True)
         self._info_my_lamp.setStyleSheet("background: palette(mid);")
         count_col.addWidget(self._info_my_lamp)
+        self._info_my_count = QLabel("－")
+        self._info_my_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        count_col.addWidget(self._info_my_count)
+        self._info_mem = QLabel("－")
+        self._info_mem.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        count_col.addWidget(self._info_mem)
         count_col.addStretch(1)
         info_row.addWidget(self._info_count)
         self._info_tsum = QLabel()
@@ -584,9 +619,11 @@ class MainWindow(QMainWindow):
         buttons.setContentsMargins(0, 0, 0, 0)
         buttons.setSpacing(layout.spacing() // 2)
         self._value_btns: list[QPushButton] = []
+        self._pair_count = 0
 
         def add_pair(button: QPushButton) -> None:
-            number = len(self._value_btns) + 1
+            self._pair_count += 1
+            number = self._pair_count
             button.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 button.sizePolicy().verticalPolicy(),
@@ -595,8 +632,15 @@ class MainWindow(QMainWindow):
                 pair = QPushButton("このプレイでやめる (F1)")
                 pair.clicked.connect(self.on_end_after_play)
                 self._end_after_btn = pair
+            elif number == 9:
+                pair = LoopCountBox()
+                self._loop_games = pair
             else:
-                pair = QPushButton(str(number))
+                pair = QPushButton(self._right_button_text(number))
+                self._value_btns.append(pair)
+                if number == 1:
+                    self._front_btn = pair
+                    pair.clicked.connect(self._toggle_stay_on_top)
             pair.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 button.sizePolicy().verticalPolicy(),
@@ -607,7 +651,6 @@ class MainWindow(QMainWindow):
             row.addWidget(button, 1)
             row.addWidget(pair, 1)
             buttons.addLayout(row)
-            self._value_btns.append(pair)
 
         self.settings_btn = QPushButton("設定")
         self.settings_btn.clicked.connect(self._open_swipe_settings)
@@ -772,7 +815,9 @@ class MainWindow(QMainWindow):
         self._register_used_tsum(None, title="ツムを追加", allow_skip=False)
 
     def on_loop_play(self, games: int | None = None) -> None:
-        self._play_games = games if isinstance(games, int) and games > 0 else None
+        if isinstance(games, bool) or not isinstance(games, int) or games <= 0:
+            games = self._loop_games.value()
+        self._play_games = None if games <= 0 else games
         self._begin_play(loop=True)
 
     def on_record_one(self) -> None:
@@ -899,7 +944,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(running)
         if running:
             self._front_timer.stop()
-            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+            self._apply_stay_on_top(False)
             if not self._suppress_show:
                 self.show()
             self._f5_down = False
@@ -915,12 +960,35 @@ class MainWindow(QMainWindow):
             self._f9_down = False
             self._f11_down = False
             self._unregister_stop_hotkey()
-            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            self._apply_stay_on_top(True)
             if not self._suppress_show:
                 self.show()
                 self._front_timer.start()
                 self._keep_front()
             self._clear_meters()
+
+    def _right_button_text(self, number: int) -> str:
+        return {
+            1: "最前面オン",
+            2: "連打繰り越し",
+            3: "ボムキャン繰り越し",
+            4: "繋げたまま繰り越し",
+            5: "ボムだけ繰り越し",
+            6: "サブツム繰り越し",
+            7: "ボムを放さず繰り越し",
+        }.get(number, str(number))
+
+    def _apply_stay_on_top(self, on: bool) -> None:
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        button = getattr(self, "_front_btn", None)
+        if button is not None:
+            button.setText("最前面オン" if on else "最前面オフ")
+
+    def _toggle_stay_on_top(self) -> None:
+        on = not bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+        self._apply_stay_on_top(on)
+        if not self._suppress_show:
+            self.show()
 
     def _clear_meters(self) -> None:
         self._info_time_value.setText("－")
@@ -933,7 +1001,8 @@ class MainWindow(QMainWindow):
         self._info_erase_value.setText("－")
         self._info_fever_en.setStyleSheet("")
         self._set_skill_lamp(False)
-        self._set_my_lamp("off")
+        self._set_my_lamp("off", 0)
+        self._info_mem.setText("－")
 
     def _meter_bar_row(self, bar: QProgressBar) -> QWidget:
         row = QWidget()
@@ -1068,16 +1137,73 @@ class MainWindow(QMainWindow):
         self._info_named.show()
 
     def _set_named_confused(self, pairs) -> None:
-        shown: list[tuple[str, str]] = []
+        shown: list[tuple[str, str, float, float]] = []
         for item in pairs or []:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
+            if not isinstance(item, (list, tuple)) or len(item) < 4:
                 continue
             name = str(item[0]).strip()
             rival = str(item[1]).strip()
-            if name and rival and (name, rival) not in shown:
-                shown.append((name, rival))
+            try:
+                score = float(item[2])
+                rival_score = float(item[3])
+            except (TypeError, ValueError):
+                continue
+            if name and rival and not any(old[0] == name and old[1] == rival for old in shown):
+                shown.append((name, rival, score, rival_score))
+        shown.sort(key=lambda item: item[2] - item[3])
         self._named_confused = shown
         self._info_confused.setEnabled(True)
+
+    def _confused_cell_size(self, table: QTableWidget, text: str) -> QSize:
+        option = QStyleOptionViewItem()
+        option.initFrom(table)
+        option.font = table.font()
+        option.fontMetrics = QFontMetrics(table.font())
+        option.text = text
+        option.features = QStyleOptionViewItem.ViewItemFeature.HasDisplay
+        return table.style().sizeFromContents(
+            QStyle.ContentsType.CT_ItemViewItem,
+            option,
+            QSize(option.fontMetrics.horizontalAdvance(text), option.fontMetrics.height()),
+            table,
+        )
+
+    def _confused_header_width(self, header: QHeaderView, text: str) -> int:
+        option = QStyleOptionHeader()
+        option.initFrom(header)
+        option.fontMetrics = QFontMetrics(header.font())
+        option.text = text
+        option.section = 0
+        option.textAlignment = Qt.AlignmentFlag.AlignCenter
+        option.orientation = Qt.Orientation.Horizontal
+        hint = header.style().sizeFromContents(
+            QStyle.ContentsType.CT_HeaderSection,
+            option,
+            QSize(option.fontMetrics.horizontalAdvance(text), option.fontMetrics.height()),
+            header,
+        )
+        return hint.width()
+
+    def _put_confused_row(
+        self,
+        table: QTableWidget,
+        row: int,
+        label: str,
+        name: str,
+        score: float,
+        low: QBrush,
+        bg: QBrush,
+    ) -> None:
+        table.setVerticalHeaderItem(row, QTableWidgetItem(label))
+        name_item = QTableWidgetItem(name)
+        score_item = QTableWidgetItem(f"{score:.3f}")
+        score_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if score < 0.70:
+            name_item.setForeground(low)
+        for item in (name_item, score_item):
+            item.setBackground(bg)
+        table.setItem(row, 0, name_item)
+        table.setItem(row, 1, score_item)
 
     def _show_named_confused(self) -> None:
         dialog = QDialog(self)
@@ -1085,12 +1211,72 @@ class MainWindow(QMainWindow):
         dialog.setModal(False)
         dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         layout = QVBoxLayout(dialog)
-        lines = QListWidget()
-        for name, rival in self._named_confused:
-            lines.addItem(f"{name}  {rival}")
-        layout.addWidget(lines)
+        pairs = self._named_confused
+        table = QTableWidget(len(pairs) * 2, 2)
+        table.setHorizontalHeaderLabels(["ツム", "スコア"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.setAlternatingRowColors(False)
+        table.setWordWrap(False)
+        low = QBrush(QColor("red"))
+        palette = table.palette()
+        base = QBrush(palette.color(QPalette.ColorRole.Base))
+        alt = QBrush(palette.color(QPalette.ColorRole.AlternateBase))
+        for index, (name, rival, score, rival_score) in enumerate(pairs):
+            bg = alt if index % 2 else base
+            self._put_confused_row(table, index * 2, "名前", name, score, low, bg)
+            self._put_confused_row(table, index * 2 + 1, "次点", rival, rival_score, low, bg)
+        header = table.horizontalHeader()
+        name_width = self._confused_cell_size(table, "ツム").width()
+        score_width = self._confused_cell_size(table, "スコア").width()
+        row_height = self._confused_cell_size(table, "ツム").height()
+        for name, rival, score, rival_score in pairs:
+            name_width = max(
+                name_width,
+                self._confused_cell_size(table, name).width(),
+                self._confused_cell_size(table, rival).width(),
+            )
+            score_width = max(
+                score_width,
+                self._confused_cell_size(table, f"{score:.3f}").width(),
+                self._confused_cell_size(table, f"{rival_score:.3f}").width(),
+            )
+        name_width = max(name_width, self._confused_header_width(header, "ツム"))
+        score_width = max(score_width, self._confused_header_width(header, "スコア"))
+        side = max(
+            self._confused_header_width(header, "名前"),
+            self._confused_header_width(header, "次点"),
+        )
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setStretchLastSection(False)
+        table.setColumnWidth(1, score_width)
+        table.verticalHeader().setFixedWidth(side)
+        table.verticalHeader().setDefaultSectionSize(row_height)
+        frame = table.frameWidth() * 2 + table.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth)
+        text_width = side + name_width + score_width + frame
+        height = table.horizontalHeader().sizeHint().height() + frame + row_height * table.rowCount()
+        layout.addWidget(table)
+        margins = layout.contentsMargins()
+        text_width += margins.left() + margins.right()
+        height += margins.top() + margins.bottom()
+        screen = self.screen() or QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen is not None else None
+        dialog.resize(text_width, height)
         self._confused_dialog = dialog
         dialog.show()
+        if area is not None:
+            outer = dialog.frameGeometry()
+            extra_w = max(0, outer.width() - dialog.width())
+            extra_h = max(0, outer.height() - dialog.height())
+            free = self.frameGeometry().left() - area.left()
+            outer_w = free if free >= text_width + extra_w else area.width()
+            client_w = max(text_width, outer_w - extra_w)
+            client_h = min(height, max(1, area.height() - extra_h))
+            dialog.setMinimumWidth(client_w)
+            dialog.resize(client_w, client_h)
+            dialog.move(area.left(), area.top())
         dialog.raise_()
         dialog.activateWindow()
 
@@ -1108,7 +1294,7 @@ class MainWindow(QMainWindow):
         else:
             self._info_skill_lamp.setStyleSheet("background: palette(mid);")
 
-    def _set_my_lamp(self, mode: str) -> None:
+    def _set_my_lamp(self, mode: str, count: int = 0) -> None:
         if mode == "red":
             self._info_my_lamp.setStyleSheet("background: red; color: white;")
         elif mode == "on":
@@ -1117,6 +1303,13 @@ class MainWindow(QMainWindow):
             )
         else:
             self._info_my_lamp.setStyleSheet("background: palette(mid);")
+        if mode in {"red", "on"} and int(count) > 0:
+            self._info_my_count.setText(str(int(count)))
+        else:
+            self._info_my_count.setText("－")
+
+    def _set_mem_use(self, mb: int) -> None:
+        self._info_mem.setText(f"{int(mb)}MB")
 
     def _fit_tsum_slot(self) -> None:
         side = self._info_text.sizeHint().height() - (2 * self._info_skill_pie.extra())
@@ -1248,6 +1441,7 @@ class MainWindow(QMainWindow):
         self._play.timeup_lamp.connect(self._set_timeup_lamp)
         self._play.skill_lamp.connect(self._set_skill_lamp)
         self._play.my_lamp.connect(self._set_my_lamp)
+        self._play.mem_use.connect(self._set_mem_use)
         self._play.failed.connect(self._on_play_fail)
         self._play.items.connect(self._show_items)
         self._play.stopped.connect(self._on_stopped)
