@@ -75,6 +75,7 @@ from app.paths import (
     SERVER_SYNC_PATH,
     SKILLS_IMAGES_DIR,
     USE_TSUM_REGISTRY,
+    MIRROR_MAIN,
     VIDEO_EXTRACTOR_MAIN,
 )
 from app.predictor import Predictor
@@ -1484,11 +1485,13 @@ class MainWindow(QMainWindow):
         self.skill_register_btn = QPushButton("SKILL画像として登録")
         self.video_app_btn = QPushButton("動画編集・生成")
         self.video_app_btn.setObjectName("video")
+        self.mirror_btn = QPushButton("画面ミラー")
         stay_row = QHBoxLayout()
         stay_row.setContentsMargins(0, 0, 0, 0)
         stay_row.addWidget(self.delete_btn)
         stay_row.addWidget(self.skill_register_btn)
         stay_row.addWidget(self.video_app_btn)
+        stay_row.addWidget(self.mirror_btn)
         right_layout.addLayout(stay_row)
         right.setMinimumWidth(480)
 
@@ -1571,6 +1574,7 @@ class MainWindow(QMainWindow):
         self.elsa_delete_btn.clicked.connect(self.delete_elsa_image)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
+        self.mirror_btn.clicked.connect(self.launch_mirror)
         self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
         self.list_widget.itemChanged.connect(self.on_list_item_changed)
         self.list_widget.itemDoubleClicked.connect(self._on_file_name_double_clicked)
@@ -2325,6 +2329,29 @@ class MainWindow(QMainWindow):
         self._extractor_launch_dialog = dialog
         self._extractor_launch_attempt = 0
         QTimer.singleShot(500, self._confirm_extractor_launch)
+
+    def launch_mirror(self) -> None:
+        script = MIRROR_MAIN
+        if not script.exists():
+            QMessageBox.warning(
+                self,
+                "アプリが見つかりません",
+                f"画面ミラーが見つかりません。\n{script}",
+            )
+            return
+        kwargs: dict = {
+            "cwd": str(script.parent),
+            "env": self._subprocess_env(),
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            subprocess.Popen(
+                [str(self._resolve_launch_python()), str(script)],
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "起動に失敗", str(exc))
 
     def _close_extractor_launch_dialog(self) -> None:
         dialog = getattr(self, "_extractor_launch_dialog", None)
@@ -4454,6 +4481,7 @@ class MainWindow(QMainWindow):
             self.delete_unsaved_btn,
             self.shortcut_btn,
             self.video_app_btn,
+            self.mirror_btn,
             self.reuse_btn,
             self.copy_box_btn,
             self.region_list,
