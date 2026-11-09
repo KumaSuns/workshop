@@ -408,7 +408,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("オートプレイ　コントローラー")
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, _load_stay_on_top())
         icon = self._ensure_app_icon()
         if icon is not None:
             window_icon = QIcon()
@@ -641,6 +641,10 @@ class MainWindow(QMainWindow):
                 if number == 1:
                     self._front_btn = pair
                     pair.clicked.connect(self._toggle_stay_on_top)
+                    on = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+                    pair.setText("最前面オン" if on else "最前面オフ")
+                elif number == 12:
+                    pair.clicked.connect(self._show_red_data)
             pair.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 button.sizePolicy().verticalPolicy(),
@@ -976,10 +980,12 @@ class MainWindow(QMainWindow):
             5: "ボムだけ繰り越し",
             6: "サブツム繰り越し",
             7: "ボムを放さず繰り越し",
+            12: "保存ツム候補",
         }.get(number, str(number))
 
     def _apply_stay_on_top(self, on: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        _save_stay_on_top(on)
         button = getattr(self, "_front_btn", None)
         if button is not None:
             button.setText("最前面オン" if on else "最前面オフ")
@@ -1153,6 +1159,115 @@ class MainWindow(QMainWindow):
         shown.sort(key=lambda item: item[2] - item[3])
         self._named_confused = shown
         self._info_confused.setEnabled(True)
+        self._keep_red_confused(shown)
+
+    def _show_red_data(self) -> None:
+        headers = ["日時", "区分", "ツム", "スコア", "相手区分", "相手", "相手スコア"]
+        rows = self._read_red_data()
+        dialog = getattr(self, "_red_dialog", None)
+        if dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("保存ツム候補")
+            dialog.setModal(False)
+            dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            layout = QVBoxLayout(dialog)
+            front_row = QHBoxLayout()
+            front_row.addStretch(1)
+            front = QPushButton("最前面オン")
+            front.clicked.connect(self._toggle_saved_front)
+            front_row.addWidget(front)
+            layout.addLayout(front_row)
+            table = QTableWidget(0, len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+            table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            table.setWordWrap(False)
+            table.verticalHeader().setVisible(False)
+            header = table.horizontalHeader()
+            header.setStretchLastSection(True)
+            layout.addWidget(table)
+            dialog.resize(860, 420)
+            self._red_dialog = dialog
+            self._red_table = table
+            self._saved_front_btn = front
+        self._fill_red_table(rows)
+        self._bring_saved_dialog(dialog)
+
+    def _bring_saved_dialog(self, dialog: QDialog) -> None:
+        dialog.showNormal()
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            frame = dialog.frameGeometry()
+            if not area.contains(frame):
+                extra_w = max(0, frame.width() - dialog.width())
+                extra_h = max(0, frame.height() - dialog.height())
+                client_w = min(dialog.width(), max(1, area.width() - extra_w))
+                client_h = min(dialog.height(), max(1, area.height() - extra_h))
+                dialog.resize(client_w, client_h)
+                dialog.move(area.left(), area.top())
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _toggle_saved_front(self) -> None:
+        dialog = self._red_dialog
+        on = not bool(dialog.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        self._saved_front_btn.setText("最前面オン" if on else "最前面オフ")
+        self._bring_saved_dialog(dialog)
+
+    def _read_red_data(self) -> list[list[str]]:
+        path = APP_ROOT / "data" / "confused_red.txt"
+        if not path.is_file():
+            return []
+        rows: list[list[str]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 7 or parts[0] == "日時":
+                continue
+            rows.append(parts[:7])
+        return rows
+
+    def _fill_red_table(self, rows: list[list[str]]) -> None:
+        table = self._red_table
+        low = QBrush(QColor("red"))
+        table.setRowCount(len(rows))
+        for row_index, parts in enumerate(rows):
+            for col, text in enumerate(parts):
+                item = QTableWidgetItem(text)
+                if col == 2:
+                    item.setForeground(low)
+                table.setItem(row_index, col, item)
+
+    def _keep_red_confused(self, pairs: list[tuple[str, str, float, float]]) -> None:
+        fresh: list[tuple[str, str]] = []
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for name, rival, score, rival_score in pairs:
+            if score < 0.70:
+                body = "\t".join(("名前", name, f"{score:.3f}", "次点", rival, f"{rival_score:.3f}"))
+                fresh.append((body, f"{now}\t{body}"))
+            if rival_score < 0.70:
+                body = "\t".join(("次点", rival, f"{rival_score:.3f}", "名前", name, f"{score:.3f}"))
+                fresh.append((body, f"{now}\t{body}"))
+        if not fresh:
+            return
+        path = APP_ROOT / "data" / "confused_red.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = "日時\t区分\tツム\tスコア\t相手区分\t相手\t相手スコア"
+        kept: set[str] = set()
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    kept.add("\t".join(parts[1:7]))
+        else:
+            path.write_text(header + "\n", encoding="utf-8")
+        adding = [line for body, line in fresh if body not in kept]
+        if not adding:
+            return
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(adding) + "\n")
 
     def _confused_cell_size(self, table: QTableWidget, text: str) -> QSize:
         option = QStyleOptionViewItem()
@@ -2423,6 +2538,15 @@ class MainWindow(QMainWindow):
 
 def _play_model_settings() -> QSettings:
     return QSettings("workshop", "AutoPlay")
+
+
+def _load_stay_on_top() -> bool:
+    stored = str(_play_model_settings().value("stay_on_top", "on") or "on")
+    return stored != "off"
+
+
+def _save_stay_on_top(on: bool) -> None:
+    _play_model_settings().setValue("stay_on_top", "on" if on else "off")
 
 
 def _load_play_model() -> tuple[bool, bool]:

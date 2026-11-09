@@ -1038,11 +1038,9 @@ def run_play(
         skill_pressed.clear()
         if skill is None:
             return False
-        if watch_hit.is_set() and _read_timer(None, rgb, timer) == 0:
+        if watch_hit.is_set():
             return False
         _skill_play[0] = True
-        watch_hit.clear()
-        _watcher_timeup[0] = False
         if skill_wait_empty:
             fill = _skill_fill(rgb, skill)
             if fill is not None and fill < SKILL_FILL_SPENT:
@@ -4775,9 +4773,8 @@ def _ensure_timeup_app(hit: Event, watching: Event) -> None:
                 note = _timeup_lamp[0]
                 if note is not None:
                     note(True)
-                if not _skill_play[0]:
-                    hit.set()
-                    _watcher_timeup[0] = True
+                hit.set()
+                _watcher_timeup[0] = True
                 continue
             if text == b"GRAB_FAIL" or text.startswith(b"GRABBED"):
                 ok = text.startswith(b"GRABBED")

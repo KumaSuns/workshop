@@ -14,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QEventLoop, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QColor,
     QDragEnterEvent,
     QDropEvent,
@@ -77,6 +78,7 @@ from app.paths import (
     USE_TSUM_REGISTRY,
     MIRROR_MAIN,
     VIDEO_EXTRACTOR_MAIN,
+    WORKSHOP_ROOT,
 )
 from app.predictor import Predictor
 from app.regions import (
@@ -1112,6 +1114,44 @@ class CoinCropListWindow(QDialog):
             self._on_select(current, None)
 
 
+class SavedTsumWindow(QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("保存ツム候補")
+        self.setModal(False)
+        self.resize(860, 420)
+        layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["日時", "区分", "ツム", "スコア", "相手区分", "相手", "相手スコア"]
+        )
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+    def reload(self) -> None:
+        path = WORKSHOP_ROOT / "tsumtsum-autoplay" / "data" / "confused_red.txt"
+        rows: list[list[str]] = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                parts = line.split("\t")
+                if len(parts) < 7 or parts[0] == "日時":
+                    continue
+                rows.append(parts[:7])
+        low = QBrush(QColor("red"))
+        self.table.setRowCount(len(rows))
+        for row_index, parts in enumerate(rows):
+            for col, text in enumerate(parts):
+                item = QTableWidgetItem(text)
+                if col == 2:
+                    item.setForeground(low)
+                self.table.setItem(row_index, col, item)
+
+
 class CoinReadWorker(QThread):
     finished_ok = Signal(object)
     failed = Signal(str)
@@ -1376,7 +1416,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.elsa_list_btn)
         self.coin_crop_list_btn = QPushButton("コイン切り出し")
         left_layout.addWidget(self.coin_crop_list_btn)
+        self.saved_tsum_btn = QPushButton("保存ツム候補")
+        left_layout.addWidget(self.saved_tsum_btn)
         self._coin_crop_window = CoinCropListWindow(self)
+        self._saved_tsum_window = SavedTsumWindow(self)
         left_layout.addStretch(1)
         left.setMinimumWidth(317)
         left.setMaximumWidth(461)
@@ -1570,6 +1613,7 @@ class MainWindow(QMainWindow):
         self.server_save_btn.clicked.connect(self.upload_data_to_server)
         self.elsa_list_btn.clicked.connect(self.toggle_elsa_list)
         self.coin_crop_list_btn.clicked.connect(self.open_coin_crop_list)
+        self.saved_tsum_btn.clicked.connect(self.open_saved_tsum_list)
         self.elsa_run_btn.clicked.connect(self.run_elsa)
         self.elsa_delete_btn.clicked.connect(self.delete_elsa_image)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
@@ -2437,6 +2481,25 @@ class MainWindow(QMainWindow):
         self._coin_crop_window.show()
         self._coin_crop_window.raise_()
         self._coin_crop_window.activateWindow()
+
+    def open_saved_tsum_list(self) -> None:
+        window = self._saved_tsum_window
+        window.reload()
+        window.showNormal()
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            frame = window.frameGeometry()
+            if not area.contains(frame):
+                extra_w = max(0, frame.width() - window.width())
+                extra_h = max(0, frame.height() - window.height())
+                window.resize(
+                    min(window.width(), max(1, area.width() - extra_w)),
+                    min(window.height(), max(1, area.height() - extra_h)),
+                )
+                window.move(area.left(), area.top())
+        window.raise_()
+        window.activateWindow()
 
     def toggle_elsa_list(self) -> None:
         if self._block_if_training():
@@ -3556,6 +3619,7 @@ class MainWindow(QMainWindow):
             self.shortcut_btn,
             self.elsa_list_btn,
             self.coin_crop_list_btn,
+            self.saved_tsum_btn,
         ):
             widget.setVisible(visible)
         if visible:
