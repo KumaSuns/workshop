@@ -724,6 +724,7 @@ def run_play(
         _watcher_timeup[0] = False
         _watcher_ended[0] = False
         watcher_told[0] = False
+        show_timeup(False)
         if timeup_seen is not None:
             timeup_seen.clear()
         go_at = None
@@ -2220,6 +2221,15 @@ def run_play(
 
     _money_note[0] = _note_result_path
     next_frame = None
+
+    def _end_after_set() -> bool:
+        return end_after is not None and end_after.is_set()
+
+    def _leave_after_this() -> None:
+        say("このプレイでやめます")
+        stop_watch.set()
+        watching.clear()
+
     try:
         while True:
             _check_stop(stop)
@@ -2490,6 +2500,9 @@ def run_play(
                     True,
                     result_text=shown_money["result"],
                 )
+                if _end_after_set():
+                    _leave_after_this()
+                    return
                 fresh_match()
                 match_over = True
                 if replay_items is not None:
@@ -2503,6 +2516,9 @@ def run_play(
             if not saw_board:
                 start = _match_start_button(image)
                 if start is not None:
+                    if games_done > 0 and _end_after_set():
+                        _leave_after_this()
+                        return
                     ask_used_now(True)
                     if _start_hearts(image) == 0:
                         _wait_for_heart(say, stop)
@@ -2565,6 +2581,13 @@ def run_play(
                         used_items = found_items
                         show_used(found_items)
                 if time.time() >= ignore_start_until:
+                    if games_done > 0 and _end_after_set() and (
+                        _match_start_button(image) is not None
+                        or pause is not None
+                        or _continue_button(image) is not None
+                    ):
+                        _leave_after_this()
+                        return
                     if _match_start_button(image) is not None:
                         ask_used_now(True)
                     if _match_start_button(image) is not None and _start_hearts(image) == 0:
@@ -3282,6 +3305,9 @@ def run_play(
                         True,
                         result_text=shown_money["result"],
                     )
+                    if _end_after_set():
+                        _leave_after_this()
+                        return
                     fresh_match()
                     match_over = True
                     if replay_items is not None:

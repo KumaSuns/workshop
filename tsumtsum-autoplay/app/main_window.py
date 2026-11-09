@@ -147,8 +147,10 @@ _PLAY_HOTKEY = 3
 _BOARD_HOTKEY = 4
 _NOW_BOARD_HOTKEY = 5
 _BEFORE_HOTKEY = 6
+_END_HOTKEY = 7
 _WM_HOTKEY = 0x0312
 _VK_Q = 0x51
+_VK_F1 = 0x70
 _VK_F5 = 0x74
 _VK_F7 = 0x76
 _VK_F8 = 0x77
@@ -643,6 +645,7 @@ class MainWindow(QMainWindow):
                     pair.clicked.connect(self._toggle_stay_on_top)
                     on = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
                     pair.setText("最前面オン" if on else "最前面オフ")
+                    self._show_button_on(pair, on)
                 elif number == 12:
                     pair.clicked.connect(self._show_red_data)
             pair.setSizePolicy(
@@ -737,6 +740,7 @@ class MainWindow(QMainWindow):
         self._front_timer.setInterval(800)
         self._front_timer.timeout.connect(self._keep_front)
         self._front_timer.start()
+        self._f1_down = False
         self._f5_down = False
         self._f5_hotkey = False
         self._play_key_at = 0.0
@@ -918,6 +922,7 @@ class MainWindow(QMainWindow):
         if not self._is_busy():
             return
         self._end_after.set()
+        self._show_button_on(getattr(self, "_end_after_btn", None), True)
         self._set_status("このプレイでやめます")
 
     def on_stop(self) -> None:
@@ -951,6 +956,7 @@ class MainWindow(QMainWindow):
             self._apply_stay_on_top(False)
             if not self._suppress_show:
                 self.show()
+            self._f1_down = False
             self._f5_down = False
             self._f7_down = False
             self._f8_down = False
@@ -959,11 +965,13 @@ class MainWindow(QMainWindow):
             self._register_stop_hotkey()
             self._capture_key_timer.start()
         else:
+            self._f1_down = False
             self._f5_down = False
             self._f7_down = False
             self._f9_down = False
             self._f11_down = False
             self._unregister_stop_hotkey()
+            self._show_button_on(getattr(self, "_end_after_btn", None), False)
             self._apply_stay_on_top(True)
             if not self._suppress_show:
                 self.show()
@@ -989,6 +997,17 @@ class MainWindow(QMainWindow):
         button = getattr(self, "_front_btn", None)
         if button is not None:
             button.setText("最前面オン" if on else "最前面オフ")
+            self._show_button_on(button, on)
+
+    def _show_button_on(self, button: QPushButton | None, on: bool) -> None:
+        if button is None:
+            return
+        if on:
+            button.setStyleSheet(
+                "QPushButton { background: palette(highlight); color: palette(highlighted-text); }"
+            )
+        else:
+            button.setStyleSheet("")
 
     def _toggle_stay_on_top(self) -> None:
         on = not bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
@@ -1006,6 +1025,7 @@ class MainWindow(QMainWindow):
         self._info_count_value.setText("－")
         self._info_erase_value.setText("－")
         self._info_fever_en.setStyleSheet("")
+        self._set_timeup_lamp(False)
         self._set_skill_lamp(False)
         self._set_my_lamp("off", 0)
         self._info_mem.setText("－")
@@ -2294,6 +2314,11 @@ class MainWindow(QMainWindow):
                 ctypes.windll.user32.GetAsyncKeyState(_VK_NUMPAD1) & 0x8000
             )
             return
+        down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F1) & 0x8000)
+        pressed = down and not self._f1_down
+        self._f1_down = down
+        if pressed:
+            self.on_end_after_play()
         down = bool(ctypes.windll.user32.GetAsyncKeyState(_VK_F7) & 0x8000)
         pressed = down and not self._f7_down
         self._f7_down = down
@@ -2331,6 +2356,9 @@ class MainWindow(QMainWindow):
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _STOP_HOTKEY:
                     QTimer.singleShot(0, self.on_stop)
                     return True, 0
+                if msg.message == _WM_HOTKEY and int(msg.wParam) == _END_HOTKEY:
+                    QTimer.singleShot(0, self.on_end_after_play)
+                    return True, 0
                 if msg.message == _WM_HOTKEY and int(msg.wParam) == _BEFORE_HOTKEY:
                     QTimer.singleShot(0, self._toggle_before_capture)
                     return True, 0
@@ -2367,6 +2395,9 @@ class MainWindow(QMainWindow):
             int(self.winId()), _STOP_HOTKEY, _MOD_NOREPEAT, _VK_Q
         )
         ctypes.windll.user32.RegisterHotKey(
+            int(self.winId()), _END_HOTKEY, _MOD_NOREPEAT, _VK_F1
+        )
+        ctypes.windll.user32.RegisterHotKey(
             int(self.winId()), _BEFORE_HOTKEY, _MOD_NOREPEAT, _VK_F7
         )
         ctypes.windll.user32.RegisterHotKey(
@@ -2385,6 +2416,7 @@ class MainWindow(QMainWindow):
         import ctypes
 
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _STOP_HOTKEY)
+        ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _END_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _BEFORE_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _CAPTURE_HOTKEY)
         ctypes.windll.user32.UnregisterHotKey(int(self.winId()), _BOARD_HOTKEY)
