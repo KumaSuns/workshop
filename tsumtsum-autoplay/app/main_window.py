@@ -10,7 +10,7 @@ from pathlib import Path
 from queue import Queue
 
 from PySide6.QtCore import QObject, QRectF, QSettings, QSize, QStandardPaths, Qt, QTimer, QEvent, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QImageReader, QPainter, QPalette, QPen, QPixmap, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QBrush, QColor, QFont, QFontInfo, QFontMetrics, QIcon, QImage, QImageReader, QPainter, QPainterPath, QPalette, QPen, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
@@ -50,18 +50,67 @@ class LoopCountBox(QSpinBox):
         self.setValue(0)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    def stepBy(self, steps: int) -> None:
-        value = self.value()
-        if steps > 0:
-            if value == 0:
-                return
-            self.setValue(0 if value <= steps else value - steps)
+class TimeUpLamp(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._on = False
+        self._text = "TIME UP"
+        self._font = self._game_font()
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        metrics = QFontMetrics(self._font)
+        pad = 10
+        self.setFixedSize(metrics.horizontalAdvance(self._text) + pad * 2, metrics.height() + pad * 2)
+
+    def _game_font(self) -> QFont:
+        rounded = QFont("Rounded Mplus 1c")
+        rounded.setStyleName("Bold")
+        rounded.setPointSize(16)
+        if QFontInfo(rounded).family().casefold() == "rounded mplus 1c":
+            return rounded
+        black = QFont("Arial")
+        black.setWeight(QFont.Weight.Black)
+        black.setPointSize(15)
+        if QFontInfo(black).family().casefold() == "arial":
+            return black
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(16)
+        return font
+
+    def set_on(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._on:
             return
-        down = -steps
-        if value == 0:
-            self.setValue(min(100, down))
+        self._on = on
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        metrics = QFontMetrics(self._font)
+        x = (self.width() - metrics.horizontalAdvance(self._text)) / 2
+        baseline = (self.height() + metrics.ascent() - metrics.descent()) / 2
+        path = QPainterPath()
+        path.addText(x, baseline, self._font, self._text)
+        if self._on:
+            shadow = QPainterPath(path)
+            shadow.translate(1.4, 2.0)
+            painter.fillPath(shadow, QColor(150, 16, 28, 110))
+            pen = QPen(QColor(214, 22, 36))
+            pen.setWidthF(6.5)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.strokePath(path, pen)
+            painter.fillPath(path, QColor(255, 255, 255))
             return
-        self.setValue(min(100, value + down))
+        pen = QPen(QColor(176, 176, 176))
+        pen.setWidthF(3.0)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.strokePath(path, pen)
+        painter.fillPath(path, QColor(244, 244, 244))
+
 
 class GaugePie(QWidget):
     def __init__(self, extra: int = 0, parent: QWidget | None = None) -> None:
@@ -428,6 +477,8 @@ class MainWindow(QMainWindow):
         self._info_frame = QFrame()
         self._info_frame.setFrameShape(QFrame.Shape.Box)
         info_row = QHBoxLayout(self._info_frame)
+        frame_left, frame_top, frame_right, frame_bottom = info_row.getContentsMargins()
+        info_row.setContentsMargins(frame_left, frame_top + 10, frame_right, frame_bottom + 10)
         info_text = QWidget()
         info = QVBoxLayout(info_text)
         info.setContentsMargins(0, 0, 0, 0)
@@ -518,8 +569,7 @@ class MainWindow(QMainWindow):
         self._info_money = QWidget()
         money_col = QVBoxLayout(self._info_money)
         money_col.setContentsMargins(0, 0, 0, 0)
-        money_col.addStretch(1)
-        self._info_timeup = QPushButton("TIME UP")
+        self._info_timeup = TimeUpLamp()
         timeup_row = QHBoxLayout()
         timeup_row.addStretch(1)
         timeup_row.addWidget(self._info_timeup)
@@ -527,28 +577,28 @@ class MainWindow(QMainWindow):
         money_col.addLayout(timeup_row)
         self._info_coin = QLabel("獲得コイン")
         self._info_coin_value = QLabel("－")
-        coin_row = QHBoxLayout()
-        coin_row.addStretch(1)
-        coin_row.addWidget(self._info_coin)
-        coin_row.addWidget(self._info_coin_value)
-        coin_row.addStretch(1)
-        money_col.addLayout(coin_row)
         self._info_result = QLabel("リザルト")
         self._info_result_value = QLabel("－")
-        result_row = QHBoxLayout()
-        result_row.addStretch(1)
-        result_row.addWidget(self._info_result)
-        result_row.addWidget(self._info_result_value)
-        result_row.addStretch(1)
-        money_col.addLayout(result_row)
         self._info_rate = QLabel("倍率")
         self._info_rate_value = QLabel("－")
-        rate_row = QHBoxLayout()
-        rate_row.addStretch(1)
-        rate_row.addWidget(self._info_rate)
-        rate_row.addWidget(self._info_rate_value)
-        rate_row.addStretch(1)
-        money_col.addLayout(rate_row)
+        money_grid = QGridLayout()
+        money_grid.setContentsMargins(0, 0, 0, 0)
+        value_align = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        label_align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        for row, label, value in (
+            (0, self._info_coin, self._info_coin_value),
+            (1, self._info_result, self._info_result_value),
+            (2, self._info_rate, self._info_rate_value),
+        ):
+            label.setAlignment(label_align)
+            value.setAlignment(value_align)
+            money_grid.addWidget(label, row, 0)
+            money_grid.addWidget(value, row, 1)
+        money_row = QHBoxLayout()
+        money_row.addStretch(1)
+        money_row.addLayout(money_grid)
+        money_row.addStretch(1)
+        money_col.addLayout(money_row)
         self._info_named = QLabel("")
         self._info_named.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self._info_named.setWordWrap(False)
@@ -558,6 +608,22 @@ class MainWindow(QMainWindow):
             named_font.setPointSize(max(7, named_size - 3))
         self._info_named.setFont(named_font)
         self._info_named.hide()
+        coin_font = QFont(self._info_coin.font())
+        coin_font.setBold(True)
+        coin_point = coin_font.pointSize()
+        if coin_point > 0:
+            coin_font.setPointSize(coin_point + 2)
+        else:
+            coin_pixel = coin_font.pixelSize()
+            if coin_pixel > 0:
+                coin_font.setPixelSize(coin_pixel + 2)
+        for widget in (
+            self._info_coin,
+            self._info_coin_value,
+            self._info_result,
+            self._info_result_value,
+        ):
+            widget.setFont(coin_font)
         money_col.addWidget(self._info_named)
         self._info_confused = QPushButton("迷ったツム")
         self._info_confused.setEnabled(False)
@@ -723,6 +789,9 @@ class MainWindow(QMainWindow):
         self._count_skill = threading.Event()
         self._loop_play = False
         self._play_games = None
+        self._match_progress = ""
+        self._match_total = ""
+        self._status_text = "待機中"
         self._suppress_show = False
         self._intro: IntroWorker | None = None
         self._play: PlayWorker | None = None
@@ -846,7 +915,13 @@ class MainWindow(QMainWindow):
         self._stop.clear()
         self._end_after.clear()
         self._set_running(True)
+        if loop:
+            self._show_button_on(self.loop_btn, True)
+            self._show_button_on(self.now_btn, False)
         self._set_status("連続プレイ" if loop else "PLAY")
+        if loop:
+            total = "∞" if self._play_games is None else str(int(self._play_games))
+            self._arm_match_progress(total)
         if not tsum_is_running():
             desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
             try:
@@ -879,7 +954,12 @@ class MainWindow(QMainWindow):
         self._stop.clear()
         self._end_after.clear()
         self._set_running(True)
+        if not self._want_record:
+            self._show_button_on(self.now_btn, True)
+            self._show_button_on(self.loop_btn, False)
         self._set_status("今すぐプレイ")
+        if not self._want_record:
+            self._arm_match_progress("1")
         self._start_play(start_match=True, ask_kinds=True, loop=False)
 
     def _ask_kind_count(self) -> int | None:
@@ -972,7 +1052,11 @@ class MainWindow(QMainWindow):
             self._f11_down = False
             self._unregister_stop_hotkey()
             self._show_button_on(getattr(self, "_end_after_btn", None), False)
-            self._apply_stay_on_top(True)
+            self._show_button_on(self.now_btn, False)
+            self._show_button_on(self.loop_btn, False)
+            self._match_progress = ""
+            self._match_total = ""
+            self._refresh_status_label()
             if not self._suppress_show:
                 self.show()
                 self._front_timer.start()
@@ -1003,8 +1087,14 @@ class MainWindow(QMainWindow):
         if button is None:
             return
         if on:
+            color = button.palette().color(QPalette.ColorRole.Highlight)
+            red, green, blue = color.red(), color.green(), color.blue()
             button.setStyleSheet(
-                "QPushButton { background: palette(highlight); color: palette(highlighted-text); }"
+                "QPushButton, QPushButton:disabled {"
+                f" background: rgb({red}, {green}, {blue});"
+                " color: white;"
+                f" border: 1px solid rgb({red}, {green}, {blue});"
+                "}"
             )
         else:
             button.setStyleSheet("")
@@ -1416,10 +1506,7 @@ class MainWindow(QMainWindow):
         dialog.activateWindow()
 
     def _set_timeup_lamp(self, on: bool) -> None:
-        if on:
-            self._info_timeup.setStyleSheet("QPushButton { background: red; color: white; }")
-        else:
-            self._info_timeup.setStyleSheet("")
+        self._info_timeup.set_on(on)
 
     def _set_skill_lamp(self, on: bool) -> None:
         if on:
@@ -1568,6 +1655,7 @@ class MainWindow(QMainWindow):
             end_after=self._end_after,
         )
         self._play.status.connect(self._set_status)
+        self._play.match_index.connect(self._on_match_index)
         self._play.preview.connect(self._debug.set_preview)
         self._play.gauges.connect(self._show_meters)
         self._play.money.connect(self._show_money)
@@ -2112,11 +2200,30 @@ class MainWindow(QMainWindow):
         play.provide_kinds(kinds)
 
     def _set_status(self, text: str) -> None:
-        self.status_label.setText(text)
+        self._status_text = text
+        self._refresh_status_label()
         self._debug.append(text)
         if text.startswith("使用ツム "):
             self._set_mytsum(text[len("使用ツム ") :])
         self._fill_history()
+
+    def _arm_match_progress(self, total: str) -> None:
+        self._match_total = total
+        self._match_progress = f"1/{total}"
+        self._refresh_status_label()
+
+    def _on_match_index(self, index: int) -> None:
+        if not self._match_total:
+            return
+        self._match_progress = f"{int(index)}/{self._match_total}"
+        self._refresh_status_label()
+
+    def _refresh_status_label(self) -> None:
+        text = self._status_text
+        if self._match_progress:
+            self.status_label.setText(f"{self._match_progress}  {text}" if text else self._match_progress)
+        else:
+            self.status_label.setText(text)
 
     def _fill_history(self) -> None:
         self._history.setPlainText(history_text())

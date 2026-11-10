@@ -160,6 +160,7 @@ class PlayWorker(QThread):
     named_tsums = Signal(str)
     named_confused = Signal(object)
     timeup_lamp = Signal(bool)
+    match_index = Signal(int)
     skill_lamp = Signal(bool)
     my_lamp = Signal(str, int)
     mem_use = Signal(int)
@@ -260,6 +261,7 @@ class PlayWorker(QThread):
                 named_line=self.named_tsums.emit,
                 named_confused=self.named_confused.emit,
                 timeup_lamp=self.timeup_lamp.emit,
+                match_index=self.match_index.emit,
             )
         except Stopped:
             self.stopped.emit()
@@ -303,6 +305,7 @@ def run_play(
     named_line: Callable[[str], None] | None = None,
     named_confused: Callable[[object], None] | None = None,
     timeup_lamp: Callable[[bool], None] | None = None,
+    match_index: Callable[[int], None] | None = None,
 ) -> None:
     def say(text: str) -> None:
         if not SHOW_SWIPE_LINES and (
@@ -317,6 +320,10 @@ def run_play(
             report(text)
 
     games_done = 0
+
+    def _show_match_index() -> None:
+        if match_index is not None:
+            match_index(games_done + 1)
 
     def _continue_after_game() -> bool:
         nonlocal games_done
@@ -512,6 +519,7 @@ def run_play(
             return True
         return bool(use_dedicated())
 
+    _show_match_index()
     say("プレイを開始します")
     say(f"予測デバイス {predictor.device}")
     reset_swipe_mouse()
@@ -2230,6 +2238,14 @@ def run_play(
         stop_watch.set()
         watching.clear()
 
+    def _clear_shown_money() -> None:
+        shown_money["coin"] = ""
+        shown_money["result"] = ""
+        _watch_digits[0] = ""
+        _watch_digits[1] = ""
+        if money is not None:
+            money("", "")
+
     try:
         while True:
             _check_stop(stop)
@@ -2300,6 +2316,7 @@ def run_play(
                 odd_top_tapped = False
             if resumed_pause and not on_pause and not on_mission:
                 saw_board = True
+                _clear_shown_money()
                 match_over = False
                 kinds_locked = True
                 arm_timeup()
@@ -2311,6 +2328,7 @@ def run_play(
                 _slow_tap(pause.center().x(), pause.center().y())
                 _sleep_stop(1.2, stop)
                 saw_board = True
+                _clear_shown_money()
                 match_over = False
                 kinds_locked = True
                 arm_timeup()
@@ -2340,6 +2358,7 @@ def run_play(
                 if go_at is not None or _in_play_hud(image):
                     ask_used_now(True)
                     saw_board = True
+                    _clear_shown_money()
                     match_over = False
                     kinds_locked = True
                     arm_timeup()
@@ -2508,6 +2527,7 @@ def run_play(
                 if replay_items is not None:
                     used_items = replay_items
                     show_used(replay_items)
+                _show_match_index()
                 say("プレイを開始します")
                 continue
             if saw_board and skill_is_nightmare(used_tsum):
@@ -2599,6 +2619,7 @@ def run_play(
                         _slow_tap(pause.center().x(), pause.center().y())
                         _sleep_stop(1.2, stop)
                         saw_board = True
+                        _clear_shown_money()
                         match_over = False
                         kinds_locked = True
                         arm_timeup()
@@ -3313,6 +3334,7 @@ def run_play(
                     if replay_items is not None:
                         used_items = replay_items
                         show_used(replay_items)
+                    _show_match_index()
                     say("プレイを開始します")
                     continue
                 last_save_at = _learn_board(
@@ -5166,32 +5188,43 @@ def _read_coin_key(
     predict = getattr(predictor, "predict_coin_digits", None)
     if predict is None:
         return ""
+
+    def digits_in(box: dict[str, int] | None) -> str:
+        if not box:
+            return ""
+        width, height = rgb.size
+        left = max(0, int(box["x"]))
+        top = max(0, int(box["y"]))
+        right = min(width, left + max(1, int(box["w"])))
+        bottom = min(height, top + max(1, int(box["h"])))
+        if right - left < 4 or bottom - top < 4:
+            return ""
+        crop = rgb.crop((left, top, right, bottom))
+        try:
+            raw = str(predict(crop, key) or "")
+        except Exception:
+            return ""
+        digits = "".join(char for char in raw if char.isdigit())
+        if save:
+            _save_coin_crop(key, crop, digits)
+        return digits
+
+    if key == "result_coin":
+        model_box = boxes.get(key) if boxes else None
+        chosen = _result_coin_box(rgb, model_box)
+        digits = digits_in(chosen)
+        if not digits and model_box:
+            icon_only = _result_coin_box(rgb, None)
+            if icon_only != chosen:
+                digits = digits_in(icon_only)
+        return digits
     if key == "coin" and rgb.size == (900, 1600):
         box = _TAUGHT_COIN_900
     else:
         if not boxes:
             return ""
         box = boxes.get(key)
-        if key == "result_coin":
-            box = _result_coin_box(rgb, box)
-    if not box:
-        return ""
-    width, height = rgb.size
-    left = max(0, int(box["x"]))
-    top = max(0, int(box["y"]))
-    right = min(width, left + max(1, int(box["w"])))
-    bottom = min(height, top + max(1, int(box["h"])))
-    if right - left < 4 or bottom - top < 4:
-        return ""
-    crop = rgb.crop((left, top, right, bottom))
-    try:
-        raw = str(predict(crop, key) or "")
-    except Exception:
-        return ""
-    digits = "".join(char for char in raw if char.isdigit())
-    if save:
-        _save_coin_crop(key, crop, digits)
-    return digits
+    return digits_in(box)
 
 
 def _read_coin(predictor, rgb, boxes: dict[str, dict[str, int]] | None) -> str:
