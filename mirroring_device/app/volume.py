@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import subprocess
 import sys
 import uuid
 from ctypes import wintypes
@@ -45,6 +46,17 @@ def playback_muted() -> bool | None:
 
 
 def mute_playback() -> bool:
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", "set volume with output muted"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return False
+        return result.returncode == 0
     return _set_muted(True)
 
 
