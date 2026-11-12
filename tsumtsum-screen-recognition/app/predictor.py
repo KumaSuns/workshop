@@ -786,10 +786,16 @@ class Predictor:
         scores = embed @ self.named_prototypes.index_select(0, choice).T
         top = torch.topk(scores, k=2, dim=1)
         margins = (top.values[:, 0] - top.values[:, 1]).tolist()
+        best_scores = top.values[:, 0].tolist()
+        rival_scores = top.values[:, 1].tolist()
         seconds = top.indices[:, 1].tolist()
-        for piece, margin, second in zip(tsums, margins, seconds):
+        for piece, margin, second, best_score, rival_score in zip(
+            tsums, margins, seconds, best_scores, rival_scores
+        ):
             shaky = float(margin) < 0.08
             piece["name_unstable"] = shaky
+            piece["name_score"] = float(best_score)
+            piece["name_rival_score"] = float(rival_score)
             if shaky:
                 rival = indices[int(second)]
                 piece["name_rival"] = names[rival] if 0 <= rival < len(names) else ""

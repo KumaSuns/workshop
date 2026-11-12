@@ -70,23 +70,97 @@ def _augment(crop: torch.Tensor) -> torch.Tensor:
     return TF.pil_to_tensor(image).float()
 
 
-def _batch(rows: list[tuple[str, str, torch.Tensor]], labels: dict[tuple[str, str], int]) -> tuple[torch.Tensor, torch.Tensor]:
-    by_name: dict[tuple[str, str], list[torch.Tensor]] = {}
+def _per_name(kind_count: int) -> int:
+    return 8 if kind_count > 1 else 16
+
+
+def epoch_passes(counts: list[int]) -> int:
+    if not counts:
+        return 1
+    per_name = _per_name(len(counts))
+    return max(1, max((count + per_name - 1) // per_name for count in counts))
+
+
+def _epoch_batches(rows: list[tuple[str, str, torch.Tensor]], labels: dict[tuple[str, str], int]):
+    pools: dict[tuple[str, str], list[torch.Tensor]] = {}
     for ja, en, crop in rows:
-        by_name.setdefault((ja, en), []).append(crop)
-    crops: list[torch.Tensor] = []
-    targets: list[int] = []
-    per_name = 8 if len(by_name) > 1 else 16
-    for name, group in by_name.items():
-        take = min(per_name, len(group))
-        for crop in random.sample(group, take):
-            crops.append(_augment(crop))
-            targets.append(labels[name])
-    order = list(range(len(crops)))
-    random.shuffle(order)
-    batch = torch.stack([crops[index] for index in order])
-    target = torch.tensor([targets[index] for index in order], dtype=torch.long)
-    return batch, target
+        pools.setdefault((ja, en), []).append(crop)
+    for group in pools.values():
+        random.shuffle(group)
+    per_name = _per_name(len(pools))
+    while True:
+        crops: list[torch.Tensor] = []
+        targets: list[int] = []
+        for name, group in pools.items():
+            if not group:
+                continue
+            take = group[:per_name]
+            del group[:per_name]
+            for crop in take:
+                crops.append(_augment(crop))
+                targets.append(labels[name])
+        if len(crops) < 2:
+            return
+        order = list(range(len(crops)))
+        random.shuffle(order)
+        batch = torch.stack([crops[index] for index in order])
+        target = torch.tensor([targets[index] for index in order], dtype=torch.long)
+        yield batch, target
+
+
+def _check_registered_faces(names, vectors, prototypes) -> dict:
+    checked = 0
+    hit = 0
+    alone: list[dict] = []
+    wrong: list[dict] = []
+    low: list[dict] = []
+    proto = F.normalize(prototypes.float(), dim=1)
+    for index, name in enumerate(names):
+        ja, en = name
+        group = vectors[name]
+        count = len(group)
+        if count < 2:
+            alone.append({"ja": ja, "en": en, "count": count})
+            continue
+        stacked = torch.stack(group).float()
+        total = stacked.sum(dim=0)
+        misses: dict[tuple[str, str], int] = {}
+        low_count = 0
+        for row_index in range(count):
+            own = total - stacked[row_index]
+            if float(own.norm()) < 1e-6:
+                continue
+            own = F.normalize(own, dim=0)
+            scores = (proto @ stacked[row_index]).clone()
+            scores[index] = torch.dot(own, stacked[row_index])
+            best = int(torch.argmax(scores).item())
+            own_score = float(scores[index])
+            checked += 1
+            if best == index:
+                hit += 1
+                if own_score < 0.70:
+                    low_count += 1
+            else:
+                other = names[best]
+                misses[other] = misses.get(other, 0) + 1
+        if misses:
+            other, other_count = max(misses.items(), key=lambda item: item[1])
+            wrong.append(
+                {
+                    "ja": ja,
+                    "en": en,
+                    "count": count,
+                    "miss": sum(misses.values()),
+                    "other_ja": other[0],
+                    "other_en": other[1],
+                    "other_count": other_count,
+                }
+            )
+        if low_count:
+            low.append({"ja": ja, "en": en, "count": count, "low": low_count})
+    wrong.sort(key=lambda item: (-int(item["miss"]), str(item["ja"]), str(item["en"])))
+    low.sort(key=lambda item: (-int(item["low"]), str(item["ja"]), str(item["en"])))
+    return {"checked": checked, "hit": hit, "alone": alone, "wrong": wrong, "low": low}
 
 
 def train(
@@ -116,20 +190,26 @@ def train(
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     model.train()
+    counts: dict[tuple[str, str], int] = {}
+    for ja, en, _crop in rows:
+        counts[(ja, en)] = counts.get((ja, en), 0) + 1
+    passes = epoch_passes(list(counts.values()))
     for epoch in range(epochs):
         if should_stop is not None and should_stop():
             raise NamedTrainingCancelled()
-        if on_progress is not None:
-            on_progress(epoch + 1, epochs, f"ツム名  {epoch + 1}/{epochs}")
-        batch, target = _batch(rows, labels)
-        if batch.size(0) < 2:
-            break
-        batch = _normalize(batch).to(device)
-        target = target.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        loss = supcon_loss(model(batch), target)
-        loss.backward()
-        optimizer.step()
+        step = 0
+        for batch, target in _epoch_batches(rows, labels):
+            step += 1
+            if should_stop is not None and should_stop():
+                raise NamedTrainingCancelled()
+            if on_progress is not None:
+                on_progress(epoch + 1, epochs, f"ツム名  {epoch + 1}/{epochs}  {step}/{passes}")
+            batch = _normalize(batch).to(device)
+            target = target.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = supcon_loss(model(batch), target)
+            loss.backward()
+            optimizer.step()
         scheduler.step()
     if should_stop is not None and should_stop():
         raise NamedTrainingCancelled()
@@ -147,6 +227,7 @@ def train(
         [F.normalize(torch.stack(vectors[name]).mean(dim=0), dim=0) for name in names]
     )
     counts = [len(vectors[name]) for name in names]
+    check = _check_registered_faces(names, vectors, prototypes)
     payload = {
         "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
         "names": [{"ja": ja, "en": en, "count": count} for (ja, en), count in zip(names, counts)],
@@ -155,6 +236,7 @@ def train(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+    payload["check"] = check
     return payload
 
 

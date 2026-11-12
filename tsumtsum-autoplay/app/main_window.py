@@ -633,7 +633,7 @@ class MainWindow(QMainWindow):
         confused_row.addWidget(self._info_confused)
         confused_row.addStretch(1)
         money_col.addLayout(confused_row)
-        self._named_confused: list[tuple[str, str, float, float]] = []
+        self._named_confused: list[tuple[str, str, float, float, str]] = []
         self._confused_dialog: QDialog | None = None
         money_col.addStretch(1)
         info_row.addWidget(self._info_money, 1)
@@ -1253,7 +1253,7 @@ class MainWindow(QMainWindow):
         self._info_named.show()
 
     def _set_named_confused(self, pairs) -> None:
-        shown: list[tuple[str, str, float, float]] = []
+        shown: list[tuple[str, str, float, float, str]] = []
         for item in pairs or []:
             if not isinstance(item, (list, tuple)) or len(item) < 4:
                 continue
@@ -1264,15 +1264,18 @@ class MainWindow(QMainWindow):
                 rival_score = float(item[3])
             except (TypeError, ValueError):
                 continue
+            crop = str(item[4]).strip() if len(item) > 4 else ""
             if name and rival and not any(old[0] == name and old[1] == rival for old in shown):
-                shown.append((name, rival, score, rival_score))
+                shown.append((name, rival, score, rival_score, crop))
         shown.sort(key=lambda item: item[2] - item[3])
         self._named_confused = shown
-        self._info_confused.setEnabled(True)
+        self._info_confused.setEnabled(
+            any(item[2] < 0.70 or item[3] < 0.70 for item in shown)
+        )
         self._keep_red_confused(shown)
 
     def _show_red_data(self) -> None:
-        headers = ["日時", "区分", "ツム", "スコア", "相手区分", "相手", "相手スコア"]
+        headers = ["日時", "ツム", "スコア", "勧め"]
         rows = self._read_red_data()
         dialog = getattr(self, "_red_dialog", None)
         if dialog is None:
@@ -1295,7 +1298,9 @@ class MainWindow(QMainWindow):
             table.setWordWrap(False)
             table.verticalHeader().setVisible(False)
             header = table.horizontalHeader()
-            header.setStretchLastSection(True)
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
             layout.addWidget(table)
             dialog.resize(860, 420)
             self._red_dialog = dialog
@@ -1342,42 +1347,68 @@ class MainWindow(QMainWindow):
     def _fill_red_table(self, rows: list[list[str]]) -> None:
         table = self._red_table
         low = QBrush(QColor("red"))
-        table.setRowCount(len(rows))
-        for row_index, parts in enumerate(rows):
-            for col, text in enumerate(parts):
+        kept = [parts for parts in rows if len(parts) >= 4 and self._score_needs_register(parts[3])]
+        table.setRowCount(len(kept))
+        for row_index, parts in enumerate(kept):
+            values = (parts[0], parts[2], parts[3], "登録した方がいい")
+            for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                if col == 2:
+                if col in (1, 3):
                     item.setForeground(low)
+                if col == 2:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 table.setItem(row_index, col, item)
 
-    def _keep_red_confused(self, pairs: list[tuple[str, str, float, float]]) -> None:
+    def _keep_red_confused(self, pairs: list[tuple[str, str, float, float, str]]) -> None:
         fresh: list[tuple[str, str]] = []
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for name, rival, score, rival_score in pairs:
+        for item in pairs:
+            name, rival, score, rival_score = item[0], item[1], item[2], item[3]
+            crop = item[4] if len(item) > 4 else ""
             if score < 0.70:
                 body = "\t".join(("名前", name, f"{score:.3f}", "次点", rival, f"{rival_score:.3f}"))
-                fresh.append((body, f"{now}\t{body}"))
+                fresh.append((body, crop))
             if rival_score < 0.70:
                 body = "\t".join(("次点", rival, f"{rival_score:.3f}", "名前", name, f"{score:.3f}"))
-                fresh.append((body, f"{now}\t{body}"))
+                fresh.append((body, crop))
         if not fresh:
             return
         path = APP_ROOT / "data" / "confused_red.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         header = "日時\t区分\tツム\tスコア\t相手区分\t相手\t相手スコア"
-        kept: set[str] = set()
-        if path.is_file():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                parts = line.split("\t")
-                if len(parts) >= 7:
-                    kept.add("\t".join(parts[1:7]))
-        else:
-            path.write_text(header + "\n", encoding="utf-8")
-        adding = [line for body, line in fresh if body not in kept]
-        if not adding:
+        crops = {body: crop for body, crop in fresh if crop}
+        lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+        if not lines or lines[0].split("\t")[0] != "日時":
+            lines.insert(0, header)
+        known: set[str] = set()
+        out: list[str] = []
+        changed = False
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) < 7 or parts[0] == "日時":
+                out.append(line)
+                continue
+            body = "\t".join(parts[1:7])
+            known.add(body)
+            current = parts[7] if len(parts) > 7 else ""
+            crop = crops.get(body, "")
+            if crop and not current:
+                parts = parts[:7] + [crop]
+                line = "\t".join(parts)
+                changed = True
+            out.append(line)
+        for body, crop in fresh:
+            if body in known:
+                continue
+            line = f"{now}\t{body}"
+            if crop:
+                line = f"{line}\t{crop}"
+            out.append(line)
+            known.add(body)
+            changed = True
+        if not changed:
             return
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write("\n".join(adding) + "\n")
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
     def _confused_cell_size(self, table: QTableWidget, text: str) -> QSize:
         option = QStyleOptionViewItem()
@@ -1409,26 +1440,32 @@ class MainWindow(QMainWindow):
         )
         return hint.width()
 
+    def _score_needs_register(self, text: str) -> bool:
+        try:
+            return float(text) < 0.70
+        except (TypeError, ValueError):
+            return False
+
     def _put_confused_row(
         self,
         table: QTableWidget,
         row: int,
-        label: str,
         name: str,
         score: float,
         low: QBrush,
         bg: QBrush,
     ) -> None:
-        table.setVerticalHeaderItem(row, QTableWidgetItem(label))
         name_item = QTableWidgetItem(name)
         score_item = QTableWidgetItem(f"{score:.3f}")
         score_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        if score < 0.70:
-            name_item.setForeground(low)
-        for item in (name_item, score_item):
+        advice_item = QTableWidgetItem("登録した方がいい")
+        name_item.setForeground(low)
+        advice_item.setForeground(low)
+        for item in (name_item, score_item, advice_item):
             item.setBackground(bg)
         table.setItem(row, 0, name_item)
         table.setItem(row, 1, score_item)
+        table.setItem(row, 2, advice_item)
 
     def _show_named_confused(self) -> None:
         dialog = QDialog(self)
@@ -1436,51 +1473,56 @@ class MainWindow(QMainWindow):
         dialog.setModal(False)
         dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         layout = QVBoxLayout(dialog)
-        pairs = self._named_confused
-        table = QTableWidget(len(pairs) * 2, 2)
-        table.setHorizontalHeaderLabels(["ツム", "スコア"])
+        rows: list[tuple[str, float]] = []
+        seen: dict[str, int] = {}
+        for item in self._named_confused:
+            name, rival, score, rival_score = item[0], item[1], item[2], item[3]
+            for label, value in ((name, score), (rival, rival_score)):
+                if value >= 0.70 or not label:
+                    continue
+                index = seen.get(label)
+                if index is None:
+                    seen[label] = len(rows)
+                    rows.append((label, value))
+                elif value < rows[index][1]:
+                    rows[index] = (label, value)
+        table = QTableWidget(len(rows), 3)
+        table.setHorizontalHeaderLabels(["ツム", "スコア", "勧め"])
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         table.setAlternatingRowColors(False)
         table.setWordWrap(False)
+        table.verticalHeader().setVisible(False)
         low = QBrush(QColor("red"))
         palette = table.palette()
         base = QBrush(palette.color(QPalette.ColorRole.Base))
         alt = QBrush(palette.color(QPalette.ColorRole.AlternateBase))
-        for index, (name, rival, score, rival_score) in enumerate(pairs):
+        for index, (name, score) in enumerate(rows):
             bg = alt if index % 2 else base
-            self._put_confused_row(table, index * 2, "名前", name, score, low, bg)
-            self._put_confused_row(table, index * 2 + 1, "次点", rival, rival_score, low, bg)
+            self._put_confused_row(table, index, name, score, low, bg)
         header = table.horizontalHeader()
         name_width = self._confused_cell_size(table, "ツム").width()
         score_width = self._confused_cell_size(table, "スコア").width()
         row_height = self._confused_cell_size(table, "ツム").height()
-        for name, rival, score, rival_score in pairs:
-            name_width = max(
-                name_width,
-                self._confused_cell_size(table, name).width(),
-                self._confused_cell_size(table, rival).width(),
-            )
-            score_width = max(
-                score_width,
-                self._confused_cell_size(table, f"{score:.3f}").width(),
-                self._confused_cell_size(table, f"{rival_score:.3f}").width(),
-            )
+        for name, score in rows:
+            name_width = max(name_width, self._confused_cell_size(table, name).width())
+            score_width = max(score_width, self._confused_cell_size(table, f"{score:.3f}").width())
         name_width = max(name_width, self._confused_header_width(header, "ツム"))
         score_width = max(score_width, self._confused_header_width(header, "スコア"))
-        side = max(
-            self._confused_header_width(header, "名前"),
-            self._confused_header_width(header, "次点"),
+        advice_width = max(
+            self._confused_cell_size(table, "登録した方がいい").width(),
+            self._confused_header_width(header, "勧め"),
         )
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setStretchLastSection(False)
         table.setColumnWidth(1, score_width)
-        table.verticalHeader().setFixedWidth(side)
+        table.setColumnWidth(2, advice_width)
         table.verticalHeader().setDefaultSectionSize(row_height)
         frame = table.frameWidth() * 2 + table.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth)
-        text_width = side + name_width + score_width + frame
+        text_width = name_width + score_width + advice_width + frame
         height = table.horizontalHeader().sizeHint().height() + frame + row_height * table.rowCount()
         layout.addWidget(table)
         margins = layout.contentsMargins()

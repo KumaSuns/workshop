@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QProgressDialog,
     QPushButton,
@@ -1122,16 +1123,17 @@ class SavedTsumWindow(QDialog):
         self.setModal(False)
         self.resize(860, 420)
         layout = QVBoxLayout(self)
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(
-            ["日時", "区分", "ツム", "スコア", "相手区分", "相手", "相手スコア"]
-        )
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["日時", "ツム", "スコア", "勧め"])
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.table)
 
     def reload(self) -> None:
@@ -1144,12 +1146,25 @@ class SavedTsumWindow(QDialog):
                     continue
                 rows.append(parts[:7])
         low = QBrush(QColor("red"))
-        self.table.setRowCount(len(rows))
-        for row_index, parts in enumerate(rows):
-            for col, text in enumerate(parts):
+        kept: list[list[str]] = []
+        for parts in rows:
+            if len(parts) < 4:
+                continue
+            try:
+                score = float(parts[3])
+            except (TypeError, ValueError):
+                continue
+            if score < 0.70:
+                kept.append(parts)
+        self.table.setRowCount(len(kept))
+        for row_index, parts in enumerate(kept):
+            values = (parts[0], parts[2], parts[3], "登録した方がいい")
+            for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                if col == 2:
+                if col in (1, 3):
                     item.setForeground(low)
+                if col == 2:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row_index, col, item)
 
 
@@ -1242,6 +1257,57 @@ class PredictWorker(QThread):
             self.failed.emit(str(exc))
 
 
+_KATAKANA_TO_HIRAGANA = str.maketrans({code: code - 0x60 for code in range(0x30A1, 0x30F7)})
+_GOJUON = "ぁあぃいぅうぇえぉおかがきぎくぐけげこごさざしじすずせぜそぞただちぢっつづてでとどなにぬねのはばぱひびぴふぶぷへべぺほぼぽまみむめもゃやゅゆょよらりるれろゎわゐゑをんゔ"
+_GOJUON_INDEX = {char: index for index, char in enumerate(_GOJUON)}
+_KANA_VOWEL = {
+    char: vowel
+    for group, vowel in (
+        ("ぁあかがさざただなはばぱまゃやらゎわ", "あ"),
+        ("ぃいきぎしじちぢにひびぴみりゐ", "い"),
+        ("ぅうゔくぐすずつづぬふぶぷむゅゆる", "う"),
+        ("ぇえけげせぜてでねへべぺめれゑ", "え"),
+        ("ぉおこごそぞとどのほぼぽもょよろを", "お"),
+        ("ん", "ん"),
+    )
+    for char in group
+}
+_NAME_READING = (
+    ("怖がらせ屋", "こわがらせや"),
+    ("戴冠式", "たいかんしき"),
+    ("探検家", "たんけんか"),
+    ("警察官", "けいさつかん"),
+    ("魔人", "まじん"),
+    ("魔法の洞窟", "まほうのどうくつ"),
+)
+_NAME_SKIP = set(" 　・･＆&＋+－-‐")
+
+
+def _japanese_name_key(ja: str, en: str) -> tuple[int, ...]:
+    text = ja.strip() or en.strip()
+    for source, reading in _NAME_READING:
+        text = text.replace(source, reading)
+    text = text.translate(_KATAKANA_TO_HIRAGANA)
+    key: list[int] = []
+    vowel = ""
+    for char in text:
+        if char in _NAME_SKIP:
+            continue
+        if char in "ーｰ":
+            if vowel:
+                key.append(_GOJUON_INDEX[vowel])
+            continue
+        folded = char.casefold()
+        index = _GOJUON_INDEX.get(folded)
+        if index is None:
+            key.append(10000 + ord(folded))
+            vowel = ""
+            continue
+        key.append(index)
+        vowel = _KANA_VOWEL.get(folded, vowel)
+    return tuple(key)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1331,6 +1397,7 @@ class MainWindow(QMainWindow):
         self.train_btn = QPushButton("学習する")
         self.train_btn.setObjectName("primary")
         self.train_shutdown_btn = QPushButton("学習してシャットダウン")
+        self.register_tsum_btn = QPushButton("登録ツム候補")
         for button in (
             self.tsum_info_btn,
             self.open_btn,
@@ -1343,6 +1410,7 @@ class MainWindow(QMainWindow):
             self.undo_piece_btn,
             self.predict_btn,
             self.train_shutdown_btn,
+            self.register_tsum_btn,
         ):
             top_layout.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
         self._tsum_info_window: TsumInfoWindow | None = None
@@ -1477,6 +1545,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.coin_crop_list_btn)
         self.saved_tsum_btn = QPushButton("保存ツム候補")
         left_layout.addWidget(self.saved_tsum_btn)
+        self.upload_model_btn = QPushButton("アップ")
+        left_layout.addWidget(self.upload_model_btn)
         self._coin_crop_window = CoinCropListWindow(self)
         self._saved_tsum_window = SavedTsumWindow(self)
         left_layout.addStretch(1)
@@ -1663,6 +1733,7 @@ class MainWindow(QMainWindow):
         self.predict_btn.clicked.connect(self.predict_current)
         self.train_btn.clicked.connect(self.on_train_button)
         self.train_shutdown_btn.clicked.connect(self.on_train_shutdown_button)
+        self.register_tsum_btn.clicked.connect(self.open_saved_tsum_list)
         self._train_fx.cancelRequested.connect(self.cancel_training)
         self._train_fx.shutdownToggleRequested.connect(self.on_train_shutdown_button)
         self.delete_btn.clicked.connect(self.delete_current)
@@ -1675,6 +1746,7 @@ class MainWindow(QMainWindow):
         self.elsa_list_btn.clicked.connect(self.toggle_elsa_list)
         self.coin_crop_list_btn.clicked.connect(self.open_coin_crop_list)
         self.saved_tsum_btn.clicked.connect(self.open_saved_tsum_list)
+        self.upload_model_btn.clicked.connect(self.upload_data_to_server)
         self.elsa_run_btn.clicked.connect(self.run_elsa)
         self.elsa_delete_btn.clicked.connect(self.delete_elsa_image)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
@@ -3715,6 +3787,7 @@ class MainWindow(QMainWindow):
             self.elsa_list_btn,
             self.coin_crop_list_btn,
             self.saved_tsum_btn,
+            self.upload_model_btn,
         ):
             widget.setVisible(visible)
         if visible:
@@ -3898,6 +3971,7 @@ class MainWindow(QMainWindow):
             "ツム名を学習します。",
             f"登録: {faces} 枚",
             f"種類: {kinds} 種類",
+            "各回で、登録した顔を全部使います。",
         ]
         if rewrite:
             lines.append(f"学習のあと、予測だけの画像 {rewrite} 枚の〇を付け直します。")
@@ -3933,6 +4007,206 @@ class MainWindow(QMainWindow):
         self._train_fx.set_progress(done, total, message)
         self.statusBar().showMessage(message)
 
+    def _score_confused_crop(self, path: Path) -> tuple[str, float, str, float] | None:
+        import torch
+        from PIL import Image
+
+        from app.tsum_type import TYPE_CROP_SCALE
+
+        proto = self.predictor.named_prototypes
+        names = list(self.predictor.named_names or [])
+        if proto is None or not names or self.predictor.type_model is None or not path.is_file():
+            return None
+        radius = 0
+        tail = path.stem.rsplit("_", 1)[-1]
+        if tail.isdigit():
+            radius = int(tail)
+        try:
+            with Image.open(path) as image:
+                rgb = image.convert("RGB")
+        except Exception:
+            return None
+        width, height = rgb.size
+        if width < 8 or height < 8:
+            return None
+        if radius < 4:
+            radius = max(4, int(round((min(width, height) / 2) / TYPE_CROP_SCALE)))
+        piece = {"x": width // 2, "y": height // 2, "r": radius, "kind": "tsum"}
+        try:
+            points = self.predictor._tsum_embeddings(rgb, [piece])
+        except Exception:
+            return None
+        if not points:
+            return None
+        embed = torch.nn.functional.normalize(
+            torch.tensor([points[0]], dtype=torch.float32), dim=1
+        )
+        scores = (embed @ proto.detach().float().cpu().T).squeeze(0)
+        if int(scores.numel()) < 1:
+            return None
+        if int(scores.numel()) == 1:
+            return (names[0], float(scores[0]), "", 0.0)
+        top = torch.topk(scores, k=2)
+        best_i = int(top.indices[0])
+        rival_i = int(top.indices[1])
+        best_name = names[best_i] if 0 <= best_i < len(names) else ""
+        rival_name = names[rival_i] if 0 <= rival_i < len(names) else ""
+        return (best_name, float(top.values[0]), rival_name, float(top.values[1]))
+
+    def _drop_settled_register_candidates(self) -> int:
+        path = WORKSHOP_ROOT / "tsumtsum-autoplay" / "data" / "confused_red.txt"
+        if not path.is_file():
+            return 0
+        lines = path.read_text(encoding="utf-8").splitlines()
+        crops_dir = path.parent / "confused_crops"
+        handled: set[str] = set()
+        used: set[str] = set()
+        scored: dict[str, tuple[str, float, str, float] | None] = {}
+        output: list[str] = []
+        bodies: set[str] = set()
+        removed = 0
+        for line in lines:
+            parts = line.split("\t")
+            crop_name = parts[7].strip() if len(parts) > 7 else ""
+            if len(parts) < 7 or parts[0] == "日時" or not crop_name:
+                output.append(line)
+                if len(parts) >= 7 and parts[0] != "日時":
+                    bodies.add("\t".join(parts[1:7]))
+                continue
+            if crop_name in handled:
+                continue
+            handled.add(crop_name)
+            same = [
+                item
+                for item in lines
+                if len(item.split("\t")) > 7 and item.split("\t")[7].strip() == crop_name
+            ]
+            if crop_name not in scored:
+                scored[crop_name] = self._score_confused_crop(crops_dir / crop_name)
+            result = scored[crop_name]
+            if result is None:
+                for item in same:
+                    output.append(item)
+                    item_parts = item.split("\t")
+                    if len(item_parts) >= 7:
+                        bodies.add("\t".join(item_parts[1:7]))
+                used.add(crop_name)
+                continue
+            best_name, best_score, rival_name, rival_score = result
+            if best_score >= 0.70:
+                removed += len(same)
+                continue
+            stamp = same[0].split("\t")[0]
+            fresh: list[str] = []
+            if best_score < 0.70 and best_name:
+                body = "\t".join(
+                    ("名前", best_name, f"{best_score:.3f}", "次点", rival_name, f"{rival_score:.3f}")
+                )
+                fresh.append(f"{stamp}\t{body}\t{crop_name}")
+            if rival_score < 0.70 and rival_name and rival_name != best_name:
+                body = "\t".join(
+                    ("次点", rival_name, f"{rival_score:.3f}", "名前", best_name, f"{best_score:.3f}")
+                )
+                fresh.append(f"{stamp}\t{body}\t{crop_name}")
+            kept_rows = []
+            for item in fresh:
+                body = "\t".join(item.split("\t")[1:7])
+                if body in bodies:
+                    continue
+                bodies.add(body)
+                kept_rows.append(item)
+            removed += max(0, len(same) - len(kept_rows))
+            output.extend(kept_rows)
+            if kept_rows:
+                used.add(crop_name)
+        text = "\n".join(output) + ("\n" if output else "")
+        current = path.read_text(encoding="utf-8")
+        if text != current:
+            path.write_text(text, encoding="utf-8")
+        for crop_name in handled - used:
+            try:
+                (crops_dir / crop_name).unlink()
+            except OSError:
+                pass
+        window = getattr(self, "_saved_tsum_window", None)
+        if window is not None:
+            window.reload()
+        return removed
+
+    def _named_check_label(self, item: dict) -> str:
+        ja = str(item.get("ja") or "").strip()
+        en = str(item.get("en") or "").strip()
+        if ja:
+            return ja
+        return en
+
+    def _named_hit_note(self, data: dict) -> str:
+        check = data.get("check")
+        if not isinstance(check, dict):
+            return ""
+        checked = int(check.get("checked") or 0)
+        if checked < 1:
+            return ""
+        hit = int(check.get("hit") or 0)
+        return f"  自分の名前 {hit}/{checked}"
+
+    def _named_result_text(self, data: dict) -> str:
+        examples = int(data.get("examples") or 0)
+        names = data.get("names") if isinstance(data.get("names"), list) else []
+        updated = int(data.get("updated_images") or 0)
+        lines = [f"登録 {examples} 枚、{len(names)} 種類"]
+        if updated:
+            lines.append(f"予測だけの画像 {updated} 枚の〇を付け直しました。")
+        check = data.get("check")
+        if not isinstance(check, dict):
+            lines.append("採点結果はありません。")
+            return "\n".join(lines)
+        checked = int(check.get("checked") or 0)
+        hit = int(check.get("hit") or 0)
+        lines.append(f"自分の名前が一番近かった顔  {hit} / {checked}")
+        lines.append("採点は、その顔を平均から外して行います。")
+        alone = [item for item in (check.get("alone") or []) if isinstance(item, dict)]
+        if alone:
+            labels = "、".join(self._named_check_label(item) for item in alone)
+            lines.append(f"1個だけなので採点しなかった  {labels}")
+        wrong = [item for item in (check.get("wrong") or []) if isinstance(item, dict)]
+        if wrong:
+            lines.append("")
+            lines.append("違う名前が一番近かった")
+            for item in wrong:
+                other = self._named_check_label(
+                    {"ja": item.get("other_ja"), "en": item.get("other_en")}
+                )
+                lines.append(
+                    f"{self._named_check_label(item)}  {int(item.get('miss') or 0)}/{int(item.get('count') or 0)}  {other}"
+                )
+        low = [item for item in (check.get("low") or []) if isinstance(item, dict)]
+        if low:
+            lines.append("")
+            lines.append("自分の名前が一番近いが、0.70 未満")
+            for item in low:
+                lines.append(
+                    f"{self._named_check_label(item)}  {int(item.get('low') or 0)}/{int(item.get('count') or 0)}"
+                )
+        if checked and not wrong and not low:
+            lines.append("採点できた顔は、全部自分の名前が一番近く、0.70 以上でした。")
+        return "\n".join(lines)
+
+    def _show_named_result(self, title: str, text: str) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        edit = QPlainTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlainText(text)
+        layout.addWidget(edit)
+        buttons = QDialogButtonBox()
+        close = buttons.addButton("閉じる", QDialogButtonBox.ButtonRole.AcceptRole)
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.resize(560, 460)
+        dialog.exec()
+
     def _on_named_train_finished(self, payload: object) -> None:
         from app.named_tsum_test import TEST_MODEL_PATH
 
@@ -3946,23 +4220,28 @@ class MainWindow(QMainWindow):
             return
         examples = int(data.get("examples") or 0)
         names = data.get("names") if isinstance(data.get("names"), list) else []
-        self.predictor.use_named_tsum_model(TEST_MODEL_PATH)
+        loaded = self.predictor.use_named_tsum_model(TEST_MODEL_PATH)
+        removed = self._drop_settled_register_candidates() if loaded else 0
         self._remember_named_duration(data)
         updated = int(data.get("updated_images") or 0)
+        removed_note = f"  候補 {removed}件削除" if removed else ""
         if self.current_id:
             self.show_sample(self.current_id)
+        result = self._named_result_text(data)
         if data.get("cancelled"):
-            self.statusBar().showMessage("ツム名の学習は保存しました。〇の付け直しは中止しました", 8000)
-            QMessageBox.information(
-                self,
-                "学習を中止",
-                "ツム名の学習は保存しました。〇の付け直しは中止しました。",
+            result = "ツム名の学習は保存しました。〇の付け直しは中止しました。\n\n" + result
+            self.statusBar().showMessage(
+                "ツム名の学習は保存しました。〇の付け直しは中止しました" + removed_note,
+                8000,
             )
+            self._show_named_result("学習を中止", result)
             return
+        hit_note = self._named_hit_note(data)
         self.statusBar().showMessage(
-            f"ツム名の学習が終わりました  {examples}枚  {len(names)}種類  他の画像 {updated}枚",
+            f"ツム名の学習が終わりました  {examples}枚  {len(names)}種類  他の画像 {updated}枚{hit_note}{removed_note}",
             8000,
         )
+        self._show_named_result("学習が終わりました", result)
 
     def _rewrite_predicted_circles(
         self,
@@ -4118,7 +4397,11 @@ class MainWindow(QMainWindow):
         self.name_saved_list.clear()
         boards: dict[str, QPixmap | None] = {}
         select = -1
-        for (ja, en), rows in grouped.items():
+        ordered = sorted(
+            grouped.items(),
+            key=lambda item: (_japanese_name_key(item[0][0], item[0][1]), item[0][0], item[0][1]),
+        )
+        for (ja, en), rows in ordered:
             row = QWidget()
             row_layout = QVBoxLayout(row)
             row_layout.setContentsMargins(4, 4, 4, 4)
@@ -4989,6 +5272,30 @@ class MainWindow(QMainWindow):
             rate = fallback
         return rate
 
+    def _named_epoch_passes(self) -> int:
+        from app.named_tsum_test import epoch_passes
+
+        counts: dict[tuple[str, str], int] = {}
+        for sample in self.dataset.all():
+            names = sample.circle_names or {}
+            if not names:
+                continue
+            for piece in sample.pieces:
+                if not is_tsum_kind(str(piece.get("kind") or "")):
+                    continue
+                saved = names.get(str(int(piece.get("group") or 1))) or {}
+                ja = str(saved.get("ja") or "").strip()
+                en = str(saved.get("en") or "").strip()
+                if not ja and not en:
+                    continue
+                raw_out = saved.get("out")
+                out = {str(item) for item in raw_out} if isinstance(raw_out, list) else set()
+                if f"{int(piece['x'])},{int(piece['y'])}" in out:
+                    continue
+                key = (ja, en)
+                counts[key] = counts.get(key, 0) + 1
+        return epoch_passes(list(counts.values()))
+
     def _estimate_named_seconds(self, faces: int, kinds: int, rewrite: int) -> float:
         from app.named_tsum_test import EPOCHS
 
@@ -4997,11 +5304,14 @@ class MainWindow(QMainWindow):
         rate = self._train_batch_rate(default)
         face_rate = self._named_rate("named_sec_per_face", 0.0)
         image_rate = self._named_rate("named_sec_per_image", 0.0)
+        passes = self._named_epoch_passes()
+        saved_passes = self._named_rate("named_passes", 1.0)
+        if saved_passes < 1:
+            saved_passes = 1.0
         if face_rate > 0:
-            train_s = face_rate * max(faces, 1)
+            train_s = face_rate * max(faces, 1) * (passes / saved_passes)
         else:
-            per_epoch = min(max(faces, 1), (8 if kinds > 1 else 16) * max(kinds, 1))
-            epoch_batches = EPOCHS * self._train_batch_count(per_epoch, 8)
+            epoch_batches = EPOCHS * passes
             proto_batches = self._train_batch_count(max(faces, 1), 8)
             train_s = 8.0 + (epoch_batches + proto_batches) * rate
         if image_rate > 0:
@@ -5023,11 +5333,12 @@ class MainWindow(QMainWindow):
             rewrite_s = float(data.get("rewrite_seconds") or 0)
         except (TypeError, ValueError):
             rewrite_s = 0.0
-        if faces > 0 and train_s >= 1.0:
+        if not data.get("cancelled") and faces > 0 and train_s >= 1.0:
             observed = train_s / faces
             if 0.002 <= observed <= 5.0:
                 prev = self._named_rate("named_sec_per_face", observed)
                 self._settings.setValue("named_sec_per_face", 0.55 * prev + 0.45 * observed)
+                self._settings.setValue("named_passes", self._named_epoch_passes())
         if data.get("cancelled") or rewrite <= 0 or rewrite_s < 1.0:
             return
         observed = rewrite_s / rewrite

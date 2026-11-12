@@ -432,7 +432,7 @@ def run_play(
     last_named = ""
     named_confused_pairs: list[tuple[str, str, float, float]] = []
 
-    def note_named(found: list) -> None:
+    def note_named(found: list, rgb=None) -> None:
         nonlocal last_named
         if named_line is None or use_named is None or not use_named():
             return
@@ -448,6 +448,9 @@ def run_play(
                 rival_score = float(piece.get("name_rival_score"))
             except (TypeError, ValueError):
                 continue
+            crop = ""
+            if rgb is not None and (score < 0.70 or rival_score < 0.70):
+                crop = _save_confused_face(rgb, piece)
             kept = next(
                 (
                     index
@@ -457,11 +460,14 @@ def run_play(
                 None,
             )
             if kept is None:
-                named_confused_pairs.append((name, rival, score, rival_score))
+                named_confused_pairs.append((name, rival, score, rival_score, crop))
+                publish_confused()
                 continue
             old_score, old_rival = named_confused_pairs[kept][2], named_confused_pairs[kept][3]
+            old_crop = named_confused_pairs[kept][4] if len(named_confused_pairs[kept]) > 4 else ""
             if score - rival_score < old_score - old_rival:
-                named_confused_pairs[kept] = (name, rival, score, rival_score)
+                named_confused_pairs[kept] = (name, rival, score, rival_score, crop or old_crop)
+                publish_confused()
         limit = int(getattr(predictor, "named_limit", 0) or 0)
         open_names = [
             str(name).strip()
@@ -1514,6 +1520,23 @@ def run_play(
         timeup_lamp(on)
         if on:
             report_mem_now()
+
+    def _timeup_before_chain(timer_box) -> bool:
+        if _watcher_ended[0]:
+            return True
+        if not watch_hit.is_set():
+            return False
+        try:
+            fresh = capture_play_frame()
+            fresh_rgb = _qimage_rgb(fresh)
+        except Exception:
+            return True
+        if fresh is None or fresh.isNull() or fresh_rgb is None:
+            return True
+        left_now = _read_timer(None, fresh_rgb, timer_box)
+        if left_now is not None and left_now > 0:
+            return False
+        return True
 
     def show_watch_money(kind: str, text: str) -> None:
         if kind == "COIN":
@@ -2695,7 +2718,7 @@ def run_play(
                 heat_s += float(getattr(predictor, "last_heat_s", 0.0) or 0.0)
                 type_s += float(getattr(predictor, "last_type_s", 0.0) or 0.0)
             tsums = [piece for piece in pieces if _is_tsum(piece)]
-            note_named(tsums)
+            note_named(tsums, rgb)
             add_idle("pred", time.perf_counter() - t0)
             add_idle("heat", heat_s)
             add_idle("type", type_s)
@@ -2871,16 +2894,7 @@ def run_play(
                             break
                         skill_busy[0] = True
                         _check_stop(stop)
-                        left_now = _read_timer(None, rgb, timer)
-                        if watch_hit.is_set() and (
-                            left_now == 0
-                            or (
-                                left_now is None
-                                and image is not None
-                                and not image.isNull()
-                                and not _in_play_hud(image)
-                            )
-                        ):
+                        if _timeup_before_chain(timer):
                             timeup = True
                             break
                         if not queue:
@@ -2910,16 +2924,7 @@ def run_play(
                                     queue.append(item)
                             if queue:
                                 continue
-                            left_now = _read_timer(None, rgb, timer)
-                            if watch_hit.is_set() and (
-                                left_now == 0
-                                or (
-                                    left_now is None
-                                    and image is not None
-                                    and not image.isNull()
-                                    and not _in_play_hud(image)
-                                )
-                            ):
+                            if _timeup_before_chain(timer):
                                 timeup = True
                                 break
                             if _nightmare_live_dice():
@@ -2968,7 +2973,7 @@ def run_play(
                                     Path("."), game, rgb=rgb, inner=_groups_inner()
                                 )
                             tsums = [piece for piece in pieces if _is_tsum(piece)]
-                            note_named(tsums)
+                            note_named(tsums, rgb)
                             board = pieces
                             pending_used |= used
                             used = set()
@@ -3091,6 +3096,10 @@ def run_play(
                                     f"この鎖{my_add} 累計{int(burst_my_n) + my_add} "
                                     f"{'する' if will_carry else 'しない'}"
                                 )
+                        if _timeup_before_chain(timer):
+                            set_my_lamp("off")
+                            timeup = True
+                            break
                         try:
                             swiped = _swipe_chain(
                                 chain,
@@ -5163,6 +5172,43 @@ def _coin_crop_label_taken(folder: Path, label: str) -> bool:
         return any(path.is_file() and path.name.endswith(suffix) for path in folder.iterdir())
     except OSError:
         return False
+
+
+_CONFUSED_CROP_SCALE = 1.1
+
+
+def _save_confused_face(rgb, piece: dict) -> str:
+    try:
+        import hashlib
+        import io
+
+        from PIL import Image
+
+        x = int(piece["x"])
+        y = int(piece["y"])
+        radius = max(4, int(piece.get("r") or 16))
+        span = max(8, int(round(radius * _CONFUSED_CROP_SCALE)))
+        width, height = rgb.size
+        canvas = Image.new("RGB", (span * 2, span * 2))
+        left, top = x - span, y - span
+        right, bottom = x + span, y + span
+        src = rgb.crop(
+            (max(0, left), max(0, top), min(width, right), min(height, bottom))
+        )
+        canvas.paste(src, (max(0, -left), max(0, -top)))
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        data = buf.getvalue()
+        digest = hashlib.sha1(data).hexdigest()[:16]
+        name = f"{digest}_{radius}.png"
+        folder = APP_ROOT / "data" / "confused_crops"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        if not path.is_file():
+            path.write_bytes(data)
+        return name
+    except Exception:
+        return ""
 
 
 def _save_coin_crop(key: str, crop, digits: str) -> None:
