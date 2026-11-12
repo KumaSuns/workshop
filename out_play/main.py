@@ -349,6 +349,26 @@ FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a", "#A4C6FF")
 FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a", "#7eb0f0")
 
 
+def _gpu_button_style(on: bool) -> str:
+    if on:
+        background = "#2c4a7a"
+        color = "#ffffff"
+        border = "#2c4a7a"
+    else:
+        background = "#ffffff"
+        color = "#17233f"
+        border = "#A4C6FF"
+    return (
+        "QPushButton, QPushButton:hover, QPushButton:checked {"
+        f" background: {background};"
+        f" color: {color};"
+        " font-weight: 700;"
+        f" border: 1px solid {border};"
+        " border-radius: 6px;"
+        "}"
+    )
+
+
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
     if pixmap.isNull():
         return pixmap
@@ -1076,12 +1096,7 @@ class MenuWindow(QMainWindow):
             if number == 4:
                 button.setCheckable(True)
                 button.setChecked(_gpu_on())
-                button.setStyleSheet(
-                    "QPushButton:checked {"
-                    " background: palette(highlight);"
-                    " color: palette(highlighted-text);"
-                    "}"
-                )
+                button.setStyleSheet(_gpu_button_style(_gpu_on()))
                 button.toggled.connect(self._set_gpu)
                 self._gpu_button = button
             side_column.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -1982,6 +1997,7 @@ class MenuWindow(QMainWindow):
         button = self._gpu_button
         if button is not None:
             button.setText("GPUオン" if on else "GPUオフ")
+            button.setStyleSheet(_gpu_button_style(on))
         self._fit_top_square()
 
     def _set_external_control(self, on: bool) -> None:
