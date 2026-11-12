@@ -485,7 +485,7 @@ def run_play(
     tried_libs = False
     while True:
         try:
-            predictor, chain_best, gap_ratio = load_play_tools()
+            predictor, chain_best, gap_ratio = load_play_tools(say)
 
             def candidates(pieces, limit=8):
                 return chain_best(pieces, limit)
@@ -526,7 +526,10 @@ def run_play(
 
     _mark_play_progress()
     say("プレイを開始します")
-    say(f"予測デバイス {predictor.device}")
+    say(f"予測デバイス {getattr(predictor, 'device_label', None) or predictor.device}")
+    device_note = str(getattr(predictor, "device_note", "") or "")
+    if device_note:
+        say(device_note)
     reset_swipe_mouse()
     unlike = load_unlike()
     skip_chains: list[frozenset[tuple[int, int]]] = []

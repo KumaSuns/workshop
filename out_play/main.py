@@ -523,6 +523,7 @@ class MenuWindow(QMainWindow):
     external_arm_ok = Signal()
     external_arm_fail = Signal(str)
     heart_note = Signal(str)
+    pc_status_ready = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -531,6 +532,7 @@ class MenuWindow(QMainWindow):
         self.external_arm_ok.connect(self._on_external_armed)
         self.external_arm_fail.connect(self._on_external_arm_failed)
         self.heart_note.connect(self._set_activity)
+        self.pc_status_ready.connect(self._apply_pc_status)
         self.setWindowTitle("AUTO PLAY")
         root = QWidget()
         _plain_surface(root)
@@ -638,6 +640,8 @@ class MenuWindow(QMainWindow):
         self._square_under = None
         self._square_side_buttons = []
         self._external_button = None
+        self._gpu_button = None
+        self._pc_status = ""
         self._external_server = None
         self._external_buffers = {}
         self._external_pin = ""
@@ -704,6 +708,8 @@ class MenuWindow(QMainWindow):
         self._app_use_check.start()
         layout.addWidget(self._footer)
         self.setCentralWidget(root)
+        self._pc_status = ""
+        threading.Thread(target=self._load_pc_status, daemon=True).start()
         self._placed = False
         self._fitting_logo = False
 
@@ -1030,8 +1036,10 @@ class MenuWindow(QMainWindow):
         self._center_square = QFrame()
         _soft_box(self._center_square)
         self._square_qr = QLabel(self._center_square)
-        self._square_qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._square_qr.setScaledContents(True)
+        self._square_qr.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._square_qr.setWordWrap(True)
+        self._square_qr.setMargin(TITLE_MARGIN // 2)
+        self._square_qr.setScaledContents(False)
         square_column = QVBoxLayout()
         square_column.setContentsMargins(0, 0, 0, 0)
         square_column.setSpacing(0)
@@ -1050,9 +1058,11 @@ class MenuWindow(QMainWindow):
         self._square_side_buttons = []
         for number in range(2, 7):
             if number == 2:
-                label = "外部操作"
-            elif number == 3:
+                continue
+            if number == 3:
                 label = "ハートを送る"
+            elif number == 4:
+                label = "GPUオン" if _gpu_on() else "GPUオフ"
             elif number == 6:
                 label = "ツムについて"
             else:
@@ -1063,16 +1073,17 @@ class MenuWindow(QMainWindow):
                 button.clicked.connect(self._open_tsum_about)
             if number == 3:
                 button.clicked.connect(self._send_hearts)
-            if number == 2:
+            if number == 4:
                 button.setCheckable(True)
+                button.setChecked(_gpu_on())
                 button.setStyleSheet(
                     "QPushButton:checked {"
                     " background: palette(highlight);"
                     " color: palette(highlighted-text);"
                     "}"
                 )
-                button.toggled.connect(self._set_external_control)
-                self._external_button = button
+                button.toggled.connect(self._set_gpu)
+                self._gpu_button = button
             side_column.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             self._square_side_buttons.append(button)
         square_row = QHBoxLayout()
@@ -1966,6 +1977,13 @@ class MenuWindow(QMainWindow):
                         return True, 0
         return super().nativeEvent(eventType, message)
 
+    def _set_gpu(self, on: bool) -> None:
+        QSettings("workshop", "AutoPlay").setValue("use_gpu", bool(on))
+        button = self._gpu_button
+        if button is not None:
+            button.setText("GPUオン" if on else "GPUオフ")
+        self._fit_top_square()
+
     def _set_external_control(self, on: bool) -> None:
         if not on:
             self._external_pin = ""
@@ -2032,32 +2050,24 @@ class MenuWindow(QMainWindow):
             poll.stop()
             poll.wait(1000)
 
+    def _load_pc_status(self) -> None:
+        self.pc_status_ready.emit(_pc_status_text())
+
+    def _apply_pc_status(self, text: str) -> None:
+        self._pc_status = text
+        self._paint_square_qr()
+
     def _paint_square_qr(self) -> None:
         label = self._square_qr
         square = self._center_square
         if label is None or square is None:
             return
-        url = self._external_page_url()
         rect = square.contentsRect()
         if rect.width() < 1 or rect.height() < 1:
             rect = square.rect()
         label.setGeometry(rect)
-        if not url or rect.width() < 1 or rect.height() < 1:
-            label.clear()
-            return
-        side = min(rect.width(), rect.height())
-        image = qrcode.make(url)
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        pix = QPixmap()
-        pix.loadFromData(buf.getvalue())
-        shown = pix.scaled(
-            side,
-            side,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        label.setPixmap(shown)
+        label.setPixmap(QPixmap())
+        label.setText(self._pc_status)
 
     def _ask_external_pin(self) -> str | None:
         dialog = QDialog(self)
@@ -3250,6 +3260,173 @@ class MenuWindow(QMainWindow):
     def _set_front(self, on: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
         self.show()
+
+
+def _gb_label(nbytes: int, places: int = 0) -> str:
+    if nbytes <= 0:
+        return ""
+    gb = nbytes / (1024 ** 3)
+    if places > 0:
+        return f"{gb:.{places}f} GB"
+    return f"{round(gb)} GB"
+
+
+def _gpu_mem_label(nbytes: int) -> str:
+    if nbytes <= 0:
+        return ""
+    mb = nbytes / (1024 ** 2)
+    if mb < 1024:
+        return f"{round(mb)} MB"
+    return _gb_label(nbytes)
+
+
+def _cpu_status() -> tuple[str, str]:
+    if sys.platform != "win32":
+        return "", ""
+    import winreg
+
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+        )
+        raw = str(winreg.QueryValueEx(key, "ProcessorNameString")[0] or "")
+    except OSError:
+        return "", ""
+    name = " ".join(raw.split())
+    ghz = ""
+    if " @ " in name:
+        name, rest = name.split(" @ ", 1)
+        number = rest.lower().replace("ghz", "").strip()
+        if number:
+            ghz = f"{number} GHz"
+    return name.strip(), ghz
+
+
+def _gpu_rows() -> list[tuple[str, int]]:
+    if sys.platform != "win32":
+        return []
+    import winreg
+
+    path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path)
+    except OSError:
+        return []
+    rows: list[tuple[str, int]] = []
+    index = 0
+    while True:
+        try:
+            child = winreg.EnumKey(root, index)
+        except OSError:
+            break
+        index += 1
+        if not child.isdigit():
+            continue
+        try:
+            key = winreg.OpenKey(root, child)
+            desc = str(winreg.QueryValueEx(key, "DriverDesc")[0] or "").strip()
+        except OSError:
+            continue
+        if not desc or "virtual" in desc.casefold():
+            continue
+        mem = 0
+        try:
+            mem = int(winreg.QueryValueEx(key, "HardwareInformation.qwMemorySize")[0] or 0)
+        except (OSError, TypeError, ValueError):
+            mem = 0
+        rows.append((desc, mem))
+    return rows
+
+
+def _installed_ram() -> tuple[int, int]:
+    if sys.platform != "win32":
+        return 0, 0
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_PhysicalMemory | ForEach-Object { $_.Capacity.ToString() + ':' + $_.Speed }",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        creationflags=flags,
+        timeout=20,
+    )
+    total = 0
+    speed = 0
+    for line in (result.stdout or "").splitlines():
+        cap, _, rate = line.strip().partition(":")
+        if cap.isdigit():
+            total += int(cap)
+        if rate.isdigit() and speed == 0:
+            speed = int(rate)
+    return total, speed
+
+
+def _pc_status_text() -> str:
+    cpu, ghz = _cpu_status()
+    ram, speed = _installed_ram()
+    if ram <= 0:
+        ram = _ram_bytes()
+    gpus = _gpu_rows()
+    drive = os.environ.get("SystemDrive", "C:") + "\\"
+    disk_total = 0
+    disk_used = 0
+    try:
+        import shutil
+
+        usage = shutil.disk_usage(drive)
+        disk_total = int(usage.total)
+        disk_used = int(usage.used)
+    except OSError:
+        disk_total = 0
+        disk_used = 0
+    lines: list[str] = []
+    if cpu:
+        lines.append("プロセッサ")
+        lines.append(cpu)
+        if ghz:
+            lines.append(ghz)
+    if ram > 0:
+        if lines:
+            lines.append("")
+        lines.append("実装 RAM")
+        lines.append(_gb_label(ram, 1))
+        if speed > 0:
+            lines.append(f"{speed} MT/s")
+    if gpus:
+        if lines:
+            lines.append("")
+        lines.append("グラフィックス")
+        ordered = sorted(gpus, key=lambda item: item[1], reverse=True)
+        for name, mem in ordered:
+            label = _gpu_mem_label(mem)
+            if label:
+                lines.append(label)
+            lines.append(name)
+    if disk_total > 0:
+        if lines:
+            lines.append("")
+        total = _gb_label(disk_total)
+        used = _gb_label(disk_used)
+        lines.append("ストレージ")
+        lines.append(total)
+        lines.append(f"使用領域 {used} / {total}")
+    return "\n".join(lines)
+
+
+def _gpu_on() -> bool:
+    stored = QSettings("workshop", "AutoPlay").value("use_gpu", True)
+    if isinstance(stored, str):
+        return stored.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(stored)
 
 
 def _type_model_choice() -> str:

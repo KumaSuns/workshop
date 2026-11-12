@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
@@ -11,12 +13,151 @@ from threading import Thread
 
 from PySide6.QtGui import QImage
 
+from PySide6.QtCore import QSettings
+
 from app.paths import APP_ROOT
 
 TRAINER_ROOT = APP_ROOT / "bundled" / "screen"
 
 
-def load_play_tools() -> tuple[object, Callable, Callable]:
+def use_gpu() -> bool:
+    stored = QSettings("workshop", "AutoPlay").value("use_gpu", True)
+    if isinstance(stored, str):
+        return stored.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(stored)
+
+
+def _python_exe() -> str:
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe":
+        console = exe.with_name("python.exe")
+        if console.is_file():
+            return str(console)
+    return str(exe)
+
+
+def _python_code(code: str) -> int:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        [_python_exe(), "-c", code],
+        check=False,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    return result.returncode
+
+
+def _install_directml() -> None:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.run(
+        [
+            _python_exe(),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "torch-directml",
+        ],
+        check=False,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+
+
+def _directml_device():
+    try:
+        import torch_directml
+    except Exception:
+        return None
+    try:
+        count = int(torch_directml.device_count())
+    except Exception:
+        return None
+    if count < 1:
+        return None
+    try:
+        return torch_directml.device()
+    except Exception:
+        return None
+
+
+def _directml_name(device) -> str:
+    index = int(getattr(device, "index", 0) or 0)
+    try:
+        import torch_directml
+
+        name = str(torch_directml.device_name(index) or "").strip()
+    except Exception:
+        name = ""
+    return name or "Radeon"
+
+
+def _graphics_forward_ok(predictor) -> bool:
+    device = predictor.device
+    if getattr(device, "type", "") != "privateuseone":
+        return True
+    import torch
+
+    piece = getattr(predictor, "piece_model", None)
+    if piece is None:
+        return False
+    try:
+        with torch.no_grad():
+            piece(torch.zeros(1, 3, 128, 128, device=device))
+            type_model = getattr(predictor, "type_model", None)
+            if type_model is not None:
+                type_model(torch.zeros(1, 3, 96, 96, device=device))
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[object, str]:
+    if not use_gpu():
+        return "cpu", ""
+    if _python_code("import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)") == 0:
+        return "cuda", ""
+    had_directml = (
+        _python_code(
+            "import torch_directml,sys; sys.exit(0 if torch_directml.device_count() else 1)"
+        )
+        == 0
+    )
+    if not had_directml:
+        if report is not None:
+            report("Radeon用の部品を入れています")
+        _install_directml()
+    if "torch" in sys.modules and not had_directml:
+        return "cpu", "Radeon用の部品を入れました。この起動ではCPUです。"
+    device = _directml_device()
+    if device is None:
+        return "cpu", ""
+    return device, ""
+
+
+def _play_device():
+    device, _note = _resolve_play_device()
+    return device
+
+
+def _remember_device(predictor, note: str) -> None:
+    if not _graphics_forward_ok(predictor):
+        predictor.reload(device="cpu")
+        predictor.device_label = "cpu"
+        predictor.device_note = "Radeonでは予測できなかったのでCPUです。"
+        return
+    kind = getattr(predictor.device, "type", "")
+    if kind == "privateuseone":
+        predictor.device_label = _directml_name(predictor.device)
+    else:
+        predictor.device_label = str(predictor.device)
+    predictor.device_note = note if predictor.device_label == "cpu" else ""
+
+
+def load_play_tools(report: Callable[[str], None] | None = None) -> tuple[object, Callable, Callable]:
+    device, note = _resolve_play_device(report)
     hidden = {
         key: sys.modules.pop(key)
         for key in list(sys.modules)
@@ -40,7 +181,14 @@ def load_play_tools() -> tuple[object, Callable, Callable]:
             raise FileNotFoundError(
                 "ツムの〇モデルがありません。画面認識アプリで学習してください。"
             )
-        predictor = Predictor(models)
+        try:
+            predictor = Predictor(models, device=device)
+        except Exception:
+            if device == "cpu":
+                raise
+            predictor = Predictor(models, device="cpu")
+            note = ""
+        _remember_device(predictor, note)
         chain_fn = tsum_chain_best_per_group
         gap_fn = farthest_gap_ratio
         keep = {
@@ -113,7 +261,7 @@ def train_play_models(predictor, stop=None) -> list[str]:
         finally:
             worker._release_cuda()
             if getattr(predictor, "reload", None) is not None:
-                predictor.reload()
+                predictor.reload(device=_play_device())
         return ran
     finally:
         keep = {
@@ -280,36 +428,72 @@ def _board_save_loop() -> None:
             pass
 
 
+_BOARD_SAVE_SCRIPT = """
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+from app.dataset import Dataset
+meta = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+image = Path(meta["image"])
+dataset = Dataset(root / "data")
+before = len(dataset.all())
+sample = dataset.import_file(image, save=False)
+if sample is None or len(dataset.all()) <= before:
+    raise SystemExit(0)
+dataset.apply_predictions(sample.id, meta.get("hud") or {})
+dataset.apply_piece_predictions(sample.id, meta.get("pieces") or [])
+sample = dataset.get(sample.id)
+if sample is None:
+    raise SystemExit(0)
+if hasattr(sample, "used_tsum"):
+    sample.used_tsum = str(meta.get("used_tsum") or "")
+    sample.used_tsum_id = str(meta.get("used_tsum_id") or "")
+if meta.get("name_tsum"):
+    token = str(getattr(sample, "used_tsum_id", "") or getattr(sample, "used_tsum", "") or "")
+    if token:
+        text = sample.source_name or "image.png"
+        prefix = token + "_"
+        if not text.casefold().startswith(prefix.casefold()):
+            sample.source_name = prefix + text
+sample.status = "predicted"
+sample.confirmed = []
+dataset.save()
+"""
+
+
 def _write_play_board(job: dict) -> None:
-    dataset_cls = _board_dataset_cls
-    if dataset_cls is None:
-        return
-    dataset = dataset_cls(TRAINER_ROOT / "data")
-    before = len(dataset.all())
     rgb = job.get("rgb")
     if rgb is None:
         return
     fd, raw = tempfile.mkstemp(suffix=".png", prefix="bluestacks_")
     os.close(fd)
     tmp = Path(raw)
-    sample = None
+    meta_path = tmp.with_suffix(".json")
     try:
         rgb.save(tmp, format="PNG")
-        sample = dataset.import_file(tmp, save=False)
-    except Exception:
-        sample = None
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "image": str(tmp),
+                    "hud": job.get("hud") or {},
+                    "pieces": job.get("pieces") or [],
+                    "used_tsum": job.get("used_tsum") or "",
+                    "used_tsum_id": job.get("used_tsum_id") or "",
+                    "name_tsum": bool(job.get("name_tsum")),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [sys.executable, "-c", _BOARD_SAVE_SCRIPT, str(TRAINER_ROOT), str(meta_path)],
+            cwd=str(TRAINER_ROOT),
+            check=False,
+        )
     finally:
         tmp.unlink(missing_ok=True)
-    if sample is None or len(dataset.all()) <= before:
-        return
-    hud = job.get("hud") or {}
-    dataset.apply_predictions(sample.id, hud)
-    dataset.apply_piece_predictions(sample.id, job.get("pieces") or [])
-    sample = dataset.get(sample.id)
-    if sample is not None:
-        sample.status = "predicted"
-        sample.confirmed = []
-        dataset.save()
+        meta_path.unlink(missing_ok=True)
 
 
 def save_play_scene(predictor, image: QImage, key: str) -> bool:

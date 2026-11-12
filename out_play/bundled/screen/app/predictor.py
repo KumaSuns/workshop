@@ -42,7 +42,7 @@ from app.tsum_type import (
 
 
 class Predictor:
-    def __init__(self, models_dir: Path, load: bool = True) -> None:
+    def __init__(self, models_dir: Path, load: bool = True, device: str | None = None) -> None:
         self.models_dir = models_dir
         self.device = torch.device("cpu")
         self.models: dict[str, GameRegionNet] = {}
@@ -97,7 +97,7 @@ class Predictor:
             ]
         )
         if load:
-            self.reload()
+            self.reload(device=device)
 
     def release(self) -> None:
         self.models = {}
@@ -137,8 +137,15 @@ class Predictor:
             keys.extend(SCENE_KEYS)
         return keys
 
-    def reload(self, pump=None, device: str | None = None) -> bool:
-        if device is None:
+    def _weight_device(self):
+        if self.device.type in {"cpu", "cuda"}:
+            return self.device
+        return "cpu"
+
+    def reload(self, pump=None, device: str | torch.device | None = None) -> bool:
+        if isinstance(device, torch.device):
+            self.device = device
+        elif device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
@@ -166,7 +173,7 @@ class Predictor:
             path = self.models_dir / model_filename(key)
             if not path.exists():
                 continue
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(path, map_location=self._weight_device(), weights_only=False)
             model = GameRegionNet(pretrained=False)
             state = (
                 checkpoint["state_dict"]
@@ -180,7 +187,7 @@ class Predictor:
             tick()
         piece_path = self.models_dir / model_filename("pieces")
         if piece_path.exists():
-            checkpoint = torch.load(piece_path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(piece_path, map_location=self._weight_device(), weights_only=False)
             model = PieceNet(pretrained=False)
             state = (
                 checkpoint["state_dict"]
@@ -194,7 +201,7 @@ class Predictor:
             tick()
         type_path = self.models_dir / model_filename("tsum_types")
         if type_path.exists():
-            checkpoint = torch.load(type_path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(type_path, map_location=self._weight_device(), weights_only=False)
             model = TsumTypeNet(pretrained=False)
             state = (
                 checkpoint["state_dict"]
@@ -215,7 +222,7 @@ class Predictor:
             path = self.models_dir / filename
             if not path.exists():
                 continue
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(path, map_location=self._weight_device(), weights_only=False)
             model = CoinDigitNet(pretrained=False)
             state = (
                 checkpoint["state_dict"]
@@ -237,7 +244,7 @@ class Predictor:
         if menu_scene.is_file():
             scene_path = menu_scene
         if scene_path.exists():
-            checkpoint = torch.load(scene_path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(scene_path, map_location=self._weight_device(), weights_only=False)
             classes = (
                 tuple(checkpoint.get("classes") or SCENE_CLASSES)
                 if isinstance(checkpoint, dict)
@@ -479,7 +486,7 @@ class Predictor:
         path = Path(path)
         if not path.is_file():
             return False
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(path, map_location=self._weight_device(), weights_only=False)
         if not isinstance(checkpoint, dict):
             return False
         state = checkpoint.get("state_dict")
@@ -580,6 +587,32 @@ class Predictor:
         picked = torch.argmax(embed @ proto.index_select(0, choice).T, dim=1).tolist()
         return [indices[int(item)] for item in picked]
 
+    def _mark_named_unstable(
+        self,
+        embed: torch.Tensor,
+        tsums: list[dict[str, int]],
+        indices: list[int],
+        names: list[str],
+    ) -> None:
+        if len(indices) < 2 or self.named_prototypes is None:
+            for piece in tsums:
+                piece["name_unstable"] = False
+                piece["name_rival"] = ""
+            return
+        choice = torch.tensor(indices, device=self.named_prototypes.device, dtype=torch.long)
+        scores = embed @ self.named_prototypes.index_select(0, choice).T
+        top = torch.topk(scores, k=2, dim=1)
+        margins = (top.values[:, 0] - top.values[:, 1]).tolist()
+        seconds = top.indices[:, 1].tolist()
+        for piece, margin, second in zip(tsums, margins, seconds):
+            shaky = float(margin) < 0.08
+            piece["name_unstable"] = shaky
+            if shaky:
+                rival = indices[int(second)]
+                piece["name_rival"] = names[rival] if 0 <= rival < len(names) else ""
+            else:
+                piece["name_rival"] = ""
+
     def _assign_named_groups(self, image: Image.Image, tsums: list[dict[str, int]]) -> None:
         proto = self.named_prototypes
         names = self.named_names
@@ -594,10 +627,12 @@ class Predictor:
         open_names = self.named_open
         open_index = [self._named_index(name) for name in open_names]
         open_index = [index for index in open_index if index >= 0]
+        used_indices = open_index
         if self.named_fixed and open_index:
             labels = self._nearest_names(embed, open_index)
         else:
             labels = self._nearest_names(embed, list(range(len(names))))
+            used_indices = list(range(len(names)))
             if limit > 0:
                 counts: dict[int, int] = {}
                 for label in labels:
@@ -615,11 +650,13 @@ class Predictor:
                     allowed.append(int(label))
                 if allowed:
                     labels = self._nearest_names(embed, allowed)
+                    used_indices = allowed
                     open_names[:] = [
                         names[index]
                         for index in allowed
                         if 0 <= index < len(names) and names[index]
                     ]
+        self._mark_named_unstable(embed, tsums, used_indices, names)
         join_at = -1
         joined: list[int] = []
         if self.named_fixed and len(self.named_join) >= 2:
