@@ -1073,8 +1073,8 @@ class MenuWindow(QMainWindow):
         self._square_under = under
         square_column.addWidget(under, 0, Qt.AlignmentFlag.AlignLeft)
         side_column = QVBoxLayout()
-        side_column.setContentsMargins(0, 0, 0, 0)
-        side_column.setSpacing(0)
+        side_column.setContentsMargins(0, 2, 0, 2)
+        side_column.setSpacing(2)
         self._square_side_buttons = []
         for number in range(2, 7):
             if number == 2:
@@ -3083,7 +3083,7 @@ class MenuWindow(QMainWindow):
         if under is not None:
             under.setFixedSize(side, row)
         for button in self._square_side_buttons:
-            button.setFixedSize(max(row, button.sizeHint().width()), row)
+            button.setFixedSize(side_w, row)
         self._paint_square_qr()
 
     def _fit_center(self) -> None:
