@@ -25,10 +25,16 @@ TEST_MODEL_PATH = DATA_DIR / "models" / "named_tsum_test.pt"
 EPOCHS = 12
 
 
-def registered_crops() -> list[tuple[str, str, torch.Tensor]]:
+class NamedTrainingCancelled(Exception):
+    pass
+
+
+def registered_crops(should_stop=None) -> list[tuple[str, str, torch.Tensor]]:
     rows: list[tuple[str, str, torch.Tensor]] = []
     dataset = Dataset()
     for sample in dataset.all():
+        if should_stop is not None and should_stop():
+            raise NamedTrainingCancelled()
         names = sample.circle_names or {}
         if not names or not sample.image_path.is_file():
             continue
@@ -83,8 +89,15 @@ def _batch(rows: list[tuple[str, str, torch.Tensor]], labels: dict[tuple[str, st
     return batch, target
 
 
-def train(path: Path = TEST_MODEL_PATH, epochs: int = EPOCHS) -> dict:
-    rows = registered_crops()
+def train(
+    path: Path = TEST_MODEL_PATH,
+    epochs: int = EPOCHS,
+    on_progress=None,
+    should_stop=None,
+) -> dict:
+    if on_progress is not None:
+        on_progress(0, epochs, "ツム名  準備しています")
+    rows = registered_crops(should_stop)
     names = sorted({(ja, en) for ja, en, _crop in rows})
     if not names:
         raise RuntimeError("登録された〇がありません")
@@ -103,7 +116,11 @@ def train(path: Path = TEST_MODEL_PATH, epochs: int = EPOCHS) -> dict:
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     model.train()
-    for _epoch in range(epochs):
+    for epoch in range(epochs):
+        if should_stop is not None and should_stop():
+            raise NamedTrainingCancelled()
+        if on_progress is not None:
+            on_progress(epoch + 1, epochs, f"ツム名  {epoch + 1}/{epochs}")
         batch, target = _batch(rows, labels)
         if batch.size(0) < 2:
             break
@@ -114,10 +131,16 @@ def train(path: Path = TEST_MODEL_PATH, epochs: int = EPOCHS) -> dict:
         loss.backward()
         optimizer.step()
         scheduler.step()
+    if should_stop is not None and should_stop():
+        raise NamedTrainingCancelled()
     model.eval()
+    if on_progress is not None:
+        on_progress(epochs, epochs, "ツム名  まとめています")
     vectors: dict[tuple[str, str], list[torch.Tensor]] = {name: [] for name in names}
     with torch.no_grad():
-        for ja, en, crop in rows:
+        for index, (ja, en, crop) in enumerate(rows):
+            if should_stop is not None and index % 32 == 0 and should_stop():
+                raise NamedTrainingCancelled()
             encoded = model(_normalize(crop.unsqueeze(0)).to(device))
             vectors[(ja, en)].append(F.normalize(encoded, dim=1).cpu().squeeze(0))
     prototypes = torch.stack(

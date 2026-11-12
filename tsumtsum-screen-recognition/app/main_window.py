@@ -66,6 +66,8 @@ from app.elsa_run import elsa_three_chains
 from app.hud_number import CoinNumberDialog, format_coin_number, read_coin_number as ocr_coin_number
 from app.image_canvas import ImageCanvas
 from app.paths import (
+    ANALYZER_MAIN,
+    MIRROR_EXE,
     APP_ROOT,
     COIN_CROP_ROOT,
     DATA_DIR,
@@ -76,7 +78,6 @@ from app.paths import (
     SERVER_SYNC_PATH,
     SKILLS_IMAGES_DIR,
     USE_TSUM_REGISTRY,
-    MIRROR_MAIN,
     VIDEO_EXTRACTOR_MAIN,
     WORKSHOP_ROOT,
 )
@@ -1167,6 +1168,64 @@ class CoinReadWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class NamedTrainWorker(QThread):
+    progress = Signal(int, int, str)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, rewrite_count: int, rewrite) -> None:
+        super().__init__()
+        self._rewrite_count = rewrite_count
+        self._rewrite = rewrite
+
+    def run(self) -> None:
+        try:
+            from app.named_tsum_test import EPOCHS, NamedTrainingCancelled, train as train_named_tsum
+
+            total = EPOCHS + max(self._rewrite_count, 0)
+
+            def on_progress(done: int, _total: int, message: str) -> None:
+                self.progress.emit(int(done), max(total, 1), message)
+                self.msleep(1)
+
+            started = time.perf_counter()
+            try:
+                payload = train_named_tsum(
+                    on_progress=on_progress,
+                    should_stop=self.isInterruptionRequested,
+                )
+            except NamedTrainingCancelled:
+                self.finished_ok.emit(
+                    {"cancelled": True, "train_seconds": time.perf_counter() - started}
+                )
+                return
+            train_seconds = time.perf_counter() - started
+            if self.isInterruptionRequested():
+                self.finished_ok.emit(
+                    {"cancelled": True, "saved": True, "train_seconds": train_seconds}
+                )
+                return
+            rewrite_started = time.perf_counter()
+            updated = self._rewrite(
+                on_progress=on_progress,
+                should_stop=self.isInterruptionRequested,
+                done_base=EPOCHS,
+                total=total,
+            )
+            rewrite_seconds = time.perf_counter() - rewrite_started
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                payload["updated_images"] = updated
+                payload["train_seconds"] = train_seconds
+                payload["rewrite_seconds"] = rewrite_seconds
+                if self.isInterruptionRequested():
+                    payload["cancelled"] = True
+                    payload["saved"] = True
+            self.finished_ok.emit(payload)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class PredictWorker(QThread):
     finished_ok = Signal(str, list)
     failed = Signal(str)
@@ -1205,7 +1264,7 @@ class MainWindow(QMainWindow):
         self.current_id: str | None = None
         self._active_key = "game"
         self.train_worker: TrainWorker | None = None
-        self._named_train_worker: CoinReadWorker | None = None
+        self._named_train_worker: NamedTrainWorker | None = None
         self._predict_worker: PredictWorker | None = None
         self._coin_worker: CoinReadWorker | None = None
         self._train_started_at: float | None = None
@@ -1528,12 +1587,14 @@ class MainWindow(QMainWindow):
         self.skill_register_btn = QPushButton("SKILL画像として登録")
         self.video_app_btn = QPushButton("動画編集・生成")
         self.video_app_btn.setObjectName("video")
+        self.video_analyze_btn = QPushButton("動画解析")
         self.mirror_btn = QPushButton("画面ミラー")
         stay_row = QHBoxLayout()
         stay_row.setContentsMargins(0, 0, 0, 0)
         stay_row.addWidget(self.delete_btn)
         stay_row.addWidget(self.skill_register_btn)
         stay_row.addWidget(self.video_app_btn)
+        stay_row.addWidget(self.video_analyze_btn)
         stay_row.addWidget(self.mirror_btn)
         right_layout.addLayout(stay_row)
         right.setMinimumWidth(480)
@@ -1618,6 +1679,7 @@ class MainWindow(QMainWindow):
         self.elsa_delete_btn.clicked.connect(self.delete_elsa_image)
         self.shortcut_btn.clicked.connect(self.create_launch_shortcut)
         self.video_app_btn.clicked.connect(self.launch_video_extractor)
+        self.video_analyze_btn.clicked.connect(self.launch_video_analyzer)
         self.mirror_btn.clicked.connect(self.launch_mirror)
         self.list_widget.currentCellChanged.connect(self.on_list_cell_changed)
         self.list_widget.itemChanged.connect(self.on_list_item_changed)
@@ -1637,6 +1699,7 @@ class MainWindow(QMainWindow):
         self.canvas.regionCommitted.connect(self.on_region_committed)
         self.canvas.regionChanged.connect(self.on_region_changed)
         self.canvas.piecesChanged.connect(self.on_pieces_changed)
+        self.canvas.pieceRemoved.connect(self._remember_removed_piece)
         self.canvas.pieceGroupChanged.connect(self.on_piece_group_changed)
         self.canvas.filesDropped.connect(self.import_paths)
         self.canvas.imageDropped.connect(self.import_qimage)
@@ -1896,10 +1959,11 @@ class MainWindow(QMainWindow):
             self.list_widget.blockSignals(False)
         if moved_row is None:
             self.list_widget.verticalScrollBar().setValue(scroll)
+            current = self.list_widget.currentRow()
+            if current >= 0:
+                self._scroll_list_row_into_view(current, 0)
         else:
-            item = self.list_widget.item(moved_row, 0)
-            if item is not None:
-                self.list_widget.scrollToItem(item)
+            self._scroll_list_row_into_view(moved_row, 0)
         self._list_filling = False
         if self._list_fill_restart:
             self._begin_list_fill(self._list_fill_select)
@@ -2374,13 +2438,13 @@ class MainWindow(QMainWindow):
         self._extractor_launch_attempt = 0
         QTimer.singleShot(500, self._confirm_extractor_launch)
 
-    def launch_mirror(self) -> None:
-        script = MIRROR_MAIN
+    def launch_video_analyzer(self) -> None:
+        script = ANALYZER_MAIN
         if not script.exists():
             QMessageBox.warning(
                 self,
                 "アプリが見つかりません",
-                f"画面ミラーが見つかりません。\n{script}",
+                f"動画解析アプリが見つかりません。\n{script}",
             )
             return
         kwargs: dict = {
@@ -2394,6 +2458,20 @@ class MainWindow(QMainWindow):
                 [str(self._resolve_launch_python()), str(script)],
                 **kwargs,
             )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "起動に失敗", str(exc))
+
+    def launch_mirror(self) -> None:
+        exe = MIRROR_EXE
+        if not exe.is_file():
+            QMessageBox.warning(
+                self,
+                "アプリが見つかりません",
+                f"画面ミラーが見つかりません。\n{exe}",
+            )
+            return
+        try:
+            subprocess.Popen([str(exe)], cwd=str(exe.parent))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "起動に失敗", str(exc))
 
@@ -2854,6 +2932,23 @@ class MainWindow(QMainWindow):
         self._refresh_region_list()
         name = PLACE_LABELS.get(self._active_key, "範囲")
         self.statusBar().showMessage(f"「{name}」はまだ保存していません。「{name}」を保存すると確定します", 4000)
+
+    def _remember_removed_piece(self, piece: object) -> None:
+        if not isinstance(piece, dict) or not is_tsum_kind(str(piece.get("kind") or "")):
+            return
+        sample = self.dataset.get(self.current_id) if self.current_id else None
+        if sample is None or not sample.image_path.is_file():
+            return
+        if self.predictor.type_model is None and not self._ensure_predictor():
+            return
+        if self.predictor.type_model is None:
+            return
+        from PIL import Image
+
+        with Image.open(sample.image_path) as image:
+            rgb = image.convert("RGB")
+        if self.predictor.remember_not_tsum(rgb, piece):
+            self.statusBar().showMessage("ツムではないものとして覚えました。次から近い〇は出ません", 4000)
 
     def on_pieces_changed(self) -> None:
         self._set_dirty(self._active_needs_save())
@@ -3767,37 +3862,145 @@ class MainWindow(QMainWindow):
         self._restyle_sample_row(sample.id)
         self.statusBar().showMessage(f"No. {group}  {ja}  {en}", 4000)
 
+    def _named_registration_counts(self) -> tuple[int, int, int]:
+        faces = 0
+        names: set[tuple[str, str]] = set()
+        rewrite = 0
+        for sample in self.dataset.all():
+            if not sample.image_path.is_file():
+                continue
+            circle_names = sample.circle_names or {}
+            tsums = [piece for piece in sample.pieces if is_tsum_kind(str(piece.get("kind") or ""))]
+            for piece in tsums:
+                saved = circle_names.get(str(int(piece.get("group") or 1))) or {}
+                ja = str(saved.get("ja") or "").strip()
+                en = str(saved.get("en") or "").strip()
+                if not ja and not en:
+                    continue
+                raw_out = saved.get("out")
+                out = {str(item) for item in raw_out} if isinstance(raw_out, list) else set()
+                if f"{int(piece['x'])},{int(piece['y'])}" in out:
+                    continue
+                faces += 1
+                names.add((ja, en))
+            if sample.status == "predicted" and "tsum" not in sample.confirmed and tsums:
+                rewrite += 1
+        return faces, len(names), rewrite
+
     def start_named_training(self) -> None:
         if self._block_if_training():
             return
-        from app.named_tsum_test import train as train_named_tsum
-
-        self.name_train_btn.setEnabled(False)
-        self.name_train_btn.setText("学習中")
-        self.name_save_btn.setEnabled(False)
-        self.train_btn.setEnabled(False)
-        self.statusBar().showMessage("ツム名を学習しています")
+        faces, kinds, rewrite = self._named_registration_counts()
+        if faces < 1 or kinds < 1:
+            QMessageBox.information(self, "まだありません", "登録された〇がありません。")
+            return
+        lines = [
+            "ツム名を学習します。",
+            f"登録: {faces} 枚",
+            f"種類: {kinds} 種類",
+        ]
+        if rewrite:
+            lines.append(f"学習のあと、予測だけの画像 {rewrite} 枚の〇を付け直します。")
+        lines.append("")
+        lines.append(self._train_eta_line(self._estimate_named_seconds(faces, kinds, rewrite)))
+        lines.append("")
+        lines.append("学習を開始しますか？")
+        self._named_plan = (faces, kinds, rewrite)
+        answer = QMessageBox.question(self, "学習を開始", "\n".join(lines))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._lock_for_training()
         self._keep_display_awake(True)
-        worker = CoinReadWorker(train_named_tsum)
+        self._place_train_fx()
+        self._train_fx.start()
+        self._train_fx.set_shutdown_visible(False)
+        QApplication.processEvents()
+        self.statusBar().showMessage("学習中です。中止できます")
+        worker = NamedTrainWorker(rewrite, self._rewrite_predicted_circles)
         self._named_train_worker = worker
+        worker.progress.connect(self._on_named_train_progress)
         worker.finished_ok.connect(self._on_named_train_finished)
         worker.failed.connect(self._on_named_train_failed)
         worker.finished.connect(self._on_named_train_thread_finished)
         worker.start()
 
+    def _on_named_train_progress(self, done: int, total: int, message: str) -> None:
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(done)
+        self._train_fx.set_progress(done, total, message)
+        self.statusBar().showMessage(message)
+
     def _on_named_train_finished(self, payload: object) -> None:
         from app.named_tsum_test import TEST_MODEL_PATH
 
+        self.progress.setVisible(False)
+        self._train_fx.stop()
+        self._unlock_after_training()
         data = payload if isinstance(payload, dict) else {}
+        if data.get("cancelled") and not data.get("saved"):
+            self.statusBar().showMessage("学習を中止しました", 4000)
+            QMessageBox.information(self, "学習を中止", "学習を中止しました。")
+            return
         examples = int(data.get("examples") or 0)
         names = data.get("names") if isinstance(data.get("names"), list) else []
         self.predictor.use_named_tsum_model(TEST_MODEL_PATH)
+        self._remember_named_duration(data)
+        updated = int(data.get("updated_images") or 0)
+        if self.current_id:
+            self.show_sample(self.current_id)
+        if data.get("cancelled"):
+            self.statusBar().showMessage("ツム名の学習は保存しました。〇の付け直しは中止しました", 8000)
+            QMessageBox.information(
+                self,
+                "学習を中止",
+                "ツム名の学習は保存しました。〇の付け直しは中止しました。",
+            )
+            return
         self.statusBar().showMessage(
-            f"ツム名の学習が終わりました  {examples}枚  {len(names)}種類",
+            f"ツム名の学習が終わりました  {examples}枚  {len(names)}種類  他の画像 {updated}枚",
             8000,
         )
 
+    def _rewrite_predicted_circles(
+        self,
+        on_progress=None,
+        should_stop=None,
+        done_base: int = 0,
+        total: int = 0,
+    ) -> int:
+        from app.named_tsum_test import TEST_MODEL_PATH
+
+        if not self.predictor.use_named_tsum_model(TEST_MODEL_PATH):
+            return 0
+        targets = [
+            sample
+            for sample in self.dataset.all()
+            if sample.status == "predicted"
+            and "tsum" not in sample.confirmed
+            and any(is_tsum_kind(str(piece.get("kind") or "")) for piece in sample.pieces)
+        ]
+        updated = 0
+        for index, sample in enumerate(targets, start=1):
+            if should_stop is not None and should_stop():
+                return updated
+            if on_progress is not None:
+                on_progress(done_base + index, total, f"〇を付け直しています  {index}/{len(targets)}")
+            game = sample.regions.get("game") or sample.game_region
+            try:
+                pieces = self.predictor.predict_pieces(sample.image_path, game)
+            except Exception:
+                continue
+            self.dataset.set_pieces(sample.id, pieces)
+            updated += 1
+        return updated
+
     def _on_named_train_failed(self, message: str) -> None:
+        self.progress.setVisible(False)
+        self._train_fx.stop()
+        self._unlock_after_training()
         QMessageBox.warning(self, "ツム名の学習", message or "学習に失敗しました")
         self.statusBar().showMessage(message or "ツム名の学習に失敗しました", 8000)
 
@@ -4545,6 +4748,7 @@ class MainWindow(QMainWindow):
             self.delete_unsaved_btn,
             self.shortcut_btn,
             self.video_app_btn,
+            self.video_analyze_btn,
             self.mirror_btn,
             self.reuse_btn,
             self.copy_box_btn,
@@ -4777,6 +4981,59 @@ class MainWindow(QMainWindow):
             overhead = 15.0 if key == "scene" else 8.0
             total += overhead + TRAIN_EPOCHS * self._train_batch_count(n, batch) * rate
         return max(total, 5.0)
+
+    def _named_rate(self, key: str, fallback: float) -> float:
+        try:
+            rate = float(self._settings.value(key, fallback) or fallback)
+        except (TypeError, ValueError):
+            rate = fallback
+        return rate
+
+    def _estimate_named_seconds(self, faces: int, kinds: int, rewrite: int) -> float:
+        from app.named_tsum_test import EPOCHS
+
+        cuda = self._cuda_available()
+        default = 0.3 if cuda else 1.8
+        rate = self._train_batch_rate(default)
+        face_rate = self._named_rate("named_sec_per_face", 0.0)
+        image_rate = self._named_rate("named_sec_per_image", 0.0)
+        if face_rate > 0:
+            train_s = face_rate * max(faces, 1)
+        else:
+            per_epoch = min(max(faces, 1), (8 if kinds > 1 else 16) * max(kinds, 1))
+            epoch_batches = EPOCHS * self._train_batch_count(per_epoch, 8)
+            proto_batches = self._train_batch_count(max(faces, 1), 8)
+            train_s = 8.0 + (epoch_batches + proto_batches) * rate
+        if image_rate > 0:
+            rewrite_s = image_rate * max(rewrite, 0)
+        else:
+            rewrite_s = max(rewrite, 0) * rate * 2
+        return max(train_s + rewrite_s, 5.0)
+
+    def _remember_named_duration(self, data: dict) -> None:
+        plan = getattr(self, "_named_plan", None)
+        if not plan:
+            return
+        faces, _kinds, rewrite = plan
+        try:
+            train_s = float(data.get("train_seconds") or 0)
+        except (TypeError, ValueError):
+            train_s = 0.0
+        try:
+            rewrite_s = float(data.get("rewrite_seconds") or 0)
+        except (TypeError, ValueError):
+            rewrite_s = 0.0
+        if faces > 0 and train_s >= 1.0:
+            observed = train_s / faces
+            if 0.002 <= observed <= 5.0:
+                prev = self._named_rate("named_sec_per_face", observed)
+                self._settings.setValue("named_sec_per_face", 0.55 * prev + 0.45 * observed)
+        if data.get("cancelled") or rewrite <= 0 or rewrite_s < 1.0:
+            return
+        observed = rewrite_s / rewrite
+        if 0.05 <= observed <= 30.0:
+            prev = self._named_rate("named_sec_per_image", observed)
+            self._settings.setValue("named_sec_per_image", 0.55 * prev + 0.45 * observed)
 
     def _remember_train_duration(self, jobs: list, started_at: float | None) -> None:
         if started_at is None:
@@ -5044,6 +5301,8 @@ class MainWindow(QMainWindow):
         self.start_training()
 
     def on_train_shutdown_button(self) -> None:
+        if self._is_named_training():
+            return
         if self._is_training():
             self._shutdown_after_train = not self._shutdown_after_train
             self._sync_train_shutdown_btn()
@@ -5055,6 +5314,11 @@ class MainWindow(QMainWindow):
         self.start_training(shutdown_after=True)
 
     def cancel_training(self) -> None:
+        if self._is_named_training():
+            self._train_fx.set_cancelling()
+            self._named_train_worker.requestInterruption()
+            self.statusBar().showMessage("学習を中止しています")
+            return
         if self.train_worker is None or not self.train_worker.isRunning():
             return
         self.train_btn.setEnabled(False)
@@ -5260,7 +5524,7 @@ class MainWindow(QMainWindow):
         if watched is self.canvas and event.type() == QEvent.Type.Resize:
             if hasattr(self, "_train_fx") and self._train_fx.isVisible():
                 self._place_train_fx()
-        if self._is_training() and watched is self.canvas and event.type() == QEvent.Type.KeyPress:
+        if (self._is_training() or self._is_named_training()) and watched is self.canvas and event.type() == QEvent.Type.KeyPress:
             return True
         if (
             event.type() == QEvent.Type.KeyPress
@@ -5316,6 +5580,19 @@ class MainWindow(QMainWindow):
         if col < 0:
             col = 0
         self.list_widget.setCurrentCell(next_row, col)
+        self._scroll_list_row_into_view(next_row, col)
+
+    def _scroll_list_row_into_view(self, row: int, col: int = 0) -> None:
+        if col < 0:
+            col = 0
+        item = self.list_widget.item(row, col)
+        if item is None:
+            item = self.list_widget.item(row, 0)
+        if item is None:
+            return
+        self.list_widget.scrollToItem(
+            item, QAbstractItemView.ScrollHint.PositionAtCenter
+        )
 
     def _unlabeled_id(self, after_id: str | None, *, backward: bool = False) -> str | None:
         samples = self.dataset.all()
@@ -5347,6 +5624,7 @@ class MainWindow(QMainWindow):
         for row in range(self.list_widget.rowCount()):
             if self._list_id_at(row) == sample_id:
                 self.list_widget.setCurrentCell(row, 0)
+                self._scroll_list_row_into_view(row, 0)
                 return
 
     def go_next_image(self) -> None:
@@ -5371,13 +5649,17 @@ class MainWindow(QMainWindow):
             self.train_worker.requestInterruption()
             self.train_worker.wait(15000)
             self._train_fx.stop()
+        if self._named_train_worker is not None and self._named_train_worker.isRunning():
+            self._named_train_worker.requestInterruption()
+            self._named_train_worker.wait(15000)
+            self._train_fx.stop()
         if self._predict_worker is not None and self._predict_worker.isRunning():
             self._predict_worker.wait(8000)
         self._keep_display_awake(False)
         event.accept()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self._is_training():
+        if self._is_training() or self._is_named_training():
             event.ignore()
             return
         if event.mimeData().hasUrls() or event.mimeData().hasImage():

@@ -51,6 +51,7 @@ class ImageCanvas(QGraphicsView):
     regionCommitted = Signal(int, int, int, int)
     regionChanged = Signal(int, int, int, int)
     piecesChanged = Signal()
+    pieceRemoved = Signal(object)
     pieceGroupChanged = Signal(int)
     filesDropped = Signal(list)
     imageDropped = Signal(object)
@@ -315,6 +316,7 @@ class ImageCanvas(QGraphicsView):
     def _remove_piece_at(self, index: int) -> bool:
         if index < 0 or index >= len(self._pieces):
             return False
+        removed = dict(self._pieces[index])
         self._pieces.pop(index)
         if self._selected_piece is not None:
             if self._selected_piece == index:
@@ -322,6 +324,7 @@ class ImageCanvas(QGraphicsView):
             elif self._selected_piece > index:
                 self._selected_piece -= 1
         self._clear_chain_trace()
+        self.pieceRemoved.emit(removed)
         self.piecesChanged.emit()
         self._update_guide()
         self.viewport().update()

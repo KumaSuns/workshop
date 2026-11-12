@@ -114,6 +114,7 @@ class TrainEffect(QWidget):
         self._cancel_btn.setEnabled(True)
         self._cancel_btn.setText("中止")
         self._shutdown_btn.setEnabled(True)
+        self._shutdown_btn.show()
         self.show()
         self.raise_()
         self._place_hud()
@@ -142,6 +143,10 @@ class TrainEffect(QWidget):
             self._shutdown_btn.setText("やっぱりシャットダウンする")
         self._place_hud()
 
+    def set_shutdown_visible(self, visible: bool) -> None:
+        self._shutdown_btn.setVisible(visible)
+        self._place_hud()
+
     def _place_hud(self) -> None:
         width = max(self.width(), 200)
         self._title.setGeometry(24, 24, width - 48, 48)
@@ -161,7 +166,10 @@ class TrainEffect(QWidget):
         status_h = 24
         gap = 12
         row_h = max(cancel_h, shut_h)
-        row_w = cancel_w + gap + shut_w
+        if self._shutdown_btn.isVisible():
+            row_w = cancel_w + gap + shut_w
+        else:
+            row_w = cancel_w
         row_x = max(12, (self.width() - row_w) // 2)
         row_y = max(12, self._bar.y() - status_h - gap - row_h)
         self._cancel_btn.move(row_x, row_y)

@@ -492,8 +492,70 @@ class Predictor:
         t_type = time.perf_counter()
         if assign_groups:
             self._assign_groups(rgb, pieces, kinds=kinds, inner=inner)
+        pieces = self._drop_remembered_not_tsums(rgb, pieces)
         self.last_type_s = time.perf_counter() - t_type
         return pieces
+
+    def _not_tsum_path(self) -> Path:
+        return self.models_dir / "not_tsum.pt"
+
+    def _not_tsum_vectors(self) -> torch.Tensor | None:
+        cached = getattr(self, "_not_tsum_cache", None)
+        if isinstance(cached, torch.Tensor):
+            return cached if cached.numel() else None
+        path = self._not_tsum_path()
+        if not path.is_file():
+            self._not_tsum_cache = torch.empty(0)
+            return None
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        vecs = data.get("vectors") if isinstance(data, dict) else None
+        if not isinstance(vecs, torch.Tensor) or vecs.ndim != 2 or vecs.shape[0] == 0:
+            self._not_tsum_cache = torch.empty(0)
+            return None
+        self._not_tsum_cache = torch.nn.functional.normalize(vecs.float(), dim=1)
+        return self._not_tsum_cache
+
+    def remember_not_tsum(self, image: Image.Image, piece: dict) -> bool:
+        if self.type_model is None or not is_tsum_kind(str(piece.get("kind") or "")):
+            return False
+        points = self._tsum_embeddings(image, [piece])
+        if not points:
+            return False
+        vec = torch.nn.functional.normalize(
+            torch.tensor(points[0], dtype=torch.float32).unsqueeze(0),
+            dim=1,
+        )
+        old = self._not_tsum_vectors()
+        if old is not None and float((old @ vec.squeeze(0)).max()) > 0.99:
+            return False
+        merged = vec if old is None else torch.cat([old, vec], dim=0)
+        self._not_tsum_cache = merged
+        path = self._not_tsum_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"vectors": merged.cpu()}, path)
+        return True
+
+    def _drop_remembered_not_tsums(
+        self,
+        rgb: Image.Image,
+        pieces: list[dict[str, int]],
+    ) -> list[dict[str, int]]:
+        negatives = self._not_tsum_vectors()
+        prototypes = self.named_prototypes
+        if negatives is None or prototypes is None or self.type_model is None:
+            return pieces
+        tsums = [piece for piece in pieces if is_tsum_kind(str(piece.get("kind") or ""))]
+        if not tsums:
+            return pieces
+        points = self._tsum_embeddings(rgb, tsums)
+        embed = torch.nn.functional.normalize(torch.tensor(points, dtype=torch.float32), dim=1)
+        proto = torch.nn.functional.normalize(prototypes.detach().float().cpu(), dim=1)
+        best_neg = (embed @ negatives.T).max(dim=1).values
+        best_pos = (embed @ proto.T).max(dim=1).values
+        drop = {id(piece) for piece, flag in zip(tsums, (best_neg > best_pos).tolist()) if flag}
+        if not drop:
+            return pieces
+        return [piece for piece in pieces if id(piece) not in drop]
 
     def _kind_from_heat(
         self,
