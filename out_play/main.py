@@ -1821,11 +1821,34 @@ class MenuWindow(QMainWindow):
             return "画面の確認"
         return ""
 
+    def _show_predict_device(self, text: str) -> None:
+        base = self._pc_status
+        kept = [
+            line
+            for line in base.splitlines()
+            if line != "予測" and not line.startswith("予測は")
+        ]
+        while kept and kept[-1] == "":
+            kept.pop()
+        if text.startswith("予測デバイス "):
+            name = text.removeprefix("予測デバイス ").strip() or "不明"
+            if name.casefold() == "cpu":
+                shown = "予測はCPU"
+            else:
+                shown = f"予測は{name}"
+            kept.extend(["", "予測", shown])
+        else:
+            kept.extend(["", text])
+        self._pc_status = "\n".join(kept)
+        self._paint_square_qr()
+
     def _set_activity(self, text: str) -> None:
         if self._activity is None:
             return
         if text.startswith("LossTime "):
             return
+        if text.startswith("予測デバイス ") or text.startswith("Radeonでは") or text.startswith("Radeon用の"):
+            self._show_predict_device(text)
         if text == "プレイを開始します" and self._used_tsum_name:
             self._note_external_tsum(self._used_tsum_name)
         self._activity.setText(text)
@@ -2070,7 +2093,14 @@ class MenuWindow(QMainWindow):
         self.pc_status_ready.emit(_pc_status_text())
 
     def _apply_pc_status(self, text: str) -> None:
+        kept = [
+            line
+            for line in self._pc_status.splitlines()
+            if line == "予測" or line.startswith("予測は") or line.startswith("Radeon")
+        ]
         self._pc_status = text
+        if kept:
+            self._pc_status = text.rstrip() + "\n\n" + "\n".join(kept)
         self._paint_square_qr()
 
     def _paint_square_qr(self) -> None:
