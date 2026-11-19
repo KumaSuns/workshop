@@ -787,7 +787,7 @@ class NamedModelWindow(QMainWindow):
         return (px - self._circle_ox) / self._circle_scale, (py - self._circle_oy) / self._circle_scale
 
     def _drag_circle(self, event) -> bool:
-        if not self._play_pieces:
+        if self._play_path is None or self._source_w <= 0:
             return False
         point = self._display_to_source(event.position().x(), event.position().y())
         if point is None:
@@ -796,13 +796,16 @@ class NamedModelWindow(QMainWindow):
         if event.type() == QEvent.Type.MouseButtonPress:
             if event.button() != Qt.MouseButton.LeftButton:
                 return False
+            if x < 0 or y < 0 or x >= self._source_w or y >= self._source_h:
+                return False
             picked = None
             for piece in self._play_pieces:
                 radius = max(8, int(piece.get("r") or 16))
                 if (int(piece["x"]) - x) ** 2 + (int(piece["y"]) - y) ** 2 <= radius ** 2:
                     picked = piece
             if picked is None:
-                return False
+                self._add_circle(x, y)
+                return True
             self._drag_piece = picked
             self._circle_undo.append((picked, int(picked["x"]), int(picked["y"])))
             self.undo_circle_btn.setEnabled(True)
@@ -829,19 +832,55 @@ class NamedModelWindow(QMainWindow):
             return True
         return False
 
+    def _add_circle(self, x: float, y: float) -> None:
+        radii = [int(piece.get("r") or 0) for piece in self._play_pieces if int(piece.get("r") or 0) > 0]
+        radii.sort()
+        radius = radii[len(radii) // 2] if radii else 36
+        groups = [
+            int(piece.get("group") or 0)
+            for piece in self._play_pieces
+            if is_tsum_kind(str(piece.get("kind") or ""))
+        ]
+        piece = {
+            "x": int(min(max(x, 0), self._source_w - 1)),
+            "y": int(min(max(y, 0), self._source_h - 1)),
+            "r": radius,
+            "kind": "tsum",
+            "group": (max(groups) if groups else 0) + 1,
+            "tsum_name": "",
+        }
+        self._play_pieces.append(piece)
+        self._circle_undo.append((piece, None, None))
+        self.undo_circle_btn.setEnabled(True)
+        pixmap = QPixmap(str(self._play_path)) if self._play_path is not None else QPixmap()
+        if not pixmap.isNull():
+            self.circle_strip.set_wrap_width(max(1, self.circle_scroll.viewport().width()))
+            self.circle_strip.set_rows(pixmap, self._play_pieces, self.circle_strip.edited_names())
+            self.circle_strip.select_piece(piece)
+        self.register_ver01_btn.setEnabled(True)
+        self._fit_play_image()
+
     def _undo_circle_drag(self) -> None:
         if not self._circle_undo:
             return
         piece, x, y = self._circle_undo.pop()
         self.undo_circle_btn.setEnabled(bool(self._circle_undo))
-        if piece not in self._play_pieces:
+        if x is None or y is None:
+            self._play_pieces = [item for item in self._play_pieces if item is not piece]
+            self.register_ver01_btn.setEnabled(bool(self._play_pieces))
+        elif piece in self._play_pieces:
+            piece["x"] = x
+            piece["y"] = y
+        else:
             return
-        piece["x"] = x
-        piece["y"] = y
         pixmap = QPixmap(str(self._play_path)) if self._play_path is not None else QPixmap()
-        if not pixmap.isNull():
-            self.circle_strip.set_wrap_width(max(1, self.circle_scroll.viewport().width()))
-            self.circle_strip.set_rows(pixmap, self._play_pieces, self.circle_strip.edited_names())
+        if pixmap.isNull() or not self._play_pieces:
+            self.circle_strip.clear_rows()
+            self._fit_play_image()
+            return
+        self.circle_strip.set_wrap_width(max(1, self.circle_scroll.viewport().width()))
+        self.circle_strip.set_rows(pixmap, self._play_pieces, self.circle_strip.edited_names())
+        if piece in self._play_pieces:
             self.circle_strip.select_piece(piece)
         self._fit_play_image()
 
