@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
+import zipfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +82,180 @@ def _install_directml() -> str:
     return _pip_text(result)
 
 
+_DIRECTML_PY = "3.12.10"
+_DIRECTML_EMBED = (
+    "https://www.python.org/ftp/python/"
+    f"{_DIRECTML_PY}/python-{_DIRECTML_PY}-embed-amd64.zip"
+)
+
+
+def _python_can_directml() -> bool:
+    return (
+        sys.platform == "win32"
+        and sys.maxsize > 2**32
+        and (3, 8) <= sys.version_info[:2] <= (3, 12)
+    )
+
+
+def _runtime_python() -> Path:
+    return APP_ROOT / "runtime" / "python312" / "python.exe"
+
+
+def _download(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as src, tmp.open("wb") as out:
+            while True:
+                chunk = src.read(1024 * 256)
+                if not chunk:
+                    break
+                out.write(chunk)
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _prepare_embed(root: Path) -> None:
+    pth = root / "python312._pth"
+    lines = pth.read_text(encoding="utf-8").splitlines()
+    kept = [
+        line
+        for line in lines
+        if line.strip() not in {"import site", "# import site", "Lib\\site-packages"}
+    ]
+    kept.extend(["Lib\\site-packages", "import site"])
+    pth.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    (root / "Lib" / "site-packages").mkdir(parents=True, exist_ok=True)
+
+
+def _runtime_ready(exe: Path) -> bool:
+    if not exe.is_file():
+        return False
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        [str(exe), "-c", "import PySide6, PIL, qrcode, torch_directml"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        creationflags=flags,
+    )
+    return result.returncode == 0
+
+
+def _install_runtime_packages(exe: Path) -> subprocess.CompletedProcess[str]:
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(
+        [
+            str(exe),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "torch-directml",
+            "PySide6",
+            "Pillow",
+            "qrcode",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=1800,
+        creationflags=flags,
+    )
+
+
+def _ensure_python312(report: Callable[[str], None] | None) -> str:
+    exe = _runtime_python()
+    if _runtime_ready(exe):
+        return ""
+    root = exe.parent
+    try:
+        if not exe.is_file():
+            if report is not None:
+                report(f"Python {_DIRECTML_PY} を入れています。")
+            archive = root.parent / f"python-{_DIRECTML_PY}-embed-amd64.zip"
+            _download(_DIRECTML_EMBED, archive)
+            root.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(archive) as packed:
+                packed.extractall(root)
+            _prepare_embed(root)
+        if report is not None:
+            report("Radeon用の部品を入れています")
+        if not (root / "Lib" / "site-packages" / "pip").is_dir():
+            get_pip = root / "get-pip.py"
+            _download("https://bootstrap.pypa.io/get-pip.py", get_pip)
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            pip_setup = subprocess.run(
+                [str(exe), str(get_pip)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+                creationflags=flags,
+            )
+            if pip_setup.returncode != 0:
+                return _pip_text(pip_setup) or "pip を入れられませんでした。"
+        installed = _install_runtime_packages(exe)
+        if installed.returncode != 0 and not _runtime_ready(exe):
+            return _pip_text(installed) or "Radeon用の部品を入れられませんでした。"
+    except Exception as exc:
+        return str(exc).strip() or "Python 3.12 を入れられませんでした。"
+    if not _runtime_ready(exe):
+        return "Radeon用の部品を入れられませんでした。"
+    return ""
+
+
+def _relaunch_with(exe: Path) -> None:
+    main = APP_ROOT / "main.py"
+    waiter = APP_ROOT / "runtime" / "relaunch.py"
+    waiter.parent.mkdir(parents=True, exist_ok=True)
+    waiter.write_text(
+        "import os, subprocess, sys, time\n"
+        "pid = int(sys.argv[1])\n"
+        "while True:\n"
+        "    try:\n"
+        "        os.kill(pid, 0)\n"
+        "    except OSError:\n"
+        "        break\n"
+        "    time.sleep(0.2)\n"
+        "subprocess.Popen([sys.argv[2], sys.argv[3], *sys.argv[5:]], cwd=sys.argv[4])\n",
+        encoding="utf-8",
+    )
+    flags = 0
+    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+        flags |= getattr(subprocess, name, 0)
+    subprocess.Popen(
+        [
+            sys.executable,
+            str(waiter),
+            str(os.getpid()),
+            str(exe),
+            str(main),
+            str(APP_ROOT),
+            *sys.argv[1:],
+        ],
+        creationflags=flags,
+        close_fds=True,
+    )
+    os._exit(0)
+
+
+def _switch_to_python312(report: Callable[[str], None] | None) -> str:
+    exe = _runtime_python()
+    if Path(sys.executable).resolve() == exe.resolve():
+        return ""
+    note = _ensure_python312(report)
+    if note:
+        return note
+    if report is not None:
+        report("Python 3.12 で起動し直します。")
+    _relaunch_with(exe)
+    return ""
+
+
 def _directml_device():
     import importlib
 
@@ -134,6 +310,14 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
         return "cpu", ""
     if _python_code("import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)") == 0:
         return "cuda", ""
+    if not _python_can_directml():
+        note = _switch_to_python312(report)
+        if Path(sys.executable).resolve() == _runtime_python().resolve():
+            device = _directml_device()
+            if device is not None:
+                return device, ""
+            return "cpu", note or _directml_device.last_error or "DirectMLの装置がありません"
+        return "cpu", note
     device = _directml_device()
     install_error = ""
     if device is None:
