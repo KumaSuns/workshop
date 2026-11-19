@@ -48,29 +48,36 @@ def _python_code(code: str) -> int:
     return result.returncode
 
 
-def _install_directml() -> str:
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    result = subprocess.run(
-        [
-            _python_exe(),
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "torch-directml",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdin=subprocess.DEVNULL,
-        creationflags=flags,
-    )
+def _pip_text(result: subprocess.CompletedProcess[str]) -> str:
+    text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
     if result.returncode == 0:
         return ""
-    text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
-    return text[-400:] if text else f"pip の終了コード {result.returncode}"
+    return text[-400:] if text else f"終了コード {result.returncode}"
+
+
+def _install_directml() -> str:
+    exe = _python_exe()
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    def run(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [exe, "-m", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+
+    pip = run(["pip", "--version"])
+    if pip.returncode != 0:
+        boot = run(["ensurepip", "--upgrade"])
+        if boot.returncode != 0:
+            return _pip_text(boot) or _pip_text(pip) or "pip がありません"
+    result = run(["pip", "install", "--disable-pip-version-check", "torch-directml"])
+    return _pip_text(result)
 
 
 def _directml_device():
@@ -135,7 +142,7 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
         install_error = _install_directml()
         device = _directml_device()
     if device is None:
-        detail = _directml_device.last_error or install_error or "DirectMLの装置がありません"
+        detail = install_error or _directml_device.last_error or "DirectMLの装置がありません"
         return "cpu", detail
     return device, ""
 
