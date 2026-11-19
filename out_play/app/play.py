@@ -529,7 +529,7 @@ def run_play(
     say(f"予測デバイス {getattr(predictor, 'device_label', None) or predictor.device}")
     device_note = str(getattr(predictor, "device_note", "") or "")
     if device_note:
-        say(device_note)
+        say(f"予測 {device_note}")
     reset_swipe_mouse()
     unlike = load_unlike()
     skip_chains: list[frozenset[tuple[int, int]]] = []

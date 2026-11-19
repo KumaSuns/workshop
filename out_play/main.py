@@ -1842,7 +1842,12 @@ class MenuWindow(QMainWindow):
         self._paint_square_qr()
 
     def _set_activity(self, text: str) -> None:
-        if text.startswith("予測デバイス ") or text.startswith("Radeonでは") or text.startswith("Radeon用の"):
+        if (
+            text.startswith("予測デバイス ")
+            or text.startswith("Radeonでは")
+            or text.startswith("Radeon用の")
+            or (text.startswith("予測 ") and not text.startswith("予測デバイス "))
+        ):
             self._show_predict_device(text)
         if self._activity is None:
             return

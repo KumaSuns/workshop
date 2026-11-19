@@ -48,9 +48,9 @@ def _python_code(code: str) -> int:
     return result.returncode
 
 
-def _install_directml() -> None:
+def _install_directml() -> str:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.run(
+    result = subprocess.run(
         [
             _python_exe(),
             "-m",
@@ -61,35 +61,54 @@ def _install_directml() -> None:
         ],
         check=False,
         capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         stdin=subprocess.DEVNULL,
         creationflags=flags,
     )
+    if result.returncode == 0:
+        return ""
+    text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+    return text[-400:] if text else f"pip の終了コード {result.returncode}"
 
 
 def _directml_device():
+    import importlib
+
+    sys.modules.pop("torch_directml", None)
+    importlib.invalidate_caches()
     try:
-        import torch_directml
-    except Exception:
+        torch_directml = importlib.import_module("torch_directml")
+    except Exception as exc:
+        _directml_device.last_error = str(exc).strip() or exc.__class__.__name__
         return None
+    chosen = None
     try:
         count = int(torch_directml.device_count())
-    except Exception:
-        return None
-    if count < 1:
-        return None
-    chosen = 0
-    for index in range(count):
-        try:
-            name = str(torch_directml.device_name(index) or "")
-        except Exception:
-            name = ""
-        if "radeon" in name.casefold():
-            chosen = index
-            break
+    except Exception as exc:
+        count = 0
+        _directml_device.last_error = str(exc).strip() or exc.__class__.__name__
+    if count >= 1:
+        chosen = 0
+        for index in range(count):
+            try:
+                name = str(torch_directml.device_name(index) or "")
+            except Exception:
+                name = ""
+            if "radeon" in name.casefold():
+                chosen = index
+                break
     try:
-        return torch_directml.device(chosen)
-    except Exception:
+        device = torch_directml.device() if chosen is None else torch_directml.device(chosen)
+    except Exception as exc:
+        _directml_device.last_error = str(exc).strip() or exc.__class__.__name__
         return None
+    _directml_device.last_error = ""
+    return device
+
+
+_directml_device.last_error = ""
 
 
 def _directml_name(device) -> str:
@@ -109,13 +128,15 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
     if _python_code("import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)") == 0:
         return "cuda", ""
     device = _directml_device()
+    install_error = ""
     if device is None:
         if report is not None:
             report("Radeon用の部品を入れています")
-        _install_directml()
+        install_error = _install_directml()
         device = _directml_device()
     if device is None:
-        return "cpu", ""
+        detail = _directml_device.last_error or install_error or "DirectMLの装置がありません"
+        return "cpu", detail
     return device, ""
 
 
