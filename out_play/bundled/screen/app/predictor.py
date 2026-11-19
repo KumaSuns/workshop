@@ -143,7 +143,7 @@ class Predictor:
         return "cpu"
 
     def reload(self, pump=None, device: str | torch.device | None = None) -> bool:
-        if isinstance(device, torch.device):
+        if isinstance(device, torch.device) or getattr(device, "type", "") == "privateuseone":
             self.device = device
         elif device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

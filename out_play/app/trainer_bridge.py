@@ -77,8 +77,17 @@ def _directml_device():
         return None
     if count < 1:
         return None
+    chosen = 0
+    for index in range(count):
+        try:
+            name = str(torch_directml.device_name(index) or "")
+        except Exception:
+            name = ""
+        if "radeon" in name.casefold():
+            chosen = index
+            break
     try:
-        return torch_directml.device()
+        return torch_directml.device(chosen)
     except Exception:
         return None
 
@@ -94,44 +103,17 @@ def _directml_name(device) -> str:
     return name or "Radeon"
 
 
-def _graphics_forward_ok(predictor) -> bool:
-    device = predictor.device
-    if getattr(device, "type", "") != "privateuseone":
-        return True
-    import torch
-
-    piece = getattr(predictor, "piece_model", None)
-    if piece is None:
-        return False
-    try:
-        with torch.no_grad():
-            piece(torch.zeros(1, 3, 128, 128, device=device))
-            type_model = getattr(predictor, "type_model", None)
-            if type_model is not None:
-                type_model(torch.zeros(1, 3, 96, 96, device=device))
-        return True
-    except Exception:
-        return False
-
-
 def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[object, str]:
     if not use_gpu():
         return "cpu", ""
     if _python_code("import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)") == 0:
         return "cuda", ""
-    had_directml = (
-        _python_code(
-            "import torch_directml,sys; sys.exit(0 if torch_directml.device_count() else 1)"
-        )
-        == 0
-    )
-    if not had_directml:
+    device = _directml_device()
+    if device is None:
         if report is not None:
             report("Radeon用の部品を入れています")
         _install_directml()
-    if "torch" in sys.modules and not had_directml:
-        return "cpu", "Radeon用の部品を入れました。この起動ではCPUです。"
-    device = _directml_device()
+        device = _directml_device()
     if device is None:
         return "cpu", ""
     return device, ""
@@ -143,11 +125,6 @@ def _play_device():
 
 
 def _remember_device(predictor, note: str) -> None:
-    if not _graphics_forward_ok(predictor):
-        predictor.reload(device="cpu")
-        predictor.device_label = "cpu"
-        predictor.device_note = "Radeonでは予測できなかったのでCPUです。"
-        return
     kind = getattr(predictor.device, "type", "")
     if kind == "privateuseone":
         predictor.device_label = _directml_name(predictor.device)
@@ -181,13 +158,7 @@ def load_play_tools(report: Callable[[str], None] | None = None) -> tuple[object
             raise FileNotFoundError(
                 "ツムの〇モデルがありません。画面認識アプリで学習してください。"
             )
-        try:
-            predictor = Predictor(models, device=device)
-        except Exception:
-            if device == "cpu":
-                raise
-            predictor = Predictor(models, device="cpu")
-            note = ""
+        predictor = Predictor(models, device=device)
         _remember_device(predictor, note)
         chain_fn = tsum_chain_best_per_group
         gap_fn = farthest_gap_ratio
