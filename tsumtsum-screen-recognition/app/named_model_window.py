@@ -105,6 +105,7 @@ class _CircleStrip(QWidget):
 
     picked = Signal()
     assigned = Signal(str)
+    opened = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -364,6 +365,16 @@ class _CircleStrip(QWidget):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        saved = self._saved_at(int(event.position().x()), int(event.position().y()))
+        if saved is None:
+            return
+        matched = re.fullmatch(r"(.+)_\d+_\d+", saved.stem)
+        if matched is None:
+            return
+        self.opened.emit(matched.group(1))
+        event.accept()
 
     def _saved_at(self, px: int, py: int) -> Path | None:
         if not self._named_groups:
@@ -651,6 +662,7 @@ class NamedModelWindow(QMainWindow):
         self.not_tsum_btn.clicked.connect(self._save_not_tsum)
         control_layout.addWidget(self.not_tsum_btn)
         self.circle_strip.picked.connect(self._sync_not_tsum_button)
+        self.circle_strip.opened.connect(self._open_saved_source)
         self.circle_strip.assigned.connect(self._assign_picked_number)
         self._blink_on = False
         self._blink = QTimer(self)
@@ -704,6 +716,19 @@ class NamedModelWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole + 2, path.stem in named)
             item.setData(Qt.ItemDataRole.UserRole + 3, path.stem in not_tsum)
             self.file_list.addItem(item)
+
+    def _open_saved_source(self, stem: str) -> None:
+        for row in range(self.file_list.count()):
+            item = self.file_list.item(row)
+            if item is None:
+                continue
+            name = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            if Path(name).stem != stem:
+                continue
+            self.file_list.setCurrentItem(item)
+            self.file_list.scrollToItem(item)
+            self._show_play_image(item)
+            return
 
     def _show_play_image(self, item: QListWidgetItem) -> None:
         name = str(item.data(Qt.ItemDataRole.UserRole) or "")
