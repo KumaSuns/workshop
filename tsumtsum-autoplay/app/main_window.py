@@ -1630,7 +1630,8 @@ class MainWindow(QMainWindow):
             self._info_model.setText("")
             return
         if named:
-            self._info_model.setText("ツム名のモデル")
+            stored = str(_play_model_settings().value("play_model", "") or "")
+            self._info_model.setText("ツム名 ver01" if stored == "named_ver01" else "ツム名のモデル")
             return
         shown = " ".join(name.split())
         if dedicated and shown:
@@ -1904,13 +1905,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("どのモデルを使いますか？"))
         dedicated = QRadioButton("使用ツムのモデル")
         named = QRadioButton("ツム名のモデル")
+        ver01 = QRadioButton("ツム名 ver01")
         shared = QRadioButton("専用のモデルではない")
         model_group = QButtonGroup(dialog)
         model_group.addButton(dedicated)
         model_group.addButton(named)
+        model_group.addButton(ver01)
         model_group.addButton(shared)
+        stored_model = str(_play_model_settings().value("play_model", "dedicated") or "dedicated")
         use_dedicated, use_named = _load_play_model()
-        if use_named:
+        if stored_model == "named_ver01":
+            ver01.setChecked(True)
+        elif use_named:
             named.setChecked(True)
         elif use_dedicated:
             dedicated.setChecked(True)
@@ -1918,12 +1924,15 @@ class MainWindow(QMainWindow):
             shared.setChecked(True)
         layout.addWidget(dedicated)
         layout.addWidget(named)
+        layout.addWidget(ver01)
         layout.addWidget(shared)
 
         def save_model(checked: bool) -> None:
             if not checked:
                 return
-            if named.isChecked():
+            if ver01.isChecked():
+                _play_model_settings().setValue("play_model", "named_ver01")
+            elif named.isChecked():
                 _save_play_model(False, True)
             elif dedicated.isChecked():
                 _save_play_model(True, False)
@@ -1939,6 +1948,7 @@ class MainWindow(QMainWindow):
 
         dedicated.toggled.connect(save_model)
         named.toggled.connect(save_model)
+        ver01.toggled.connect(save_model)
         shared.toggled.connect(save_model)
 
         layout.addWidget(QLabel("なぞるスピード"))
@@ -2732,7 +2742,7 @@ def _save_stay_on_top(on: bool) -> None:
 
 def _load_play_model() -> tuple[bool, bool]:
     stored = str(_play_model_settings().value("play_model", "dedicated") or "dedicated")
-    if stored == "named":
+    if stored == "named" or stored == "named_ver01":
         return False, True
     if stored == "shared":
         return False, False

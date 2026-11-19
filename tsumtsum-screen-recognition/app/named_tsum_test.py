@@ -10,18 +10,21 @@ from torchvision.transforms import functional as TF
 from torchvision.transforms import ColorJitter
 
 from app.dataset import Dataset
-from app.paths import DATA_DIR
+from app.paths import DATA_DIR, IMAGE_EXTENSIONS
 from app.regions import is_tsum_kind
 from app.tsum_type import (
     IMAGENET_MEAN,
     IMAGENET_STD,
     TYPE_FILL,
+    TYPE_INPUT,
     TsumTypeNet,
     isolated_tsum_rgb,
     supcon_loss,
 )
 
 TEST_MODEL_PATH = DATA_DIR / "models" / "named_tsum_test.pt"
+VER01_MODEL_PATH = DATA_DIR / "models" / "named_tsum_ver01.pt"
+VER01_IMAGE_DIR = DATA_DIR / "named_tsum_ver01"
 EPOCHS = 12
 
 
@@ -168,10 +171,13 @@ def train(
     epochs: int = EPOCHS,
     on_progress=None,
     should_stop=None,
+    rows: list[tuple[str, str, torch.Tensor]] | None = None,
+    on_fraction=None,
 ) -> dict:
     if on_progress is not None:
         on_progress(0, epochs, "ツム名  準備しています")
-    rows = registered_crops(should_stop)
+    if rows is None:
+        rows = registered_crops(should_stop)
     names = sorted({(ja, en) for ja, en, _crop in rows})
     if not names:
         raise RuntimeError("登録された〇がありません")
@@ -194,6 +200,17 @@ def train(
     for ja, en, _crop in rows:
         counts[(ja, en)] = counts.get((ja, en), 0) + 1
     passes = epoch_passes(list(counts.values()))
+    work = epochs * passes + len(rows)
+
+    def fraction(done: int, text: str) -> None:
+        if on_fraction is None:
+            return
+        if work <= 0:
+            on_fraction(0, text)
+            return
+        on_fraction(min(100, int(done * 100 / work)), text)
+
+    fraction(0, "準備しています")
     for epoch in range(epochs):
         if should_stop is not None and should_stop():
             raise NamedTrainingCancelled()
@@ -204,6 +221,7 @@ def train(
                 raise NamedTrainingCancelled()
             if on_progress is not None:
                 on_progress(epoch + 1, epochs, f"ツム名  {epoch + 1}/{epochs}  {step}/{passes}")
+            fraction(epoch * passes + step, f"{epoch + 1}/{epochs}")
             batch = _normalize(batch).to(device)
             target = target.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -216,6 +234,7 @@ def train(
     model.eval()
     if on_progress is not None:
         on_progress(epochs, epochs, "ツム名  まとめています")
+    fraction(epochs * passes, "まとめています")
     vectors: dict[tuple[str, str], list[torch.Tensor]] = {name: [] for name in names}
     with torch.no_grad():
         for index, (ja, en, crop) in enumerate(rows):
@@ -223,14 +242,27 @@ def train(
                 raise NamedTrainingCancelled()
             encoded = model(_normalize(crop.unsqueeze(0)).to(device))
             vectors[(ja, en)].append(F.normalize(encoded, dim=1).cpu().squeeze(0))
-    prototypes = torch.stack(
+            fraction(epochs * passes + index + 1, "まとめています")
+    averaged = torch.stack(
         [F.normalize(torch.stack(vectors[name]).mean(dim=0), dim=0) for name in names]
     )
     counts = [len(vectors[name]) for name in names]
-    check = _check_registered_faces(names, vectors, prototypes)
+    check = _check_registered_faces(names, vectors, averaged)
+    saved_names = []
+    proto_rows = []
+    for (ja, en), count in zip(names, counts):
+        vecs = vectors[(ja, en)]
+        if ja == "ツムではない":
+            for vec in vecs:
+                proto_rows.append(F.normalize(vec, dim=0))
+                saved_names.append({"ja": ja, "en": en, "count": 1})
+        else:
+            proto_rows.append(F.normalize(torch.stack(vecs).mean(dim=0), dim=0))
+            saved_names.append({"ja": ja, "en": en, "count": count})
+    prototypes = torch.stack(proto_rows)
     payload = {
         "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
-        "names": [{"ja": ja, "en": en, "count": count} for (ja, en), count in zip(names, counts)],
+        "names": saved_names,
         "prototypes": prototypes,
         "examples": len(rows),
     }
@@ -238,6 +270,44 @@ def train(
     torch.save(payload, path)
     payload["check"] = check
     return payload
+
+
+def ver01_rows() -> list[tuple[str, str, torch.Tensor]]:
+    rows: list[tuple[str, str, torch.Tensor]] = []
+    if not VER01_IMAGE_DIR.is_dir():
+        return rows
+    for folder in sorted(VER01_IMAGE_DIR.iterdir()):
+        if not folder.is_dir():
+            continue
+        ja = folder.name.strip()
+        if not ja:
+            continue
+        for image_path in sorted(folder.iterdir()):
+            if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            with Image.open(image_path) as opened:
+                image = opened.convert("RGB").resize((TYPE_INPUT, TYPE_INPUT), Image.Resampling.BILINEAR)
+            rows.append((ja, "", TF.pil_to_tensor(image).float()))
+    return rows
+
+
+def estimate_ver01_seconds(
+    rows: list[tuple[str, str, torch.Tensor]],
+    face_rate: float,
+    saved_passes: float,
+    batch_rate: float,
+) -> float:
+    faces = len(rows)
+    counts: dict[tuple[str, str], int] = {}
+    for ja, en, _crop in rows:
+        counts[(ja, en)] = counts.get((ja, en), 0) + 1
+    passes = epoch_passes(list(counts.values()))
+    if saved_passes < 1:
+        saved_passes = 1.0
+    if face_rate > 0:
+        return max(face_rate * max(faces, 1) * (passes / saved_passes), 5.0)
+    proto_batches = max(1, (max(faces, 1) + 7) // 8)
+    return max(8.0 + (EPOCHS * passes + proto_batches) * batch_rate, 5.0)
 
 
 def main() -> None:

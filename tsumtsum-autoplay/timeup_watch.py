@@ -244,10 +244,11 @@ def _read_commands() -> None:
         folder = parts[2] if len(parts) > 2 else ""
         named = len(parts) > 3 and parts[3] == "1"
         inner = not (len(parts) > 4 and parts[4] == "0")
-        _grab_queue.put((name, folder, named, inner))
+        model = parts[5] if len(parts) > 5 and parts[5] else "named_tsum_test.pt"
+        _grab_queue.put((name, folder, named, inner, model))
 
 
-def _grab_board(capture, name: str, folder: str, named: bool, inner: bool) -> None:
+def _grab_board(capture, name: str, folder: str, named: bool, inner: bool, model: str) -> None:
     try:
         if _board_tools["predictor"] is None:
             from app.trainer_bridge import load_play_tools, save_play_board
@@ -258,7 +259,7 @@ def _grab_board(capture, name: str, folder: str, named: bool, inner: bool) -> No
         predictor = _board_tools["predictor"]
         save = _board_tools["save"]
         if named:
-            path = Path(predictor.models_dir) / "named_tsum_test.pt"
+            path = Path(predictor.models_dir) / Path(model).name
             if not predictor.use_named_tsum_model(path):
                 _emit("GRAB_FAIL")
                 return

@@ -2274,6 +2274,7 @@ def run_play(
             _check_stop(stop)
             _grab_play["name"] = used_tsum
             _grab_play["named"] = bool(use_named is not None and use_named())
+            _grab_play["model"] = _named_model_file()
             _grab_play["inner"] = _groups_inner()
             _sync_named()
             coin_now = _watch_digits[0]
@@ -4789,7 +4790,7 @@ _timeup_proc: list[subprocess.Popen | None] = [None]
 _timeup_arm_hit: list = [None]
 _timeup_watching: list = [None]
 _grab_note: list = [None]
-_grab_play: dict[str, object] = {"name": "", "named": False, "inner": True}
+_grab_play: dict[str, object] = {"name": "", "named": False, "inner": True, "model": "named_tsum_test.pt"}
 _money_note: list = [None]
 _timeup_lamp: list = [None]
 _watch_money: list = [None]
@@ -4869,9 +4870,11 @@ def request_board_grab() -> bool:
     folder = _used_tsum_folder(name)
     named = "1" if _grab_play.get("named") else "0"
     inner = "0" if _grab_play.get("inner") is False else "1"
+    model = str(_grab_play.get("model") or "named_tsum_test.pt")
     safe_name = name.replace("\t", " ").replace("\n", " ").replace("\r", " ")
     safe_folder = folder.replace("\t", " ").replace("\n", " ").replace("\r", " ")
-    line = f"GRAB\t{safe_name}\t{safe_folder}\t{named}\t{inner}\n"
+    safe_model = Path(model).name.replace("\t", "").replace("\n", "").replace("\r", "")
+    line = f"GRAB\t{safe_name}\t{safe_folder}\t{named}\t{inner}\t{safe_model}\n"
     try:
         proc.stdin.write(line.encode("utf-8"))
         proc.stdin.flush()
@@ -5513,11 +5516,20 @@ def _apply_type_model(predictor, name: str, use_dedicated, use_named) -> None:
     _apply_used_type_model(predictor, _model_tsum_name(name, use_dedicated))
 
 
+def _named_model_file() -> str:
+    from PySide6.QtCore import QSettings
+
+    stored = str(QSettings("workshop", "AutoPlay").value("play_model", "") or "")
+    if stored == "named_ver01":
+        return "named_tsum_ver01.pt"
+    return "named_tsum_test.pt"
+
+
 def _apply_named_type_model(predictor) -> None:
     switch = getattr(predictor, "use_named_tsum_model", None)
     if switch is None:
         raise RuntimeError("ツム名のモデルを読み込めません。")
-    path = Path(getattr(predictor, "models_dir")) / "named_tsum_test.pt"
+    path = Path(getattr(predictor, "models_dir")) / _named_model_file()
     with _gpu_lock:
         if not switch(path):
             raise RuntimeError("ツム名のモデルがありません。")

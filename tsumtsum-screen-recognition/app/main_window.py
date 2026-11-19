@@ -1445,6 +1445,7 @@ class MainWindow(QMainWindow):
         self.name_save_btn = QPushButton("登録")
         self.name_train_btn = QPushButton("学習する")
         self.name_train_btn.setObjectName("primary")
+        self.named_model_btn = QPushButton("NamedModel")
         self.name_saved_list = QListWidget()
         self.name_saved_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.name_saved_list.setWordWrap(True)
@@ -1459,6 +1460,7 @@ class MainWindow(QMainWindow):
         name_layout.addWidget(self.name_en)
         name_layout.addWidget(self.name_save_btn)
         name_layout.addWidget(self.name_train_btn)
+        name_layout.addWidget(self.named_model_btn)
         self.name_panel.hide()
         self._name_window = QDialog(self)
         self._name_window.setWindowTitle("ツム名")
@@ -1760,6 +1762,7 @@ class MainWindow(QMainWindow):
         self.named_circle_btn.toggled.connect(self._toggle_named_circle_mode)
         self.name_save_btn.clicked.connect(self._register_circle_name)
         self.name_train_btn.clicked.connect(self.start_named_training)
+        self.named_model_btn.clicked.connect(self.open_named_model)
         self.name_ja.textChanged.connect(lambda text: self._show_existing_name("ja", text))
         self.name_en.textChanged.connect(lambda text: self._show_existing_name("en", text))
         self.name_saved_list.itemClicked.connect(self._open_saved_circle_name)
@@ -3959,6 +3962,17 @@ class MainWindow(QMainWindow):
             if sample.status == "predicted" and "tsum" not in sample.confirmed and tsums:
                 rewrite += 1
         return faces, len(names), rewrite
+
+    def open_named_model(self) -> None:
+        from app.named_model_window import NamedModelWindow
+
+        window = getattr(self, "_named_model_window", None)
+        if window is None:
+            window = NamedModelWindow()
+            self._named_model_window = window
+        window.showMaximized()
+        window.raise_()
+        window.activateWindow()
 
     def start_named_training(self) -> None:
         if self._block_if_training():

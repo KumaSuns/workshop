@@ -83,10 +83,21 @@ def _acquire_instance_lock() -> QLockFile | None:
     return None
 
 
+def _open_named_model() -> None:
+    from app.named_model_window import NamedModelWindow
+
+    window = NamedModelWindow()
+    window.showMaximized()
+    sys.exit(QApplication.instance().exec())
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("TsumTsum Screen Trainer")
     app.setOrganizationName("workshop")
+    if "--named-model" in sys.argv:
+        _open_named_model()
+        return
     paths = _initial_paths(sys.argv)
 
     lock = _acquire_instance_lock()
