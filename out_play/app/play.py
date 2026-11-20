@@ -202,6 +202,9 @@ class PlayWorker(QThread):
     def finish_after_this(self) -> None:
         self.finish_after.set()
 
+    def clear_finish_after(self) -> None:
+        self.finish_after.clear()
+
     def provide_kinds(self, kinds: int | None) -> None:
         self._kinds_answer = kinds
         self._kinds_gate.set()

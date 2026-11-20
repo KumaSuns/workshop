@@ -1111,6 +1111,8 @@ class MenuWindow(QMainWindow):
                 label = "ハートを送る"
             elif number == 4:
                 label = "GPUオン" if _gpu_on() else "GPUオフ"
+            elif number == 5:
+                label = "SHOW DATA"
             elif number == 6:
                 label = "ツムについて"
             else:
@@ -1118,9 +1120,12 @@ class MenuWindow(QMainWindow):
             button = QPushButton(label)
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
+            if number == 5:
+                button.clicked.connect(self._show_play_data)
             if number == 6:
                 button.clicked.connect(self._open_tsum_about)
             if number == 3:
+                button.setEnabled(False)
                 button.clicked.connect(self._send_hearts)
             if number == 4:
                 button.setCheckable(True)
@@ -1517,6 +1522,36 @@ class MenuWindow(QMainWindow):
         self._refresh_model_summary()
         QMessageBox.information(self, "モデルを取り込みました", f"{label} を取り込みました。")
 
+    def _show_play_data(self) -> None:
+        from app.game_record import load_game_records
+
+        window = getattr(self, "_play_data_window", None)
+        if window is None:
+            window = QDialog(self)
+            window.setWindowTitle("SHOW DATA")
+            window.resize(720, 480)
+            layout = QVBoxLayout(window)
+            layout.setContentsMargins(8, 8, 8, 8)
+            listing = QListWidget()
+            listing.setStyleSheet(
+                "QListWidget { background: #ffffff; color: #17233f; }"
+            )
+            layout.addWidget(listing)
+            window._list = listing
+            self._play_data_window = window
+        listing = window._list
+        listing.clear()
+        rows = load_game_records()
+        if not rows:
+            listing.addItem("記録がありません")
+        else:
+            for item in reversed(rows):
+                text = "".join(part for part, _right in _game_record_parts(item))
+                listing.addItem(text)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
     def _fill_records(self, slot: QFrame) -> None:
         from app.game_record import load_game_records
 
@@ -1699,7 +1734,7 @@ class MenuWindow(QMainWindow):
         grid.addWidget(end_button, 0, 0, Qt.AlignmentFlag.AlignLeft)
         play_button = QPushButton("オートプレイ")
         play_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        play_button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
+        play_button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
         self._autoplay_button = play_button
         self._write_button_key(play_button, "オートプレイ", "F3")
         play_button.clicked.connect(self._on_autoplay)
@@ -1940,6 +1975,7 @@ class MenuWindow(QMainWindow):
             self._set_flow_lamp(lamp)
 
     def _on_play_done(self) -> None:
+        self._set_end_play_blink(False)
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
         self._play_current = None
@@ -2005,8 +2041,43 @@ class MenuWindow(QMainWindow):
         worker = self._play_worker
         if worker is None or not worker.isRunning():
             return
+        if worker.finish_after.is_set():
+            worker.clear_finish_after()
+            self._set_end_play_blink(False)
+            self._set_activity("")
+            return
         worker.finish_after_this()
+        self._set_end_play_blink(True)
         self._set_activity("このプレイでやめます")
+
+    def _set_end_play_blink(self, on: bool) -> None:
+        button = self._end_play_button
+        timer = getattr(self, "_end_play_blink", None)
+        if not on:
+            if timer is not None:
+                timer.stop()
+            if button is not None:
+                button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
+            return
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(500)
+            timer.timeout.connect(self._tick_end_play_blink)
+            self._end_play_blink = timer
+            self._end_play_blink_on = False
+        self._end_play_blink_on = False
+        self._tick_end_play_blink()
+        timer.start()
+
+    def _tick_end_play_blink(self) -> None:
+        button = self._end_play_button
+        if button is None:
+            return
+        self._end_play_blink_on = not getattr(self, "_end_play_blink_on", False)
+        if self._end_play_blink_on:
+            button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
+        else:
+            button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
 
     def _stop_play(self) -> None:
         item_check = self._item_check
@@ -2047,6 +2118,7 @@ class MenuWindow(QMainWindow):
         self._set_activity("停止しています")
 
     def _on_play_stopped(self) -> None:
+        self._set_end_play_blink(False)
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
         self._play_current = None
