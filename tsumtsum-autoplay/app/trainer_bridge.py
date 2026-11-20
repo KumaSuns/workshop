@@ -16,7 +16,7 @@ from app.paths import APP_ROOT
 TRAINER_ROOT = APP_ROOT.parent / "tsumtsum-screen-recognition"
 
 
-def load_play_tools() -> tuple[object, Callable, Callable]:
+def load_play_tools(device: str | None = None) -> tuple[object, Callable, Callable]:
     hidden = {
         key: sys.modules.pop(key)
         for key in list(sys.modules)
@@ -40,7 +40,8 @@ def load_play_tools() -> tuple[object, Callable, Callable]:
             raise FileNotFoundError(
                 "ツムの〇モデルがありません。画面認識アプリで学習してください。"
             )
-        predictor = Predictor(models)
+        predictor = Predictor(models, load=False)
+        predictor.reload(device=device)
         chain_fn = tsum_chain_best_per_group
         gap_fn = farthest_gap_ratio
         keep = {

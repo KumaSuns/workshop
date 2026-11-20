@@ -417,7 +417,10 @@ def run_play(
 
     say("モデルを読み込み中")
     try:
-        predictor, chain_best, gap_ratio = load_play_tools()
+        predictor, chain_best, gap_ratio = load_play_tools(
+            "cpu" if _reuse_cpu_vec else None
+        )
+        predictor._cpu_vec_device = bool(_reuse_cpu_vec)
         loaded_predictor[0] = predictor
 
         def candidates(pieces, limit=8):
@@ -2278,6 +2281,15 @@ def run_play(
     try:
         while True:
             _check_stop(stop)
+            forced_cpu = bool(getattr(predictor, "_cpu_vec_device", False))
+            if _reuse_cpu_vec and predictor.device.type != "cpu":
+                predictor.reload(device="cpu")
+                predictor._cpu_vec_device = True
+                _apply_type_model(predictor, used_tsum, use_dedicated, use_named)
+            elif not _reuse_cpu_vec and forced_cpu:
+                predictor.reload(device=None)
+                predictor._cpu_vec_device = False
+                _apply_type_model(predictor, used_tsum, use_dedicated, use_named)
             predictor.reuse_cpu_vec = _reuse_cpu_vec
             _grab_play["name"] = used_tsum
             _grab_play["named"] = bool(use_named is not None and use_named())
