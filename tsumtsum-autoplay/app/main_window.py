@@ -186,6 +186,7 @@ from app.play import (
     request_board_grab,
     register_used_tsum_id,
     save_used_tsum_teach,
+    set_reuse_cpu_vec,
     used_tsum_names,
 )
 
@@ -712,6 +713,10 @@ class MainWindow(QMainWindow):
                     on = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
                     pair.setText("最前面オン" if on else "最前面オフ")
                     self._show_button_on(pair, on)
+                elif number == 11:
+                    self._cpu_vec_btn = pair
+                    pair.setCheckable(True)
+                    pair.toggled.connect(self._on_cpu_vec_toggled)
                 elif number == 12:
                     pair.clicked.connect(self._show_red_data)
             pair.setSizePolicy(
@@ -1072,8 +1077,13 @@ class MainWindow(QMainWindow):
             5: "ボムだけ繰り越し",
             6: "サブツム繰り越し",
             7: "ボムを放さず繰り越し",
+            11: "CPUだけ",
             12: "保存ツム候補",
         }.get(number, str(number))
+
+    def _on_cpu_vec_toggled(self, on: bool) -> None:
+        set_reuse_cpu_vec(on)
+        self._show_button_on(getattr(self, "_cpu_vec_btn", None), on)
 
     def _apply_stay_on_top(self, on: bool) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)

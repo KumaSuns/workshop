@@ -62,6 +62,7 @@ class Predictor:
         self.scene_classes: tuple[str, ...] = SCENE_CLASSES
         self.last_heat_s = 0.0
         self.last_type_s = 0.0
+        self.reuse_cpu_vec = False
         self._transform = transforms.Compose(
             [
                 transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
@@ -547,7 +548,15 @@ class Predictor:
         tsums = [piece for piece in pieces if is_tsum_kind(str(piece.get("kind") or ""))]
         if not tsums:
             return pieces
-        points = self._tsum_embeddings(rgb, tsums)
+        vectors = [piece.get("_vec") for piece in tsums]
+        if (
+            self.device.type == "cpu"
+            and self.reuse_cpu_vec
+            and all(isinstance(vec, tuple) and vec for vec in vectors)
+        ):
+            points = vectors
+        else:
+            points = self._tsum_embeddings(rgb, tsums)
         embed = torch.nn.functional.normalize(torch.tensor(points, dtype=torch.float32), dim=1)
         proto = torch.nn.functional.normalize(prototypes.detach().float().cpu(), dim=1)
         best_neg = (embed @ negatives.T).max(dim=1).values

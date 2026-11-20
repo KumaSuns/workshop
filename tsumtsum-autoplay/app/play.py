@@ -129,6 +129,12 @@ CBUZZ_BOMB_CANCEL_MASH = BOMB_CANCEL_MASH
 CBUZZ_BOMB_CANCEL_BEFORE = BOMB_CANCEL_BEFORE
 # 連打・ボムキャン・繋げたまま すべてオフ
 SKILL_CARRY_ON = False
+_reuse_cpu_vec = False
+
+
+def set_reuse_cpu_vec(on: bool) -> None:
+    global _reuse_cpu_vec
+    _reuse_cpu_vec = bool(on)
 TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
@@ -2272,6 +2278,7 @@ def run_play(
     try:
         while True:
             _check_stop(stop)
+            predictor.reuse_cpu_vec = _reuse_cpu_vec
             _grab_play["name"] = used_tsum
             _grab_play["named"] = bool(use_named is not None and use_named())
             _grab_play["model"] = _named_model_file()
