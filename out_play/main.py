@@ -18,6 +18,7 @@ from pathlib import Path
 import qrcode
 
 from PySide6.QtCore import QDir, QEvent, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtWidgets import QHeaderView
 from PySide6.QtNetwork import QHostAddress, QLocalServer, QLocalSocket, QTcpServer
 from PySide6.QtGui import (
     QColor,
@@ -50,6 +51,8 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -1529,25 +1532,66 @@ class MenuWindow(QMainWindow):
         if window is None:
             window = QDialog(self)
             window.setWindowTitle("SHOW DATA")
-            window.resize(720, 480)
             layout = QVBoxLayout(window)
             layout.setContentsMargins(8, 8, 8, 8)
-            listing = QListWidget()
-            listing.setStyleSheet(
-                "QListWidget { background: #ffffff; color: #17233f; }"
+            table = QTableWidget()
+            table.setColumnCount(8)
+            table.setHorizontalHeaderLabels(
+                ["連番", "日付", "使用ツム", "使用アイテム", "素コイン", "リザルトコイン", "倍率", "コイン利益"]
             )
-            layout.addWidget(listing)
-            window._list = listing
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            table.setStyleSheet("QTableWidget { background: #ffffff; color: #17233f; }")
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            layout.addWidget(table)
+            window._table = table
             self._play_data_window = window
-        listing = window._list
-        listing.clear()
+        table = window._table
         rows = load_game_records()
-        if not rows:
-            listing.addItem("記録がありません")
-        else:
-            for item in reversed(rows):
-                text = "".join(part for part, _right in _game_record_parts(item))
-                listing.addItem(text)
+        table.setRowCount(len(rows))
+        for index, item in enumerate(reversed(rows)):
+            names = _item_names(item)
+            coin = item.get("coin")
+            result = item.get("result_coin")
+            if result is not None and coin is not None and int(coin) > 0:
+                rate_text = f"×{int(result) / int(coin):.1f}"
+            else:
+                rate_text = "×－"
+            if result is not None:
+                gain_text = _coin_number_text(int(result) - _item_coin_cost(names))
+            else:
+                gain_text = "－"
+            values = [
+                str(len(rows) - index),
+                str(item.get("started") or ""),
+                str(item.get("tsum") or ""),
+                "、".join(names),
+                _coin_number_text(coin),
+                _coin_number_text(result),
+                rate_text,
+                gain_text,
+            ]
+            for column, text in enumerate(values):
+                cell = QTableWidgetItem(text)
+                if column in {0, 4, 5, 6, 7}:
+                    cell.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                table.setItem(index, column, cell)
+        screen = window.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            width = int(area.width() * 0.9)
+            height = int(area.height() * 0.9)
+            window.setGeometry(
+                area.x() + (area.width() - width) // 2,
+                area.y() + (area.height() - height) // 2,
+                width,
+                height,
+            )
         window.show()
         window.raise_()
         window.activateWindow()
