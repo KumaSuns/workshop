@@ -1550,10 +1550,50 @@ class NamedModelWindow(QMainWindow):
                 button_h,
             )
 
+    def _create_macos_launch_shortcut(self, desktop: Path) -> Path:
+        app_path = desktop / "NamedModel.app"
+        contents = app_path / "Contents"
+        macos_dir = contents / "MacOS"
+        if app_path.exists():
+            import shutil
+
+            shutil.rmtree(app_path)
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        python = Path(sys.executable)
+        launcher = macos_dir / "launch"
+        launcher.write_text(
+            "#!/bin/bash\n"
+            f'cd "{APP_ROOT}"\n'
+            f'exec "{python}" main.py {NAMED_MODEL_ARG}\n',
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        (contents / "Info.plist").write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>launch</string>
+  <key>CFBundleIdentifier</key><string>workshop.named-model</string>
+  <key>CFBundleName</key><string>NamedModel</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>10.13</string>
+</dict>
+</plist>
+""",
+            encoding="utf-8",
+        )
+        return app_path
+
     def create_launch_shortcut(self) -> None:
         desktop = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
         if not desktop:
             QMessageBox.warning(self, "デスクトップがありません", "デスクトップの場所が分かりませんでした。")
+            return
+        if sys.platform == "darwin":
+            dest = self._create_macos_launch_shortcut(Path(desktop))
+            QMessageBox.information(self, "起動アイコン", f"デスクトップに作りました。\n{dest}")
             return
         lnk = Path(desktop) / "NamedModel.lnk"
         python = Path(sys.executable)
