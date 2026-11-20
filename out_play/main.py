@@ -1674,6 +1674,7 @@ class MenuWindow(QMainWindow):
         grid.setSpacing(4)
         end_button = QPushButton("このプレイでやめる")
         end_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        end_button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
         self._end_play_button = end_button
         self._write_button_key(end_button, "このプレイでやめる", "F2")
         end_button.clicked.connect(self._end_after_this_play)
@@ -1681,6 +1682,7 @@ class MenuWindow(QMainWindow):
         grid.addWidget(end_button, 0, 0, Qt.AlignmentFlag.AlignLeft)
         play_button = QPushButton("オートプレイ")
         play_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        play_button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
         self._autoplay_button = play_button
         self._write_button_key(play_button, "オートプレイ", "F3")
         play_button.clicked.connect(self._on_autoplay)
@@ -1731,6 +1733,7 @@ class MenuWindow(QMainWindow):
         self._launch_button.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
+        self._launch_button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
         self._launch_button.clicked.connect(self._create_desktop_shortcut)
         self._center_buttons.append(self._launch_button)
         self._center_blank = QFrame()
@@ -3230,7 +3233,7 @@ class MenuWindow(QMainWindow):
         for button in getattr(self, "_count_buttons", []):
             text_w = button.fontMetrics().horizontalAdvance(button.text())
             text_h = button.fontMetrics().height()
-            button.setFixedSize(max(height * 3 // 4, text_w + text_h), max(height * 3 // 4, text_h))
+            button.setFixedSize(max(height, text_w + text_h), height)
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
