@@ -1634,6 +1634,9 @@ class MenuWindow(QMainWindow):
             graph_row.addWidget(graph_button, 0, Qt.AlignmentFlag.AlignLeft)
             graph_row.addStretch(1)
             layout.addLayout(graph_row)
+            body = QHBoxLayout()
+            body.setContentsMargins(0, 0, 0, 0)
+            body.setSpacing(8)
             table = QTableWidget()
             table.setColumnCount(11)
             table.setHorizontalHeaderLabels(
@@ -1657,9 +1660,28 @@ class MenuWindow(QMainWindow):
             table.setStyleSheet("QTableWidget { background: #ffffff; color: #17233f; }")
             header = table.horizontalHeader()
             header.setStretchLastSection(False)
+            header.setSectionsClickable(True)
+            header.setSortIndicatorShown(False)
+            header.sectionClicked.connect(self._sort_play_column)
             header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            layout.addWidget(table)
+            body.addWidget(table, 1)
+            tsum_scroll = QScrollArea()
+            tsum_scroll.setWidgetResizable(True)
+            tsum_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            tsum_host = QWidget()
+            tsum_column = QVBoxLayout(tsum_host)
+            tsum_column.setContentsMargins(0, 0, 0, 0)
+            tsum_column.setSpacing(4)
+            tsum_column.addStretch(1)
+            tsum_scroll.setWidget(tsum_host)
+            body.addWidget(tsum_scroll, 0)
+            layout.addLayout(body)
             window._table = table
+            window._tsum_column = tsum_column
+            window._tsum_buttons = QButtonGroup(window)
+            window._tsum_buttons.setExclusive(True)
+            window._play_tsum = ""
+            window._play_sort = None
             self._play_data_window = window
         self._fill_play_data_table()
         if not window.isVisible():
@@ -1681,7 +1703,7 @@ class MenuWindow(QMainWindow):
     def _show_coin_graph(self) -> None:
         from app.game_record import load_game_records
 
-        rows = load_game_records()
+        rows = self._selected_play_rows(load_game_records())
         window = getattr(self, "_coin_graph_window", None)
         if window is None:
             window = QDialog(self)
@@ -1700,6 +1722,79 @@ class MenuWindow(QMainWindow):
         window.raise_()
         window.activateWindow()
 
+    def _pick_play_tsum(self, name: str) -> None:
+        window = getattr(self, "_play_data_window", None)
+        if window is None:
+            return
+        window._play_tsum = name
+        self._fill_play_data_table()
+
+    def _selected_play_rows(self, rows: list[dict]) -> list[dict]:
+        window = getattr(self, "_play_data_window", None)
+        picked = str(getattr(window, "_play_tsum", "") or "")
+        if not picked:
+            return []
+        return [item for item in rows if str(item.get("tsum") or "").strip() == picked]
+
+    def _sync_play_tsum_buttons(self, rows: list[dict]) -> None:
+        window = getattr(self, "_play_data_window", None)
+        column = getattr(window, "_tsum_column", None) if window is not None else None
+        group = getattr(window, "_tsum_buttons", None) if window is not None else None
+        if column is None or group is None:
+            return
+        names: list[str] = []
+        for item in rows:
+            name = str(item.get("tsum") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        current = [button.text() for button in group.buttons()]
+        if current == names:
+            for button in group.buttons():
+                button.setChecked(button.text() == window._play_tsum)
+            return
+        for button in list(group.buttons()):
+            group.removeButton(button)
+            button.deleteLater()
+        while column.count() > 1:
+            item = column.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not names:
+            return
+        metrics = QFontMetrics(window.font())
+        width = max(metrics.horizontalAdvance(name) for name in names) + 24
+        height = metrics.height() + 12
+        for name in names:
+            button = QPushButton(name)
+            button.setCheckable(True)
+            button.setFixedSize(width, height)
+            button.setChecked(name == window._play_tsum)
+            button.clicked.connect(lambda _checked=False, picked=name: self._pick_play_tsum(picked))
+            group.addButton(button)
+            column.insertWidget(column.count() - 1, button)
+
+    def _sort_play_column(self, column: int) -> None:
+        if column not in (4, 5):
+            return
+        window = getattr(self, "_play_data_window", None)
+        if window is None:
+            return
+        current = getattr(window, "_play_sort", None)
+        descending = False
+        if current is not None and current[0] == column:
+            descending = not current[1]
+        window._play_sort = (column, descending)
+        header = window._table.horizontalHeader()
+        header.blockSignals(True)
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(
+            column,
+            Qt.SortOrder.DescendingOrder if descending else Qt.SortOrder.AscendingOrder,
+        )
+        header.blockSignals(False)
+        self._fill_play_data_table()
+
     def _fill_play_data_table(self) -> None:
         from app.game_record import load_game_records
 
@@ -1707,7 +1802,9 @@ class MenuWindow(QMainWindow):
         table = getattr(window, "_table", None) if window is not None else None
         if table is None:
             return
-        rows = load_game_records()
+        saved = load_game_records()
+        self._sync_play_tsum_buttons(saved)
+        rows = self._selected_play_rows(saved)
         running = 0
         totals: list[int] = []
         for item in rows:
@@ -1715,8 +1812,24 @@ class MenuWindow(QMainWindow):
             if result is not None:
                 running += int(result) - _item_coin_cost(_item_names(item))
             totals.append(running)
-        table.setRowCount(len(rows))
-        for index, item in enumerate(reversed(rows)):
+        entries = [(index + 1, item, totals[index]) for index, item in enumerate(rows)]
+        sort = getattr(window, "_play_sort", None)
+        if sort is None:
+            entries.reverse()
+        else:
+            column, descending = sort
+            field = "coin" if column == 4 else "result_coin"
+
+            def sort_key(entry: tuple[int, dict, int]) -> tuple[bool, int]:
+                value = entry[1].get(field)
+                if value is None:
+                    return (True, 0)
+                number = int(value)
+                return (False, -number if descending else number)
+
+            entries.sort(key=sort_key)
+        table.setRowCount(len(entries))
+        for index, (serial, item, total) in enumerate(entries):
             names = _item_names(item)
             coin = item.get("coin")
             result = item.get("result_coin")
@@ -1730,7 +1843,7 @@ class MenuWindow(QMainWindow):
                 gain_text = "－"
             record_id = item.get("id")
             values = [
-                str(len(rows) - index),
+                str(serial),
                 str(item.get("started") or ""),
                 str(item.get("tsum") or ""),
                 "、".join(names),
@@ -1738,7 +1851,7 @@ class MenuWindow(QMainWindow):
                 _coin_number_text(result),
                 rate_text,
                 gain_text,
-                _coin_number_text(totals[len(rows) - 1 - index]),
+                _coin_number_text(total),
                 str(item.get("model") or ""),
             ]
             for column, text in enumerate(values):
