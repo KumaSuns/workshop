@@ -3116,7 +3116,8 @@ class MenuWindow(QMainWindow):
         row = max(1, side * 4 // 25)
         pad = 0
         if self._square_side_buttons:
-            pad = self._square_side_buttons[0].fontMetrics().height()
+            metrics = self._square_side_buttons[0].fontMetrics()
+            pad = metrics.height() + metrics.horizontalAdvance("ああ")
         side_w = row
         for button in self._square_side_buttons:
             side_w = max(side_w, button.sizeHint().width() + pad)
