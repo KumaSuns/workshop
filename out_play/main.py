@@ -604,6 +604,7 @@ class MenuWindow(QMainWindow):
             0,
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
         )
+        self._header_buttons = [restart_button, request_button, settings_button]
         self._front = QCheckBox("最前面")
         self._front.setStyleSheet("background: transparent;")
         self._front.toggled.connect(self._set_front)
@@ -819,6 +820,7 @@ class MenuWindow(QMainWindow):
             y = max(area.top(), area.bottom() - frame.height() + 1)
         self.move(x, y)
         self._fit_logo()
+        self._fit_header_buttons()
         QTimer.singleShot(0, self._fit_items)
         QTimer.singleShot(0, self._fit_top_square)
         QTimer.singleShot(0, self._fit_center)
@@ -829,6 +831,7 @@ class MenuWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._fit_logo()
+        self._fit_header_buttons()
         QTimer.singleShot(0, self._fit_items)
         QTimer.singleShot(0, self._fit_top_square)
         QTimer.singleShot(0, self._fit_center)
@@ -858,6 +861,20 @@ class MenuWindow(QMainWindow):
         )
         self._logo.setPixmap(scaled)
         self._fitting_logo = False
+
+    def _fit_header_buttons(self) -> None:
+        buttons = getattr(self, "_header_buttons", [])
+        if not buttons:
+            return
+        width = 0
+        for button in buttons:
+            button.setMinimumWidth(0)
+            button.setMaximumWidth(16777215)
+            width = max(width, button.sizeHint().width())
+        if width < 1:
+            return
+        for button in buttons:
+            button.setFixedWidth(width)
 
     def _fill_model(self, model_box: QFrame) -> None:
         self._model_box = model_box
