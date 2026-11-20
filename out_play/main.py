@@ -3204,6 +3204,7 @@ class MenuWindow(QMainWindow):
         for button in self._square_side_buttons:
             button.setFixedSize(side_w, row)
         self._paint_square_qr()
+        self._fit_center()
 
     def _fit_center(self) -> None:
         slot = self._center_slot
@@ -3215,7 +3216,13 @@ class MenuWindow(QMainWindow):
         if width < 1 or height < 1:
             return
         button_w = width * 3 // 2
-        tall = max(1, height * 3 // 2)
+        tall = 0
+        for button in getattr(self, "_square_side_buttons", []):
+            if button.text() == "ハートを送る" and button.height() > 1:
+                tall = button.height()
+                break
+        if tall < 1:
+            tall = height
         end_button = self._end_play_button
         if end_button is not None:
             text_w = end_button.fontMetrics().horizontalAdvance(end_button.text())
@@ -3231,10 +3238,21 @@ class MenuWindow(QMainWindow):
             field = self._center_input.lineEdit()
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        for button in getattr(self, "_count_buttons", []):
+        count_buttons = getattr(self, "_count_buttons", [])
+        count_w = 0
+        count_h = 0
+        for button in count_buttons:
             text_w = button.fontMetrics().horizontalAdvance(button.text())
             text_h = button.fontMetrics().height()
-            button.setFixedSize(max(height * 3 // 4, text_w + text_h), max(height * 3 // 4, text_h))
+            count_w = max(count_w, text_w + text_h)
+            count_h = max(count_h, text_h)
+        count_w = max(height * 3 // 4, count_w)
+        count_h = max(height * 3 // 4, count_h)
+        for button in count_buttons:
+            button.setFixedSize(count_w, count_h)
+        if self._launch_button is not None and count_buttons:
+            gaps = 5 * (len(count_buttons) - 1)
+            self._launch_button.setFixedSize(count_w * len(count_buttons) + gaps, tall)
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
