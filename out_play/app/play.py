@@ -2446,6 +2446,7 @@ def run_play(
                     earned=earned_coin,
                     on_result=retry_now,
                     notify_record=publish,
+                    model="NamedType" if use_named else "PatternType",
                 )
                 watch_hit.clear()
                 if _settle_after_timeup(coin_text, result_text, watched=True):
@@ -3228,6 +3229,7 @@ def run_play(
                         earned=earned_coin,
                         on_result=retry_on_check,
                         notify_record=publish,
+                        model="NamedType" if use_named else "PatternType",
                     )
                     if _settle_after_timeup(coin_text, result_text, watched=True):
                         return
@@ -4841,6 +4843,7 @@ def _note_match_end(
     earned: int | None = None,
     on_result: bool = False,
     notify_record: Callable[[dict], None] | None = None,
+    model: str = "",
 ) -> None:
     if skill_wait_empty:
         fill = _skill_fill(rgb, skill)
@@ -4887,7 +4890,9 @@ def _note_match_end(
         waits,
         upload,
     )
-    recorded = append_game_record(started, used_tsum, items, duration, earn_n, result_n)
+    recorded = append_game_record(
+        started, used_tsum, items, duration, earn_n, result_n, model
+    )
     if notify_record is not None:
         notify_record(recorded)
 

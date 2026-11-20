@@ -36,6 +36,7 @@ def append_game_record(
     play_time: int | None,
     coin: int | None,
     result_coin: int | None,
+    model: str = "",
 ) -> dict:
     names = [str(name) for name in (items or []) if str(name)]
     item = {
@@ -46,6 +47,7 @@ def append_game_record(
         "play_time": None if play_time is None else int(play_time),
         "coin": None if coin is None else int(coin),
         "result_coin": None if result_coin is None else int(result_coin),
+        "model": str(model or ""),
     }
     PATH.parent.mkdir(parents=True, exist_ok=True)
     with _lock:

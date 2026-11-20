@@ -1533,10 +1533,9 @@ class MenuWindow(QMainWindow):
             layout = QVBoxLayout(window)
             layout.setContentsMargins(8, 8, 8, 8)
             table = QTableWidget()
-            table.setColumnCount(9)
+            table.setColumnCount(10)
             table.setHorizontalHeaderLabels(
                 [
-                    "削除",
                     "連番",
                     "日付",
                     "使用ツム",
@@ -1545,6 +1544,8 @@ class MenuWindow(QMainWindow):
                     "リザルトコイン",
                     "倍率",
                     "コイン利益",
+                    "モデル",
+                    "削除",
                 ]
             )
             table.verticalHeader().setVisible(False)
@@ -1596,11 +1597,6 @@ class MenuWindow(QMainWindow):
             else:
                 gain_text = "－"
             record_id = item.get("id")
-            button = QPushButton("削除")
-            button.clicked.connect(
-                lambda _checked=False, row_id=record_id: self._delete_play_data(row_id)
-            )
-            table.setCellWidget(index, 0, button)
             values = [
                 str(len(rows) - index),
                 str(item.get("started") or ""),
@@ -1610,9 +1606,10 @@ class MenuWindow(QMainWindow):
                 _coin_number_text(result),
                 rate_text,
                 gain_text,
+                str(item.get("model") or ""),
             ]
-            for column, text in enumerate(values, start=1):
-                if column == 2:
+            for column, text in enumerate(values):
+                if column == 1:
                     table.setCellWidget(
                         index,
                         column,
@@ -1623,7 +1620,7 @@ class MenuWindow(QMainWindow):
                         ),
                     )
                     continue
-                if column == 3:
+                if column == 2:
                     table.setCellWidget(
                         index,
                         column,
@@ -1634,7 +1631,7 @@ class MenuWindow(QMainWindow):
                         ),
                     )
                     continue
-                if column in {5, 6, 7, 8}:
+                if column in {4, 5, 6, 7}:
                     table.setCellWidget(
                         index,
                         column,
@@ -1645,12 +1642,28 @@ class MenuWindow(QMainWindow):
                         ),
                     )
                     continue
+                if column == 8:
+                    table.setCellWidget(
+                        index,
+                        column,
+                        self._play_data_label(
+                            text,
+                            Qt.AlignmentFlag.AlignCenter,
+                            "0",
+                        ),
+                    )
+                    continue
                 cell = QTableWidgetItem(text)
-                if column == 1:
+                if column == 0:
                     cell.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                     )
                 table.setItem(index, column, cell)
+            button = QPushButton("削除")
+            button.clicked.connect(
+                lambda _checked=False, row_id=record_id: self._delete_play_data(row_id)
+            )
+            table.setCellWidget(index, 9, button)
 
     def _play_data_label(self, text: str, align: Qt.AlignmentFlag, padding: str) -> QLabel:
         label = QLabel(text)
