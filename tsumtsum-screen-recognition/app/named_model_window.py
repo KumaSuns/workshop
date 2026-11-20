@@ -116,6 +116,7 @@ class _CircleStrip(QWidget):
         self._gallery: list[QPixmap] = []
         self._named_groups: list[tuple[str, list[tuple[QPixmap, Path]]]] = []
         self._saved_path: Path | None = None
+        self._saved_paths: set[Path] = set()
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
     def clear_rows(self) -> None:
@@ -161,6 +162,8 @@ class _CircleStrip(QWidget):
             label = names.get(key) or "ボム" if key == "B" else names.get(key, "")
             rows.append((key, color, label, grouped[key]))
         self._rows = rows
+        self._saved_path = None
+        self._saved_paths = set()
         self._sync_edits()
         self._apply_size()
         self.picked.emit()
@@ -170,6 +173,8 @@ class _CircleStrip(QWidget):
         self._picked = None
         self._gallery = tiles
         self._named_groups = []
+        self._saved_path = None
+        self._saved_paths = set()
         for edit in self._edits.values():
             edit.hide()
         self._apply_size()
@@ -178,12 +183,19 @@ class _CircleStrip(QWidget):
     def saved_path(self) -> Path | None:
         return self._saved_path
 
+    def showing_saved(self) -> bool:
+        return bool(self._named_groups)
+
+    def saved_paths(self) -> list[Path]:
+        return list(self._saved_paths)
+
     def show_named(self, groups: list[tuple[str, list[tuple[QPixmap, Path]]]]) -> None:
         self._rows = []
         self._picked = None
         self._gallery = []
         self._named_groups = groups
         self._saved_path = None
+        self._saved_paths = set()
         for edit in self._edits.values():
             edit.hide()
         self._apply_size()
@@ -280,7 +292,7 @@ class _CircleStrip(QWidget):
                 column = 0
                 x = self.GAP
                 for tile, path in tiles:
-                    chosen = path == self._saved_path
+                    chosen = path in self._saved_paths
                     if not tile.isNull():
                         painter.drawPixmap(x, y, tile)
                     painter.setPen(QPen(QColor("#FFFFFF") if chosen else QColor("#F0A202"), 4 if chosen else 2))
@@ -346,7 +358,14 @@ class _CircleStrip(QWidget):
     def mousePressEvent(self, event) -> None:
         saved = self._saved_at(int(event.position().x()), int(event.position().y()))
         if saved is not None:
-            self._saved_path = saved
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                if saved in self._saved_paths:
+                    self._saved_paths.discard(saved)
+                else:
+                    self._saved_paths.add(saved)
+            else:
+                self._saved_paths = {saved}
+            self._saved_path = saved if saved in self._saved_paths else None
             self.setFocus()
             self.update()
             return
@@ -504,6 +523,15 @@ class _Ver01Progress(QWidget):
         )
         self.detail.setText(f"終わりました\n{shown}")
         self.close_btn.setEnabled(True)
+        self._bring_forward()
+
+    def _bring_forward(self) -> None:
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
+        self.show()
 
     def mark_failed(self, message: str) -> None:
         self._running = False
@@ -633,6 +661,7 @@ class NamedModelWindow(QMainWindow):
         self._circle_undo: list[tuple[dict, int, int]] = []
         self._play_path: Path | None = None
         self._play_pieces: list[dict] = []
+        self._place_big = False
         self._drag_piece: dict | None = None
         self._circle_scale = 1.0
         self._circle_ox = 0.0
@@ -797,6 +826,9 @@ class NamedModelWindow(QMainWindow):
         self.play_image.setPixmap(scaled)
 
     def eventFilter(self, watched, event) -> bool:
+        if watched is self.play_image and event.type() == QEvent.Type.Wheel:
+            if self._wheel_circle(event):
+                return True
         if watched is self.play_image and event.type() in {
             QEvent.Type.MouseButtonPress,
             QEvent.Type.MouseMove,
@@ -811,6 +843,45 @@ class NamedModelWindow(QMainWindow):
             return None
         return (px - self._circle_ox) / self._circle_scale, (py - self._circle_oy) / self._circle_scale
 
+    def _circle_at(self, x: float, y: float) -> dict | None:
+        picked = None
+        for piece in self._play_pieces:
+            radius = max(8, int(piece.get("r") or 16))
+            if (int(piece["x"]) - x) ** 2 + (int(piece["y"]) - y) ** 2 <= radius ** 2:
+                picked = piece
+        return picked
+
+    def _wheel_circle(self, event) -> bool:
+        if self._play_path is None or self._source_w <= 0:
+            return False
+        if event.angleDelta().y() == 0:
+            return False
+        point = self._display_to_source(event.position().x(), event.position().y())
+        if point is None:
+            return False
+        x, y = point
+        piece = self._circle_at(x, y)
+        if piece is None:
+            self._place_big = not self._place_big
+            return True
+        big = str(piece.get("kind") or "") == "big" or int(piece.get("big") or 0) == 1
+        radius = max(8, int(piece.get("r") or 16))
+        if big:
+            piece["kind"] = "tsum"
+            piece.pop("big", None)
+            piece["r"] = max(8, int(round(radius / 1.8)))
+        else:
+            piece["kind"] = "big"
+            piece["big"] = 1
+            piece["r"] = max(8, int(round(radius * 1.8)))
+        pixmap = QPixmap(str(self._play_path)) if self._play_path is not None else QPixmap()
+        if not pixmap.isNull():
+            self.circle_strip.set_wrap_width(max(1, self.circle_scroll.viewport().width()))
+            self.circle_strip.set_rows(pixmap, self._play_pieces, self.circle_strip.edited_names())
+            self.circle_strip.select_piece(piece)
+        self._fit_play_image()
+        return True
+
     def _drag_circle(self, event) -> bool:
         if self._play_path is None or self._source_w <= 0:
             return False
@@ -823,11 +894,7 @@ class NamedModelWindow(QMainWindow):
                 return False
             if x < 0 or y < 0 or x >= self._source_w or y >= self._source_h:
                 return False
-            picked = None
-            for piece in self._play_pieces:
-                radius = max(8, int(piece.get("r") or 16))
-                if (int(piece["x"]) - x) ** 2 + (int(piece["y"]) - y) ** 2 <= radius ** 2:
-                    picked = piece
+            picked = self._circle_at(x, y)
             if picked is None:
                 self._add_circle(x, y)
                 return True
@@ -861,6 +928,8 @@ class NamedModelWindow(QMainWindow):
         radii = [int(piece.get("r") or 0) for piece in self._play_pieces if int(piece.get("r") or 0) > 0]
         radii.sort()
         radius = radii[len(radii) // 2] if radii else 36
+        if self._place_big:
+            radius = max(8, int(round(radius * 1.8)))
         groups = [
             int(piece.get("group") or 0)
             for piece in self._play_pieces
@@ -870,10 +939,12 @@ class NamedModelWindow(QMainWindow):
             "x": int(min(max(x, 0), self._source_w - 1)),
             "y": int(min(max(y, 0), self._source_h - 1)),
             "r": radius,
-            "kind": "tsum",
+            "kind": "big" if self._place_big else "tsum",
             "group": (max(groups) if groups else 0) + 1,
             "tsum_name": "",
         }
+        if self._place_big:
+            piece["big"] = 1
         self._play_pieces.append(piece)
         self._circle_undo.append((piece, None, None))
         self.undo_circle_btn.setEnabled(True)
@@ -981,19 +1052,21 @@ class NamedModelWindow(QMainWindow):
     def _move_saved_face(self, name: str) -> None:
         from app.named_tsum_test import VER01_IMAGE_DIR
 
-        source = self.circle_strip.saved_path()
-        if source is None or not source.is_file():
+        sources = [path for path in self.circle_strip.saved_paths() if path.is_file()]
+        if not sources:
             return
         folder = VER01_IMAGE_DIR / name
         folder.mkdir(parents=True, exist_ok=True)
-        target = folder / source.name
-        if source.resolve() == target.resolve():
-            return
-        if target.exists():
-            source.unlink()
-        else:
-            source.rename(target)
-        self._show_saved_faces()
+        for source in sources:
+            target = folder / source.name
+            if source.resolve() == target.resolve():
+                continue
+            if target.exists():
+                source.unlink()
+            else:
+                source.rename(target)
+        if self.circle_strip.showing_saved():
+            self._show_saved_faces()
 
     def _show_saved_faces(self) -> None:
         import locale
@@ -1191,6 +1264,7 @@ class NamedModelWindow(QMainWindow):
             return
         names = self.circle_strip.edited_names()
         saved = 0
+        overwritten = 0
         stem = self._play_path.stem
         for piece in self._play_pieces:
             kind = str(piece.get("kind") or "")
@@ -1216,7 +1290,10 @@ class NamedModelWindow(QMainWindow):
             tile = pixmap.copy(QRect(x - span, y - span, span * 2, span * 2))
             if tile.isNull():
                 continue
-            tile.save(str(folder / f"{stem}_{x}_{y}.png"))
+            target = folder / f"{stem}_{x}_{y}.png"
+            if target.is_file():
+                overwritten += 1
+            tile.save(str(target))
             saved += 1
         current = self.file_list.currentItem()
         current_name = str(current.data(Qt.ItemDataRole.UserRole) or "") if current is not None else ""
@@ -1227,7 +1304,13 @@ class NamedModelWindow(QMainWindow):
                 if item is not None and item.data(Qt.ItemDataRole.UserRole) == current_name:
                     self.file_list.setCurrentItem(item)
                     break
-        QMessageBox.information(self, "登録", f"{saved} 枚を {VER01_IMAGE_DIR} に登録しました。")
+        if overwritten and overwritten == saved:
+            verb = "上書き保存しました"
+        elif overwritten:
+            verb = f"登録しました。{overwritten} 枚は上書き保存です"
+        else:
+            verb = "登録しました"
+        QMessageBox.information(self, "登録", f"{saved} 枚を {VER01_IMAGE_DIR} に{verb}。")
 
     def _sync_not_tsum_button(self) -> None:
         piece = self.circle_strip.picked_piece()
