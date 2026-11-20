@@ -702,7 +702,7 @@ class MenuWindow(QMainWindow):
         body.addWidget(model_box, 1)
         right_column = QVBoxLayout()
         right_column.setContentsMargins(0, 0, 0, 0)
-        right_column.setSpacing(5)
+        right_column.setSpacing(10)
         for index in range(3):
             slot = QFrame()
             slot.setFrameShape(QFrame.Shape.NoFrame)
@@ -1593,6 +1593,15 @@ class MenuWindow(QMainWindow):
         self._game_list.setItemWidget(entry, self._record_row(parts))
         self._align_game_records()
 
+    def _set_play_count(self, value: str) -> None:
+        box = self._center_input
+        if box is None:
+            return
+        index = box.findText(value)
+        if index < 0:
+            return
+        box.setCurrentIndex(index)
+
     def _show_play_count(self) -> None:
         label = getattr(self, "_play_count_label", None)
         if label is None:
@@ -1680,7 +1689,27 @@ class MenuWindow(QMainWindow):
         play_key.setContext(Qt.ShortcutContext.WindowShortcut)
         play_key.activated.connect(self._on_autoplay)
         self._center_buttons.append(play_button)
-        grid.addWidget(play_button, 1, 0, Qt.AlignmentFlag.AlignLeft)
+        play_row = QWidget()
+        play_line = QHBoxLayout(play_row)
+        play_line.setContentsMargins(0, 0, 0, 0)
+        play_line.setSpacing(5)
+        play_line.addWidget(play_button)
+        self._center_input = QComboBox()
+        self._center_input.setEditable(True)
+        self._center_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._center_input.addItems([str(value) for value in range(1, 101)])
+        self._center_input.addItem("∞")
+        field = self._center_input.lineEdit()
+        field.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9∞]*")))
+        field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._center_input.setCurrentIndex(0)
+        self._center_input.currentTextChanged.connect(self._show_play_count)
+        self._show_play_count()
+        self._center_input.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        play_line.addWidget(self._center_input)
+        grid.addWidget(play_row, 1, 0, Qt.AlignmentFlag.AlignLeft)
         self._launch_button = QPushButton("起動アイコンをデスクトップに作成")
         self._launch_button.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
@@ -1713,21 +1742,20 @@ class MenuWindow(QMainWindow):
         column.addWidget(self._center_blank, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(grid_host, 0, Qt.AlignmentFlag.AlignLeft)
         column.addWidget(self._launch_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self._center_input = QComboBox()
-        self._center_input.setEditable(True)
-        self._center_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self._center_input.addItems([str(value) for value in range(1, 101)])
-        self._center_input.addItem("∞")
-        field = self._center_input.lineEdit()
-        field.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9]*")))
-        field.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._center_input.setCurrentIndex(0)
-        self._center_input.currentTextChanged.connect(self._show_play_count)
-        self._show_play_count()
-        self._center_input.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
-        )
-        grid.addWidget(self._center_input, 2, 0, Qt.AlignmentFlag.AlignLeft)
+        count_row = QWidget()
+        count_line = QHBoxLayout(count_row)
+        count_line.setContentsMargins(0, 0, 0, 0)
+        count_line.setSpacing(5)
+        self._count_buttons = []
+        for label in ("1", "2", "3", "5", "10", "20", "50", "100", "∞"):
+            count_button = QPushButton(label)
+            count_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            count_button.clicked.connect(
+                lambda _checked=False, value=label: self._set_play_count(value)
+            )
+            count_line.addWidget(count_button)
+            self._count_buttons.append(count_button)
+        grid.addWidget(count_row, 2, 0, Qt.AlignmentFlag.AlignLeft)
         outer.addWidget(holder, 0, Qt.AlignmentFlag.AlignHCenter)
         outer.addStretch(1)
         outer.addWidget(
@@ -3181,6 +3209,10 @@ class MenuWindow(QMainWindow):
             field = self._center_input.lineEdit()
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for button in getattr(self, "_count_buttons", []):
+            text_w = button.fontMetrics().horizontalAdvance(button.text())
+            text_w += button.fontMetrics().height()
+            button.setFixedSize(max(height, text_w), height)
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
