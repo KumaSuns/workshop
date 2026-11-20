@@ -11,6 +11,7 @@ from PySide6.QtGui import QClipboard, QColor, QFont, QFontMetrics, QIcon, QPaint
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -107,12 +108,14 @@ class _CircleStrip(QWidget):
     picked = Signal()
     assigned = Signal(str)
     opened = Signal(str)
+    name_menu = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._rows: list[tuple[str, QColor, str, list[tuple[QPixmap, dict]]]] = []
         self._wrap = 1
         self._edits: dict[str, QLineEdit] = {}
+        self._name_btns: dict[str, QPushButton] = {}
         self._picked: dict | None = None
         self._gallery: list[QPixmap] = []
         self._named_groups: list[tuple[str, list[tuple[QPixmap, Path]]]] = []
@@ -127,6 +130,8 @@ class _CircleStrip(QWidget):
         self._picked = None
         for edit in self._edits.values():
             edit.hide()
+        for button in self._name_btns.values():
+            button.hide()
         self.setFixedSize(1, 1)
         self.picked.emit()
         self.update()
@@ -178,6 +183,8 @@ class _CircleStrip(QWidget):
         self._saved_paths = set()
         for edit in self._edits.values():
             edit.hide()
+        for button in self._name_btns.values():
+            button.hide()
         self._apply_size()
         self.picked.emit()
 
@@ -199,8 +206,22 @@ class _CircleStrip(QWidget):
         self._saved_paths = set()
         for edit in self._edits.values():
             edit.hide()
+        for button in self._name_btns.values():
+            button.hide()
         self._apply_size()
         self.picked.emit()
+
+    def set_row_name(self, key: str, name: str) -> None:
+        edit = self._edits.get(key)
+        if edit is None or not edit.isVisible():
+            return
+        edit.setText(name)
+
+    def name_button(self, key: str) -> QPushButton | None:
+        button = self._name_btns.get(key)
+        if button is None or not button.isVisible():
+            return None
+        return button
 
     def set_wrap_width(self, width: int) -> None:
         self._wrap = max(1, width)
@@ -248,18 +269,32 @@ class _CircleStrip(QWidget):
             edit = self._edits.get(key)
             if edit is None:
                 edit = QLineEdit(self)
+                edit.setFont(QFont("Yu Gothic UI", 11, QFont.Weight.Bold))
+                edit.setStyleSheet("QLineEdit { background: #FFFFFF; color: #101216; }")
                 self._edits[key] = edit
             edit.setText(name)
+            button = self._name_btns.get(key)
+            if button is None:
+                button = QPushButton(self)
+                button.setFixedSize(self.NAME_H, self.NAME_H)
+                button.clicked.connect(lambda _checked=False, row_key=key: self.name_menu.emit(row_key))
+                self._name_btns[key] = button
         for key, edit in self._edits.items():
             if key not in alive:
                 edit.hide()
+        for key, button in self._name_btns.items():
+            if key not in alive:
+                button.hide()
 
     def _place_edits(self) -> None:
         per = self._per_row()
         y = self.GAP
         for key, _color, _name, tiles in self._rows:
             edit = self._edits[key]
-            edit.setGeometry(self.LABEL, y, max(1, self.width() - self.LABEL), self.NAME_H)
+            button = self._name_btns[key]
+            button.setGeometry(0, y, self.NAME_H, self.NAME_H)
+            button.show()
+            edit.setGeometry(self.NAME_H, y, max(1, self.width() - self.NAME_H), self.NAME_H)
             edit.show()
             y += self.NAME_H
             lines = max(1, (len(tiles) + per - 1) // per)
@@ -438,20 +473,33 @@ class _CircleStrip(QWidget):
 class _Ver01TrainThread(QThread):
     failed = Signal(str)
     done = Signal(str)
+    cancelled = Signal()
     progressed = Signal(int, str)
 
     def __init__(self, rows: list) -> None:
         super().__init__()
         self._rows = rows
+        self._stop = False
+
+    def request_stop(self) -> None:
+        self._stop = True
 
     def run(self) -> None:
         try:
-            from app.named_tsum_test import VER01_MODEL_PATH, train
+            from app.named_tsum_test import VER01_MODEL_PATH, NamedTrainingCancelled, train
 
             def on_fraction(percent: int, text: str) -> None:
                 self.progressed.emit(int(percent), str(text))
 
-            train(path=VER01_MODEL_PATH, rows=self._rows, on_fraction=on_fraction)
+            train(
+                path=VER01_MODEL_PATH,
+                rows=self._rows,
+                on_fraction=on_fraction,
+                should_stop=lambda: self._stop,
+            )
+        except NamedTrainingCancelled:
+            self.cancelled.emit()
+            return
         except Exception as exc:
             self.failed.emit(str(exc).strip() or "学習できませんでした。")
             return
@@ -460,11 +508,12 @@ class _Ver01TrainThread(QThread):
 
 
 class _Ver01Progress(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, main_window: QWidget) -> None:
         super().__init__(None)
+        self._main_window = main_window
         self.setWindowTitle("学習")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-        self.setFixedSize(420, 168)
+        self.setFixedSize(560, 210)
         self._running = True
         self._thread: _Ver01TrainThread | None = None
         self.setStyleSheet(
@@ -478,6 +527,7 @@ class _Ver01Progress(QWidget):
             " background: #FFFFFF; color: #35507A; font-size: 14px; font-weight: 700;"
             " min-width: 120px; min-height: 32px; }"
             "QPushButton:disabled { color: #B0B8C4; border-color: #E4D7A8; }"
+            "QCheckBox { color: #35507A; font-size: 14px; font-weight: 700; }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 8, 18, 8)
@@ -493,13 +543,24 @@ class _Ver01Progress(QWidget):
         self.detail.setObjectName("detail")
         self.detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.detail.setFixedHeight(36)
+        self.shutdown_box = QCheckBox("終わったらシャットダウン")
+        self.cancel_btn = QPushButton("中止")
+        self.cancel_btn.clicked.connect(self._cancel)
+        self.main_btn = QPushButton("メインウィンドウ")
+        self.main_btn.clicked.connect(self._show_main)
         self.close_btn = QPushButton("とじる")
         self.close_btn.setEnabled(False)
         self.close_btn.clicked.connect(self.close)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(12)
+        buttons.addWidget(self.cancel_btn)
+        buttons.addWidget(self.main_btn)
+        buttons.addWidget(self.close_btn)
         layout.addWidget(self.percent)
         layout.addWidget(self.bar)
         layout.addWidget(self.detail)
-        layout.addWidget(self.close_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.shutdown_box, 0, Qt.AlignmentFlag.AlignHCenter)
+        layout.addLayout(buttons)
 
     def is_running(self) -> bool:
         return self._running
@@ -508,6 +569,7 @@ class _Ver01Progress(QWidget):
         self._thread = thread
         thread.progressed.connect(self.set_progress)
         thread.done.connect(self.mark_done)
+        thread.cancelled.connect(self.mark_cancelled)
         thread.failed.connect(self.mark_failed)
 
     def set_progress(self, percent: int, text: str) -> None:
@@ -523,8 +585,32 @@ class _Ver01Progress(QWidget):
             path, Qt.TextElideMode.ElideMiddle, max(1, self.detail.width())
         )
         self.detail.setText(f"終わりました\n{shown}")
+        self.cancel_btn.setEnabled(False)
+        self.shutdown_box.setEnabled(False)
         self.close_btn.setEnabled(True)
+        if self.shutdown_box.isChecked():
+            subprocess.run(["shutdown", "/s", "/t", "0"], check=False)
         self._bring_forward()
+
+    def _show_main(self) -> None:
+        window = self._main_window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _cancel(self) -> None:
+        if self._thread is None or not self._running:
+            return
+        self.cancel_btn.setEnabled(False)
+        self.detail.setText("中止しています")
+        self._thread.request_stop()
+
+    def mark_cancelled(self) -> None:
+        self._running = False
+        self.cancel_btn.setEnabled(False)
+        self.shutdown_box.setEnabled(False)
+        self.close_btn.setEnabled(True)
+        self.detail.setText("中止しました")
 
     def _bring_forward(self) -> None:
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
@@ -536,6 +622,8 @@ class _Ver01Progress(QWidget):
 
     def mark_failed(self, message: str) -> None:
         self._running = False
+        self.cancel_btn.setEnabled(False)
+        self.shutdown_box.setEnabled(False)
         self.close_btn.setEnabled(True)
         shown = QFontMetrics(self.detail.font()).elidedText(
             message, Qt.TextElideMode.ElideRight, max(1, self.detail.width())
@@ -680,7 +768,25 @@ class NamedModelWindow(QMainWindow):
         self.register_ver01_btn = QPushButton("登録")
         self.register_ver01_btn.setEnabled(False)
         self.register_ver01_btn.clicked.connect(self._register_ver01)
-        control_layout.addWidget(self.register_ver01_btn)
+        self.circle_count_label = QLabel("〇 0")
+        self.tsum_count_label = QLabel("ツム 0")
+        self.big_count_label = QLabel("デカツム 0")
+        self.bomb_count_label = QLabel("ボム 0")
+        for label in (
+            self.circle_count_label,
+            self.tsum_count_label,
+            self.big_count_label,
+            self.bomb_count_label,
+        ):
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        register_row = QHBoxLayout()
+        register_row.setContentsMargins(0, 0, 0, 0)
+        register_row.addWidget(self.register_ver01_btn, 4)
+        register_row.addWidget(self.circle_count_label, 1)
+        register_row.addWidget(self.tsum_count_label, 1)
+        register_row.addWidget(self.big_count_label, 1)
+        register_row.addWidget(self.bomb_count_label, 1)
+        control_layout.addLayout(register_row)
         self.circle_strip = _CircleStrip()
         self.circle_scroll = QScrollArea(self.control_window)
         self.circle_scroll.setWidgetResizable(False)
@@ -696,6 +802,7 @@ class NamedModelWindow(QMainWindow):
         self.circle_strip.picked.connect(self._sync_not_tsum_button)
         self.circle_strip.opened.connect(self._open_saved_source)
         self.circle_strip.assigned.connect(self._assign_picked_number)
+        self.circle_strip.name_menu.connect(self._pick_row_name)
         self._blink_on = False
         self._blink = QTimer(self)
         self._blink.setInterval(280)
@@ -774,7 +881,26 @@ class NamedModelWindow(QMainWindow):
         self.play_name.setText(name if self._play_path is not None else "")
         self._fit_play_image()
 
+    def _refresh_circle_counts(self) -> None:
+        total = len(self._play_pieces)
+        normal = 0
+        big = 0
+        bomb = 0
+        for piece in self._play_pieces:
+            kind = str(piece.get("kind") or "")
+            if kind == "bomb":
+                bomb += 1
+            elif kind == "big" or int(piece.get("big") or 0) == 1:
+                big += 1
+            elif is_tsum_kind(kind):
+                normal += 1
+        self.circle_count_label.setText(f"〇 {total}")
+        self.tsum_count_label.setText(f"ツム {normal}")
+        self.big_count_label.setText(f"デカツム {big}")
+        self.bomb_count_label.setText(f"ボム {bomb}")
+
     def _fit_play_image(self) -> None:
+        self._refresh_circle_counts()
         if self._play_path is None:
             self.play_image.clear()
             self.play_name.clear()
@@ -983,7 +1109,7 @@ class NamedModelWindow(QMainWindow):
             self.circle_strip.select_piece(piece)
         self._fit_play_image()
 
-    def _show_registered_names(self) -> None:
+    def _registered_tsum_names(self) -> list[str]:
         import locale
 
         from app.named_tsum_test import VER01_IMAGE_DIR
@@ -1004,17 +1130,34 @@ class NamedModelWindow(QMainWindow):
             names.sort(key=locale.strxfrm)
         finally:
             locale.setlocale(locale.LC_COLLATE, previous)
-        menu = QMenu(self.name_list_btn)
+        return names
+
+    def _tsum_name_menu(self, parent) -> QMenu:
+        menu = QMenu(parent)
+        names = self._registered_tsum_names()
         if not names:
             empty = menu.addAction("登録がありません")
             empty.setEnabled(False)
         else:
             for name in names:
                 menu.addAction(name)
+        return menu
+
+    def _show_registered_names(self) -> None:
+        menu = self._tsum_name_menu(self.name_list_btn)
         chosen = menu.exec(self.name_list_btn.mapToGlobal(self.name_list_btn.rect().bottomLeft()))
         if chosen is not None and chosen.isEnabled():
             QApplication.clipboard().setText(chosen.text(), QClipboard.Mode.Clipboard)
             self._move_saved_face(chosen.text())
+
+    def _pick_row_name(self, key: str) -> None:
+        button = self.circle_strip.name_button(key)
+        if button is None:
+            return
+        menu = self._tsum_name_menu(button)
+        chosen = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+        if chosen is not None and chosen.isEnabled():
+            self.circle_strip.set_row_name(key, chosen.text())
 
     def _show_registered_bombs(self) -> None:
         import locale
@@ -1450,7 +1593,7 @@ class NamedModelWindow(QMainWindow):
         kinds = len({ja for ja, _en, _crop in rows})
         if not _ask_ver01_start(clock, len(rows), kinds):
             return
-        window = _Ver01Progress()
+        window = _Ver01Progress(self)
         thread = _Ver01TrainThread(rows)
         window.attach(thread)
         _ver01_progress = window

@@ -32,6 +32,9 @@ def _lock_path() -> Path:
     return Path(QDir.tempPath()) / f"{IPC_NAME}.lock"
 
 
+NAMED_MODEL_IPC = f"{IPC_NAME}-named-model"
+
+
 def _lock_holder_pid(lock: QLockFile) -> int:
     try:
         pid, _hostname, _app = lock.getLockInfo()
@@ -86,9 +89,22 @@ def _acquire_instance_lock() -> QLockFile | None:
 def _open_named_model() -> None:
     from app.named_model_window import NamedModelWindow
 
+    lock = QLockFile(str(Path(QDir.tempPath()) / f"{NAMED_MODEL_IPC}.lock"))
+    if not lock.tryLock(100):
+        if _lock_holder_dead(lock):
+            lock.removeStaleLockFile()
+        if not lock.tryLock(100):
+            QMessageBox.information(
+                None,
+                "すでに起動しています",
+                "ツム名の画面は、すでに開いています。",
+            )
+            sys.exit(0)
+    app = QApplication.instance()
+    app._named_model_lock = lock
     window = NamedModelWindow()
     window.showMaximized()
-    sys.exit(QApplication.instance().exec())
+    sys.exit(app.exec())
 
 
 def main() -> None:
