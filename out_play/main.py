@@ -1526,8 +1526,6 @@ class MenuWindow(QMainWindow):
         QMessageBox.information(self, "モデルを取り込みました", f"{label} を取り込みました。")
 
     def _show_play_data(self) -> None:
-        from app.game_record import load_game_records
-
         window = getattr(self, "_play_data_window", None)
         if window is None:
             window = QDialog(self)
@@ -1535,9 +1533,19 @@ class MenuWindow(QMainWindow):
             layout = QVBoxLayout(window)
             layout.setContentsMargins(8, 8, 8, 8)
             table = QTableWidget()
-            table.setColumnCount(8)
+            table.setColumnCount(9)
             table.setHorizontalHeaderLabels(
-                ["連番", "日付", "使用ツム", "使用アイテム", "素コイン", "リザルトコイン", "倍率", "コイン利益"]
+                [
+                    "削除",
+                    "連番",
+                    "日付",
+                    "使用ツム",
+                    "使用アイテム",
+                    "素コイン",
+                    "リザルトコイン",
+                    "倍率",
+                    "コイン利益",
+                ]
             )
             table.verticalHeader().setVisible(False)
             table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1545,11 +1553,34 @@ class MenuWindow(QMainWindow):
             table.setStyleSheet("QTableWidget { background: #ffffff; color: #17233f; }")
             header = table.horizontalHeader()
             header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
             layout.addWidget(table)
             window._table = table
             self._play_data_window = window
-        table = window._table
+        self._fill_play_data_table()
+        if not window.isVisible():
+            screen = window.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                width = int(area.width() * 0.9)
+                height = int(area.height() * 0.9)
+                window.setGeometry(
+                    area.x() + (area.width() - width) // 2,
+                    area.y() + (area.height() - height) // 2,
+                    width,
+                    height,
+                )
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _fill_play_data_table(self) -> None:
+        from app.game_record import load_game_records
+
+        window = getattr(self, "_play_data_window", None)
+        table = getattr(window, "_table", None) if window is not None else None
+        if table is None:
+            return
         rows = load_game_records()
         table.setRowCount(len(rows))
         for index, item in enumerate(reversed(rows)):
@@ -1564,6 +1595,12 @@ class MenuWindow(QMainWindow):
                 gain_text = _coin_number_text(int(result) - _item_coin_cost(names))
             else:
                 gain_text = "－"
+            record_id = item.get("id")
+            button = QPushButton("削除")
+            button.clicked.connect(
+                lambda _checked=False, row_id=record_id: self._delete_play_data(row_id)
+            )
+            table.setCellWidget(index, 0, button)
             values = [
                 str(len(rows) - index),
                 str(item.get("started") or ""),
@@ -1574,27 +1611,68 @@ class MenuWindow(QMainWindow):
                 rate_text,
                 gain_text,
             ]
-            for column, text in enumerate(values):
+            for column, text in enumerate(values, start=1):
+                if column == 2:
+                    table.setCellWidget(
+                        index,
+                        column,
+                        self._play_data_label(
+                            text,
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                            "0.5em",
+                        ),
+                    )
+                    continue
+                if column == 3:
+                    table.setCellWidget(
+                        index,
+                        column,
+                        self._play_data_label(
+                            text,
+                            Qt.AlignmentFlag.AlignCenter,
+                            "0",
+                        ),
+                    )
+                    continue
+                if column in {5, 6, 7, 8}:
+                    table.setCellWidget(
+                        index,
+                        column,
+                        self._play_data_label(
+                            text,
+                            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                            "0 0.5em",
+                        ),
+                    )
+                    continue
                 cell = QTableWidgetItem(text)
-                if column in {0, 4, 5, 6, 7}:
+                if column == 1:
                     cell.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                     )
                 table.setItem(index, column, cell)
-        screen = window.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            area = screen.availableGeometry()
-            width = int(area.width() * 0.9)
-            height = int(area.height() * 0.9)
-            window.setGeometry(
-                area.x() + (area.width() - width) // 2,
-                area.y() + (area.height() - height) // 2,
-                width,
-                height,
-            )
-        window.show()
-        window.raise_()
-        window.activateWindow()
+
+    def _play_data_label(self, text: str, align: Qt.AlignmentFlag, padding: str) -> QLabel:
+        label = QLabel(text)
+        label.setAlignment(align)
+        label.setStyleSheet(
+            "QLabel { background: transparent; color: #17233f; padding: " + padding + "; }"
+        )
+        return label
+
+    def _delete_play_data(self, record_id: int) -> None:
+        from app.game_record import delete_game_record
+
+        if not delete_game_record(record_id):
+            return
+        game_list = self._game_list
+        if game_list is not None:
+            for row in range(game_list.count()):
+                listed = game_list.item(row)
+                if listed is not None and listed.data(Qt.ItemDataRole.UserRole) == record_id:
+                    game_list.takeItem(row)
+                    break
+        self._fill_play_data_table()
 
     def _fill_records(self, slot: QFrame) -> None:
         from app.game_record import load_game_records

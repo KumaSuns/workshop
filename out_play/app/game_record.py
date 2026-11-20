@@ -83,6 +83,34 @@ def set_result_coin(record_id: int, result_coin: int) -> dict | None:
     return found
 
 
+def delete_game_record(record_id: int) -> bool:
+    if record_id is None:
+        return False
+    with _lock:
+        if not PATH.is_file():
+            return False
+        lines = PATH.read_text(encoding="utf-8").splitlines()
+        kept: list[str] = []
+        removed = False
+        for raw in lines:
+            text = raw.strip()
+            if not text:
+                continue
+            try:
+                item = json.loads(text)
+            except json.JSONDecodeError:
+                kept.append(raw)
+                continue
+            if isinstance(item, dict) and item.get("id") == record_id and not removed:
+                removed = True
+                continue
+            kept.append(raw)
+        if not removed:
+            return False
+        PATH.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    return True
+
+
 def update_game_coins(record_id: int, coin: int | None, result_coin: int | None) -> dict | None:
     if record_id is None or (coin is None and result_coin is None):
         return None
