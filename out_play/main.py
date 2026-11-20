@@ -3113,17 +3113,20 @@ class MenuWindow(QMainWindow):
         if side < 1:
             side = 1
         gap = full - side
-        row = max(1, side // 5)
+        row = max(1, side * 4 // 25)
+        pad = 0
+        if self._square_side_buttons:
+            pad = self._square_side_buttons[0].fontMetrics().height()
         side_w = row
         for button in self._square_side_buttons:
-            side_w = max(side_w, button.sizeHint().width())
+            side_w = max(side_w, button.sizeHint().width() + pad)
         if TITLE_MARGIN + side > usable_h:
             side = max(1, usable_h - TITLE_MARGIN)
-            row = max(1, side // 5)
+            row = max(1, side * 4 // 25)
             side_w = max(side_w, row)
         if side + side_w > usable_w:
             side = max(1, usable_w - side_w)
-            row = max(1, side // 5)
+            row = max(1, side * 4 // 25)
         gap = max(0, min(gap, usable_w - side - side_w))
         body = self._tsum_body
         if body is not None:
