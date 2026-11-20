@@ -17,7 +17,7 @@ from pathlib import Path
 
 import qrcode
 
-from PySide6.QtCore import QDir, QEvent, QLockFile, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDir, QEvent, QLockFile, QRect, QRegularExpression, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import QHeaderView
 from PySide6.QtNetwork import QHostAddress, QLocalServer, QLocalSocket, QTcpServer
 from PySide6.QtGui import (
@@ -589,15 +589,22 @@ class _CoinChart(QWidget):
         average_y = point_at(1, average)[1]
         painter.setPen(QPen(QColor("#E23B2F"), 1.6, Qt.PenStyle.DashLine))
         painter.drawLine(plot.left() + 8, int(average_y), plot.right() - 8, int(average_y))
-        painter.setPen(QColor("#E23B2F"))
-        painter.drawText(
-            plot.right() - 168,
-            int(average_y) - 18,
-            160,
-            16,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            f"平均 {average:,}",
+        label = f"平均 {average:,}"
+        painter.setFont(QFont("Yu Gothic UI", 12, QFont.Weight.Bold))
+        label_width = painter.fontMetrics().horizontalAdvance(label) + 16
+        label_height = 24
+        label_rect = QRect(
+            plot.right() - label_width - 8,
+            max(plot.top() + 4, int(average_y) - label_height - 4),
+            label_width,
+            label_height,
         )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawRoundedRect(label_rect, 4, 4)
+        painter.setPen(QColor("#9E1B12"))
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, label)
+        painter.setFont(QFont("Yu Gothic UI", 11))
         painter.setPen(QPen(line_color, 2.4))
         painter.drawLine(plot.left(), 22, plot.left() + 28, 22)
         painter.setPen(QColor("#17233f"))
