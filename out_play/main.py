@@ -349,6 +349,19 @@ FLOW_LAMP_BLINK_WHITE = _flow_lamp_style("#ffffff", "#2c4a7a", "#A4C6FF")
 FLOW_LAMP_BLINK = _flow_lamp_style("#A4C6FF", "#2c4a7a", "#7eb0f0")
 
 
+def _side_button_style(background: str, color: str, border: str) -> str:
+    return (
+        "QPushButton, QPushButton:hover, QPushButton:checked, QPushButton:disabled {"
+        f" background: {background};"
+        f" color: {color};"
+        " font-weight: 700;"
+        f" border: 1px solid {border};"
+        " border-radius: 6px;"
+        " padding: 0px;"
+        "}"
+    )
+
+
 def _gpu_button_style(on: bool) -> str:
     if on:
         background = "#2c4a7a"
@@ -358,15 +371,7 @@ def _gpu_button_style(on: bool) -> str:
         background = "#ffffff"
         color = "#17233f"
         border = "#A4C6FF"
-    return (
-        "QPushButton, QPushButton:hover, QPushButton:checked {"
-        f" background: {background};"
-        f" color: {color};"
-        " font-weight: 700;"
-        f" border: 1px solid {border};"
-        " border-radius: 6px;"
-        "}"
-    )
+    return _side_button_style(background, color, border)
 
 
 def _dim_pixmap(pixmap: QPixmap) -> QPixmap:
@@ -666,7 +671,6 @@ class MenuWindow(QMainWindow):
         self._center_square = None
         self._square_qr = None
         self._top_square_host = None
-        self._square_under = None
         self._square_side_buttons = []
         self._external_button = None
         self._gpu_button = None
@@ -1079,10 +1083,6 @@ class MenuWindow(QMainWindow):
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
-        under = QPushButton("1")
-        under.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._square_under = under
-        square_column.addWidget(under, 0, Qt.AlignmentFlag.AlignLeft)
         side_column = QVBoxLayout()
         side_column.setContentsMargins(0, 2, 0, 2)
         side_column.setSpacing(2)
@@ -1100,6 +1100,7 @@ class MenuWindow(QMainWindow):
                 label = str(number)
             button = QPushButton(label)
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
             if number == 6:
                 button.clicked.connect(self._open_tsum_about)
             if number == 3:
@@ -2035,15 +2036,7 @@ class MenuWindow(QMainWindow):
         button.setEnabled(False)
         button.setChecked(False)
         button.setText("GPUなし")
-        button.setStyleSheet(
-            "QPushButton, QPushButton:disabled {"
-            " background: #ffffff;"
-            " color: #FF5192;"
-            " font-weight: 700;"
-            " border: 1px solid #FF5192;"
-            " border-radius: 6px;"
-            "}"
-        )
+        button.setStyleSheet(_side_button_style("#ffffff", "#FF5192", "#FF5192"))
         button.blockSignals(False)
         self._fit_top_square()
 
@@ -3124,9 +3117,8 @@ class MenuWindow(QMainWindow):
         side_w = row
         for button in self._square_side_buttons:
             side_w = max(side_w, button.sizeHint().width())
-        if TITLE_MARGIN + side + row > usable_h:
-            room = max(1, usable_h - TITLE_MARGIN)
-            side = max(1, room * 5 // 6)
+        if TITLE_MARGIN + side > usable_h:
+            side = max(1, usable_h - TITLE_MARGIN)
             row = max(1, side // 5)
             side_w = max(side_w, row)
         if side + side_w > usable_w:
@@ -3137,9 +3129,6 @@ class MenuWindow(QMainWindow):
         if body is not None:
             body.setContentsMargins(gap, TITLE_MARGIN, 0, 0)
         square.setFixedSize(side, side)
-        under = self._square_under
-        if under is not None:
-            under.setFixedSize(side, row)
         for button in self._square_side_buttons:
             button.setFixedSize(side_w, row)
         self._paint_square_qr()
