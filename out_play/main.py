@@ -3210,9 +3210,15 @@ class MenuWindow(QMainWindow):
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         for button in getattr(self, "_count_buttons", []):
+            font = button.font()
+            point = font.pointSize()
+            if point < 1:
+                point = 9
+            font.setPointSize(max(1, point // 2))
+            button.setFont(font)
             text_w = button.fontMetrics().horizontalAdvance(button.text())
             text_w += button.fontMetrics().height()
-            button.setFixedSize(max(height, text_w), height)
+            button.setFixedSize(max(height // 2, text_w), max(1, height // 2))
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
