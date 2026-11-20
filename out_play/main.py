@@ -1339,14 +1339,24 @@ class MenuWindow(QMainWindow):
     def _ask_app_update(self, available: bool) -> None:
         if not available:
             return
-        box = QMessageBox(self)
-        box.setWindowTitle("AUTO PLAY")
-        box.setText("アプリの更新があります。更新してもよろしいですか？")
-        yes = box.addButton("はい", QMessageBox.ButtonRole.AcceptRole)
-        no = box.addButton("いいえ", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(yes)
-        box.exec()
-        if box.clickedButton() is not yes:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AUTO PLAY")
+        column = QVBoxLayout(dialog)
+        column.addWidget(QLabel("アプリの更新があります。更新してもよろしいですか？"))
+        row = QHBoxLayout()
+        no = QPushButton("いいえ")
+        yes = QPushButton("はい")
+        yes.setDefault(True)
+        yes.setAutoDefault(True)
+        no.setAutoDefault(False)
+        row.addWidget(no)
+        row.addWidget(yes)
+        column.addLayout(row)
+        yes.clicked.connect(dialog.accept)
+        no.clicked.connect(dialog.reject)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), dialog, dialog.accept)
+        QShortcut(QKeySequence(Qt.Key.Key_Enter), dialog, dialog.accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         ok, detail = _pull_app_update()
         if ok:
