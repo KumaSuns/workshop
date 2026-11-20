@@ -27,6 +27,7 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPalette,
     QPen,
     QPixmap,
@@ -481,8 +482,9 @@ class _CoinChart(QWidget):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.fillRect(self.rect(), QColor("#FFFFFF"))
-        left, top, right, bottom = 64, 36, 24, 42
+        left, top, right, bottom = 72, 48, 28, 40
         plot = self.rect().adjusted(left, top, -right, -bottom)
         if plot.width() < 2 or plot.height() < 2:
             return
@@ -496,33 +498,44 @@ class _CoinChart(QWidget):
         if not numbers:
             painter.drawText(plot, Qt.AlignmentFlag.AlignCenter, "数値がありません")
             return
-        high = max(numbers)
+        high = max(max(numbers), 1)
         low = 0
-        span = max(1, high - low)
+        span = high
         count = max(1, self._count)
+        average = _floor_number(sum(numbers) / len(numbers))
 
-        def point_at(serial: int, value: int) -> tuple[float, float]:
+        def point_at(serial: int, value: float) -> tuple[float, float]:
             x = plot.left() + (serial - 0.5) * plot.width() / count
             y = plot.bottom() - (value - low) * plot.height() / span
             return x, y
 
-        painter.setPen(QPen(QColor("#D0D5DD"), 1))
-        painter.drawRect(plot)
-        for step in range(5):
-            value = int(round(low + span * step / 4))
-            y = plot.bottom() - (value - low) * plot.height() / span
-            painter.drawLine(plot.left(), int(y), plot.right(), int(y))
-            painter.setPen(QColor("#17233f"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#F4F7FB"))
+        painter.drawRoundedRect(plot, 8, 8)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for step in range(1, 4):
+            value = high * step / 4
+            y = plot.bottom() - value * plot.height() / span
+            painter.setPen(QPen(QColor("#E3E8F0"), 1))
+            painter.drawLine(plot.left() + 8, int(y), plot.right() - 8, int(y))
+            painter.setPen(QColor("#5C6B80"))
             painter.drawText(
                 0,
                 int(y) - 8,
-                left - 8,
+                left - 10,
                 16,
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                f"{value:,}",
+                f"{int(value):,}",
             )
-            painter.setPen(QPen(QColor("#D0D5DD"), 1))
-        painter.setPen(QColor("#17233f"))
+        painter.setPen(QColor("#5C6B80"))
+        painter.drawText(
+            0,
+            plot.bottom() - 8,
+            left - 10,
+            16,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            "0",
+        )
         marks = {1, count}
         if count > 2:
             marks.add((count + 1) // 2)
@@ -530,32 +543,65 @@ class _CoinChart(QWidget):
             x = plot.left() + (serial - 0.5) * plot.width() / count
             painter.drawText(
                 int(x) - 24,
-                plot.bottom() + 6,
+                plot.bottom() + 8,
                 48,
-                24,
+                22,
                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
                 str(serial),
             )
-        series = ((coins, QColor("#2c4a7a"), "素コイン"),)
-        for values, color, _name in series:
-            painter.setPen(QPen(color, 2))
-            previous = None
-            for serial, value in values:
-                if value is None:
-                    previous = None
-                    continue
-                current = point_at(serial, value)
-                if previous is not None:
-                    painter.drawLine(int(previous[0]), int(previous[1]), int(current[0]), int(current[1]))
-                painter.drawEllipse(int(current[0]) - 3, int(current[1]) - 3, 6, 6)
-                previous = current
-        legend_x = plot.left()
-        for _values, color, name in series:
-            painter.setPen(QPen(color, 2))
-            painter.drawLine(legend_x, 16, legend_x + 28, 16)
-            painter.setPen(QColor("#17233f"))
-            painter.drawText(legend_x + 34, 8, 120, 16, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
-            legend_x += 160
+        line_color = QColor("#2C4A7A")
+        fill = QColor("#2C4A7A")
+        fill.setAlpha(36)
+        run: list[tuple[float, float]] = []
+
+        def paint_run() -> None:
+            if len(run) < 2:
+                run.clear()
+                return
+            path = QPainterPath()
+            path.moveTo(run[0][0], plot.bottom())
+            for x, y in run:
+                path.lineTo(x, y)
+            path.lineTo(run[-1][0], plot.bottom())
+            path.closeSubpath()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawPath(path)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(line_color, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            for start, end in zip(run, run[1:]):
+                painter.drawLine(int(start[0]), int(start[1]), int(end[0]), int(end[1]))
+            run.clear()
+
+        for serial, value in coins:
+            if value is None:
+                paint_run()
+                continue
+            run.append(point_at(serial, value))
+        paint_run()
+        painter.setBrush(line_color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for serial, value in coins:
+            if value is None:
+                continue
+            x, y = point_at(serial, value)
+            painter.drawEllipse(int(x) - 3, int(y) - 3, 6, 6)
+        average_y = point_at(1, average)[1]
+        painter.setPen(QPen(QColor("#E23B2F"), 1.6, Qt.PenStyle.DashLine))
+        painter.drawLine(plot.left() + 8, int(average_y), plot.right() - 8, int(average_y))
+        painter.setPen(QColor("#E23B2F"))
+        painter.drawText(
+            plot.right() - 168,
+            int(average_y) - 18,
+            160,
+            16,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            f"平均 {average:,}",
+        )
+        painter.setPen(QPen(line_color, 2.4))
+        painter.drawLine(plot.left(), 22, plot.left() + 28, 22)
+        painter.setPen(QColor("#17233f"))
+        painter.drawText(plot.left() + 34, 14, 80, 16, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "素コイン")
 
 
 def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
@@ -1729,10 +1775,10 @@ class MenuWindow(QMainWindow):
             window._tsum_buttons.setExclusive(True)
             window._item_column = item_column
             window._item_buttons = QButtonGroup(window)
-            window._item_buttons.setExclusive(True)
+            window._item_buttons.setExclusive(False)
             window._stat_labels = stat_labels
             window._play_tsum = ""
-            window._play_item = ""
+            window._play_items = set()
             window._play_sort = None
             self._play_data_window = window
         self._fill_play_data_table()
@@ -1765,9 +1811,7 @@ class MenuWindow(QMainWindow):
             if str(item.get("tsum") or "").strip() == tsum_name
         ]
         numbered = [(index + 1, item) for index, item in enumerate(tsum_rows)]
-        item_name = str(getattr(window, "_play_item", "") or "")
-        if item_name:
-            numbered = [pair for pair in numbered if item_name in _item_names(pair[1])]
+        numbered = [pair for pair in numbered if self._item_row_on(pair[1])]
         return numbered, len(tsum_rows)
 
     def _apply_coin_graph(self, chart: _CoinChart) -> None:
@@ -1805,15 +1849,24 @@ class MenuWindow(QMainWindow):
         if window is None:
             return
         window._play_tsum = name
-        window._play_item = ""
+        window._play_items = set()
         self._fill_play_data_table()
 
-    def _pick_play_item(self, name: str) -> None:
+    def _toggle_play_item(self, name: str, on: bool) -> None:
         window = getattr(self, "_play_data_window", None)
         if window is None:
             return
-        window._play_item = name
+        enabled = window._play_items
+        if on:
+            enabled.add(name)
+        else:
+            enabled.discard(name)
         self._fill_play_data_table()
+
+    def _item_row_on(self, item: dict) -> bool:
+        window = getattr(self, "_play_data_window", None)
+        enabled = getattr(window, "_play_items", set()) if window is not None else set()
+        return all(name in enabled for name in _item_names(item))
 
     def _reset_play_sort(self) -> None:
         window = getattr(self, "_play_data_window", None)
@@ -1832,10 +1885,7 @@ class MenuWindow(QMainWindow):
         if not picked:
             return []
         chosen = [item for item in rows if str(item.get("tsum") or "").strip() == picked]
-        item_name = str(getattr(window, "_play_item", "") or "")
-        if not item_name:
-            return chosen
-        return [item for item in chosen if item_name in _item_names(item)]
+        return [item for item in chosen if self._item_row_on(item)]
 
     def _sync_play_tsum_buttons(self, rows: list[dict]) -> None:
         window = getattr(self, "_play_data_window", None)
@@ -1886,12 +1936,16 @@ class MenuWindow(QMainWindow):
             for name in _item_names(item):
                 if name not in names:
                     names.append(name)
-        if window._play_item and window._play_item not in names:
-            window._play_item = ""
+        enabled = window._play_items
+        for name in list(enabled):
+            if name not in names:
+                enabled.discard(name)
         current = [button.text() for button in group.buttons()]
         if current == names:
             for button in group.buttons():
-                button.setChecked(button.text() == window._play_item)
+                button.blockSignals(True)
+                button.setChecked(button.text() in enabled)
+                button.blockSignals(False)
             return
         for button in list(group.buttons()):
             group.removeButton(button)
@@ -1910,8 +1964,9 @@ class MenuWindow(QMainWindow):
             button = QPushButton(name)
             button.setCheckable(True)
             button.setFixedSize(width, height)
-            button.setChecked(name == window._play_item)
-            button.clicked.connect(lambda _checked=False, picked=name: self._pick_play_item(picked))
+            button.setStyleSheet("QPushButton:checked { background: #2c4a7a; color: #ffffff; }")
+            button.setChecked(name in window._play_items)
+            button.toggled.connect(lambda on, picked=name: self._toggle_play_item(picked, on))
             group.addButton(button)
             column.insertWidget(column.count() - 1, button)
 
