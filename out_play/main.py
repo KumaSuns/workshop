@@ -1342,9 +1342,9 @@ class MenuWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("AUTO PLAY")
         box.setText("アプリの更新があります。更新してもよろしいですか？")
-        yes = box.addButton("はい", QMessageBox.ButtonRole.YesRole)
-        no = box.addButton("いいえ", QMessageBox.ButtonRole.NoRole)
-        box.setDefaultButton(no)
+        yes = box.addButton("はい", QMessageBox.ButtonRole.AcceptRole)
+        no = box.addButton("いいえ", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(yes)
         box.exec()
         if box.clickedButton() is not yes:
             return
