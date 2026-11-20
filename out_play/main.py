@@ -1708,6 +1708,23 @@ class MenuWindow(QMainWindow):
         self._center_input.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
+        self._center_input.setStyleSheet(
+            "QComboBox {"
+            " background: #ffffff;"
+            " color: #17233f;"
+            " font-weight: 700;"
+            " border: 1px solid #bdbdbd;"
+            " border-radius: 6px;"
+            " padding: 0px 6px;"
+            "}"
+            "QComboBox::drop-down { border: none; width: 16px; }"
+            "QComboBox QLineEdit {"
+            " background: transparent;"
+            " color: #17233f;"
+            " font-weight: 700;"
+            " border: none;"
+            "}"
+        )
         play_line.addWidget(self._center_input)
         grid.addWidget(play_row, 1, 0, Qt.AlignmentFlag.AlignLeft)
         self._launch_button = QPushButton("起動アイコンをデスクトップに作成")
@@ -1750,6 +1767,7 @@ class MenuWindow(QMainWindow):
         for label in ("1", "2", "3", "5", "10", "20", "50", "100", "∞"):
             count_button = QPushButton(label)
             count_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            count_button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
             count_button.clicked.connect(
                 lambda _checked=False, value=label: self._set_play_count(value)
             )
@@ -3179,7 +3197,7 @@ class MenuWindow(QMainWindow):
         if count:
             buttons_h = count * row + 2 * (count - 1) + 4
         if self._slots:
-            self._slots[0].setFixedHeight(max(side, buttons_h))
+            self._slots[0].setFixedHeight(max(side, buttons_h) + TITLE_MARGIN)
         for button in self._square_side_buttons:
             button.setFixedSize(side_w, row)
         self._paint_square_qr()
@@ -3210,15 +3228,9 @@ class MenuWindow(QMainWindow):
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         for button in getattr(self, "_count_buttons", []):
-            font = button.font()
-            point = font.pointSize()
-            if point < 1:
-                point = 9
-            font.setPointSize(max(1, point * 3 // 4))
-            button.setFont(font)
             text_w = button.fontMetrics().horizontalAdvance(button.text())
-            text_w += button.fontMetrics().height()
-            button.setFixedSize(max(height * 3 // 4, text_w), max(1, height * 3 // 4))
+            text_h = button.fontMetrics().height()
+            button.setFixedSize(max(height * 3 // 4, text_w + text_h), max(height * 3 // 4, text_h))
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
