@@ -22,10 +22,13 @@ from PySide6.QtWidgets import QHeaderView
 from PySide6.QtNetwork import QHostAddress, QLocalServer, QLocalSocket, QTcpServer
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QFontMetrics,
     QImage,
     QKeySequence,
+    QPainter,
     QPalette,
+    QPen,
     QPixmap,
     QRegularExpressionValidator,
     QShortcut,
@@ -453,6 +456,97 @@ def _item_names(item: dict) -> list[str]:
 
 def _item_coin_cost(names: list[str]) -> int:
     return sum(int(ITEM_COIN_COST.get(name, 0) or 0) for name in names)
+
+
+class _CoinChart(QWidget):
+    def __init__(self, rows: list[dict]) -> None:
+        super().__init__()
+        self._rows = rows
+        self.setMinimumSize(640, 360)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#FFFFFF"))
+        left, top, right, bottom = 64, 36, 24, 42
+        plot = self.rect().adjusted(left, top, -right, -bottom)
+        if plot.width() < 2 or plot.height() < 2:
+            return
+        coins: list[int | None] = []
+        results: list[int | None] = []
+        for item in self._rows:
+            coin = item.get("coin")
+            result = item.get("result_coin")
+            coins.append(None if coin is None else int(coin))
+            results.append(None if result is None else int(result))
+        numbers = [value for value in coins + results if value is not None]
+        painter.setPen(QColor("#17233f"))
+        painter.setFont(QFont("Yu Gothic UI", 11))
+        if not numbers:
+            painter.drawText(plot, Qt.AlignmentFlag.AlignCenter, "数値がありません")
+            return
+        high = max(numbers)
+        low = 0
+        span = max(1, high - low)
+        count = max(1, len(self._rows))
+
+        def point_at(index: int, value: int) -> tuple[float, float]:
+            x = plot.left() + (index + 0.5) * plot.width() / count
+            y = plot.bottom() - (value - low) * plot.height() / span
+            return x, y
+
+        painter.setPen(QPen(QColor("#D0D5DD"), 1))
+        painter.drawRect(plot)
+        for step in range(5):
+            value = int(round(low + span * step / 4))
+            y = plot.bottom() - (value - low) * plot.height() / span
+            painter.drawLine(plot.left(), int(y), plot.right(), int(y))
+            painter.setPen(QColor("#17233f"))
+            painter.drawText(
+                0,
+                int(y) - 8,
+                left - 8,
+                16,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                f"{value:,}",
+            )
+            painter.setPen(QPen(QColor("#D0D5DD"), 1))
+        painter.setPen(QColor("#17233f"))
+        marks = {0, count - 1}
+        if count > 2:
+            marks.add(count // 2)
+        for index in sorted(marks):
+            x = plot.left() + (index + 0.5) * plot.width() / count
+            painter.drawText(
+                int(x) - 24,
+                plot.bottom() + 6,
+                48,
+                24,
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                str(index + 1),
+            )
+        series = (
+            (coins, QColor("#2c4a7a"), "素コイン"),
+            (results, QColor("#F0A202"), "リザルトコイン"),
+        )
+        for values, color, _name in series:
+            painter.setPen(QPen(color, 2))
+            previous = None
+            for index, value in enumerate(values):
+                if value is None:
+                    previous = None
+                    continue
+                current = point_at(index, value)
+                if previous is not None:
+                    painter.drawLine(int(previous[0]), int(previous[1]), int(current[0]), int(current[1]))
+                painter.drawEllipse(int(current[0]) - 3, int(current[1]) - 3, 6, 6)
+                previous = current
+        legend_x = plot.left()
+        for _values, color, name in series:
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(legend_x, 16, legend_x + 28, 16)
+            painter.setPen(QColor("#17233f"))
+            painter.drawText(legend_x + 34, 8, 120, 16, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+            legend_x += 160
 
 
 def _game_record_parts(item: dict) -> list[tuple[str, bool]]:
@@ -1532,8 +1626,16 @@ class MenuWindow(QMainWindow):
             window.setWindowTitle("SHOW DATA")
             layout = QVBoxLayout(window)
             layout.setContentsMargins(8, 8, 8, 8)
+            graph_row = QHBoxLayout()
+            graph_row.setContentsMargins(0, 0, 0, 0)
+            graph_button = QPushButton("グラフ")
+            graph_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            graph_button.clicked.connect(self._show_coin_graph)
+            graph_row.addWidget(graph_button, 0, Qt.AlignmentFlag.AlignLeft)
+            graph_row.addStretch(1)
+            layout.addLayout(graph_row)
             table = QTableWidget()
-            table.setColumnCount(10)
+            table.setColumnCount(11)
             table.setHorizontalHeaderLabels(
                 [
                     "連番",
@@ -1544,6 +1646,7 @@ class MenuWindow(QMainWindow):
                     "リザルトコイン",
                     "倍率",
                     "コイン利益",
+                    "利益累計",
                     "モデル",
                     "削除",
                 ]
@@ -1575,6 +1678,28 @@ class MenuWindow(QMainWindow):
         window.raise_()
         window.activateWindow()
 
+    def _show_coin_graph(self) -> None:
+        from app.game_record import load_game_records
+
+        rows = load_game_records()
+        window = getattr(self, "_coin_graph_window", None)
+        if window is None:
+            window = QDialog(self)
+            window.setWindowTitle("グラフ")
+            window.resize(900, 520)
+            layout = QVBoxLayout(window)
+            layout.setContentsMargins(8, 8, 8, 8)
+            chart = _CoinChart(rows)
+            layout.addWidget(chart)
+            window._chart = chart
+            self._coin_graph_window = window
+        else:
+            window._chart._rows = rows
+            window._chart.update()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
     def _fill_play_data_table(self) -> None:
         from app.game_record import load_game_records
 
@@ -1583,6 +1708,13 @@ class MenuWindow(QMainWindow):
         if table is None:
             return
         rows = load_game_records()
+        running = 0
+        totals: list[int] = []
+        for item in rows:
+            result = item.get("result_coin")
+            if result is not None:
+                running += int(result) - _item_coin_cost(_item_names(item))
+            totals.append(running)
         table.setRowCount(len(rows))
         for index, item in enumerate(reversed(rows)):
             names = _item_names(item)
@@ -1606,6 +1738,7 @@ class MenuWindow(QMainWindow):
                 _coin_number_text(result),
                 rate_text,
                 gain_text,
+                _coin_number_text(totals[len(rows) - 1 - index]),
                 str(item.get("model") or ""),
             ]
             for column, text in enumerate(values):
@@ -1631,7 +1764,7 @@ class MenuWindow(QMainWindow):
                         ),
                     )
                     continue
-                if column in {4, 5, 6, 7}:
+                if column in {4, 5, 6, 7, 8}:
                     table.setCellWidget(
                         index,
                         column,
@@ -1642,7 +1775,7 @@ class MenuWindow(QMainWindow):
                         ),
                     )
                     continue
-                if column == 8:
+                if column == 9:
                     table.setCellWidget(
                         index,
                         column,
@@ -1663,7 +1796,7 @@ class MenuWindow(QMainWindow):
             button.clicked.connect(
                 lambda _checked=False, row_id=record_id: self._delete_play_data(row_id)
             )
-            table.setCellWidget(index, 9, button)
+            table.setCellWidget(index, 10, button)
         table.resizeColumnsToContents()
 
     def _play_data_label(self, text: str, align: Qt.AlignmentFlag, padding: str) -> QLabel:
