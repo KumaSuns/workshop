@@ -459,9 +459,10 @@ def _item_coin_cost(names: list[str]) -> int:
 
 
 class _CoinChart(QWidget):
-    def __init__(self, rows: list[dict]) -> None:
+    def __init__(self, points: list[tuple[int, dict]], count: int) -> None:
         super().__init__()
-        self._rows = rows
+        self._points = points
+        self._count = count
         self.setMinimumSize(640, 360)
 
     def paintEvent(self, event) -> None:
@@ -471,14 +472,14 @@ class _CoinChart(QWidget):
         plot = self.rect().adjusted(left, top, -right, -bottom)
         if plot.width() < 2 or plot.height() < 2:
             return
-        coins: list[int | None] = []
-        results: list[int | None] = []
-        for item in self._rows:
+        coins: list[tuple[int, int | None]] = []
+        results: list[tuple[int, int | None]] = []
+        for serial, item in self._points:
             coin = item.get("coin")
             result = item.get("result_coin")
-            coins.append(None if coin is None else int(coin))
-            results.append(None if result is None else int(result))
-        numbers = [value for value in coins + results if value is not None]
+            coins.append((serial, None if coin is None else int(coin)))
+            results.append((serial, None if result is None else int(result)))
+        numbers = [value for _serial, value in coins + results if value is not None]
         painter.setPen(QColor("#17233f"))
         painter.setFont(QFont("Yu Gothic UI", 11))
         if not numbers:
@@ -487,10 +488,10 @@ class _CoinChart(QWidget):
         high = max(numbers)
         low = 0
         span = max(1, high - low)
-        count = max(1, len(self._rows))
+        count = max(1, self._count)
 
-        def point_at(index: int, value: int) -> tuple[float, float]:
-            x = plot.left() + (index + 0.5) * plot.width() / count
+        def point_at(serial: int, value: int) -> tuple[float, float]:
+            x = plot.left() + (serial - 0.5) * plot.width() / count
             y = plot.bottom() - (value - low) * plot.height() / span
             return x, y
 
@@ -511,18 +512,18 @@ class _CoinChart(QWidget):
             )
             painter.setPen(QPen(QColor("#D0D5DD"), 1))
         painter.setPen(QColor("#17233f"))
-        marks = {0, count - 1}
+        marks = {1, count}
         if count > 2:
-            marks.add(count // 2)
-        for index in sorted(marks):
-            x = plot.left() + (index + 0.5) * plot.width() / count
+            marks.add((count + 1) // 2)
+        for serial in sorted(marks):
+            x = plot.left() + (serial - 0.5) * plot.width() / count
             painter.drawText(
                 int(x) - 24,
                 plot.bottom() + 6,
                 48,
                 24,
                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                str(index + 1),
+                str(serial),
             )
         series = (
             (coins, QColor("#2c4a7a"), "素コイン"),
@@ -531,11 +532,11 @@ class _CoinChart(QWidget):
         for values, color, _name in series:
             painter.setPen(QPen(color, 2))
             previous = None
-            for index, value in enumerate(values):
+            for serial, value in values:
                 if value is None:
                     previous = None
                     continue
-                current = point_at(index, value)
+                current = point_at(serial, value)
                 if previous is not None:
                     painter.drawLine(int(previous[0]), int(previous[1]), int(current[0]), int(current[1]))
                 painter.drawEllipse(int(current[0]) - 3, int(current[1]) - 3, 6, 6)
@@ -1628,6 +1629,10 @@ class MenuWindow(QMainWindow):
             layout.setContentsMargins(8, 8, 8, 8)
             graph_row = QHBoxLayout()
             graph_row.setContentsMargins(0, 0, 0, 0)
+            order_button = QPushButton("連番")
+            order_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            order_button.clicked.connect(self._reset_play_sort)
+            graph_row.addWidget(order_button, 0, Qt.AlignmentFlag.AlignLeft)
             graph_button = QPushButton("グラフ")
             graph_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             graph_button.clicked.connect(self._show_coin_graph)
@@ -1675,12 +1680,26 @@ class MenuWindow(QMainWindow):
             tsum_column.addStretch(1)
             tsum_scroll.setWidget(tsum_host)
             body.addWidget(tsum_scroll, 0)
+            item_scroll = QScrollArea()
+            item_scroll.setWidgetResizable(True)
+            item_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            item_host = QWidget()
+            item_column = QVBoxLayout(item_host)
+            item_column.setContentsMargins(0, 0, 0, 0)
+            item_column.setSpacing(4)
+            item_column.addStretch(1)
+            item_scroll.setWidget(item_host)
+            body.addWidget(item_scroll, 0)
             layout.addLayout(body)
             window._table = table
             window._tsum_column = tsum_column
             window._tsum_buttons = QButtonGroup(window)
             window._tsum_buttons.setExclusive(True)
+            window._item_column = item_column
+            window._item_buttons = QButtonGroup(window)
+            window._item_buttons.setExclusive(True)
             window._play_tsum = ""
+            window._play_item = ""
             window._play_sort = None
             self._play_data_window = window
         self._fill_play_data_table()
@@ -1700,10 +1719,38 @@ class MenuWindow(QMainWindow):
         window.raise_()
         window.activateWindow()
 
-    def _show_coin_graph(self) -> None:
+    def _graph_play_points(self) -> tuple[list[tuple[int, dict]], int]:
         from app.game_record import load_game_records
 
-        rows = self._selected_play_rows(load_game_records())
+        window = getattr(self, "_play_data_window", None)
+        tsum_name = str(getattr(window, "_play_tsum", "") or "")
+        if not tsum_name:
+            return [], 0
+        tsum_rows = [
+            item
+            for item in load_game_records()
+            if str(item.get("tsum") or "").strip() == tsum_name
+        ]
+        numbered = [(index + 1, item) for index, item in enumerate(tsum_rows)]
+        item_name = str(getattr(window, "_play_item", "") or "")
+        if item_name:
+            numbered = [pair for pair in numbered if item_name in _item_names(pair[1])]
+        return numbered, len(tsum_rows)
+
+    def _apply_coin_graph(self, chart: _CoinChart) -> None:
+        points, count = self._graph_play_points()
+        chart._points = points
+        chart._count = count
+        chart.update()
+
+    def _refresh_coin_graph(self) -> None:
+        window = getattr(self, "_coin_graph_window", None)
+        chart = getattr(window, "_chart", None) if window is not None else None
+        if chart is None:
+            return
+        self._apply_coin_graph(chart)
+
+    def _show_coin_graph(self) -> None:
         window = getattr(self, "_coin_graph_window", None)
         if window is None:
             window = QDialog(self)
@@ -1711,13 +1758,11 @@ class MenuWindow(QMainWindow):
             window.resize(900, 520)
             layout = QVBoxLayout(window)
             layout.setContentsMargins(8, 8, 8, 8)
-            chart = _CoinChart(rows)
+            chart = _CoinChart([], 0)
             layout.addWidget(chart)
             window._chart = chart
             self._coin_graph_window = window
-        else:
-            window._chart._rows = rows
-            window._chart.update()
+        self._apply_coin_graph(window._chart)
         window.show()
         window.raise_()
         window.activateWindow()
@@ -1727,6 +1772,25 @@ class MenuWindow(QMainWindow):
         if window is None:
             return
         window._play_tsum = name
+        window._play_item = ""
+        self._fill_play_data_table()
+
+    def _pick_play_item(self, name: str) -> None:
+        window = getattr(self, "_play_data_window", None)
+        if window is None:
+            return
+        window._play_item = name
+        self._fill_play_data_table()
+
+    def _reset_play_sort(self) -> None:
+        window = getattr(self, "_play_data_window", None)
+        if window is None:
+            return
+        window._play_sort = None
+        header = window._table.horizontalHeader()
+        header.blockSignals(True)
+        header.setSortIndicatorShown(False)
+        header.blockSignals(False)
         self._fill_play_data_table()
 
     def _selected_play_rows(self, rows: list[dict]) -> list[dict]:
@@ -1734,7 +1798,11 @@ class MenuWindow(QMainWindow):
         picked = str(getattr(window, "_play_tsum", "") or "")
         if not picked:
             return []
-        return [item for item in rows if str(item.get("tsum") or "").strip() == picked]
+        chosen = [item for item in rows if str(item.get("tsum") or "").strip() == picked]
+        item_name = str(getattr(window, "_play_item", "") or "")
+        if not item_name:
+            return chosen
+        return [item for item in chosen if item_name in _item_names(item)]
 
     def _sync_play_tsum_buttons(self, rows: list[dict]) -> None:
         window = getattr(self, "_play_data_window", None)
@@ -1774,6 +1842,46 @@ class MenuWindow(QMainWindow):
             group.addButton(button)
             column.insertWidget(column.count() - 1, button)
 
+    def _sync_play_item_buttons(self, rows: list[dict]) -> None:
+        window = getattr(self, "_play_data_window", None)
+        column = getattr(window, "_item_column", None) if window is not None else None
+        group = getattr(window, "_item_buttons", None) if window is not None else None
+        if column is None or group is None:
+            return
+        names: list[str] = []
+        for item in rows:
+            for name in _item_names(item):
+                if name not in names:
+                    names.append(name)
+        if window._play_item and window._play_item not in names:
+            window._play_item = ""
+        current = [button.text() for button in group.buttons()]
+        if current == names:
+            for button in group.buttons():
+                button.setChecked(button.text() == window._play_item)
+            return
+        for button in list(group.buttons()):
+            group.removeButton(button)
+            button.deleteLater()
+        while column.count() > 1:
+            item = column.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not names:
+            return
+        metrics = QFontMetrics(window.font())
+        width = max(metrics.horizontalAdvance(name) for name in names) + 24
+        height = metrics.height() + 12
+        for name in names:
+            button = QPushButton(name)
+            button.setCheckable(True)
+            button.setFixedSize(width, height)
+            button.setChecked(name == window._play_item)
+            button.clicked.connect(lambda _checked=False, picked=name: self._pick_play_item(picked))
+            group.addButton(button)
+            column.insertWidget(column.count() - 1, button)
+
     def _sort_play_column(self, column: int) -> None:
         if column not in (4, 5):
             return
@@ -1804,6 +1912,11 @@ class MenuWindow(QMainWindow):
             return
         saved = load_game_records()
         self._sync_play_tsum_buttons(saved)
+        tsum_name = str(getattr(window, "_play_tsum", "") or "")
+        tsum_rows = [
+            item for item in saved if tsum_name and str(item.get("tsum") or "").strip() == tsum_name
+        ]
+        self._sync_play_item_buttons(tsum_rows)
         rows = self._selected_play_rows(saved)
         running = 0
         totals: list[int] = []
@@ -1911,6 +2024,7 @@ class MenuWindow(QMainWindow):
             )
             table.setCellWidget(index, 10, button)
         table.resizeColumnsToContents()
+        self._refresh_coin_graph()
 
     def _play_data_label(self, text: str, align: Qt.AlignmentFlag, padding: str) -> QLabel:
         label = QLabel(text)
