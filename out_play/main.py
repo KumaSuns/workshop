@@ -1553,8 +1553,8 @@ class MenuWindow(QMainWindow):
             table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
             table.setStyleSheet("QTableWidget { background: #ffffff; color: #17233f; }")
             header = table.horizontalHeader()
+            header.setStretchLastSection(False)
             header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
             layout.addWidget(table)
             window._table = table
             self._play_data_window = window
@@ -1664,6 +1664,7 @@ class MenuWindow(QMainWindow):
                 lambda _checked=False, row_id=record_id: self._delete_play_data(row_id)
             )
             table.setCellWidget(index, 9, button)
+        table.resizeColumnsToContents()
 
     def _play_data_label(self, text: str, align: Qt.AlignmentFlag, padding: str) -> QLabel:
         label = QLabel(text)
