@@ -702,12 +702,12 @@ class MenuWindow(QMainWindow):
         body.addWidget(model_box, 1)
         right_column = QVBoxLayout()
         right_column.setContentsMargins(0, 0, 0, 0)
-        right_column.setSpacing(0)
-        for _ in range(3):
+        right_column.setSpacing(5)
+        for index in range(3):
             slot = QFrame()
             slot.setFrameShape(QFrame.Shape.NoFrame)
             _plain_surface(slot)
-            right_column.addWidget(slot, 1)
+            right_column.addWidget(slot, 0 if index == 0 else 1)
             self._slots.append(slot)
         body.addLayout(right_column, 2)
         body_host = QWidget()
@@ -1063,7 +1063,7 @@ class MenuWindow(QMainWindow):
         right_box.setFrameShape(QFrame.Shape.NoFrame)
         column.addWidget(right_box, 1)
         right = QVBoxLayout(right_box)
-        right.setContentsMargins(0, 0, 0, TITLE_MARGIN)
+        right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(0)
         self._tsum_body = QVBoxLayout()
         self._tsum_body.setContentsMargins(0, 0, 0, 0)
@@ -1656,20 +1656,20 @@ class MenuWindow(QMainWindow):
         holder = QWidget()
         holder.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
         column = QVBoxLayout(holder)
-        column.setContentsMargins(0, 10, 0, 0)
+        column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(0)
         grid_host = QWidget()
         grid_host.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
         grid = QGridLayout(grid_host)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(0)
+        grid.setSpacing(4)
         end_button = QPushButton("このプレイでやめる")
         end_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._end_play_button = end_button
         self._write_button_key(end_button, "このプレイでやめる", "F2")
         end_button.clicked.connect(self._end_after_this_play)
         self._center_buttons.append(end_button)
-        grid.addWidget(end_button, 0, 1)
+        grid.addWidget(end_button, 0, 0, Qt.AlignmentFlag.AlignLeft)
         play_button = QPushButton("オートプレイ")
         play_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._autoplay_button = play_button
@@ -1680,7 +1680,7 @@ class MenuWindow(QMainWindow):
         play_key.setContext(Qt.ShortcutContext.WindowShortcut)
         play_key.activated.connect(self._on_autoplay)
         self._center_buttons.append(play_button)
-        grid.addWidget(play_button, 0, 2)
+        grid.addWidget(play_button, 1, 0, Qt.AlignmentFlag.AlignLeft)
         self._launch_button = QPushButton("起動アイコンをデスクトップに作成")
         self._launch_button.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
@@ -1727,10 +1727,9 @@ class MenuWindow(QMainWindow):
         self._center_input.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
-        grid.addWidget(self._center_input, 0, 3)
-        outer.addStretch(1)
+        grid.addWidget(self._center_input, 2, 0, Qt.AlignmentFlag.AlignLeft)
         outer.addWidget(holder, 0, Qt.AlignmentFlag.AlignHCenter)
-        outer.addStretch(2)
+        outer.addStretch(1)
         outer.addWidget(
             stop_hint,
             0,
@@ -3115,7 +3114,11 @@ class MenuWindow(QMainWindow):
             return
         rect = host.contentsRect()
         usable_w = rect.width()
-        usable_h = max(0, rect.height() - TITLE_MARGIN)
+        band = rect.height()
+        parent = self._slots[0].parentWidget() if self._slots else None
+        if parent is not None and parent.height() > 0:
+            band = parent.height() // 3
+        usable_h = max(0, band - TITLE_MARGIN)
         full = min(usable_w, usable_h)
         if full < 1:
             return
@@ -3143,6 +3146,12 @@ class MenuWindow(QMainWindow):
         if body is not None:
             body.setContentsMargins(gap, TITLE_MARGIN, 0, 0)
         square.setFixedSize(side, side)
+        buttons_h = 0
+        count = len(self._square_side_buttons)
+        if count:
+            buttons_h = count * row + 2 * (count - 1) + 4
+        if self._slots:
+            self._slots[0].setFixedHeight(max(side, buttons_h))
         for button in self._square_side_buttons:
             button.setFixedSize(side_w, row)
         self._paint_square_qr()
