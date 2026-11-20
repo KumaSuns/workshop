@@ -544,6 +544,7 @@ class MenuWindow(QMainWindow):
     external_arm_fail = Signal(str)
     heart_note = Signal(str)
     pc_status_ready = Signal(str)
+    gpu_present = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
@@ -553,6 +554,7 @@ class MenuWindow(QMainWindow):
         self.external_arm_fail.connect(self._on_external_arm_failed)
         self.heart_note.connect(self._set_activity)
         self.pc_status_ready.connect(self._apply_pc_status)
+        self.gpu_present.connect(self._apply_gpu_presence)
         self.setWindowTitle("AUTO PLAY")
         root = QWidget()
         _plain_surface(root)
@@ -738,6 +740,7 @@ class MenuWindow(QMainWindow):
         self.setCentralWidget(root)
         self._pc_status = ""
         threading.Thread(target=self._load_pc_status, daemon=True).start()
+        threading.Thread(target=self._load_gpu_presence, daemon=True).start()
         self._placed = False
         self._fitting_logo = False
 
@@ -2018,6 +2021,31 @@ class MenuWindow(QMainWindow):
                         QTimer.singleShot(0, action)
                         return True, 0
         return super().nativeEvent(eventType, message)
+
+    def _load_gpu_presence(self) -> None:
+        self.gpu_present.emit(_prediction_gpu())
+
+    def _apply_gpu_presence(self, present: bool) -> None:
+        if present:
+            return
+        button = self._gpu_button
+        if button is None:
+            return
+        button.blockSignals(True)
+        button.setEnabled(False)
+        button.setChecked(False)
+        button.setText("GPUなし")
+        button.setStyleSheet(
+            "QPushButton, QPushButton:disabled {"
+            " background: #ffffff;"
+            " color: #FF5192;"
+            " font-weight: 700;"
+            " border: 1px solid #FF5192;"
+            " border-radius: 6px;"
+            "}"
+        )
+        button.blockSignals(False)
+        self._fit_top_square()
 
     def _set_gpu(self, on: bool) -> None:
         QSettings("workshop", "AutoPlay").setValue("use_gpu", bool(on))
@@ -3487,6 +3515,22 @@ def _pc_status_text() -> str:
         lines.append(total)
         lines.append(f"使用領域 {used} / {total}")
     return "\n".join(lines)
+
+
+def _prediction_gpu() -> bool:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return True
+    except Exception:
+        pass
+    try:
+        import torch_directml
+
+        return int(torch_directml.device_count()) > 0
+    except Exception:
+        return False
 
 
 def _gpu_on() -> bool:
