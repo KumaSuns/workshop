@@ -447,6 +447,20 @@ def _coin_number_text(value) -> str:
     return f"{int(value):,}"
 
 
+def _floor_number(value: float) -> int:
+    import math
+
+    return math.floor(value)
+
+
+def _play_time_text(value) -> str:
+    if value is None:
+        return "－"
+    seconds = max(0, int(value))
+    minutes, sec = divmod(seconds, 60)
+    return f"{minutes:02d}分{sec:02d}秒"
+
+
 def _item_names(item: dict) -> list[str]:
     names = item.get("items") or []
     if isinstance(names, str):
@@ -473,13 +487,10 @@ class _CoinChart(QWidget):
         if plot.width() < 2 or plot.height() < 2:
             return
         coins: list[tuple[int, int | None]] = []
-        results: list[tuple[int, int | None]] = []
         for serial, item in self._points:
             coin = item.get("coin")
-            result = item.get("result_coin")
             coins.append((serial, None if coin is None else int(coin)))
-            results.append((serial, None if result is None else int(result)))
-        numbers = [value for _serial, value in coins + results if value is not None]
+        numbers = [value for _serial, value in coins if value is not None]
         painter.setPen(QColor("#17233f"))
         painter.setFont(QFont("Yu Gothic UI", 11))
         if not numbers:
@@ -525,10 +536,7 @@ class _CoinChart(QWidget):
                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
                 str(serial),
             )
-        series = (
-            (coins, QColor("#2c4a7a"), "素コイン"),
-            (results, QColor("#F0A202"), "リザルトコイン"),
-        )
+        series = ((coins, QColor("#2c4a7a"), "素コイン"),)
         for values, color, _name in series:
             painter.setPen(QPen(color, 2))
             previous = None
@@ -1643,7 +1651,7 @@ class MenuWindow(QMainWindow):
             body.setContentsMargins(0, 0, 0, 0)
             body.setSpacing(8)
             table = QTableWidget()
-            table.setColumnCount(11)
+            table.setColumnCount(12)
             table.setHorizontalHeaderLabels(
                 [
                     "連番",
@@ -1655,6 +1663,7 @@ class MenuWindow(QMainWindow):
                     "倍率",
                     "コイン利益",
                     "利益累計",
+                    "プレイ時間",
                     "モデル",
                     "削除",
                 ]
@@ -1670,6 +1679,27 @@ class MenuWindow(QMainWindow):
             header.sectionClicked.connect(self._sort_play_column)
             header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
             body.addWidget(table, 1)
+            stats = QFrame()
+            stats.setFrameShape(QFrame.Shape.Box)
+            stats.setLineWidth(1)
+            stats.setMinimumWidth(220)
+            stats_layout = QVBoxLayout(stats)
+            stats_layout.setContentsMargins(8, 8, 8, 8)
+            stats_layout.setSpacing(6)
+            stat_labels: dict[str, QLabel] = {}
+            for key, title in (
+                ("coin", "平均素コイン"),
+                ("result", "平均リザルトコイン"),
+                ("rate", "平均倍率"),
+                ("hour", "1時間あたり"),
+                ("minute", "1分あたり"),
+            ):
+                label = QLabel(f"{title} －")
+                label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                stat_labels[key] = label
+                stats_layout.addWidget(label)
+            stats_layout.addStretch(1)
+            body.addWidget(stats, 0)
             tsum_scroll = QScrollArea()
             tsum_scroll.setWidgetResizable(True)
             tsum_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1682,6 +1712,8 @@ class MenuWindow(QMainWindow):
             body.addWidget(tsum_scroll, 0)
             item_scroll = QScrollArea()
             item_scroll.setWidgetResizable(True)
+            item_scroll.setFrameShape(QFrame.Shape.Box)
+            item_scroll.setMinimumWidth(160)
             item_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             item_host = QWidget()
             item_column = QVBoxLayout(item_host)
@@ -1698,6 +1730,7 @@ class MenuWindow(QMainWindow):
             window._item_column = item_column
             window._item_buttons = QButtonGroup(window)
             window._item_buttons.setExclusive(True)
+            window._stat_labels = stat_labels
             window._play_tsum = ""
             window._play_item = ""
             window._play_sort = None
@@ -1965,6 +1998,7 @@ class MenuWindow(QMainWindow):
                 rate_text,
                 gain_text,
                 _coin_number_text(total),
+                _play_time_text(item.get("play_time")),
                 str(item.get("model") or ""),
             ]
             for column, text in enumerate(values):
@@ -1990,7 +2024,7 @@ class MenuWindow(QMainWindow):
                         ),
                     )
                     continue
-                if column in {4, 5, 6, 7, 8}:
+                if column in {4, 5, 6, 7, 8, 9}:
                     table.setCellWidget(
                         index,
                         column,
@@ -2001,7 +2035,7 @@ class MenuWindow(QMainWindow):
                         ),
                     )
                     continue
-                if column == 9:
+                if column == 10:
                     table.setCellWidget(
                         index,
                         column,
@@ -2022,9 +2056,38 @@ class MenuWindow(QMainWindow):
             button.clicked.connect(
                 lambda _checked=False, row_id=record_id: self._delete_play_data(row_id)
             )
-            table.setCellWidget(index, 10, button)
+            table.setCellWidget(index, 11, button)
+        self._show_play_stats(rows, totals[-1] if rows else None)
         table.resizeColumnsToContents()
         self._refresh_coin_graph()
+
+    def _show_play_stats(self, rows: list[dict], total_gain: int | None) -> None:
+        window = getattr(self, "_play_data_window", None)
+        labels = getattr(window, "_stat_labels", None) if window is not None else None
+        if not labels:
+            return
+        coins = [int(item["coin"]) for item in rows if item.get("coin") is not None]
+        results = [int(item["result_coin"]) for item in rows if item.get("result_coin") is not None]
+        rates = [
+            int(item["result_coin"]) / int(item["coin"])
+            for item in rows
+            if item.get("coin") is not None and int(item["coin"]) > 0 and item.get("result_coin") is not None
+        ]
+        seconds = sum(int(item["play_time"]) for item in rows if item.get("play_time") is not None)
+        coin_text = "－" if not coins else f"{_floor_number(sum(coins) / len(coins)):,}"
+        result_text = "－" if not results else f"{_floor_number(sum(results) / len(results)):,}"
+        rate_text = "－" if not rates else f"×{_floor_number(sum(rates) / len(rates))}"
+        if total_gain is None or seconds <= 0:
+            hour_text = "－"
+            minute_text = "－"
+        else:
+            hour_text = f"{_floor_number(total_gain * 3600 / seconds):,}"
+            minute_text = f"{_floor_number(total_gain * 60 / seconds):,}"
+        labels["coin"].setText(f"平均素コイン {coin_text}")
+        labels["result"].setText(f"平均リザルトコイン {result_text}")
+        labels["rate"].setText(f"平均倍率 {rate_text}")
+        labels["hour"].setText(f"1時間あたり {hour_text}")
+        labels["minute"].setText(f"1分あたり {minute_text}")
 
     def _play_data_label(self, text: str, align: Qt.AlignmentFlag, padding: str) -> QLabel:
         label = QLabel(text)
