@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.paths import APP_ROOT, DATA_DIR, IMAGE_EXTENSIONS
+from app.paths import APP_ROOT, DATA_DIR, IMAGE_EXTENSIONS, SERVER_SYNC_PATH
 from app.regions import PIECE_COLORS, is_tsum_kind, tsum_group_color
 
 NAMED_MODEL_ARG = "--named-model"
@@ -634,6 +635,8 @@ class NamedModelWindow(QMainWindow):
         self.number_buttons[14].clicked.connect(self._show_registered_bombs)
         self.number_buttons[15].setText("ツムではない")
         self.number_buttons[15].clicked.connect(self._show_not_tsum_images)
+        self.number_buttons[16].setText("サーバー\nアップ")
+        self.number_buttons[16].clicked.connect(self._upload_ver01_model)
         self.number_buttons[17].setText("学習")
         self.number_buttons[17].clicked.connect(self._ask_ver01_train)
         for button in self.number_buttons:
@@ -1370,6 +1373,46 @@ class NamedModelWindow(QMainWindow):
         QMessageBox.information(
             self, "ツムではない", f"1 枚を {VER01_IMAGE_DIR / 'ツムではない'} に保存しました。"
         )
+
+    def _upload_ver01_model(self) -> None:
+        from app.named_tsum_test import VER01_MODEL_PATH
+
+        model = VER01_MODEL_PATH
+        if not model.is_file():
+            QMessageBox.warning(self, "モデルがありません", "送るモデルがありません。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "サーバーに保存",
+            "次のモデルを http://hokkai-syabusyabu.com/home_page/workshop/models に保存します。続けますか？\n"
+            + model.name,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        spec = importlib.util.spec_from_file_location("workshop_server_sync", SERVER_SYNC_PATH)
+        if spec is None or spec.loader is None:
+            QMessageBox.critical(self, "保存できませんでした", f"サーバー同期が見つかりません。\n{SERVER_SYNC_PATH}")
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            module.run_with_progress(
+                self,
+                "サーバーに保存しています",
+                lambda progress: self._send_ver01_model(module, model, progress),
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "保存できませんでした", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "サーバーに保存しました", f"{model.name} を保存しました。")
+
+    def _send_ver01_model(self, sync, model: Path, progress) -> None:
+        progress(0, 1, model.name)
+        sync.upload_model(model)
+        progress(1, 1, model.name)
 
     def _ask_ver01_train(self) -> None:
         global _ver01_progress
