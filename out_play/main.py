@@ -3215,6 +3215,7 @@ class MenuWindow(QMainWindow):
         if width < 1 or height < 1:
             return
         button_w = width * 3 // 2
+        tall = max(1, height * 3 // 2)
         end_button = self._end_play_button
         if end_button is not None:
             text_w = end_button.fontMetrics().horizontalAdvance(end_button.text())
@@ -3222,18 +3223,18 @@ class MenuWindow(QMainWindow):
             button_w = max(button_w, text_w)
         for button in self._center_buttons:
             if self._launch_button is not None and button is self._launch_button:
-                button.setFixedSize(width * 3, height)
+                button.setFixedSize(width * 3, tall)
             else:
-                button.setFixedSize(button_w, height)
+                button.setFixedSize(button_w, tall)
         if self._center_input is not None:
-            self._center_input.setFixedSize(width, height)
+            self._center_input.setFixedSize(width, tall)
             field = self._center_input.lineEdit()
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
         for button in getattr(self, "_count_buttons", []):
             text_w = button.fontMetrics().horizontalAdvance(button.text())
             text_h = button.fontMetrics().height()
-            button.setFixedSize(max(height, text_w + text_h), height)
+            button.setFixedSize(max(height * 3 // 4, text_w + text_h), max(height * 3 // 4, text_h))
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
