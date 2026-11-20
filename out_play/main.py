@@ -1747,10 +1747,17 @@ class MenuWindow(QMainWindow):
                 ("hour", "1時間あたり"),
                 ("minute", "1分あたり"),
             ):
-                label = QLabel(f"{title} －")
-                label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                stat_labels[key] = label
-                stats_layout.addWidget(label)
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(8)
+                name = QLabel(title)
+                name.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                value = QLabel("－")
+                value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                stat_labels[key] = value
+                row.addWidget(name, 0)
+                row.addWidget(value, 1)
+                stats_layout.addLayout(row)
             stats_layout.addStretch(1)
             body.addWidget(stats, 0)
             tsum_scroll = QScrollArea()
@@ -2145,11 +2152,11 @@ class MenuWindow(QMainWindow):
         else:
             hour_text = f"{_floor_number(total_gain * 3600 / seconds):,}"
             minute_text = f"{_floor_number(total_gain * 60 / seconds):,}"
-        labels["coin"].setText(f"平均素コイン {coin_text}")
-        labels["result"].setText(f"平均リザルトコイン {result_text}")
-        labels["rate"].setText(f"平均倍率 {rate_text}")
-        labels["hour"].setText(f"1時間あたり {hour_text}")
-        labels["minute"].setText(f"1分あたり {minute_text}")
+        labels["coin"].setText(coin_text)
+        labels["result"].setText(result_text)
+        labels["rate"].setText(rate_text)
+        labels["hour"].setText(hour_text)
+        labels["minute"].setText(minute_text)
 
     def _play_data_label(self, text: str, align: Qt.AlignmentFlag, padding: str) -> QLabel:
         label = QLabel(text)
