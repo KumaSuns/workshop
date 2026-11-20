@@ -3214,11 +3214,11 @@ class MenuWindow(QMainWindow):
             point = font.pointSize()
             if point < 1:
                 point = 9
-            font.setPointSize(max(1, point // 2))
+            font.setPointSize(max(1, point * 3 // 4))
             button.setFont(font)
             text_w = button.fontMetrics().horizontalAdvance(button.text())
             text_w += button.fontMetrics().height()
-            button.setFixedSize(max(height // 2, text_w), max(1, height // 2))
+            button.setFixedSize(max(height * 3 // 4, text_w), max(1, height * 3 // 4))
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
