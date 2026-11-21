@@ -764,6 +764,37 @@ def _nvidia_gpu_percent():
         return None
 
 
+def _load_psutil(report):
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        return psutil
+    report("使用状況の部品を入れています")
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    result = subprocess.run(
+        [str(_python_for_pip()), "-m", "pip", "install", "--disable-pip-version-check", "psutil"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    try:
+        import importlib
+
+        importlib.invalidate_caches()
+        import psutil
+    except ImportError:
+        detail = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+        report(detail[-200:] if detail else "使用状況の部品を入れられませんでした")
+        return None
+    return psutil
+
+
 class _ResourcePoll(QThread):
     ready = Signal(object)
 
@@ -775,10 +806,8 @@ class _ResourcePoll(QThread):
         self._stopped = True
 
     def run(self) -> None:
-        try:
-            import psutil
-        except ImportError:
-            self.ready.emit({"error": "psutil がありません"})
+        psutil = _load_psutil(lambda text: self.ready.emit({"error": text}))
+        if psutil is None or self._stopped:
             return
         proc = psutil.Process()
         proc.cpu_percent(interval=None)
@@ -3835,10 +3864,25 @@ class MenuWindow(QMainWindow):
         if button.property("pressing"):
             return
         button.setProperty("pressing", True)
-        if button.property("confirm"):
-            button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
-        button.setDown(True)
-        QTimer.singleShot(200, lambda b=button, s=slot: self._finish_tsum_press(b, s))
+        if not button.property("confirm"):
+            button.setDown(True)
+            QTimer.singleShot(200, lambda b=button, s=slot: self._finish_tsum_press(b, s))
+            return
+        state = {"on": False, "left": 4}
+
+        def tick(b=button, s=slot, hold=state) -> None:
+            if hold["left"] <= 0:
+                self._finish_tsum_press(b, s)
+                return
+            hold["on"] = not hold["on"]
+            hold["left"] -= 1
+            if hold["on"]:
+                b.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
+            else:
+                b.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#A4C6FF"))
+            QTimer.singleShot(150, tick)
+
+        tick()
 
     def _finish_tsum_press(self, button: QPushButton, slot) -> None:
         button.setDown(False)
