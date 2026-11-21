@@ -1499,8 +1499,9 @@ class MenuWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
         button_row = QHBoxLayout()
-        button_row.setContentsMargins(0, 0, 0, 2)
+        button_row.setContentsMargins(0, 0, 0, 8)
         button_row.setSpacing(2)
+        self._square_button_row = button_row
         self._square_side_buttons = []
         for number in range(2, 7):
             if number == 2:
@@ -2449,6 +2450,7 @@ class MenuWindow(QMainWindow):
             "QListWidget QLabel { color: #17233f; background: transparent; }"
         )
         column.addWidget(self._game_list, 1)
+        self._fit_game_list_height()
         for item in load_game_records():
             self._show_game_record(item)
 
@@ -2496,6 +2498,19 @@ class MenuWindow(QMainWindow):
             for label_index, label in enumerate(labels):
                 label.setFixedWidth(widest[label_index])
             listed.setSizeHint(widget.sizeHint())
+        self._fit_game_list_height()
+
+    def _fit_game_list_height(self) -> None:
+        game_list = getattr(self, "_game_list", None)
+        if game_list is None:
+            return
+        metrics = QFontMetrics(game_list.font())
+        row = metrics.lineSpacing()
+        if game_list.count() > 0:
+            hint = game_list.sizeHintForRow(0)
+            if hint > 1:
+                row = hint
+        game_list.setMinimumHeight(row * 20 + 2)
 
     def _show_game_record(self, item: object) -> None:
         if not isinstance(item, dict) or self._game_list is None:
@@ -4383,21 +4398,11 @@ class MenuWindow(QMainWindow):
         body = self._tsum_body
         if body is not None:
             body.setContentsMargins(0, TITLE_MARGIN, 0, 0)
+        self._fit_center()
         panel_w = usable_w
-        view = host.parentWidget()
-        while view is not None and not isinstance(view, QScrollArea):
-            view = view.parentWidget()
-        if isinstance(view, QScrollArea):
-            port = view.viewport()
-            left = host.mapTo(port, host.contentsRect().topLeft()).x()
-            room = port.width() - max(0, left)
-            if room > 1:
-                panel_w = min(panel_w, room)
-        center = getattr(self, "_center_slot", None)
-        if center is not None:
-            blank_w = center.contentsRect().width() * 6 // 8
-            if blank_w > 1:
-                panel_w = min(panel_w, blank_w)
+        blank = getattr(self, "_center_blank", None)
+        if blank is not None and blank.width() > 1:
+            panel_w = blank.width()
         square.setFixedSize(panel_w, side)
         panel = getattr(self, "_pc_panel", None)
         if panel is not None:
@@ -4418,12 +4423,14 @@ class MenuWindow(QMainWindow):
             meter.setMaximumWidth(panel_w)
             meter.setFixedWidth(panel_w)
             meter_h = meter.sizeHint().height()
-        if self._slots:
-            self._slots[0].setFixedHeight(button_h + 2 + side + TITLE_MARGIN + meter_h)
         for button in self._square_side_buttons:
             button.setFixedSize(button_w, button_h)
+        panel_h = side + meter_h
+        if panel is not None:
+            panel_h = max(panel_h, panel.sizeHint().height())
+        if self._slots:
+            self._slots[0].setFixedHeight(TITLE_MARGIN + button_h + 8 + panel_h + 2)
         self._paint_square_qr()
-        self._fit_center()
 
     def _fit_center(self) -> None:
         slot = self._center_slot
@@ -4473,6 +4480,26 @@ class MenuWindow(QMainWindow):
             self._launch_button.setFixedSize(count_w * len(count_buttons) + gaps, tall)
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
+            panel = getattr(self, "_pc_panel", None)
+            square = self._center_square
+            if panel is not None and square is not None and self._center_blank.width() > 1:
+                panel_w = self._center_blank.width()
+                panel.setMinimumWidth(0)
+                panel.setMaximumWidth(panel_w)
+                panel.setFixedWidth(panel_w)
+                square.setFixedWidth(panel_w)
+                meter = getattr(self, "_resource_meter", None)
+                if meter is not None:
+                    meter.setMinimumWidth(0)
+                    meter.setMaximumWidth(panel_w)
+                    meter.setFixedWidth(panel_w)
+                buttons = getattr(self, "_square_side_buttons", [])
+                count = len(buttons)
+                if count:
+                    fitted = (panel_w - 2 * (count - 1)) // count
+                    if fitted > 1:
+                        for button in buttons:
+                            button.setFixedWidth(min(button.width(), fitted))
 
     def _section_title(
         self, text: str, top: int = TITLE_MARGIN, bottom: int = TITLE_MARGIN, point: int = TITLE_POINT
