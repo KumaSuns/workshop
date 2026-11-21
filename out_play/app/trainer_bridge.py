@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -413,7 +414,7 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
                 device = _directml_device()
                 if device is not None:
                     return device, ""
-            probed = probed + "\nこの画面は閉じません。予測はCPUです。"
+            return "cpu", "remote\n" + exe
         if install_note:
             probed = install_note + "\n" + probed
         return "cpu", probed
@@ -443,6 +444,145 @@ def _play_device():
     return device
 
 
+def _block_write(stream, payload: bytes) -> None:
+    stream.write(len(payload).to_bytes(4, "little"))
+    stream.write(payload)
+    stream.flush()
+
+
+def _block_read(stream) -> bytes:
+    size_raw = stream.read(4)
+    if len(size_raw) < 4:
+        raise EOFError
+    size = int.from_bytes(size_raw, "little")
+    data = b""
+    while len(data) < size:
+        chunk = stream.read(size - len(data))
+        if not chunk:
+            raise EOFError
+        data += chunk
+    return data
+
+
+class _RadeonPredict:
+    def __init__(self, exe: str) -> None:
+        self.exe = exe
+        self.proc = None
+        self.error = ""
+        self._lock = __import__("threading").Lock()
+
+    def start(self) -> bool:
+        script = APP_ROOT / "runtime" / "radeon_predict.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(
+            "import io, json, sys\n"
+            "from pathlib import Path\n"
+            "from PIL import Image\n"
+            "root = Path(sys.argv[1])\n"
+            "sys.path.insert(0, str(root / 'bundled' / 'screen'))\n"
+            "import torch_directml\n"
+            "from app.predictor import Predictor\n"
+            "predictor = Predictor(root / 'bundled' / 'screen' / 'data' / 'models', device=torch_directml.device())\n"
+            "def read_block():\n"
+            "    size_raw = sys.stdin.buffer.read(4)\n"
+            "    if len(size_raw) < 4:\n"
+            "        raise EOFError\n"
+            "    size = int.from_bytes(size_raw, 'little')\n"
+            "    data = b''\n"
+            "    while len(data) < size:\n"
+            "        chunk = sys.stdin.buffer.read(size - len(data))\n"
+            "        if not chunk:\n"
+            "            raise EOFError\n"
+            "        data += chunk\n"
+            "    return data\n"
+            "def write_block(payload):\n"
+            "    sys.stdout.buffer.write(len(payload).to_bytes(4, 'little'))\n"
+            "    sys.stdout.buffer.write(payload)\n"
+            "    sys.stdout.buffer.flush()\n"
+            "sys.stdout.buffer.write(b'ready\\n')\n"
+            "sys.stdout.buffer.flush()\n"
+            "while True:\n"
+            "    try:\n"
+            "        header = json.loads(read_block().decode('utf-8'))\n"
+            "        image = Image.open(io.BytesIO(read_block())).convert('RGB')\n"
+            "    except EOFError:\n"
+            "        break\n"
+            "    if header['op'] == 'pieces':\n"
+            "        pieces = predictor.predict_pieces(Path('.'), header.get('game'), kinds=int(header.get('kinds') or 0), rgb=image, inner=bool(header.get('inner', True)), assign_groups=bool(header.get('assign', True)))\n"
+            "        body = {'pieces': pieces, 'heat': predictor.last_heat_s, 'type': predictor.last_type_s}\n"
+            "    else:\n"
+            "        body = {'boxes': predictor.predict_all(Path('.'), rgb=image)}\n"
+            "    write_block(json.dumps(body).encode('utf-8'))\n",
+            encoding="utf-8",
+        )
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._log = APP_ROOT / "runtime" / "radeon_predict_log.txt"
+        try:
+            self._err = self._log.open("w", encoding="utf-8", errors="replace")
+            self.proc = subprocess.Popen(
+                [self.exe, str(script), str(APP_ROOT)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._err,
+                cwd=str(APP_ROOT),
+                creationflags=flags,
+            )
+        except OSError as exc:
+            self.error = str(exc).strip() or "Radeonの予測を開始できませんでした。"
+            return False
+        assert self.proc.stdout is not None
+        line = self.proc.stdout.readline()
+        if line.strip() != b"ready" or self.proc.poll() is not None:
+            self._err.flush()
+            text = self._log.read_text(encoding="utf-8", errors="replace").strip() if self._log.is_file() else ""
+            self.error = text[-400:] if text else "Radeonの予測が開始しませんでした。"
+            return False
+        return True
+
+    def _ask(self, header: dict, rgb) -> dict:
+        if self.proc is None or self.proc.poll() is not None or self.proc.stdin is None or self.proc.stdout is None:
+            raise RuntimeError(self.error or "Radeonの予測が止まっています。")
+        buffer = io.BytesIO()
+        rgb.convert("RGB").save(buffer, format="PNG")
+        with self._lock:
+            _block_write(self.proc.stdin, json.dumps(header).encode("utf-8"))
+            _block_write(self.proc.stdin, buffer.getvalue())
+            return json.loads(_block_read(self.proc.stdout).decode("utf-8"))
+
+    def bind(self, predictor) -> None:
+        def predict_pieces(image_path, game, kinds=0, rgb=None, inner=True, assign_groups=True):
+            if rgb is None:
+                from PIL import Image
+
+                with Image.open(image_path) as image:
+                    rgb = image.convert("RGB")
+            body = self._ask(
+                {
+                    "op": "pieces",
+                    "game": game,
+                    "kinds": kinds,
+                    "inner": inner,
+                    "assign": assign_groups,
+                },
+                rgb,
+            )
+            predictor.last_heat_s = float(body.get("heat") or 0.0)
+            predictor.last_type_s = float(body.get("type") or 0.0)
+            return body.get("pieces") or []
+
+        def predict_all(image_path, rgb=None):
+            if rgb is None:
+                from PIL import Image
+
+                with Image.open(image_path) as image:
+                    rgb = image.convert("RGB")
+            body = self._ask({"op": "all"}, rgb)
+            return body.get("boxes") or {}
+
+        predictor.predict_pieces = predict_pieces
+        predictor.predict_all = predict_all
+
+
 def _remember_device(predictor, note: str) -> None:
     kind = getattr(predictor.device, "type", "")
     if kind == "privateuseone":
@@ -454,6 +594,10 @@ def _remember_device(predictor, note: str) -> None:
 
 def load_play_tools(report: Callable[[str], None] | None = None) -> tuple[object, Callable, Callable]:
     device, note = _resolve_play_device(report)
+    remote = ""
+    if isinstance(note, str) and note.startswith("remote\n"):
+        remote = note.split("\n", 1)[1].strip()
+        note = ""
     hidden = {
         key: sys.modules.pop(key)
         for key in list(sys.modules)
@@ -478,7 +622,19 @@ def load_play_tools(report: Callable[[str], None] | None = None) -> tuple[object
                 "ツムの〇モデルがありません。画面認識アプリで学習してください。"
             )
         predictor = Predictor(models, device=device)
-        _remember_device(predictor, note)
+        if remote:
+            if report is not None:
+                report("予測をRadeonで開始しています")
+            remote_predict = _RadeonPredict(remote)
+            if remote_predict.start():
+                remote_predict.bind(predictor)
+                predictor.device_label = "Radeon"
+                predictor.device_note = ""
+            else:
+                note = remote_predict.error or "Radeonの予測が開始しませんでした。"
+                _remember_device(predictor, note)
+        else:
+            _remember_device(predictor, note)
         chain_fn = tsum_chain_best_per_group
         gap_fn = farthest_gap_ratio
         keep = {
