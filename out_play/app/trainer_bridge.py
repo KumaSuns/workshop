@@ -413,10 +413,7 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
                 device = _directml_device()
                 if device is not None:
                     return device, ""
-            window = Path(exe).with_name("pythonw.exe")
-            if report is not None:
-                report("Radeonで予測するため、起動し直します。")
-            _relaunch_with(window if window.is_file() else Path(exe))
+            probed = probed + "\nこの画面は閉じません。予測はCPUです。"
         if install_note:
             probed = install_note + "\n" + probed
         return "cpu", probed
