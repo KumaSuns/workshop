@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QRadioButton,
@@ -701,6 +702,99 @@ class _ExternalPoll(QThread):
                 self.msleep(100)
 
 
+def _resource_sample(psutil, proc) -> dict:
+    cpu = psutil.cpu_percent(interval=None)
+    virtual = psutil.virtual_memory()
+    total_gb = virtual.total / (1024 ** 3)
+    used_gb = (virtual.total - virtual.available) / (1024 ** 3)
+    root = "C:\\" if sys.platform == "win32" else "/"
+    disk_pct = None
+    disk_free_gb = None
+    try:
+        usage = psutil.disk_usage(root)
+        disk_pct = float(usage.percent)
+        disk_free_gb = usage.free / (1024 ** 3)
+    except OSError:
+        pass
+    return {
+        "cpu": float(cpu),
+        "used_gb": used_gb,
+        "total_gb": total_gb,
+        "memory_pct": float(virtual.percent),
+        "disk_pct": disk_pct,
+        "disk_free_gb": disk_free_gb,
+        "app_mb": proc.memory_info().rss / (1024 ** 2),
+        "app_cpu": float(proc.cpu_percent(interval=None)),
+        "gpu": _nvidia_gpu_percent(),
+    }
+
+
+_nvidia_missing = False
+
+
+def _nvidia_gpu_percent():
+    global _nvidia_missing
+    if _nvidia_missing or sys.platform != "win32":
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=0.4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _nvidia_missing = True
+        return None
+    if result.returncode != 0:
+        _nvidia_missing = True
+        return None
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        return max(0.0, min(100.0, float(lines[0].split()[0])))
+    except ValueError:
+        return None
+
+
+class _ResourcePoll(QThread):
+    ready = Signal(object)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._stopped = False
+
+    def stop(self) -> None:
+        self._stopped = True
+
+    def run(self) -> None:
+        try:
+            import psutil
+        except ImportError:
+            self.ready.emit({"error": "psutil がありません"})
+            return
+        proc = psutil.Process()
+        proc.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=None)
+        while not self._stopped:
+            try:
+                sample = _resource_sample(psutil, proc)
+            except Exception:
+                sample = {"error": "使用状況を読めません"}
+            self.ready.emit(sample)
+            for _ in range(10):
+                if self._stopped:
+                    return
+                self.msleep(100)
+
+
 class MenuWindow(QMainWindow):
     tsum_icon_ready = Signal(str)
     external_commands = Signal(list)
@@ -709,6 +803,7 @@ class MenuWindow(QMainWindow):
     heart_note = Signal(str)
     pc_status_ready = Signal(str)
     gpu_present = Signal(bool)
+    resource_ready = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -719,6 +814,7 @@ class MenuWindow(QMainWindow):
         self.heart_note.connect(self._set_activity)
         self.pc_status_ready.connect(self._apply_pc_status)
         self.gpu_present.connect(self._apply_gpu_presence)
+        self.resource_ready.connect(self._apply_resources)
         self.setWindowTitle("AUTO PLAY")
         root = QWidget()
         _plain_surface(root)
@@ -903,6 +999,9 @@ class MenuWindow(QMainWindow):
         layout.addWidget(self._footer)
         self.setCentralWidget(root)
         self._pc_status = ""
+        self._resource_poll = _ResourcePoll(self)
+        self._resource_poll.ready.connect(self.resource_ready)
+        self._resource_poll.start()
         threading.Thread(target=self._load_pc_status, daemon=True).start()
         threading.Thread(target=self._load_gpu_presence, daemon=True).start()
         self._placed = False
@@ -1256,6 +1355,12 @@ class MenuWindow(QMainWindow):
         square_column.setSpacing(0)
         square_column.addWidget(
             self._center_square,
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
+        self._resource_meter = self._build_resource_meter()
+        square_column.addWidget(
+            self._resource_meter,
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
@@ -2889,6 +2994,119 @@ class MenuWindow(QMainWindow):
             poll.stop()
             poll.wait(1000)
 
+    def _build_resource_meter(self) -> QFrame:
+        frame = QFrame()
+        _soft_box(frame)
+        column = QVBoxLayout(frame)
+        column.setContentsMargins(6, 4, 6, 4)
+        column.setSpacing(2)
+        self._resource_rows: dict[str, tuple[QLabel, QProgressBar]] = {}
+        names = (
+            ("cpu", "CPU"),
+            ("memory", "メモリ"),
+            ("gpu", "GPU"),
+            ("disk", "ディスク"),
+            ("free", "C空き"),
+            ("app_mb", "アプリ"),
+            ("app_cpu", "アプリCPU"),
+        )
+        for key, title in names:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            name = QLabel(title)
+            name.setStyleSheet("color: #17233f; background: transparent;")
+            value = QLabel("—")
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value.setStyleSheet("color: #17233f; background: transparent;")
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(8)
+            bar.setStyleSheet(_resource_bar_style("#A4C6FF"))
+            row.addWidget(name)
+            row.addWidget(bar, 1)
+            row.addWidget(value)
+            column.addLayout(row)
+            self._resource_rows[key] = (value, bar)
+        return frame
+
+    def _apply_resources(self, sample: object) -> None:
+        rows = getattr(self, "_resource_rows", None)
+        if not isinstance(sample, dict) or not rows:
+            return
+        error = sample.get("error")
+        if error:
+            value, bar = rows["cpu"]
+            value.setText(str(error))
+            bar.setValue(0)
+            return
+        self._set_resource_bar("cpu", sample.get("cpu"), f"{sample.get('cpu', 0):.0f}%")
+        memory_pct = sample.get("memory_pct")
+        used = sample.get("used_gb")
+        total = sample.get("total_gb")
+        memory_text = "—"
+        if isinstance(used, (int, float)) and isinstance(total, (int, float)):
+            memory_text = f"{used:.1f} / {total:.1f} GB  {float(memory_pct or 0):.0f}%"
+        memory_color = "#A4C6FF"
+        if isinstance(memory_pct, (int, float)) and memory_pct >= 90:
+            memory_color = "#FF1A6F"
+        elif isinstance(memory_pct, (int, float)) and memory_pct >= 80:
+            memory_color = "#F0A202"
+        self._set_resource_bar("memory", memory_pct, memory_text, memory_color)
+        gpu = sample.get("gpu")
+        if isinstance(gpu, (int, float)):
+            self._set_resource_bar("gpu", gpu, f"{gpu:.0f}%")
+        else:
+            self._set_resource_bar("gpu", None, "取得不可")
+        self._set_resource_bar(
+            "disk",
+            sample.get("disk_pct"),
+            "—" if sample.get("disk_pct") is None else f"{float(sample['disk_pct']):.0f}%",
+        )
+        free = sample.get("disk_free_gb")
+        free_color = "#A4C6FF"
+        free_text = "—"
+        if isinstance(free, (int, float)):
+            free_text = f"{free:.1f} GB"
+            if free < 5:
+                free_color = "#FF1A6F"
+            elif free < 10:
+                free_color = "#F0A202"
+        free_pct = None
+        disk_pct = sample.get("disk_pct")
+        if isinstance(disk_pct, (int, float)):
+            free_pct = max(0.0, min(100.0, 100.0 - float(disk_pct)))
+        self._set_resource_bar("free", free_pct, free_text, free_color)
+        app_mb = sample.get("app_mb")
+        app_pct = None
+        total = sample.get("total_gb")
+        if isinstance(app_mb, (int, float)) and isinstance(total, (int, float)) and total > 0:
+            app_pct = max(0.0, min(100.0, float(app_mb) / (float(total) * 1024) * 100))
+        self._set_resource_bar(
+            "app_mb",
+            app_pct,
+            "—" if not isinstance(app_mb, (int, float)) else f"{app_mb:.0f} MB",
+        )
+        self._set_resource_bar(
+            "app_cpu",
+            sample.get("app_cpu"),
+            "—" if sample.get("app_cpu") is None else f"{float(sample['app_cpu']):.0f}%",
+        )
+
+    def _set_resource_bar(self, key: str, percent, text: str, color: str = "#A4C6FF") -> None:
+        pair = self._resource_rows.get(key)
+        if pair is None:
+            return
+        value, bar = pair
+        value.setText(text)
+        if isinstance(percent, (int, float)):
+            bar.setValue(int(max(0, min(100, round(float(percent))))))
+        else:
+            bar.setValue(0)
+        bar.setStyleSheet(_resource_bar_style(color))
+
     def _load_pc_status(self) -> None:
         self.pc_status_ready.emit(_pc_status_text())
 
@@ -3229,6 +3447,10 @@ class MenuWindow(QMainWindow):
         self._external_reply(socket, "404 Not Found", {"ok": False})
 
     def closeEvent(self, event) -> None:
+        poll = getattr(self, "_resource_poll", None)
+        if poll is not None:
+            poll.stop()
+            poll.wait(300)
         self._stop_external_site()
         self._stop_external_server()
         self._unregister_tsum_hotkeys()
@@ -3924,8 +4146,13 @@ class MenuWindow(QMainWindow):
         count = len(self._square_side_buttons)
         if count:
             buttons_h = count * row + 2 * (count - 1) + 4
+        meter = getattr(self, "_resource_meter", None)
+        meter_h = 0
+        if meter is not None:
+            meter.setFixedWidth(side)
+            meter_h = meter.sizeHint().height()
         if self._slots:
-            self._slots[0].setFixedHeight(max(side, buttons_h) + TITLE_MARGIN)
+            self._slots[0].setFixedHeight(max(side, buttons_h) + TITLE_MARGIN + meter_h)
         for button in self._square_side_buttons:
             button.setFixedSize(side_w, row)
         self._paint_square_qr()
@@ -4462,6 +4689,16 @@ def _memory_use_percent() -> int | None:
     if total <= 0:
         return None
     return max(0, min(100, round((total - available) / total * 100)))
+
+
+def _resource_bar_style(color: str) -> str:
+    return (
+        "QProgressBar { background: #ffffff; border: 1px solid #A4C6FF; border-radius: 3px; }"
+        "QProgressBar::chunk {"
+        f" background: {color};"
+        " border-radius: 2px;"
+        "}"
+    )
 
 
 def _guide_score() -> int:
