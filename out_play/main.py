@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import ctypes
@@ -5776,7 +5777,14 @@ def _ensure_pillow() -> None:
     sys.modules.pop("PIL", None)
 
 
+def _remove_coin_crops() -> None:
+    folder = ROOT.parent / "data" / "coin_crops"
+    if folder.is_dir():
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def main() -> None:
+    _remove_coin_crops()
     _ensure_pillow()
     app = QApplication(sys.argv)
     try:

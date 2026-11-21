@@ -5101,30 +5101,6 @@ def _result_coin_box(image, model_box: dict[str, int] | None) -> dict[str, int] 
 
 
 _TAUGHT_COIN_900 = {"x": 311, "y": 234, "w": 275, "h": 73}
-_COIN_CROP_ROOT = APP_ROOT.parent / "data" / "coin_crops"
-
-
-def _coin_crop_label_taken(folder: Path, label: str) -> bool:
-    suffix = f"_{label}.png"
-    try:
-        return any(path.is_file() and path.name.endswith(suffix) for path in folder.iterdir())
-    except OSError:
-        return False
-
-
-def _save_coin_crop(key: str, crop, digits: str) -> None:
-    if key not in ("coin", "result_coin"):
-        return
-    folder = _COIN_CROP_ROOT / key
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        label = digits if digits else "empty"
-        if _coin_crop_label_taken(folder, label):
-            return
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        crop.save(folder / f"{stamp}_{label}.png")
-    except Exception:
-        return
 
 
 def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key: str) -> str:
@@ -5156,7 +5132,6 @@ def _read_coin_key(predictor, rgb, boxes: dict[str, dict[str, int]] | None, key:
     except Exception:
         return ""
     digits = "".join(char for char in raw if char.isdigit())
-    _save_coin_crop(key, crop, digits)
     return digits
 
 
