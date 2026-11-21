@@ -1477,7 +1477,7 @@ class MenuWindow(QMainWindow):
         self._pc_panel = QFrame()
         _soft_box(self._pc_panel)
         panel_column = QVBoxLayout(self._pc_panel)
-        panel_column.setContentsMargins(0, 0, 0, 0)
+        panel_column.setContentsMargins(2, 2, 2, 2)
         panel_column.setSpacing(0)
         self._center_square = QFrame()
         self._center_square.setStyleSheet("background: #ffffff; border: none;")
