@@ -1376,7 +1376,7 @@ class MenuWindow(QMainWindow):
         inner = QVBoxLayout(self._item_box)
         inner.setContentsMargins(0, 0, 0, 5)
         inner.setSpacing(0)
-        inner.addWidget(self._section_title("使用アイテム", 5, 5))
+        inner.addWidget(self._section_title("使用アイテム", 2, 5))
         block = QWidget()
         block.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
         block_layout = QVBoxLayout(block)
