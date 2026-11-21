@@ -968,10 +968,98 @@ def _has_highscore_plate(image: QImage) -> bool:
     return False
 
 
+def _highscore_close_button(image: QImage) -> QRect | None:
+    if image is None or image.isNull() or not _has_highscore_plate(image):
+        return None
+    height = image.height()
+    width = image.width()
+    pills = []
+    for pill in _yellow_pills(image):
+        if pill.width() < pill.height() * 1.65:
+            continue
+        if not height * 0.55 < pill.center().y() < height * 0.80:
+            continue
+        if abs(pill.center().x() - width / 2) > width * 0.22:
+            continue
+        if pill.width() < width * 0.18 or pill.width() > width * 0.55:
+            continue
+        if _is_daily_mission(image, pill):
+            continue
+        pills.append(pill)
+    if not pills:
+        return None
+    return min(pills, key=lambda rect: rect.center().y())
+
+
+def _has_levelup_panel(image: QImage) -> bool:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return False
+    cyan = False
+    for blob in _all_blobs(sample, _is_levelup_cyan):
+        xs = [point[0] for point in blob]
+        ys = [point[1] for point in blob]
+        box_w = max(xs) - min(xs) + 1
+        box_h = max(ys) - min(ys) + 1
+        cx = (min(xs) + max(xs)) / 2 / width
+        cy = (min(ys) + max(ys)) / 2 / height
+        if box_w < width * 0.45 or box_w > width * 0.95:
+            continue
+        if box_h < height * 0.04:
+            continue
+        if abs(cx - 0.5) > 0.20:
+            continue
+        if 0.45 <= cy <= 0.70:
+            cyan = True
+            break
+    if not cyan:
+        return False
+    gold = 0
+    top = int(height * 0.22)
+    bottom = int(height * 0.40)
+    left = int(width * 0.30)
+    right = int(width * 0.70)
+    for y in range(top, bottom):
+        for x in range(left, right):
+            red, green, blue = sample[y][x]
+            if red > 220 and green > 150 and blue < 180 and green > blue + 40:
+                gold += 1
+    return gold >= 12
+
+
+def _levelup_close_button(image: QImage) -> QRect | None:
+    """レベルアップ画面のとじる。"""
+    if image is None or image.isNull() or not _has_levelup_panel(image):
+        return None
+    height = image.height()
+    width = image.width()
+    pills = []
+    for pill in _yellow_pills(image):
+        if pill.width() < pill.height() * 1.5:
+            continue
+        if not height * 0.78 < pill.center().y() < height * 0.93:
+            continue
+        if abs(pill.center().x() - width / 2) > width * 0.22:
+            continue
+        if pill.width() < width * 0.25 or pill.width() > width * 0.60:
+            continue
+        if _is_daily_mission(image, pill):
+            continue
+        pills.append(pill)
+    if not pills:
+        return None
+    return max(pills, key=lambda rect: rect.width() * rect.height())
+
+
 def _close_button(image: QImage) -> QRect | None:
     mission_close = _mission_dialog_close(image)
     if mission_close is not None:
         return mission_close
+    levelup = _levelup_close_button(image)
+    if levelup is not None:
+        return levelup
     if _has_highscore_plate(image):
         pills = [
             pill
@@ -983,6 +1071,17 @@ def _close_button(image: QImage) -> QRect | None:
         if pills:
             return max(pills, key=lambda rect: rect.width() * rect.height())
     return None
+
+
+def _is_levelup_cyan(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return (
+        red < 120
+        and green > 160
+        and blue > 180
+        and blue >= green - 25
+        and green > red + 50
+    )
 
 
 def _is_highscore_cyan(pixel: tuple[int, int, int]) -> bool:
@@ -1072,6 +1171,59 @@ def _sample(image: QImage) -> list[list[tuple[int, int, int]]]:
         rows.append(row)
     _sample_cache = (key, rows)
     return rows
+
+
+def _dice_board(image: QImage) -> bool:
+    if image.isNull() or image.width() < 40 or image.height() < 40:
+        return False
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width < 8 or height < 8:
+        return False
+
+    def luma(pixel: tuple[int, int, int]) -> float:
+        return 0.299 * pixel[0] + 0.587 * pixel[1] + 0.114 * pixel[2]
+
+    def ratio(y0: int, y1: int, x0: int, x1: int, match) -> float:
+        total = 0
+        hit = 0
+        for y in range(y0, y1):
+            row = sample[y]
+            for x in range(x0, x1):
+                total += 1
+                if match(row[x]):
+                    hit += 1
+        return hit / total if total else 0.0
+
+    dark = lambda pixel: luma(pixel) < 50
+    if ratio(0, max(1, height // 10), 0, width, dark) < 0.7:
+        return False
+    if ratio(int(height * 0.85), height, 0, width, dark) < 0.7:
+        return False
+    cream = ratio(
+        int(height * 0.16),
+        int(height * 0.30),
+        int(width * 0.2),
+        int(width * 0.8),
+        lambda pixel: (
+            pixel[0] > 180
+            and pixel[1] > 160
+            and pixel[2] > 120
+            and pixel[0] > pixel[2]
+            and abs(pixel[0] - pixel[1]) < 50
+        ),
+    )
+    if cream < 0.35:
+        return False
+    green = ratio(
+        int(height * 0.32),
+        int(height * 0.62),
+        int(width * 0.25),
+        int(width * 0.75),
+        lambda pixel: pixel[1] > 140 and pixel[1] > pixel[0] + 15 and pixel[1] > pixel[2],
+    )
+    return green >= 0.25
 
 
 def _mean_luma(rows: list[list[tuple[int, int, int]]]) -> float:

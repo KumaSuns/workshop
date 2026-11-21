@@ -36,8 +36,9 @@ from app.intro import (
     _close_button,
     _continue_button,
     _daily_mission_button,
+    _dice_board,
     _extend_cancel_button,
-    _has_highscore_plate,
+    _highscore_close_button,
     _in_play_hud,
     _is_extend_dialog,
     _match_start_button,
@@ -1420,8 +1421,28 @@ def run_play(
             return 9
         return 10
 
+    def _gadget_save_my() -> bool:
+        if not skill_is_gadget(used_tsum):
+            return False
+        left = latest_gauge[3]
+        return _gadget_skill_hold(
+            _fever_playing(rgb, game),
+            _meter_fever_fill(rgb, fever, skill, fan),
+            left,
+        )
+
+    def _drop_my_chains(
+        found: list[list[dict[str, int]]],
+    ) -> list[list[dict[str, int]]]:
+        if not found or not _gadget_save_my():
+            return found
+        others = [item for item in found if not _chain_is_my(item)]
+        return others if others else found
+
     def _chain_pref(chain: list[dict[str, int]]) -> tuple:
         is_my = _chain_is_my(chain)
+        if _gadget_save_my():
+            return (not is_my, len(chain))
         if skill_is_nightmare(used_tsum):
             aim = _nightmare_chain_n()
             n = len(chain)
@@ -1488,7 +1509,7 @@ def run_play(
         if pooh_long:
             return found
         found.sort(key=_chain_pref, reverse=True)
-        return found
+        return _drop_my_chains(found)
     kinds_locked = False
     used_items: list[str] | None = start_items
     go_at: float | None = None
@@ -1524,6 +1545,23 @@ def run_play(
     def arm_timeup() -> None:
         _ensure_timeup_app(watch_hit, watching)
         watching.set()
+
+    def _timeup_before_chain(timer_box) -> bool:
+        if _watcher_ended[0]:
+            return True
+        if not watch_hit.is_set():
+            return False
+        try:
+            fresh = capture_play_frame()
+            fresh_rgb = _qimage_rgb(fresh)
+        except Exception:
+            return True
+        if fresh is None or fresh.isNull() or fresh_rgb is None:
+            return True
+        left_now = _read_timer(None, fresh_rgb, timer_box)
+        if left_now is not None and left_now > 0:
+            return False
+        return True
 
     if resumed_pause:
         arm_timeup()
@@ -2250,6 +2288,10 @@ def run_play(
                     say("画面を待っています")
                     _sleep_stop(0.25, stop)
                 continue
+            if _dismiss_extend_dialog(image, say, stop):
+                continue
+            if not _in_play_hud(image) and _dismiss_highscore_dialog(image, say, stop):
+                continue
             on_board = (
                 saw_board
                 and image is not None
@@ -2536,7 +2578,7 @@ def run_play(
                             _sleep_stop(0.4, stop)
                             continue
                         say("とじるをクリックします")
-                        _slow_tap(point[0], point[1])
+                        tap(point[0], point[1])
                         last_close_at = point
                         _sleep_stop(1.2, stop)
                         continue
@@ -2579,7 +2621,7 @@ def run_play(
                 cancel = None if image.isNull() else _cancel_button(image)
                 if cancel is not None:
                     say("キャンセルをクリックします")
-                    _slow_tap(cancel.center().x(), cancel.center().y())
+                    tap(cancel.center().x(), cancel.center().y())
                     _sleep_stop(1.2, stop)
                     continue
                 say("プレイを待っています")
@@ -2804,16 +2846,7 @@ def run_play(
                             break
                         skill_busy[0] = True
                         _check_stop(stop)
-                        left_now = _read_timer(None, rgb, timer)
-                        if watch_hit.is_set() and (
-                            left_now == 0
-                            or (
-                                left_now is None
-                                and image is not None
-                                and not image.isNull()
-                                and not _in_play_hud(image)
-                            )
-                        ):
+                        if _timeup_before_chain(timer):
                             timeup = True
                             break
                         if not queue:
@@ -2828,6 +2861,13 @@ def run_play(
                                     extra=burst_skip,
                                     used_spots=used,
                                 )
+                                if (
+                                    screen_swipes > 0
+                                    and more
+                                    and _gadget_save_my()
+                                    and all(_chain_is_my(item) for item in more)
+                                ):
+                                    more = []
                                 for item in more:
                                     key = _chain_key(item)
                                     if key in seen_keys:
@@ -2836,16 +2876,7 @@ def run_play(
                                     queue.append(item)
                             if queue:
                                 continue
-                            left_now = _read_timer(None, rgb, timer)
-                            if watch_hit.is_set() and (
-                                left_now == 0
-                                or (
-                                    left_now is None
-                                    and image is not None
-                                    and not image.isNull()
-                                    and not _in_play_hud(image)
-                                )
-                            ):
+                            if _timeup_before_chain(timer):
                                 timeup = True
                                 break
                             if _nightmare_live_dice():
@@ -3020,6 +3051,9 @@ def run_play(
                                     f"この鎖{my_add} 累計{int(burst_my_n) + my_add} "
                                     f"{'する' if will_carry else 'しない'}"
                                 )
+                        if _timeup_before_chain(timer):
+                            timeup = True
+                            break
                         try:
                             swiped = _swipe_chain(
                                 chain,
@@ -5174,13 +5208,13 @@ def _read_scene_money(predictor, frame_rgb, force_key: str = "") -> tuple[str, s
 
 
 def _dismiss_highscore_dialog(image: QImage, say: StatusFn, stop: Event | None) -> bool:
-    if image is None or image.isNull() or not _has_highscore_plate(image):
+    if image is None or image.isNull():
         return False
-    button = _close_button(image)
+    button = _highscore_close_button(image)
     if button is None:
         return False
     say("とじるをクリックします")
-    _slow_tap(button.center().x(), button.center().y())
+    tap(button.center().x(), button.center().y())
     _sleep_stop(1.0, stop)
     return True
 
@@ -5192,7 +5226,7 @@ def _dismiss_extend_dialog(image: QImage, say: StatusFn, stop: Event | None) -> 
     if button is None:
         return False
     say("キャンセルをクリックします")
-    _slow_tap(button.center().x(), button.center().y())
+    tap(button.center().x(), button.center().y())
     _sleep_stop(1.0, stop)
     return True
 
@@ -5939,10 +5973,17 @@ def _click_start_or_continue(
                 say("続けるを検出しました")
             _seen_model()
             return kinds, locked, "continue", used_name, items
-        cancel = _cancel_button(image)
+        highscore = _highscore_close_button(image)
+        if highscore is not None:
+            say("とじるをクリックします")
+            tap(highscore.center().x(), highscore.center().y())
+            _sleep_stop(1.0, stop)
+            deadline = max(deadline, time.time() + 12)
+            continue
+        cancel = _extend_cancel_button(image) or _cancel_button(image)
         if cancel is not None:
             say("キャンセルをクリックします")
-            _slow_tap(cancel.center().x(), cancel.center().y())
+            tap(cancel.center().x(), cancel.center().y())
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
             continue
@@ -5959,7 +6000,7 @@ def _click_start_or_continue(
                 _sleep_stop(0.4, stop)
                 continue
             say("とじるをクリックします")
-            _slow_tap(point[0], point[1])
+            tap(point[0], point[1])
             last_close_at = point
             _sleep_stop(1.2, stop)
             deadline = max(deadline, time.time() + 12)
@@ -5999,6 +6040,11 @@ def _click_start_or_continue(
                 say("続けるを検出しました")
             _seen_model()
             return kinds, locked, "continue", used_name, items
+        if _dice_board(image):
+            say("上部から少し下へずらします")
+            _swipe_top_down(image)
+            _sleep_stop(0.8, stop)
+            continue
         if not image.isNull() and (not odd_top_tapped or stop_at_start):
             if not odd_top_tapped:
                 say("上部をクリックします")
@@ -6008,6 +6054,18 @@ def _click_start_or_continue(
         _sleep_stop(0.4, stop)
     _seen_model()
     return kinds, locked, "", used_name, items
+
+
+def _swipe_top_down(image: QImage) -> None:
+    x = image.width() // 2
+    y0 = max(1, image.height() // 10)
+    y1 = min(image.height() - 1, y0 + max(24, image.height() // 10))
+    swipe_path(
+        [(x, y0), (x, (y0 + y1) // 2), (x, y1)],
+        duration_ms=300,
+        screen_w=image.width(),
+        screen_h=image.height(),
+    )
 
 
 def _tap_continue_now(say: StatusFn, stop: Event | None) -> bool:
