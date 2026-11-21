@@ -135,7 +135,7 @@ def _runtime_ready(exe: Path) -> bool:
         return False
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     result = subprocess.run(
-        [str(exe), "-c", "import PySide6, PIL, qrcode, torch_directml"],
+        [str(exe), "-c", "import PySide6, PIL, qrcode, torch_directml, torchvision"],
         capture_output=True,
         text=True,
         timeout=120,
@@ -154,6 +154,7 @@ def _install_runtime_packages(exe: Path) -> subprocess.CompletedProcess[str]:
             "install",
             "--disable-pip-version-check",
             "torch-directml",
+            "torchvision",
             "PySide6",
             "Pillow",
             "qrcode",
@@ -306,7 +307,7 @@ def _directml_name(device) -> str:
     return name or "Radeon"
 
 
-def _directml_probe() -> str:
+def _directml_probe(exe: str) -> str:
     code = r"""
 import sys, traceback
 from pathlib import Path
@@ -331,7 +332,7 @@ except Exception:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         result = subprocess.run(
-            [_python_exe(), "-c", code, str(APP_ROOT)],
+            [exe, "-c", code, str(APP_ROOT)],
             check=False,
             capture_output=True,
             text=True,
@@ -361,11 +362,22 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
         if report is not None:
             report("Radeonへ移す試し")
         install_note = ""
-        if _python_code("import torch_directml") != 0:
-            if report is not None:
-                report("Radeon用の部品を入れています")
-            install_note = _install_directml()
-        probed = _directml_probe()
+        exe = _python_exe()
+        if not _python_can_directml() or _python_code("import torch_directml") != 0:
+            if _python_can_directml():
+                if report is not None:
+                    report("Radeon用の部品を入れています")
+                install_note = _install_directml()
+            if not _python_can_directml() or _python_code("import torch_directml") != 0:
+                if report is not None:
+                    report(f"Python {_DIRECTML_PY} を用意しています。")
+                prepared = _ensure_python312(report)
+                if prepared:
+                    install_note = prepared if not install_note else install_note + "\n" + prepared
+                runtime = _runtime_python()
+                if runtime.is_file():
+                    exe = str(runtime)
+        probed = _directml_probe(exe)
         if install_note and "成功しました" not in probed:
             probed = install_note + "\n" + probed
         return "cpu", probed
