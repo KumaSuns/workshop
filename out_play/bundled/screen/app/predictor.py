@@ -390,6 +390,8 @@ class Predictor:
             )
         self.last_heat_s = time.perf_counter() - t_heat
         t_type = time.perf_counter()
+        if getattr(self.device, "type", "") == "cpu":
+            inner = False
         if assign_groups:
             self._assign_groups(rgb, pieces, kinds=kinds, inner=inner)
         self.last_type_s = time.perf_counter() - t_type
