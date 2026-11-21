@@ -133,6 +133,8 @@ TIME_BOMB_NUMBER = 9
 BOMB_MANY = 3
 SKIP_TTL = 4.0
 ERASE_WAIT = 0.15
+_STILL_DIFF = 12
+_STILL_HOLD = 0.4
 FAN_GAP = 2.0
 _gpu_lock = Lock()
 
@@ -2254,6 +2256,8 @@ def run_play(
         return False
 
     next_frame = None
+    still_sample: list[bytes | None] = [None]
+    still_since = [0.0]
     try:
         while True:
             _check_stop(stop)
@@ -2669,6 +2673,17 @@ def run_play(
                     if skill_pressed is not None and skill_pressed.is_set():
                         if apply_checker_skill(False):
                             continue
+            if getattr(getattr(predictor, "device", None), "type", "") == "cpu":
+                sample = _board_sample(rgb, game)
+                moving = _board_moving(still_sample[0], sample)
+                still_sample[0] = sample
+                if moving:
+                    if still_since[0] <= 0:
+                        still_since[0] = time.perf_counter()
+                    if time.perf_counter() - still_since[0] < _STILL_HOLD:
+                        continue
+                else:
+                    still_since[0] = 0.0
             t0 = time.perf_counter()
             heat_s = 0.0
             type_s = 0.0
@@ -4654,6 +4669,30 @@ def _median_spacing(tsums: list[dict[str, int]]) -> float:
         return 0.0
     nearest.sort()
     return nearest[len(nearest) // 2]
+
+
+def _board_sample(rgb, game: dict[str, int] | None) -> bytes | None:
+    if rgb is None:
+        return None
+    if game is not None:
+        left = max(0, int(game["x"]))
+        top = max(0, int(game["y"]))
+        right = min(rgb.width, left + max(1, int(game["w"])))
+        bottom = min(rgb.height, top + max(1, int(game["h"])))
+        if right <= left or bottom <= top:
+            crop = rgb
+        else:
+            crop = rgb.crop((left, top, right, bottom))
+    else:
+        crop = rgb
+    return crop.resize((24, 36)).convert("L").tobytes()
+
+
+def _board_moving(prev: bytes | None, now: bytes | None) -> bool:
+    if not prev or not now or len(prev) != len(now):
+        return False
+    total = sum(abs(a - b) for a, b in zip(prev, now))
+    return total / len(now) > _STILL_DIFF
 
 
 def _qimage_rgb(image: QImage):
