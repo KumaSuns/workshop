@@ -212,21 +212,44 @@ def _ensure_python312(report: Callable[[str], None] | None) -> str:
 
 def _relaunch_with(exe: Path) -> None:
     main = APP_ROOT / "main.py"
+    log = APP_ROOT / "runtime" / "relaunch_log.txt"
     waiter = APP_ROOT / "runtime" / "relaunch.py"
     waiter.parent.mkdir(parents=True, exist_ok=True)
     waiter.write_text(
         "import os, subprocess, sys, time\n"
         "pid = int(sys.argv[1])\n"
-        "while True:\n"
+        "for _ in range(50):\n"
         "    try:\n"
         "        os.kill(pid, 0)\n"
         "    except OSError:\n"
         "        break\n"
         "    time.sleep(0.2)\n"
-        "subprocess.Popen([sys.argv[2], sys.argv[3], *sys.argv[5:]], cwd=sys.argv[4])\n",
+        "time.sleep(0.5)\n"
+        "log = open(sys.argv[5], 'w', encoding='utf-8', errors='replace')\n"
+        "try:\n"
+        "    child = subprocess.Popen(\n"
+        "        [sys.argv[2], sys.argv[3], *sys.argv[6:]],\n"
+        "        cwd=sys.argv[4],\n"
+        "        stdout=log,\n"
+        "        stderr=subprocess.STDOUT,\n"
+        "    )\n"
+        "except Exception as exc:\n"
+        "    log.write(str(exc))\n"
+        "    log.close()\n"
+        "    import ctypes\n"
+        "    ctypes.windll.user32.MessageBoxW(None, '起動し直しを開始できませんでした。\\n' + str(exc), 'AUTO PLAY', 0x10)\n"
+        "    raise SystemExit(1)\n"
+        "time.sleep(3)\n"
+        "code = child.poll()\n"
+        "log.flush()\n"
+        "log.close()\n"
+        "if code is not None:\n"
+        "    text = open(sys.argv[5], encoding='utf-8', errors='replace').read()[-800:]\n"
+        "    import ctypes\n"
+        "    ctypes.windll.user32.MessageBoxW(None, '起動し直したアプリがすぐ閉じました。\\n' + text, 'AUTO PLAY', 0x10)\n",
         encoding="utf-8",
     )
-    flags = 0
+    flags = 0x01000000
     for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
         flags |= getattr(subprocess, name, 0)
     subprocess.Popen(
@@ -237,6 +260,7 @@ def _relaunch_with(exe: Path) -> None:
             str(exe),
             str(main),
             str(APP_ROOT),
+            str(log),
             *sys.argv[1:],
         ],
         creationflags=flags,
