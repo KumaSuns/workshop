@@ -1358,12 +1358,6 @@ class MenuWindow(QMainWindow):
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
-        self._resource_meter = self._build_resource_meter()
-        square_column.addWidget(
-            self._resource_meter,
-            0,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-        )
         side_column = QVBoxLayout()
         side_column.setContentsMargins(0, 2, 0, 2)
         side_column.setSpacing(2)
@@ -1406,6 +1400,12 @@ class MenuWindow(QMainWindow):
         square_row.addLayout(side_column)
         square_row.setAlignment(side_column, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self._tsum_body.addLayout(square_row)
+        self._resource_meter = self._build_resource_meter()
+        self._tsum_body.addWidget(
+            self._resource_meter,
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
         right.addLayout(self._tsum_body, 1)
         self._top_square_host = right_box
         self._tsum_actions = QVBoxLayout()
@@ -3019,6 +3019,9 @@ class MenuWindow(QMainWindow):
             value = QLabel("—")
             value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             value.setStyleSheet("color: #17233f; background: transparent;")
+            wide = value.fontMetrics().horizontalAdvance("psutil がありません")
+            wide = max(wide, value.fontMetrics().horizontalAdvance("00.0 / 00.0 GB  100%"))
+            value.setMinimumWidth(wide)
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(0)
@@ -4149,7 +4152,7 @@ class MenuWindow(QMainWindow):
         meter = getattr(self, "_resource_meter", None)
         meter_h = 0
         if meter is not None:
-            meter.setFixedWidth(side)
+            meter.setFixedWidth(max(side + side_w, usable_w - gap))
             meter_h = meter.sizeHint().height()
         if self._slots:
             self._slots[0].setFixedHeight(max(side, buttons_h) + TITLE_MARGIN + meter_h)
