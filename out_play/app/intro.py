@@ -587,6 +587,8 @@ def _same_button(left: QRect | None, right: QRect | None) -> bool:
 
 
 def _home_play_button(image: QImage) -> QRect | None:
+    if _in_play_hud(image):
+        return None
     start = _match_start_button(image)
     if _yellow_pair_left(image) is not None:
         return None

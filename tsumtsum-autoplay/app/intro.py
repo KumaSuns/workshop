@@ -454,6 +454,8 @@ def _daily_mission_button(image: QImage) -> QRect | None:
 
 
 def _play_button(image: QImage) -> QRect | None:
+    if _in_play_hud(image):
+        return None
     if (
         _retry_button(image) is not None
         or _pause_continue_button(image) is not None
