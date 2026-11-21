@@ -3522,6 +3522,12 @@ class MenuWindow(QMainWindow):
         dialog.setWindowFlag(Qt.WindowType.Window, True)
         dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         dialog.setModal(False)
+        dialog.setStyleSheet(
+            "QDialog { background: #ffffff; color: #17233f; }"
+            "QLabel { background: transparent; color: #17233f; }"
+            "QListWidget { background: #ffffff; color: #17233f;"
+            f" border: 1px solid {SURFACE_LINE}; }}"
+        )
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(28, 22, 28, 22)
         layout.setSpacing(14)
@@ -3569,7 +3575,7 @@ class MenuWindow(QMainWindow):
         count = max(1, round(gap / space)) if space else 1
         return label + (" " * count) + f"({key})"
 
-    def _add_tsum_button(self, text: str, slot, keys=()) -> QPushButton:
+    def _add_tsum_button(self, text: str, slot, keys=(), accent: bool = False) -> QPushButton:
         button = QPushButton(text)
         font = button.font()
         point = font.pointSize()
@@ -3582,6 +3588,11 @@ class MenuWindow(QMainWindow):
         button.setMinimumHeight(metrics.height() * 2)
         button.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         button.setAutoDefault(False)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        if accent:
+            button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
+        else:
+            button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#A4C6FF"))
 
         def activate(b=button, s=slot) -> None:
             self._show_tsum_press(b, s)
@@ -3624,14 +3635,10 @@ class MenuWindow(QMainWindow):
         label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         label.setContentsMargins(0, 0, 0, label.fontMetrics().height() // 2)
         self._tsum_prompt = label
-        self._tsum_blink_on = True
-        self._paint_tsum_prompt()
-        if self._tsum_blink_timer is None:
-            timer = QTimer(self)
-            timer.setInterval(500)
-            timer.timeout.connect(self._toggle_tsum_prompt)
-            self._tsum_blink_timer = timer
-        self._tsum_blink_timer.start()
+        point = self._tsum_prompt_pt
+        label.setStyleSheet(
+            f"color: #17233f; font-weight: 700; font-size: {point}pt; background: transparent;"
+        )
         return label
 
     def _toggle_tsum_prompt(self) -> None:
@@ -3657,6 +3664,7 @@ class MenuWindow(QMainWindow):
                 self._tsum_button_text("はい", "Enter"),
                 lambda: self._accept_used_tsum(guess, None),
                 (Qt.Key.Key_Return, Qt.Key.Key_Enter),
+                accent=True,
             ),
             self._add_tsum_button(
                 self._tsum_button_text("いいえ", "N"),
@@ -3702,7 +3710,7 @@ class MenuWindow(QMainWindow):
         below.setFixedHeight(gap)
         layout.addWidget(below)
         buttons = (
-            self._add_tsum_button("これにします", self._accept_listed_tsum),
+            self._add_tsum_button("これにします", self._accept_listed_tsum, accent=True),
             self._add_tsum_button("やめる", self._cancel_used_tsum),
         )
         width = max(button.minimumWidth() for button in buttons)
