@@ -2722,7 +2722,7 @@ class MenuWindow(QMainWindow):
             count_line.addWidget(count_button)
             self._count_buttons.append(count_button)
         grid.addWidget(count_row, 2, 0, Qt.AlignmentFlag.AlignLeft)
-        outer.addWidget(holder, 0, Qt.AlignmentFlag.AlignHCenter)
+        outer.addWidget(holder, 0, Qt.AlignmentFlag.AlignLeft)
         outer.addStretch(1)
         outer.addWidget(
             stop_hint,
@@ -4436,10 +4436,7 @@ class MenuWindow(QMainWindow):
         body = getattr(self, "_tsum_body", None)
         if blank is None or host is None or body is None or blank.width() < 1:
             return
-        left = blank.mapTo(host, blank.rect().topLeft()).x()
-        if left < 0:
-            left = 0
-        body.setContentsMargins(left, TITLE_MARGIN, 0, 0)
+        body.setContentsMargins(0, TITLE_MARGIN, 0, 0)
 
     def _fit_center(self) -> None:
         slot = self._center_slot
