@@ -1509,7 +1509,7 @@ class MenuWindow(QMainWindow):
             if number == 3:
                 label = "ハートを送る"
             elif number == 4:
-                label = "GPUオン" if _gpu_on() else "GPUオフ"
+                label = "GPU" if _gpu_on() else "CPUのみ"
             elif number == 5:
                 label = "SHOW DATA"
             elif number == 6:
@@ -3099,24 +3099,13 @@ class MenuWindow(QMainWindow):
         self.gpu_present.emit(_prediction_gpu())
 
     def _apply_gpu_presence(self, present: bool) -> None:
-        if present:
-            return
-        button = self._gpu_button
-        if button is None:
-            return
-        button.blockSignals(True)
-        button.setEnabled(False)
-        button.setChecked(False)
-        button.setText("GPUなし")
-        button.setStyleSheet(_side_button_style("#ffffff", "#FF5192", "#FF5192"))
-        button.blockSignals(False)
-        self._fit_top_square()
+        return
 
     def _set_gpu(self, on: bool) -> None:
         QSettings("workshop", "AutoPlay").setValue("use_gpu", bool(on))
         button = self._gpu_button
         if button is not None:
-            button.setText("GPUオン" if on else "GPUオフ")
+            button.setText("GPU" if on else "CPUのみ")
             button.setStyleSheet(_gpu_button_style(on))
         self._fit_top_square()
 
