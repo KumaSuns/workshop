@@ -14,7 +14,6 @@ SAMPLE_H = 90
 BOOT_TIMEOUT = 120
 FLOW_TIMEOUT = 180
 PRE_CLICK_WAIT = 1.2
-TAP_GAP = 0.55
 DIALOG_STABLE = 3
 VIDEO_STABLE = 5
 START_STABLE = 3
@@ -240,8 +239,6 @@ def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -
 
 def _slow_tap(x: int, y: int) -> None:
     time.sleep(PRE_CLICK_WAIT)
-    tap(x, y)
-    time.sleep(TAP_GAP)
     tap(x, y)
 
 
