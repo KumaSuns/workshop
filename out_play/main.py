@@ -4375,8 +4375,17 @@ class MenuWindow(QMainWindow):
             metrics = self._square_side_buttons[0].fontMetrics()
             pad = metrics.height() + metrics.horizontalAdvance("ああ")
         side_w = row
+        gpu_button = getattr(self, "_gpu_button", None)
         for button in self._square_side_buttons:
-            side_w = max(side_w, button.sizeHint().width() + pad)
+            hint = button.sizeHint().width()
+            if button is gpu_button:
+                saved = button.text()
+                button.setText("CPUのみ")
+                hint = max(hint, button.sizeHint().width())
+                button.setText("GPU")
+                hint = max(hint, button.sizeHint().width())
+                button.setText(saved)
+            side_w = max(side_w, hint + pad)
         if TITLE_MARGIN + side > usable_h:
             side = max(1, usable_h - TITLE_MARGIN)
             row = max(1, side * 4 // 25)
