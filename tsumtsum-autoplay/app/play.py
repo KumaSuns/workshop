@@ -403,7 +403,7 @@ def run_play(
 
     if start_match:
         _seen, _locked, arrived, seen_tsum, start_items = _click_start_or_continue(
-            say, stop, tap_start=False
+            say, stop, tap_start=False, predictor=loaded_predictor[0]
         )
         if seen_tsum:
             used_tsum = seen_tsum
@@ -2531,7 +2531,7 @@ def run_play(
                 earned_now[0] = shown_money["coin"]
                 publish_confused()
                 if not again:
-                    _replay_after_timeup(say, stop, stop_at_start=True)
+                    _replay_after_timeup(say, stop, stop_at_start=True, predictor=predictor)
                     _commit_earned(
                         shown_money["coin"],
                         saved_ok,
@@ -2548,7 +2548,7 @@ def run_play(
                     stop_watch.set()
                     watching.clear()
                     return
-                _seen, replay_items = _replay_after_timeup(say, stop)
+                _seen, replay_items = _replay_after_timeup(say, stop, predictor=predictor)
                 _commit_earned(
                     shown_money["coin"],
                     saved_ok,
@@ -2629,7 +2629,8 @@ def run_play(
                             and abs(point[1] - last_close_at[1]) < image.height() * 0.08
                         )
                         if same_close:
-                            say("プレイを待っています")
+                            if _play_ready(rgb, predictor):
+                                say("プレイを待っています")
                             _sleep_stop(0.4, stop)
                             continue
                         say("とじるをクリックします")
@@ -2685,7 +2686,8 @@ def run_play(
                     _slow_tap(cancel.center().x(), cancel.center().y())
                     _sleep_stop(1.2, stop)
                     continue
-                say("プレイを待っています")
+                if _play_ready(rgb, predictor):
+                    say("プレイを待っています")
                 _sleep_stop(0.35, stop)
                 continue
             erased_now = False
@@ -3324,7 +3326,7 @@ def run_play(
                     earned_now[0] = shown_money["coin"]
                     publish_confused()
                     if not again:
-                        _replay_after_timeup(say, stop, stop_at_start=True)
+                        _replay_after_timeup(say, stop, stop_at_start=True, predictor=predictor)
                         _commit_earned(
                             shown_money["coin"],
                             saved_ok,
@@ -3341,7 +3343,7 @@ def run_play(
                         stop_watch.set()
                         watching.clear()
                         return
-                    _seen, replay_items = _replay_after_timeup(say, stop)
+                    _seen, replay_items = _replay_after_timeup(say, stop, predictor=predictor)
                     _commit_earned(
                         shown_money["coin"],
                         saved_ok,
@@ -4922,6 +4924,19 @@ def _stop_timeup_app() -> None:
         proc.kill()
 
 
+def _play_ready(rgb, predictor) -> bool:
+    if rgb is None or predictor is None:
+        return False
+    try:
+        with _gpu_lock:
+            boxes = predictor.predict_all(Path("."), rgb=rgb)
+    except Exception:
+        return False
+    if not isinstance(boxes, dict):
+        return False
+    return bool(boxes.get("fan") and boxes.get("skill") and boxes.get("timer"))
+
+
 def _money_digits(text: str) -> str:
     return "".join(char for char in str(text or "") if char.isdigit()).lstrip("0")
 
@@ -5334,7 +5349,7 @@ def _timer_still_running(rgb, timer: dict[str, int] | None) -> bool:
 
 
 def _replay_after_timeup(
-    say: StatusFn, stop: Event | None, stop_at_start: bool = False
+    say: StatusFn, stop: Event | None, stop_at_start: bool = False, predictor=None
 ) -> tuple[str, list[str] | None]:
     _seen, _locked, arrived, used_name, items = _click_start_or_continue(
         say,
@@ -5343,6 +5358,7 @@ def _replay_after_timeup(
         read_tsum=False,
         after_timeup=True,
         stop_at_start=stop_at_start,
+        predictor=predictor,
     )
     if arrived == "continue" and not stop_at_start:
         _tap_continue_now(say, stop)
@@ -5948,6 +5964,7 @@ def _click_start_or_continue(
     read_tsum: bool = True,
     after_timeup: bool = False,
     stop_at_start: bool = False,
+    predictor=None,
 ) -> tuple[int, bool, str, str, list[str] | None]:
     deadline = time.time() + 12
     kinds = 5
@@ -6046,7 +6063,9 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
                 deadline = max(deadline, time.time() + 12)
             else:
-                say("プレイを待っています")
+                frame = _qimage_rgb(image)
+                if _play_ready(frame, predictor):
+                    say("プレイを待っています")
                 _sleep_stop(0.4, stop)
             continue
         pause = _pause_continue_button(image)
@@ -6089,7 +6108,9 @@ def _click_start_or_continue(
                 and abs(point[1] - last_close_at[1]) < image.height() * 0.08
             )
             if same_close:
-                say("プレイを待っています")
+                frame = _qimage_rgb(image)
+                if _play_ready(frame, predictor):
+                    say("プレイを待っています")
                 _sleep_stop(0.4, stop)
                 continue
             say("とじるをクリックします")

@@ -209,7 +209,6 @@ def _dismiss_popups(say: StatusFn, deadline: float, stop: Event | None = None) -
             time.sleep(0.7)
             continue
         popup_hits = 0
-        say("プレイを待っています")
         time.sleep(0.35)
     raise TimeoutError("プレイが出ませんでした。")
 

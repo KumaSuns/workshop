@@ -2574,7 +2574,8 @@ def run_play(
                             and abs(point[1] - last_close_at[1]) < image.height() * 0.08
                         )
                         if same_close:
-                            say("プレイを待っています")
+                            if _play_ready(rgb, predictor):
+                                say("プレイを待っています")
                             _sleep_stop(0.4, stop)
                             continue
                         say("とじるをクリックします")
@@ -2624,7 +2625,8 @@ def run_play(
                     tap(cancel.center().x(), cancel.center().y())
                     _sleep_stop(1.2, stop)
                     continue
-                say("プレイを待っています")
+                if _play_ready(rgb, predictor):
+                    say("プレイを待っています")
                 _sleep_stop(0.35, stop)
                 continue
             erased_now = False
@@ -5303,6 +5305,19 @@ def _watch_money_screens(predictor, say: StatusFn, stop: Event | None) -> tuple[
     return shown["coin"], shown["result"]
 
 
+def _play_ready(rgb, predictor) -> bool:
+    if rgb is None or predictor is None:
+        return False
+    try:
+        with _gpu_lock:
+            boxes = predictor.predict_all(Path("."), rgb=rgb)
+    except Exception:
+        return False
+    if not isinstance(boxes, dict):
+        return False
+    return bool(boxes.get("fan") and boxes.get("skill") and boxes.get("timer"))
+
+
 def _live_board(image: QImage, rgb, predictor) -> bool:
     if image is None or image.isNull():
         return False
@@ -5960,7 +5975,9 @@ def _click_start_or_continue(
                 _sleep_stop(1.2, stop)
                 deadline = max(deadline, time.time() + 12)
             else:
-                say("プレイを待っています")
+                frame = _qimage_rgb(image)
+                if _play_ready(frame, predictor):
+                    say("プレイを待っています")
                 _sleep_stop(0.4, stop)
             continue
         pause = _pause_continue_button(image)
@@ -5996,7 +6013,9 @@ def _click_start_or_continue(
                 and abs(point[1] - last_close_at[1]) < image.height() * 0.08
             )
             if same_close:
-                say("プレイを待っています")
+                frame = _qimage_rgb(image)
+                if _play_ready(frame, predictor):
+                    say("プレイを待っています")
                 _sleep_stop(0.4, stop)
                 continue
             say("とじるをクリックします")
