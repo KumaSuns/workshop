@@ -4465,7 +4465,10 @@ class MenuWindow(QMainWindow):
             else:
                 button.setFixedSize(button_w, tall)
         if self._center_input is not None:
-            self._center_input.setFixedSize(width, tall)
+            input_metrics = self._center_input.fontMetrics()
+            input_w = input_metrics.horizontalAdvance("00") + input_metrics.height() + 28
+            input_w = max(width, input_w)
+            self._center_input.setFixedSize(input_w, tall)
             field = self._center_input.lineEdit()
             if field is not None:
                 field.setAlignment(Qt.AlignmentFlag.AlignCenter)
