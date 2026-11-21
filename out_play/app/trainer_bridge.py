@@ -347,7 +347,7 @@ except Exception:
     except OSError as exc:
         return str(exc).strip() or "モデルをRadeonへ移す試しを開始できませんでした。"
     if result.returncode == 0:
-        return "モデルをRadeonへ移す試しは成功しました。プレイはCPUのままです。"
+        return "モデルをRadeonへ移す試しは成功しました。"
     text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
     tail = text[-400:] if text else "出力はありません。"
     return f"終了コード {result.returncode}\n{tail}"
@@ -359,6 +359,13 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
     if _python_code("import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)") == 0:
         return "cuda", ""
     if not DIRECTML_DEVICE:
+        runtime = _runtime_python()
+        on_runtime = Path(sys.executable).resolve().parent == runtime.resolve().parent
+        if on_runtime and _python_code("import torch_directml") == 0:
+            device = _directml_device()
+            if device is not None:
+                return device, ""
+            return "cpu", _directml_device.last_error or "DirectMLの装置がありません"
         if report is not None:
             report("Radeonへ移す試し")
         install_note = ""
@@ -374,11 +381,19 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
                 prepared = _ensure_python312(report)
                 if prepared:
                     install_note = prepared if not install_note else install_note + "\n" + prepared
-                runtime = _runtime_python()
                 if runtime.is_file():
                     exe = str(runtime)
         probed = _directml_probe(exe)
-        if install_note and "成功しました" not in probed:
+        if "成功しました" in probed:
+            if Path(exe).resolve() == Path(_python_exe()).resolve():
+                device = _directml_device()
+                if device is not None:
+                    return device, ""
+            window = Path(exe).with_name("pythonw.exe")
+            if report is not None:
+                report("Radeonで予測するため、起動し直します。")
+            _relaunch_with(window if window.is_file() else Path(exe))
+        if install_note:
             probed = install_note + "\n" + probed
         return "cpu", probed
     if not _python_can_directml():
