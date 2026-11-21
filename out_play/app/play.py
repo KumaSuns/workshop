@@ -2336,16 +2336,9 @@ def run_play(
                 continue
             if saw_board:
                 played_once = True
-            if not saw_board and not on_pause and _play_ready(rgb, predictor):
-                saw_board = True
-                match_over = False
-                kinds_locked = True
-                arm_timeup()
-                if go_at is None:
-                    go_at = time.time()
             live = False
             if not saw_board and not on_pause:
-                live = _live_board(image, rgb, predictor) or _play_ready(rgb, predictor)
+                live = _live_board(image, rgb, predictor)
             if on_mission and not live:
                 before_start[0] = True
             elif saw_board or live:
@@ -2620,7 +2613,7 @@ def run_play(
                     if _tap_start_or_continue(image, say, stop):
                         continue
                 play = None if image.isNull() else _home_play_button(image)
-                if play is not None and not _play_ready(rgb, predictor):
+                if play is not None:
                     say("プレイをクリックします")
                     last_close_at = None
                     _slow_tap(play.center().x(), play.center().y())
@@ -5929,10 +5922,7 @@ def _click_start_or_continue(
         if image.isNull():
             _sleep_stop(0.4, stop)
             continue
-        frame_rgb = _qimage_rgb(image)
-        if predictor is not None and (
-            _live_board(image, frame_rgb, predictor) or _play_ready(frame_rgb, predictor)
-        ):
+        if predictor is not None and _live_board(image, _qimage_rgb(image), predictor):
             _seen_model()
             return kinds, locked, "", used_name, items
         used = _five_to_four_used_path(path)
