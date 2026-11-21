@@ -1474,8 +1474,13 @@ class MenuWindow(QMainWindow):
         self._tsum_body = QVBoxLayout()
         self._tsum_body.setContentsMargins(0, 0, 0, 0)
         self._tsum_body.setSpacing(0)
+        self._pc_panel = QFrame()
+        _soft_box(self._pc_panel)
+        panel_column = QVBoxLayout(self._pc_panel)
+        panel_column.setContentsMargins(0, 0, 0, 0)
+        panel_column.setSpacing(0)
         self._center_square = QFrame()
-        _soft_box(self._center_square)
+        self._center_square.setStyleSheet("background: #ffffff; border: none;")
         self._square_scroll = QScrollArea(self._center_square)
         self._square_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._square_scroll.setWidgetResizable(False)
@@ -1488,17 +1493,14 @@ class MenuWindow(QMainWindow):
         self._square_qr.setMargin(TITLE_MARGIN // 2)
         self._square_qr.setStyleSheet("background: #ffffff; color: #17233f;")
         self._square_scroll.setWidget(self._square_qr)
-        square_column = QVBoxLayout()
-        square_column.setContentsMargins(0, 0, 0, 0)
-        square_column.setSpacing(0)
-        square_column.addWidget(
+        panel_column.addWidget(
             self._center_square,
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
-        side_column = QVBoxLayout()
-        side_column.setContentsMargins(0, 2, 0, 2)
-        side_column.setSpacing(2)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 2)
+        button_row.setSpacing(2)
         self._square_side_buttons = []
         for number in range(2, 7):
             if number == 2:
@@ -1515,6 +1517,10 @@ class MenuWindow(QMainWindow):
                 label = str(number)
             button = QPushButton(label)
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            button_font = button.font()
+            if button_font.pointSize() > 1:
+                button_font.setPointSize(button_font.pointSize() - 1)
+                button.setFont(button_font)
             button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
             if number == 5:
                 button.clicked.connect(self._show_play_data)
@@ -1529,18 +1535,19 @@ class MenuWindow(QMainWindow):
                 button.setStyleSheet(_gpu_button_style(_gpu_on()))
                 button.toggled.connect(self._set_gpu)
                 self._gpu_button = button
-            side_column.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            button_row.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self._square_side_buttons.append(button)
-        square_row = QHBoxLayout()
-        square_row.setContentsMargins(0, 0, 0, 0)
-        square_row.setSpacing(0)
-        square_row.addLayout(square_column)
-        square_row.addLayout(side_column)
-        square_row.setAlignment(side_column, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self._tsum_body.addLayout(square_row)
+        button_row.addStretch(1)
+        self._tsum_body.addLayout(button_row)
         self._resource_meter = self._build_resource_meter()
-        self._tsum_body.addWidget(
+        self._resource_meter.setStyleSheet("background: transparent; border: none;")
+        panel_column.addWidget(
             self._resource_meter,
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
+        self._tsum_body.addWidget(
+            self._pc_panel,
             0,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
         )
@@ -4378,20 +4385,27 @@ class MenuWindow(QMainWindow):
         body = self._tsum_body
         if body is not None:
             body.setContentsMargins(gap, TITLE_MARGIN, 0, 0)
-        square.setFixedSize(side, side)
-        buttons_h = 0
+        panel_w = max(side + side_w, usable_w - gap)
+        square.setFixedSize(panel_w, side)
+        panel = getattr(self, "_pc_panel", None)
+        if panel is not None:
+            panel.setFixedWidth(panel_w)
+        button_h = max(1, row * 11 // 12)
         count = len(self._square_side_buttons)
+        button_w = side_w
         if count:
-            buttons_h = count * row + 2 * (count - 1) + 4
+            fitted = (panel_w - 2 * (count - 1)) // count
+            if fitted > 1:
+                button_w = min(side_w, fitted)
         meter = getattr(self, "_resource_meter", None)
         meter_h = 0
         if meter is not None:
-            meter.setFixedWidth(max(side + side_w, usable_w - gap))
+            meter.setFixedWidth(panel_w)
             meter_h = meter.sizeHint().height()
         if self._slots:
-            self._slots[0].setFixedHeight(max(side, buttons_h) + TITLE_MARGIN + meter_h)
+            self._slots[0].setFixedHeight(button_h + 2 + side + TITLE_MARGIN + meter_h)
         for button in self._square_side_buttons:
-            button.setFixedSize(side_w, row)
+            button.setFixedSize(button_w, button_h)
         self._paint_square_qr()
         self._fit_center()
 
@@ -4406,10 +4420,9 @@ class MenuWindow(QMainWindow):
             return
         button_w = width * 3 // 2
         tall = 0
-        for button in getattr(self, "_square_side_buttons", []):
-            if button.text() == "ハートを送る" and button.height() > 1:
-                tall = button.height()
-                break
+        square = self._center_square
+        if square is not None and square.height() > 1:
+            tall = max(1, square.height() * 4 // 25)
         if tall < 1:
             tall = height
         end_button = self._end_play_button
