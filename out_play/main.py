@@ -3136,18 +3136,27 @@ class MenuWindow(QMainWindow):
             ("app_mb", "アプリ"),
             ("app_cpu", "アプリCPU"),
         )
+        name_width = 0
+        value_width = 0
+        sample_font = QFontMetrics(QApplication.font())
+        for _key, title in names:
+            name_width = max(name_width, sample_font.horizontalAdvance(title))
+        value_width = max(
+            sample_font.horizontalAdvance("psutil がありません"),
+            sample_font.horizontalAdvance("00.0 / 00.0 GB  100%"),
+        )
         for key, title in names:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(4)
             name = QLabel(title)
+            name.setFixedWidth(name_width)
+            name.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             name.setStyleSheet("color: #17233f; background: transparent;")
             value = QLabel("—")
+            value.setFixedWidth(value_width)
             value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             value.setStyleSheet("color: #17233f; background: transparent;")
-            wide = value.fontMetrics().horizontalAdvance("psutil がありません")
-            wide = max(wide, value.fontMetrics().horizontalAdvance("00.0 / 00.0 GB  100%"))
-            value.setMinimumWidth(wide)
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(0)
