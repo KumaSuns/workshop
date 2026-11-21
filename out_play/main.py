@@ -2842,6 +2842,7 @@ class MenuWindow(QMainWindow):
 
     def _on_play_done(self) -> None:
         self._set_end_play_blink(False)
+        self._set_autoplay_blink(False)
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
         self._play_current = None
@@ -2916,6 +2917,35 @@ class MenuWindow(QMainWindow):
         self._set_end_play_blink(True)
         self._set_activity("このプレイでやめます")
 
+    def _set_autoplay_blink(self, on: bool) -> None:
+        button = self._autoplay_button
+        timer = getattr(self, "_autoplay_blink", None)
+        if not on:
+            if timer is not None:
+                timer.stop()
+            if button is not None:
+                button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
+            return
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(500)
+            timer.timeout.connect(self._tick_autoplay_blink)
+            self._autoplay_blink = timer
+            self._autoplay_blink_on = False
+        self._autoplay_blink_on = False
+        self._tick_autoplay_blink()
+        timer.start()
+
+    def _tick_autoplay_blink(self) -> None:
+        button = self._autoplay_button
+        if button is None:
+            return
+        self._autoplay_blink_on = not getattr(self, "_autoplay_blink_on", False)
+        if self._autoplay_blink_on:
+            button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
+        else:
+            button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#bdbdbd"))
+
     def _set_end_play_blink(self, on: bool) -> None:
         button = self._end_play_button
         timer = getattr(self, "_end_play_blink", None)
@@ -2952,6 +2982,7 @@ class MenuWindow(QMainWindow):
             return
         self._stopped_by_key = True
         self._autoplay_alive = False
+        self._set_autoplay_blink(False)
         if not self._play_stop.is_set():
             self._play_stop.set()
             if self._intro is not None and self._intro.isRunning():
@@ -2985,6 +3016,7 @@ class MenuWindow(QMainWindow):
 
     def _on_play_stopped(self) -> None:
         self._set_end_play_blink(False)
+        self._set_autoplay_blink(False)
         self._autoplay_alive = False
         self._unregister_stop_hotkey()
         self._play_current = None
@@ -3697,6 +3729,7 @@ class MenuWindow(QMainWindow):
             return
         if self._autoplay_button is not None:
             self._autoplay_button.setEnabled(False)
+        self._set_autoplay_blink(True)
         self._external_play = "システム起動"
         self._external_tsum_line = ""
         self._external_result = ""
@@ -3710,6 +3743,7 @@ class MenuWindow(QMainWindow):
     def _on_items_checked(self, payload: object) -> None:
         self._item_check = None
         if self._play_stop.is_set() or not self._autoplay_alive:
+            self._set_autoplay_blink(False)
             if self._autoplay_button is not None:
                 self._autoplay_button.setEnabled(True)
             self._clear_external_phase()
@@ -3722,6 +3756,7 @@ class MenuWindow(QMainWindow):
         ok, games = self._game_count()
         if not ok:
             self._autoplay_alive = False
+            self._set_autoplay_blink(False)
             self._clear_external_phase()
             self._set_activity("プレイするゲーム数がありません。")
             QMessageBox.information(self, "オートプレイ", "プレイするゲーム数がありません。")
@@ -3756,6 +3791,7 @@ class MenuWindow(QMainWindow):
     def _on_play_api_fail(self, message: str) -> None:
         self._play_api_load = None
         self._autoplay_alive = False
+        self._set_autoplay_blink(False)
         self._clear_external_phase()
         text = str(message or "プレイの準備に失敗しました。")
         self._set_activity(text)
@@ -3771,6 +3807,7 @@ class MenuWindow(QMainWindow):
 
     def _on_intro_fail(self, message: str) -> None:
         self._autoplay_alive = False
+        self._set_autoplay_blink(False)
         self._unregister_stop_hotkey()
         self._clear_external_phase()
         self._set_activity(message)
@@ -3779,6 +3816,7 @@ class MenuWindow(QMainWindow):
 
     def _on_play_fail(self, message: str) -> None:
         self._autoplay_alive = False
+        self._set_autoplay_blink(False)
         self._unregister_stop_hotkey()
         self._play_current = None
         self._show_play_count()
