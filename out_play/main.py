@@ -3575,7 +3575,7 @@ class MenuWindow(QMainWindow):
         count = max(1, round(gap / space)) if space else 1
         return label + (" " * count) + f"({key})"
 
-    def _add_tsum_button(self, text: str, slot, keys=()) -> QPushButton:
+    def _add_tsum_button(self, text: str, slot, keys=(), confirm: bool = False) -> QPushButton:
         button = QPushButton(text)
         font = button.font()
         point = font.pointSize()
@@ -3590,6 +3590,7 @@ class MenuWindow(QMainWindow):
         button.setAutoDefault(False)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#A4C6FF"))
+        button.setProperty("confirm", confirm)
 
         def activate(b=button, s=slot) -> None:
             self._show_tsum_press(b, s)
@@ -3609,6 +3610,8 @@ class MenuWindow(QMainWindow):
         if button.property("pressing"):
             return
         button.setProperty("pressing", True)
+        if button.property("confirm"):
+            button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
         button.setDown(True)
         QTimer.singleShot(200, lambda b=button, s=slot: self._finish_tsum_press(b, s))
 
@@ -3661,6 +3664,7 @@ class MenuWindow(QMainWindow):
                 self._tsum_button_text("はい", "Enter"),
                 lambda: self._accept_used_tsum(guess, None),
                 (Qt.Key.Key_Return, Qt.Key.Key_Enter),
+                confirm=True,
             ),
             self._add_tsum_button(
                 self._tsum_button_text("いいえ", "N"),
