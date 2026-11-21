@@ -4384,9 +4384,20 @@ class MenuWindow(QMainWindow):
         if body is not None:
             body.setContentsMargins(0, TITLE_MARGIN, 0, 0)
         panel_w = usable_w
+        view = host.parentWidget()
+        while view is not None and not isinstance(view, QScrollArea):
+            view = view.parentWidget()
+        if isinstance(view, QScrollArea):
+            port = view.viewport()
+            left = host.mapTo(port, host.contentsRect().topLeft()).x()
+            room = port.width() - max(0, left)
+            if room > 1:
+                panel_w = min(panel_w, room)
         square.setFixedSize(panel_w, side)
         panel = getattr(self, "_pc_panel", None)
         if panel is not None:
+            panel.setMinimumWidth(0)
+            panel.setMaximumWidth(panel_w)
             panel.setFixedWidth(panel_w)
         button_h = max(1, row * 11 // 12)
         count = len(self._square_side_buttons)
@@ -4398,6 +4409,8 @@ class MenuWindow(QMainWindow):
         meter = getattr(self, "_resource_meter", None)
         meter_h = 0
         if meter is not None:
+            meter.setMinimumWidth(0)
+            meter.setMaximumWidth(panel_w)
             meter.setFixedWidth(panel_w)
             meter_h = meter.sizeHint().height()
         if self._slots:
