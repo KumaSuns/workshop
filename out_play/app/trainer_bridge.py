@@ -311,6 +311,8 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
         return "cpu", ""
     if _python_code("import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)") == 0:
         return "cuda", ""
+    if not DIRECTML_DEVICE:
+        return "cpu", ""
     if not _python_can_directml():
         note = _switch_to_python312(report)
         if Path(sys.executable).resolve() == _runtime_python().resolve():
@@ -319,8 +321,6 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
                 return device, ""
             return "cpu", note or _directml_device.last_error or "DirectMLの装置がありません"
         return "cpu", note
-    if not DIRECTML_DEVICE:
-        return "cpu", ""
     device = _directml_device()
     install_error = ""
     if device is None:
