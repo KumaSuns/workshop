@@ -889,6 +889,67 @@ def _sample(image: QImage) -> list[list[tuple[int, int, int]]]:
     return rows
 
 
+def _dice_board(image: QImage) -> bool:
+    if image.isNull() or image.width() < 40 or image.height() < 40:
+        return False
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width < 8 or height < 8:
+        return False
+
+    def luma(pixel: tuple[int, int, int]) -> float:
+        return 0.299 * pixel[0] + 0.587 * pixel[1] + 0.114 * pixel[2]
+
+    def ratio(y0: int, y1: int, x0: int, x1: int, match) -> float:
+        total = 0
+        hit = 0
+        for y in range(y0, y1):
+            row = sample[y]
+            for x in range(x0, x1):
+                total += 1
+                if match(row[x]):
+                    hit += 1
+        return hit / total if total else 0.0
+
+    dark = lambda pixel: luma(pixel) < 50
+    if ratio(0, max(1, height // 10), 0, width, dark) < 0.7:
+        return False
+    if ratio(int(height * 0.85), height, 0, width, dark) < 0.7:
+        return False
+    cream = ratio(
+        int(height * 0.16),
+        int(height * 0.30),
+        int(width * 0.2),
+        int(width * 0.8),
+        lambda pixel: (
+            pixel[0] > 180
+            and pixel[1] > 160
+            and pixel[2] > 120
+            and pixel[0] > pixel[2]
+            and abs(pixel[0] - pixel[1]) < 50
+        ),
+    )
+    if cream < 0.35:
+        return False
+    board = ratio(
+        int(height * 0.32),
+        int(height * 0.62),
+        int(width * 0.25),
+        int(width * 0.75),
+        lambda pixel: (
+            (pixel[1] > 140 and pixel[1] > pixel[0] + 15 and pixel[1] > pixel[2])
+            or (
+                pixel[0] > 190
+                and pixel[1] > 160
+                and pixel[2] < 140
+                and pixel[0] + 30 > pixel[1]
+            )
+        ),
+    )
+    return board >= 0.25
+
+
 def _mean_luma(rows: list[list[tuple[int, int, int]]]) -> float:
     total = 0.0
     count = 0

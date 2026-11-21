@@ -1213,14 +1213,22 @@ def _dice_board(image: QImage) -> bool:
     )
     if cream < 0.35:
         return False
-    green = ratio(
+    board = ratio(
         int(height * 0.32),
         int(height * 0.62),
         int(width * 0.25),
         int(width * 0.75),
-        lambda pixel: pixel[1] > 140 and pixel[1] > pixel[0] + 15 and pixel[1] > pixel[2],
+        lambda pixel: (
+            (pixel[1] > 140 and pixel[1] > pixel[0] + 15 and pixel[1] > pixel[2])
+            or (
+                pixel[0] > 190
+                and pixel[1] > 160
+                and pixel[2] < 140
+                and pixel[0] + 30 > pixel[1]
+            )
+        ),
     )
-    return green >= 0.25
+    return board >= 0.25
 
 
 def _mean_luma(rows: list[list[tuple[int, int, int]]]) -> float:
