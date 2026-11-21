@@ -360,7 +360,15 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
     if not DIRECTML_DEVICE:
         if report is not None:
             report("Radeonへ移す試し")
-        return "cpu", _directml_probe()
+        install_note = ""
+        if _python_code("import torch_directml") != 0:
+            if report is not None:
+                report("Radeon用の部品を入れています")
+            install_note = _install_directml()
+        probed = _directml_probe()
+        if install_note and "成功しました" not in probed:
+            probed = install_note + "\n" + probed
+        return "cpu", probed
     if not _python_can_directml():
         note = _switch_to_python312(report)
         if Path(sys.executable).resolve() == _runtime_python().resolve():
