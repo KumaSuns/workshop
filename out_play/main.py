@@ -1471,11 +1471,18 @@ class MenuWindow(QMainWindow):
         self._tsum_body.setSpacing(0)
         self._center_square = QFrame()
         _soft_box(self._center_square)
-        self._square_qr = QLabel(self._center_square)
+        self._square_scroll = QScrollArea(self._center_square)
+        self._square_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._square_scroll.setWidgetResizable(False)
+        self._square_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._square_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._square_scroll.setStyleSheet("QScrollArea { background: #ffffff; border: none; }")
+        self._square_qr = QLabel()
         self._square_qr.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self._square_qr.setWordWrap(True)
         self._square_qr.setMargin(TITLE_MARGIN // 2)
-        self._square_qr.setScaledContents(False)
+        self._square_qr.setStyleSheet("background: #ffffff; color: #17233f;")
+        self._square_scroll.setWidget(self._square_qr)
         square_column = QVBoxLayout()
         square_column.setContentsMargins(0, 0, 0, 0)
         square_column.setSpacing(0)
@@ -3255,17 +3262,22 @@ class MenuWindow(QMainWindow):
     def _paint_square_qr(self) -> None:
         label = self._square_qr
         square = self._center_square
-        if label is None or square is None:
+        scroll = getattr(self, "_square_scroll", None)
+        if label is None or square is None or scroll is None:
             return
         rect = square.contentsRect()
         if rect.width() < 1 or rect.height() < 1:
             rect = square.rect()
-        label.setGeometry(rect)
+        scroll.setGeometry(rect)
         label.setPixmap(QPixmap())
         if self._predict_lines:
             label.setText("\n".join(self._predict_lines) + "\n\n" + self._pc_status)
         else:
             label.setText(self._pc_status)
+        bar = scroll.verticalScrollBar().sizeHint().width()
+        width = max(1, rect.width() - bar)
+        label.setFixedWidth(width)
+        label.adjustSize()
 
     def _ask_external_pin(self) -> str | None:
         dialog = QDialog(self)
