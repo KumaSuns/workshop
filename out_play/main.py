@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import ctypes
 import threading
 import time
 import urllib.error
@@ -702,7 +703,7 @@ class _ExternalPoll(QThread):
                 self.msleep(100)
 
 
-def _resource_sample(psutil, proc) -> dict:
+def _resource_sample(psutil, proc, gpu_reader) -> dict:
     cpu = psutil.cpu_percent(interval=None)
     virtual = psutil.virtual_memory()
     total_gb = virtual.total / (1024 ** 3)
@@ -725,8 +726,17 @@ def _resource_sample(psutil, proc) -> dict:
         "disk_free_gb": disk_free_gb,
         "app_mb": proc.memory_info().rss / (1024 ** 2),
         "app_cpu": float(proc.cpu_percent(interval=None)),
-        "gpu": _nvidia_gpu_percent(),
+        "gpu": _gpu_percent(gpu_reader),
     }
+
+
+def _gpu_percent(gpu_reader):
+    nvidia = _nvidia_gpu_percent()
+    if nvidia is not None:
+        return nvidia
+    if gpu_reader is None:
+        return None
+    return gpu_reader.percent()
 
 
 _nvidia_missing = False
@@ -762,6 +772,90 @@ def _nvidia_gpu_percent():
         return max(0.0, min(100.0, float(lines[0].split()[0])))
     except ValueError:
         return None
+
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [
+        ("CStatus", ctypes.c_ulong),
+        ("_pad", ctypes.c_ulong),
+        ("doubleValue", ctypes.c_double),
+    ]
+
+
+class _PDH_FMT_COUNTERVALUE_ITEM(ctypes.Structure):
+    _fields_ = [
+        ("szName", ctypes.c_wchar_p),
+        ("FmtValue", _PDH_FMT_COUNTERVALUE),
+    ]
+
+
+class _WinGpuUse:
+    def __init__(self) -> None:
+        self._query = None
+        self._counter = None
+        self._failed = sys.platform != "win32"
+        self._primed = False
+
+    def open(self) -> bool:
+        if self._failed or self._query is not None:
+            return not self._failed
+        pdh = ctypes.windll.pdh
+        query = ctypes.c_void_p()
+        counter = ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+            self._failed = True
+            return False
+        path = "\\GPU Engine(*)\\Utilization Percentage"
+        if pdh.PdhAddEnglishCounterW(query, path, 0, ctypes.byref(counter)) != 0:
+            pdh.PdhCloseQuery(query)
+            self._failed = True
+            return False
+        self._query = query
+        self._counter = counter
+        self.percent()
+        return True
+
+    def close(self) -> None:
+        query = self._query
+        self._query = None
+        self._counter = None
+        if query is not None:
+            ctypes.windll.pdh.PdhCloseQuery(query)
+
+    def percent(self):
+        if self._failed or self._query is None or self._counter is None:
+            return None
+        pdh = ctypes.windll.pdh
+        if pdh.PdhCollectQueryData(self._query) != 0:
+            self._failed = True
+            return None
+        if not self._primed:
+            self._primed = True
+            return None
+        size = ctypes.c_ulong(0)
+        count = ctypes.c_ulong(0)
+        status = pdh.PdhGetFormattedCounterArrayW(
+            self._counter, 0x00000200, ctypes.byref(size), ctypes.byref(count), None
+        )
+        if size.value <= 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        status = pdh.PdhGetFormattedCounterArrayW(
+            self._counter, 0x00000200, ctypes.byref(size), ctypes.byref(count), buf
+        )
+        if status != 0:
+            return None
+        items = ctypes.cast(buf, ctypes.POINTER(_PDH_FMT_COUNTERVALUE_ITEM))
+        total = 0.0
+        any_engine = 0.0
+        for index in range(int(count.value)):
+            name = items[index].szName or ""
+            value = float(items[index].FmtValue.doubleValue)
+            any_engine += value
+            if "engtype_3d" in name.casefold():
+                total += value
+        used = total if total > 0 else any_engine
+        return max(0.0, min(100.0, used))
 
 
 def _load_psutil(report):
@@ -812,16 +906,19 @@ class _ResourcePoll(QThread):
         proc = psutil.Process()
         proc.cpu_percent(interval=None)
         psutil.cpu_percent(interval=None)
+        gpu_reader = _WinGpuUse()
+        gpu_reader.open()
         while not self._stopped:
             try:
-                sample = _resource_sample(psutil, proc)
+                sample = _resource_sample(psutil, proc, gpu_reader)
             except Exception:
                 sample = {"error": "使用状況を読めません"}
             self.ready.emit(sample)
             for _ in range(10):
                 if self._stopped:
-                    return
+                    break
                 self.msleep(100)
+        gpu_reader.close()
 
 
 class MenuWindow(QMainWindow):
