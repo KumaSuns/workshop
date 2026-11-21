@@ -2694,7 +2694,10 @@ def run_play(
                     if skill_pressed is not None and skill_pressed.is_set():
                         if apply_checker_skill(False):
                             continue
-            if getattr(getattr(predictor, "device", None), "type", "") == "cpu":
+            if (
+                getattr(getattr(predictor, "device", None), "type", "") == "cpu"
+                and not getattr(predictor, "piece_on_radeon", False)
+            ):
                 sample = _board_sample(rgb, game)
                 moving = _board_moving(still_sample[0], sample)
                 still_sample[0] = sample

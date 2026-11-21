@@ -504,7 +504,7 @@ class _RadeonPredict:
             "while True:\n"
             "    try:\n"
             "        header = json.loads(read_block().decode('utf-8'))\n"
-            "        image = Image.open(io.BytesIO(read_block())).convert('RGB')\n"
+            "        image = Image.frombytes('RGB', (int(header['w']), int(header['h'])), read_block())\n"
             "    except EOFError:\n"
             "        break\n"
             "    if header['op'] == 'pieces':\n"
@@ -542,11 +542,11 @@ class _RadeonPredict:
     def _ask(self, header: dict, rgb) -> dict:
         if self.proc is None or self.proc.poll() is not None or self.proc.stdin is None or self.proc.stdout is None:
             raise RuntimeError(self.error or "Radeonの予測が止まっています。")
-        buffer = io.BytesIO()
-        rgb.convert("RGB").save(buffer, format="PNG")
+        rgb = rgb.convert("RGB")
+        header["w"], header["h"] = rgb.size
         with self._lock:
             _block_write(self.proc.stdin, json.dumps(header).encode("utf-8"))
-            _block_write(self.proc.stdin, buffer.getvalue())
+            _block_write(self.proc.stdin, rgb.tobytes())
             return json.loads(_block_read(self.proc.stdout).decode("utf-8"))
 
     def bind(self, predictor) -> None:
@@ -581,6 +581,7 @@ class _RadeonPredict:
 
         predictor.predict_pieces = predict_pieces
         predictor.predict_all = predict_all
+        predictor.piece_on_radeon = True
 
 
 def _remember_device(predictor, note: str) -> None:
