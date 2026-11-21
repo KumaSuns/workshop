@@ -2379,6 +2379,15 @@ def run_play(
                     go_at = time.time()
                 resumed_pause = True
                 continue
+            if not saw_board and not on_pause and _play_ready(rgb, predictor):
+                ask_used_now(True)
+                saw_board = True
+                _clear_shown_money()
+                match_over = False
+                kinds_locked = True
+                arm_timeup()
+                if go_at is None:
+                    go_at = time.time()
             if on_mission:
                 before_start[0] = True
             elif saw_board:
@@ -2393,12 +2402,13 @@ def run_play(
                 go_at = None
                 watching.clear()
             elif not saw_board and not on_pause:
+                ready = _play_ready(rgb, predictor)
                 if go_at is None:
                     with _gpu_lock:
                         scene, _score = _scene_top(predictor, rgb)
                     if scene == "go":
                         go_at = time.time()
-                if go_at is not None or _in_play_hud(image):
+                if go_at is not None or _in_play_hud(image) or ready:
                     ask_used_now(True)
                     saw_board = True
                     _clear_shown_money()
@@ -2674,7 +2684,7 @@ def run_play(
                     if _tap_start_or_continue(image, say, stop):
                         continue
                 play = None if image.isNull() else _play_button(image)
-                if play is not None:
+                if play is not None and not _play_ready(rgb, predictor):
                     say("プレイをクリックします")
                     last_close_at = None
                     _slow_tap(play.center().x(), play.center().y())
@@ -5990,6 +6000,8 @@ def _click_start_or_continue(
             continue
         note_money = _scene_money_hook[0]
         rgb = _qimage_rgb(image)
+        if not stop_at_start and _play_ready(rgb, predictor):
+            return kinds, locked, "", used_name, items
         extend = _is_extend_dialog(image)
         if extend:
             stable_result = ""
