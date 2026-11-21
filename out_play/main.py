@@ -3102,7 +3102,9 @@ class MenuWindow(QMainWindow):
         return
 
     def _set_gpu(self, on: bool) -> None:
-        QSettings("workshop", "AutoPlay").setValue("use_gpu", bool(on))
+        settings = QSettings("workshop", "AutoPlay")
+        settings.setValue("use_gpu", bool(on))
+        settings.sync()
         button = self._gpu_button
         if button is not None:
             button.setText("GPU" if on else "CPUのみ")
@@ -4069,21 +4071,8 @@ class MenuWindow(QMainWindow):
             button.setDown(True)
             QTimer.singleShot(200, lambda b=button, s=slot: self._finish_tsum_press(b, s))
             return
-        state = {"on": False, "left": 4}
-
-        def tick(b=button, s=slot, hold=state) -> None:
-            if hold["left"] <= 0:
-                self._finish_tsum_press(b, s)
-                return
-            hold["on"] = not hold["on"]
-            hold["left"] -= 1
-            if hold["on"]:
-                b.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
-            else:
-                b.setStyleSheet(_side_button_style("#ffffff", "#17233f", "#A4C6FF"))
-            QTimer.singleShot(150, tick)
-
-        tick()
+        button.setStyleSheet(_side_button_style("#F0A202", "#17233f", "#C47E00"))
+        QTimer.singleShot(600, lambda b=button, s=slot: self._finish_tsum_press(b, s))
 
     def _finish_tsum_press(self, button: QPushButton, slot) -> None:
         button.setDown(False)
