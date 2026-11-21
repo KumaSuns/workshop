@@ -790,14 +790,90 @@ def _highscore_close_button(image: QImage) -> QRect | None:
     return min(pills, key=lambda rect: rect.center().y())
 
 
+def _has_levelup_panel(image: QImage) -> bool:
+    sample = _sample(image)
+    height = len(sample)
+    width = len(sample[0]) if sample else 0
+    if width == 0:
+        return False
+    cyan = False
+    for blob in _all_blobs(sample, _is_levelup_cyan):
+        xs = [point[0] for point in blob]
+        ys = [point[1] for point in blob]
+        box_w = max(xs) - min(xs) + 1
+        box_h = max(ys) - min(ys) + 1
+        cx = (min(xs) + max(xs)) / 2 / width
+        cy = (min(ys) + max(ys)) / 2 / height
+        if box_w < width * 0.45 or box_w > width * 0.95:
+            continue
+        if box_h < height * 0.04:
+            continue
+        if abs(cx - 0.5) > 0.20:
+            continue
+        if 0.45 <= cy <= 0.70:
+            cyan = True
+            break
+    if not cyan:
+        return False
+    gold = 0
+    top = int(height * 0.22)
+    bottom = int(height * 0.40)
+    left = int(width * 0.30)
+    right = int(width * 0.70)
+    for y in range(top, bottom):
+        for x in range(left, right):
+            red, green, blue = sample[y][x]
+            if red > 220 and green > 150 and blue < 180 and green > blue + 40:
+                gold += 1
+    return gold >= 12
+
+
+def _levelup_close_button(image: QImage) -> QRect | None:
+    """レベルアップ画面のとじる。"""
+    if image is None or image.isNull() or not _has_levelup_panel(image):
+        return None
+    height = image.height()
+    width = image.width()
+    pills = []
+    for pill in _yellow_pills(image):
+        if pill.width() < pill.height() * 1.5:
+            continue
+        if not height * 0.78 < pill.center().y() < height * 0.93:
+            continue
+        if abs(pill.center().x() - width / 2) > width * 0.22:
+            continue
+        if pill.width() < width * 0.25 or pill.width() > width * 0.60:
+            continue
+        if _is_daily_mission(image, pill):
+            continue
+        pills.append(pill)
+    if not pills:
+        return None
+    return max(pills, key=lambda rect: rect.width() * rect.height())
+
+
 def _close_button(image: QImage) -> QRect | None:
     mission_close = _mission_dialog_close(image)
     if mission_close is not None:
         return mission_close
+    levelup = _levelup_close_button(image)
+    if levelup is not None:
+        return levelup
     highscore = _highscore_close_button(image)
     if highscore is not None:
         return highscore
     return None
+
+
+def _is_levelup_cyan(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return (
+        red < 120
+        and green > 160
+        and blue > 180
+        and blue >= green - 25
+        and green > red + 50
+    )
 
 
 def _is_highscore_cyan(pixel: tuple[int, int, int]) -> bool:
