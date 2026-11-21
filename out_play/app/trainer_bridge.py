@@ -306,13 +306,61 @@ def _directml_name(device) -> str:
     return name or "Radeon"
 
 
+def _directml_probe() -> str:
+    code = r"""
+import sys, traceback
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "bundled" / "screen"))
+try:
+    import torch
+    import torch_directml
+    from app.piece_model import PieceNet, adapt_piece_state
+    device = torch_directml.device()
+    path = root / "bundled" / "screen" / "data" / "models" / "pieces.pt"
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    model = PieceNet(pretrained=False)
+    state = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    adapt_piece_state(model, state)
+    model.to(device)
+    print("ok")
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+"""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            [_python_exe(), "-c", code, str(APP_ROOT)],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=90,
+            creationflags=flags,
+        )
+    except subprocess.TimeoutExpired:
+        return "モデルをRadeonへ移す試しが90秒で終わりませんでした。"
+    except OSError as exc:
+        return str(exc).strip() or "モデルをRadeonへ移す試しを開始できませんでした。"
+    if result.returncode == 0:
+        return "モデルをRadeonへ移す試しは成功しました。プレイはCPUのままです。"
+    text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+    tail = text[-400:] if text else "出力はありません。"
+    return f"終了コード {result.returncode}\n{tail}"
+
+
 def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[object, str]:
     if not use_gpu():
         return "cpu", ""
     if _python_code("import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)") == 0:
         return "cuda", ""
     if not DIRECTML_DEVICE:
-        return "cpu", ""
+        if report is not None:
+            report("Radeonへ移す試し")
+        return "cpu", _directml_probe()
     if not _python_can_directml():
         note = _switch_to_python312(report)
         if Path(sys.executable).resolve() == _runtime_python().resolve():
