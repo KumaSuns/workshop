@@ -3839,6 +3839,35 @@ class MenuWindow(QMainWindow):
             )
         dialog.exec()
 
+    def _on_probe(self, text: str) -> None:
+        worker = self._play_worker
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Radeon")
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        dialog.resize(520, 360)
+        column = QVBoxLayout(dialog)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QLabel(text)
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        body.setStyleSheet("color: #17233f; background: #ffffff;")
+        scroll.setWidget(body)
+        column.addWidget(scroll, 1)
+        row = QHBoxLayout()
+        run = QPushButton("実行")
+        cancel = QPushButton("キャンセル")
+        row.addStretch(1)
+        row.addWidget(run)
+        row.addWidget(cancel)
+        column.addLayout(row)
+        run.clicked.connect(dialog.accept)
+        cancel.clicked.connect(dialog.reject)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if worker is not None:
+            worker.provide_probe(accepted)
+
     def _on_need_used_tsum(self, guess: str, path: str, pick_only: bool) -> None:
         worker = self._play_worker
         if worker is None:
@@ -5224,6 +5253,7 @@ def _start_match(window: MenuWindow) -> None:
     worker.play_progress.connect(window._on_play_progress)
     worker.items.connect(window._on_play_items)
     worker.need_used_tsum.connect(window._on_need_used_tsum)
+    worker.need_probe.connect(window._on_probe)
     worker.need_kinds.connect(window._on_need_kinds)
     worker.failed.connect(window._on_play_fail)
     worker.completed.connect(window._on_play_done)

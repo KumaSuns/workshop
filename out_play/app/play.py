@@ -165,6 +165,7 @@ class PlayWorker(QThread):
     flow = Signal(str)
     need_kinds = Signal()
     need_used_tsum = Signal(str, str, bool)
+    need_probe = Signal(str)
     recorded = Signal(object)
     play_progress = Signal(int, object)
     external_phase = Signal(str)
@@ -198,6 +199,8 @@ class PlayWorker(QThread):
         self._kinds_answer: int | None = None
         self._used_gate = Event()
         self._used_answer: str | None = None
+        self._probe_gate = Event()
+        self._probe_answer = False
         self.skill_pressed = Event()
         self.timeup_seen = Event()
         self.finish_after = Event()
@@ -215,6 +218,18 @@ class PlayWorker(QThread):
     def provide_used_tsum(self, name: str | None) -> None:
         self._used_answer = name
         self._used_gate.set()
+
+    def provide_probe(self, run: bool) -> None:
+        self._probe_answer = bool(run)
+        self._probe_gate.set()
+
+    def _request_probe(self, text: str) -> bool:
+        self._probe_gate.clear()
+        self._probe_answer = False
+        self.need_probe.emit(text)
+        while not self._probe_gate.wait(timeout=0.2):
+            _check_stop(self._stop)
+        return self._probe_answer
 
     def _request_kinds(self) -> int | None:
         self._kinds_gate.clear()
@@ -263,6 +278,7 @@ class PlayWorker(QThread):
                 show_progress=self.play_progress.emit,
                 note_board=lambda: self.external_phase.emit("board"),
                 note_end=lambda: self.external_phase.emit("end"),
+                request_probe=self._request_probe,
             )
         except Stopped:
             self.stopped.emit()
@@ -411,6 +427,7 @@ def run_play(
     show_progress: Callable[[int, int | None], None] | None = None,
     note_board: Callable[[], None] | None = None,
     note_end: Callable[[], None] | None = None,
+    request_probe: Callable[[str], bool] | None = None,
 ) -> None:
     global _flow_mark
     _flow_mark = mark
@@ -535,7 +552,11 @@ def run_play(
     say(f"予測デバイス {getattr(predictor, 'device_label', None) or predictor.device}")
     device_note = str(getattr(predictor, "device_note", "") or "")
     if device_note:
-        say(f"予測 {device_note}")
+        if request_probe is not None:
+            if not request_probe(device_note):
+                raise Stopped()
+        else:
+            say(f"予測 {device_note}")
     reset_swipe_mouse()
     unlike = load_unlike()
     skip_chains: list[frozenset[tuple[int, int]]] = []
