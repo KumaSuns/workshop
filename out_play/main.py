@@ -1400,7 +1400,7 @@ class MenuWindow(QMainWindow):
         above = QVBoxLayout(tsum_box)
         above.setContentsMargins(0, 0, 0, 0)
         above.setSpacing(0)
-        above.addWidget(self._section_title("使用ツム"))
+        above.addWidget(self._section_title("使用ツム", point=self._win_title_point()))
         self._used_tsum_icon = QLabel()
         self._used_tsum_icon.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self._used_tsum_icon.setMinimumWidth(0)
@@ -1433,26 +1433,31 @@ class MenuWindow(QMainWindow):
         row.setSpacing(TITLE_MARGIN)
         row.addStretch(1)
         row.addWidget(
-            self._count_side("プレイ回数", self._play_count_label),
+            self._count_side("プレイ回数", self._play_count_label, self._win_title_point()),
             0,
             Qt.AlignmentFlag.AlignTop,
         )
         row.addWidget(tsum_box, 0, Qt.AlignmentFlag.AlignTop)
         row.addWidget(
-            self._count_side("ツム認知度", self._tsum_recognition),
+            self._count_side("ツム認知度", self._tsum_recognition, self._win_title_point()),
             0,
             Qt.AlignmentFlag.AlignTop,
         )
         row.addStretch(1)
         left.insertLayout(left.indexOf(self._item_box), row)
 
-    def _count_side(self, title: str, label: QLabel) -> QWidget:
+    def _win_title_point(self) -> int:
+        if sys.platform == "win32":
+            return TITLE_POINT - 1
+        return TITLE_POINT
+
+    def _count_side(self, title: str, label: QLabel, point: int = TITLE_POINT) -> QWidget:
         wrap = QWidget()
         wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         column = QVBoxLayout(wrap)
         column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(0)
-        column.addWidget(self._section_title(title))
+        column.addWidget(self._section_title(title, point=point))
         column.addWidget(label)
         return wrap
 
@@ -4440,7 +4445,9 @@ class MenuWindow(QMainWindow):
         if self._center_blank is not None:
             self._center_blank.setFixedSize(width * 6, height * 3)
 
-    def _section_title(self, text: str, top: int = TITLE_MARGIN, bottom: int = TITLE_MARGIN) -> QWidget:
+    def _section_title(
+        self, text: str, top: int = TITLE_MARGIN, bottom: int = TITLE_MARGIN, point: int = TITLE_POINT
+    ) -> QWidget:
         wrap = QWidget()
         column = QVBoxLayout(wrap)
         column.setContentsMargins(0, top, 0, bottom)
@@ -4448,7 +4455,7 @@ class MenuWindow(QMainWindow):
         title = QLabel(text)
         title_font = title.font()
         title_font.setBold(True)
-        title_font.setPointSize(TITLE_POINT)
+        title_font.setPointSize(point)
         title.setFont(title_font)
         title.setStyleSheet("color: #2c4a7a; background: transparent;")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
