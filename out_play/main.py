@@ -4393,6 +4393,11 @@ class MenuWindow(QMainWindow):
             room = port.width() - max(0, left)
             if room > 1:
                 panel_w = min(panel_w, room)
+        center = getattr(self, "_center_slot", None)
+        if center is not None:
+            blank_w = center.contentsRect().width() * 6 // 8
+            if blank_w > 1:
+                panel_w = min(panel_w, blank_w)
         square.setFixedSize(panel_w, side)
         panel = getattr(self, "_pc_panel", None)
         if panel is not None:
