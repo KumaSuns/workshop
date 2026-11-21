@@ -4365,7 +4365,6 @@ class MenuWindow(QMainWindow):
         side = full * 3 // 4
         if side < 1:
             side = 1
-        gap = full - side
         row = max(1, side * 4 // 25)
         pad = 0
         if self._square_side_buttons:
@@ -4381,11 +4380,10 @@ class MenuWindow(QMainWindow):
         if side + side_w > usable_w:
             side = max(1, usable_w - side_w)
             row = max(1, side * 4 // 25)
-        gap = max(0, min(gap, usable_w - side - side_w))
         body = self._tsum_body
         if body is not None:
-            body.setContentsMargins(gap, TITLE_MARGIN, 0, 0)
-        panel_w = max(side + side_w, usable_w - gap)
+            body.setContentsMargins(0, TITLE_MARGIN, 0, 0)
+        panel_w = usable_w
         square.setFixedSize(panel_w, side)
         panel = getattr(self, "_pc_panel", None)
         if panel is not None:
