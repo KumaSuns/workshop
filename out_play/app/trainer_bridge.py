@@ -507,12 +507,18 @@ class _RadeonPredict:
             "        image = Image.frombytes('RGB', (int(header['w']), int(header['h'])), read_block())\n"
             "    except EOFError:\n"
             "        break\n"
-            "    if header['op'] == 'pieces':\n"
-            "        pieces = predictor.predict_pieces(Path('.'), header.get('game'), kinds=int(header.get('kinds') or 0), rgb=image, inner=bool(header.get('inner', True)), assign_groups=bool(header.get('assign', True)))\n"
-            "        body = {'pieces': pieces, 'heat': predictor.last_heat_s, 'type': predictor.last_type_s}\n"
-            "    else:\n"
-            "        body = {'boxes': predictor.predict_all(Path('.'), rgb=image)}\n"
-            "    write_block(json.dumps(body).encode('utf-8'))\n",
+            "    except Exception as exc:\n"
+            "        write_block(json.dumps({'error': str(exc)}).encode('utf-8'))\n"
+            "        continue\n"
+            "    try:\n"
+            "        if header['op'] == 'pieces':\n"
+            "            pieces = predictor.predict_pieces(Path('.'), header.get('game'), kinds=int(header.get('kinds') or 0), rgb=image, inner=bool(header.get('inner', True)), assign_groups=bool(header.get('assign', True)))\n"
+            "            body = {'pieces': pieces, 'heat': predictor.last_heat_s, 'type': predictor.last_type_s}\n"
+            "        else:\n"
+            "            body = {'boxes': predictor.predict_all(Path('.'), rgb=image)}\n"
+            "        write_block(json.dumps(body).encode('utf-8'))\n"
+            "    except Exception as exc:\n"
+            "        write_block(json.dumps({'error': str(exc)}).encode('utf-8'))\n",
             encoding="utf-8",
         )
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -544,39 +550,71 @@ class _RadeonPredict:
             raise RuntimeError(self.error or "Radeonの予測が止まっています。")
         rgb = rgb.convert("RGB")
         header["w"], header["h"] = rgb.size
+        holder: dict = {}
+
+        def read() -> None:
+            try:
+                holder["body"] = json.loads(_block_read(self.proc.stdout).decode("utf-8"))
+            except Exception as exc:
+                holder["error"] = exc
+
         with self._lock:
             _block_write(self.proc.stdin, json.dumps(header).encode("utf-8"))
             _block_write(self.proc.stdin, rgb.tobytes())
-            return json.loads(_block_read(self.proc.stdout).decode("utf-8"))
+            waiter = __import__("threading").Thread(target=read, daemon=True)
+            waiter.start()
+            waiter.join(3)
+        if waiter.is_alive():
+            self.proc.kill()
+            raise TimeoutError("Radeonの予測が3秒で返りませんでした。")
+        if "error" in holder:
+            raise holder["error"]
+        body = holder.get("body") or {}
+        if body.get("error"):
+            raise RuntimeError(str(body["error"]))
+        return body
 
     def bind(self, predictor) -> None:
+        local_pieces = predictor.predict_pieces
+        local_all = predictor.predict_all
+
         def predict_pieces(image_path, game, kinds=0, rgb=None, inner=True, assign_groups=True):
+            if self.proc is None or self.proc.poll() is not None:
+                return local_pieces(image_path, game, kinds, rgb, inner, assign_groups)
             if rgb is None:
                 from PIL import Image
 
                 with Image.open(image_path) as image:
                     rgb = image.convert("RGB")
-            body = self._ask(
-                {
-                    "op": "pieces",
-                    "game": game,
-                    "kinds": kinds,
-                    "inner": inner,
-                    "assign": assign_groups,
-                },
-                rgb,
-            )
+            try:
+                body = self._ask(
+                    {
+                        "op": "pieces",
+                        "game": game,
+                        "kinds": kinds,
+                        "inner": inner,
+                        "assign": assign_groups,
+                    },
+                    rgb,
+                )
+            except Exception:
+                return local_pieces(image_path, game, kinds, rgb, inner, assign_groups)
             predictor.last_heat_s = float(body.get("heat") or 0.0)
             predictor.last_type_s = float(body.get("type") or 0.0)
             return body.get("pieces") or []
 
         def predict_all(image_path, rgb=None):
+            if self.proc is None or self.proc.poll() is not None:
+                return local_all(image_path, rgb)
             if rgb is None:
                 from PIL import Image
 
                 with Image.open(image_path) as image:
                     rgb = image.convert("RGB")
-            body = self._ask({"op": "all"}, rgb)
+            try:
+                body = self._ask({"op": "all"}, rgb)
+            except Exception:
+                return local_all(image_path, rgb)
             return body.get("boxes") or {}
 
         predictor.predict_pieces = predict_pieces
