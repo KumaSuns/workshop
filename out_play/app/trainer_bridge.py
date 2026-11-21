@@ -20,6 +20,7 @@ from PySide6.QtCore import QSettings
 from app.paths import APP_ROOT
 
 TRAINER_ROOT = APP_ROOT / "bundled" / "screen"
+DIRECTML_DEVICE = False
 
 
 def use_gpu() -> bool:
@@ -318,6 +319,8 @@ def _resolve_play_device(report: Callable[[str], None] | None = None) -> tuple[o
                 return device, ""
             return "cpu", note or _directml_device.last_error or "DirectMLの装置がありません"
         return "cpu", note
+    if not DIRECTML_DEVICE:
+        return "cpu", ""
     device = _directml_device()
     install_error = ""
     if device is None:
