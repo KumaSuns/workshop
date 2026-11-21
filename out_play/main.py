@@ -4395,9 +4395,6 @@ class MenuWindow(QMainWindow):
         if side + side_w > usable_w:
             side = max(1, usable_w - side_w)
             row = max(1, side * 4 // 25)
-        body = self._tsum_body
-        if body is not None:
-            body.setContentsMargins(0, TITLE_MARGIN, 0, 0)
         self._fit_center()
         panel_w = usable_w
         blank = getattr(self, "_center_blank", None)
@@ -4430,7 +4427,19 @@ class MenuWindow(QMainWindow):
             panel_h = max(panel_h, panel.sizeHint().height())
         if self._slots:
             self._slots[0].setFixedHeight(TITLE_MARGIN + button_h + 8 + panel_h + 2)
+        self._align_panel_left()
         self._paint_square_qr()
+
+    def _align_panel_left(self) -> None:
+        blank = getattr(self, "_center_blank", None)
+        host = getattr(self, "_top_square_host", None)
+        body = getattr(self, "_tsum_body", None)
+        if blank is None or host is None or body is None or blank.width() < 1:
+            return
+        left = blank.mapTo(host, blank.rect().topLeft()).x()
+        if left < 0:
+            left = 0
+        body.setContentsMargins(left, TITLE_MARGIN, 0, 0)
 
     def _fit_center(self) -> None:
         slot = self._center_slot
@@ -4493,6 +4502,7 @@ class MenuWindow(QMainWindow):
                     meter.setMinimumWidth(0)
                     meter.setMaximumWidth(panel_w)
                     meter.setFixedWidth(panel_w)
+                self._align_panel_left()
                 buttons = getattr(self, "_square_side_buttons", [])
                 count = len(buttons)
                 if count:
